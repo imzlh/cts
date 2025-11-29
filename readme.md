@@ -60,13 +60,17 @@ console.log(`Hello, ${user.name}!`);
 ```
 
 ```bash
-tjs cli.ts main.ts
+cp '<path to cjs>' ./cjs
+npm run build
+npm run bundle
+./cjs --help
 ```
 
 ### JSR Packages with Version Ranges
 
 ```typescript
 // test.ts
+// note: assert package requires WebAPI Intl, so you are required to write a polyfill
 import { assert } from "jsr:@std/assert@^1.0.16";  // ✅ Supports version ranges
 import { parse } from "jsr:@std/path@~0.200.0";     // ✅ Latest matching version
 
@@ -247,19 +251,28 @@ tjs cli.ts app.ts
 ### Command Line Options
 
 ```bash
-tjs cli.ts [options] <file.ts> [args...]
+TypeScript Runtime for tjs
+
+Usage: cjs [options] <file.ts> [args...]
 
 Options:
-  --help, -h              Show help message
-  --version, -v           Show version
-  --cache-dir <path>      Cache directory (default: ~/.tjs/cache)
-  --no-http               Disable HTTP imports
-  --no-jsr                Disable JSR imports
-  --no-node               Disable Node.js compat
-  --silent                Suppress logs
-  --memory-limit <size>   Memory limit (e.g., 512MB, 1GB)
-  --max-stack-size <size> Stack size (e.g., 2MB)
+  --help, -h              Show this help message
+  --version, -v           Show version information
+  --cache-dir <path>      Set cache directory (default: ~/.cts/)
+  --no-http               Disable HTTP module loading
+  --no-jsr                Disable JSR module loading
+  --no-node               Disable Node.js compatibility
+  --silent                Suppress download logs
+  --memory-limit <size>   Set memory limit (e.g., 256MB, 1GB)
+  --max-stack-size <size> Set max stack size (e.g., 1MB)
   --jsr-cache-ttl <days>  JSR cache TTL in days (default: 7)
+  --polyfill <file>       Load polyfill file before entry file
+
+Examples:
+  cjs main.ts
+  cjs --silent app.ts
+  cjs --memory-limit 512MB script.ts
+  CTS_CACHE_DIR=/tmp/cache cjs app.ts
 ```
 
 ### Environment Variables
