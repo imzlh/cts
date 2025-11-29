@@ -12,12 +12,7 @@
   "license": "MIT",
   "packageManager": "pnpm@10.17.1",
   "dependencies": {
-    "abortcontroller-polyfill": "^1.7.8",
-    "event-target-polyfill": "^0.0.4",
-    "sucrase": "^3.35.1",
-    "url-polyfill": "^1.1.14",
-    "web-streams-polyfill": "^4.2.0",
-    "whatwg-fetch": "^3.6.20"
+    "sucrase": "^3.35.1"
   },
   "devDependencies": {
     "esbuild": "^0.27.0"

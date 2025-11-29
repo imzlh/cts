@@ -18,23 +18,26 @@ A complete, modular TypeScript/TSX/JSX runtime for QuickJS/tjs with HTTP imports
 ## 📦 Installation
 
 ```bash
-# Copy all files to your project
-typescript-runtime/
-├── cli.ts
-├── config.ts
-├── index.ts
-├── resolver.ts
-├── runtime.ts
-├── transformer.ts
-├── types.ts
-├── utils.ts
-├── version.ts       # Version comparison
-├── targz.ts         # Tar.gz extraction
-└── resolvers/
-    ├── http.ts
-    ├── jsr.ts      # JSR with version ranges
-    ├── node.ts
-    └── npm.ts      # NPM with auto-download
+cts
+├── example
+│   └── findkeyword.ts
+├── main.ts
+├── package.json
+├── readme.md
+├── src
+│   ├── config.ts
+│   ├── resolver
+│   │   ├── http.ts
+│   │   ├── index.ts
+│   │   ├── jsr.ts
+│   │   ├── node.ts
+│   │   └── npm.ts
+│   ├── runtime.ts
+│   ├── transformer.ts
+│   ├── types.ts
+│   └── utils.ts
+├── tsconfig.json
+└── types
 ```
 
 ## 🚀 Quick Start
