@@ -1,0 +1,7 @@
+package-lock.json
+package-lock.yaml
+test.json
+dist.js
+cjs
+node_modules/
+types/
