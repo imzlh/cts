@@ -71,6 +71,11 @@ export class TypeScriptRuntime {
                     importMeta.main = false;
                 }
 
+                // add resolve function to import.meta
+                importMeta.resolve = (name: string, parent: string): string => {
+                    return this.resolver.resolve(name, parent);
+                };
+
                 // user-defined meta
                 Object.assign(importMeta, this.additionalMeta);
             }
