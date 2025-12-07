@@ -6,10 +6,10 @@ import {
     joinPaths,
     dirname,
     hashString,
-    getExtensionFromUrl,
     ensureDir,
     SimpleUrl,
-    normalizePath
+    normalizePath,
+    getBasenameFromUrl
 } from '../utils';
 
 const fs = import.meta.use('fs');
@@ -35,7 +35,7 @@ export class HttpResolver {
             const cachedPath = this.getCachePath(url);
             if (fs.exists(cachedPath)) {
                 this.urlMap.set(cachedPath, url);
-                return cachedPath;
+                return url;
             }
 
             // Log download
@@ -69,28 +69,17 @@ export class HttpResolver {
         const resolvedPath = normalizePath(joinPaths(parentDir, relativePath));
 
         // Construct new URL
-        const newUrl = `${url.protocol}://${url.host}${resolvedPath}`;
-
+        let newUrl = `${url.protocol}://${url.host}${resolvedPath}`;
         return this.resolve(newUrl);
     }
 
     /**
-     * 获取 HTTP URL 对应的本地文件路径
-     * 
-     * @param url HTTP(S) URL
-     * @returns 本地文件路径
+     * Get local path
      */
     getLocalPath(url: string): string {
         if (this.urlMap.has(url))
-            return url;
+            return this.urlMap.get(url)!;
         return this.getCachePath(url);
-    }
-
-    /**
-     * Get original URL for a cached path
-     */
-    getOriginalUrl(cachedPath: string): string | undefined {
-        return this.urlMap.get(cachedPath);
     }
 
     /**
@@ -125,10 +114,10 @@ export class HttpResolver {
     private getCachePath(url: string): string {
         const parsed = new SimpleUrl(url);
         const hash = hashString(url);
-        const ext = getExtensionFromUrl(url);
+        const ext = getBasenameFromUrl(url);
 
         // Create path: cacheDir/http/host/hash.ext
-        return joinPaths(this.config.cacheDir, 'http', parsed.host, `${hash}${ext}`);
+        return joinPaths(this.config.cacheDir, 'http', parsed.host, `${hash}/${ext}`);
     }
 
     /**

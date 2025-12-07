@@ -1,0 +1,1 @@
+import.meta.use('console').log(await import('jsr:@ryweal/progress'))

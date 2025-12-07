@@ -26,8 +26,8 @@ export interface ConfigOptions {
     baseUrl?: string;
     /** Import map from deno.json */
     importMap?: Record<string, string>;
-    /** Whether to use polyfill */
-    polyfill?: boolean;
+    /** polyfill path */
+    polyfill?: string;
 }
 
 /**
@@ -39,6 +39,9 @@ export interface RuntimeConfig extends Required<Omit<ConfigOptions, 'pathAliases
     importMap?: Record<string, string>;
     memoryLimit?: number;
     maxStackSize?: number;
+    _?: string;  // entry
+    _args?: string[];  // entry args
+    _offset: number;  // entry offset
 }
 
 /**

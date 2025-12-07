@@ -13,6 +13,54 @@ export function errMsg(e: unknown): string {
     return String(e);
 }
 
+type Template = Record<string, 'string' | 'boolean' | 'number'>;
+export function parseArgs<T extends Template>(
+    argv: string[],
+    tpl: T
+): { 
+    [K in keyof T]?: T[K] extends 'string' ? string : T[K] extends 'number' ? number : boolean;
+ } & { _?: string, _args?: string[], _offset: number } {
+    const out: any = {};
+
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i]!;
+        if (!arg.startsWith('--')){
+            // entry
+            out._ = arg;
+            out._args = argv.slice(i + 1);
+            out._offset = i + 1;
+            break;
+        }
+
+        const key = arg.slice(2);
+        const type = tpl[key];
+        if (!type) {
+            throw new Error(`Invalid argument: ${key}`);
+        }
+        const next = argv[i + 1];
+
+        switch (type) {
+            case 'boolean':
+                out[key] = true;
+                break;
+            case 'string':
+                if (next && !next.startsWith('--')) {
+                    out[key] = next;
+                    i++;
+                }
+                break;
+            case 'number':
+                if (next && !next.startsWith('--')) {
+                    const n = Number(next);
+                    if (!Number.isNaN(n)) out[key] = n;
+                    i++;
+                }
+                break;
+        }
+    }
+    return out;
+}
+
 /**
  * Read a text file synchronously
  */
@@ -115,18 +163,17 @@ export function hashString(str: string): string {
 }
 
 /**
- * Get file extension from URL
+ * Get file basename from URL
  */
-export function getExtensionFromUrl(url: string): string {
+export function getBasenameFromUrl(url: string): string {
     const path = url.split('?')[0]!.split('#')[0]!;
-    const lastDot = path.lastIndexOf('.');
     const lastSlash = path.lastIndexOf('/');
 
-    if (lastDot > lastSlash && lastDot > 0) {
-        return path.substring(lastDot);
+    if (lastSlash > 0) {
+        return path.substring(lastSlash);
     }
 
-    return '.js'; // Default extension
+    return 'index.js'; // Default extension
 }
 
 /**

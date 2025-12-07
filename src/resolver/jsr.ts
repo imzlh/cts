@@ -48,12 +48,13 @@ export class JsrResolver {
                 parsed.path,
                 versionMeta
             );
-            this.downloadFile(parsed.scope, parsed.name, version, resolvedPath);
+            const abspath = this.downloadFile(parsed.scope, parsed.name, version, resolvedPath);
 
             // Track URL mapping
-            const endPath = normalizePath(resolvedPath);
+            let endPath = normalizePath(resolvedPath);
+            if (endPath[0] == '/') endPath = endPath.substring(1);
             const jsrUrl = `jsr:@${parsed.scope}/${parsed.name}@${version}/${endPath}`;
-            this.urlMap.set(resolvedPath, jsrUrl);
+            this.urlMap.set(jsrUrl, abspath);
 
             return jsrUrl;
         } catch (error) {
@@ -74,11 +75,11 @@ export class JsrResolver {
     /**
      * download file from JSR registry
      */
-    private downloadFile(scope: string, name: string, version: string, filePath: string): void {
+    private downloadFile(scope: string, name: string, version: string, filePath: string, refresh = false) {
         const localPath = joinPaths(this.config.cacheDir, 'jsr', scope, name, version, filePath);
 
-        if (fs.exists(localPath)) {
-            return;
+        if (!refresh && fs.exists(localPath)) {
+            return localPath; // not required to download again
         }
 
         this.logDownload(`Downloading @${scope}/${name}@${version}/${filePath}`);
@@ -88,6 +89,8 @@ export class JsrResolver {
         ensureDir(dirname(localPath));
         const encoded = engine.encodeString(fileContent);
         fs.writeFile(localPath, encoded.buffer);
+
+        return localPath;
     }
 
     /**
@@ -108,6 +111,7 @@ export class JsrResolver {
         // ensure file is downloaded
         this.downloadFile(parsed.scope, parsed.name, parsed.version, filePath);
 
+        // build path
         return joinPaths(
             this.config.cacheDir,
             'jsr',
@@ -116,13 +120,6 @@ export class JsrResolver {
             parsed.version,
             filePath
         );
-    }
-
-    /**
-     * Get original JSR URL for a cached path
-     */
-    getOriginalUrl(cachedPath: string): string | undefined {
-        return this.urlMap.get(cachedPath);
     }
 
     /**
@@ -263,6 +260,7 @@ export class JsrResolver {
 
     /**
      * resolve jsr file path
+     * warn: it returns a relative path to package root
      */
     private resolveFile(
         scope: string,

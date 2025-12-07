@@ -1,72 +1,14 @@
 // cli.ts - Command Line Interface
 
 import { createRuntime } from './src/runtime.js';
-import { loadConfigFile } from './src/config.js';
-import { errMsg, dirname } from './src/utils.js';
+import { createConfig, loadConfigFile } from './src/config.js';
+import { errMsg, dirname, readTextFile } from './src/utils.js';
 
 const sys = import.meta.use('sys');
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');
 const console = import.meta.use('console');
-
-/**
- * Parse CLI arguments
- */
-function parseArgs(args: string[]): {
-    entryFile: string | null;
-    scriptArgs: string[];
-    showHelp: boolean;
-    showVersion: boolean;
-} {
-    const result = {
-        entryFile: null as string | null,
-        scriptArgs: [] as string[],
-        showHelp: false,
-        showVersion: false,
-    };
-
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i]!;
-
-        if (arg === '--help' || arg === '-h') {
-            result.showHelp = true;
-            return result;
-        }
-
-        if (arg === '--version' || arg === '-v') {
-            result.showVersion = true;
-            return result;
-        }
-
-        // Skip runtime options (they're handled by config.ts)
-        if (arg.startsWith('--') && [
-            '--cache-dir',
-            '--memory-limit',
-            '--max-stack-size',
-            '--jsr-cache-ttl'
-        ].includes(arg)) {
-            i++; // Skip the next argument (the value)
-            continue;
-        }
-
-        if (arg.startsWith('--no-')) {
-            continue;
-        }
-
-        if (arg === '--silent') {
-            continue;
-        }
-
-        // First non-option argument is the entry file
-        if (!result.entryFile) {
-            result.entryFile = arg;
-            result.scriptArgs = args.slice(i + 1);
-            break;
-        }
-    }
-
-    return result;
-}
+const engine = import.meta.use('engine');
 
 /**
  * Show help message
@@ -116,59 +58,47 @@ function showHelp(): void {
 }
 
 /**
- * Show version information
- */
-function showVersion(): void {
-    const engine = import.meta.use('engine');
-    console.log(`TypeScript Runtime for tjs`);
-    console.log(`tjs: ${engine.versions.tjs}`);
-    console.log(`QuickJS: ${engine.versions.quickjs}`);
-}
-
-/**
  * Main entry point
  */
 async function main(): Promise<void> {
-    const args = sys.args.slice(1);
-    const parsed = parseArgs(args);
+    const entryDir = os.cwd;
+    const fileConfig = loadConfigFile(entryDir);
 
-    if (parsed.showHelp) {
+    // Create runtime with file config
+    const runtime = createRuntime(fileConfig);
+
+    if (!runtime.rtConfig._) {
         showHelp();
         os.exit(0);
         return;
     }
 
-    if (parsed.showVersion) {
-        showVersion();
-        os.exit(0);
-        return;
-    }
+    
+    // Update sys.args to only include script arguments
+    sys.args.splice(0, runtime.rtConfig._offset -1);
+    let entryFile = runtime.rtConfig._;
 
-    if (!parsed.entryFile) {
-        console.error('Error: No entry file specified');
-        console.error('Use --help for usage information');
+    // initialize polyfill
+    if (runtime.rtConfig.polyfill) try{
+        const file = readTextFile(runtime.rtConfig.polyfill);
+        // will eval the code in module scope
+        const mod = new engine.Module(file, fs.realpath(runtime.rtConfig.polyfill));
+        mod.meta.use = import.meta.use;
+        await mod.eval();
+    } catch (error) {
+        console.error('\n❌ Error loading polyfill:', errMsg(error));
+        if (error instanceof Error && error.stack) {
+            console.error(error.stack);
+        }
         os.exit(1);
-        return;
     }
-
-    let entryFile = parsed.entryFile;
 
     // Resolve entry file path
     if (!entryFile.startsWith('.') && !entryFile.startsWith('/')) {
         entryFile = fs.realpath(entryFile);
     }
 
-    // Update sys.args to only include script arguments
-    sys.args.splice(1, sys.args.length - 1, ...parsed.scriptArgs);
-
     try {
-        // Load config file from entry directory
-        const entryDir = dirname(entryFile);
-        const fileConfig = loadConfigFile(entryDir);
-
-        // Create runtime with file config
-        const runtime = createRuntime(fileConfig);
-
         // Import and execute entry file
         await import(entryFile);
     } catch (error) {

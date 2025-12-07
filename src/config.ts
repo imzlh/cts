@@ -1,5 +1,6 @@
 // config.ts - Runtime Configuration Management
 import type { RuntimeConfig, ConfigOptions } from './types.ts';
+import { parseArgs } from './utils.js';
 
 const os = import.meta.use('os');
 const sys = import.meta.use('sys');
@@ -23,62 +24,6 @@ const DEFAULTS = {
     memoryLimit: undefined,
     maxStackSize: undefined,
 } as const;
-
-/**
- * Parse command line arguments for configuration
- */
-function parseCliArgs(args: string[]): Partial<ConfigOptions> {
-    const config: Partial<ConfigOptions> = {};
-
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i];
-
-        switch (arg) {
-            case '--cache-dir':
-                config.cacheDir = args[++i];
-                break;
-            case '--no-http':
-                config.enableHttp = false;
-                break;
-            case '--no-jsr':
-                config.enableJsr = false;
-                break;
-            case '--no-node':
-                config.enableNode = false;
-                break;
-            case '--silent':
-                config.silent = true;
-                break;
-            case '--memory-limit': {
-                const limit = args[++i];
-                config.memoryLimit = parseMemorySize(limit);
-                break;
-            }
-            case '--max-stack-size': {
-                const size = args[++i];
-                config.maxStackSize = parseMemorySize(size);
-                break;
-            }
-            case '--jsr-cache-ttl': {
-                const days = parseInt(args[++i] ?? '7', 10);
-                config.jsrCacheTTL = days * 24 * 60 * 60 * 1000;
-                break;
-            }
-            case '--polyfill': {
-                const file = args[++i];
-                if (!file) throw new Error('Missing polyfill file');
-                import(file).then(module => {
-                    config.polyfill = true;
-                }).catch(e => {
-                    console.error('Failed to load polyfill:', e);
-                });
-                break;
-            }
-        }
-    }
-
-    return config;
-}
 
 /**
  * Parse memory size string (e.g., "256MB", "1GB")
@@ -205,12 +150,21 @@ function dirname(path: string): string {
  */
 export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeConfig {
     // Priority: CLI args > user config > env vars > defaults
-    const cliConfig = parseCliArgs(sys.args.slice(1));
+    const cliConfig = parseArgs(sys.args.slice(1), {
+        'cache-dir': 'string',
+        'silent': 'boolean',
+        'memory-limit': 'string',
+        'no-http': 'boolean',
+        'no-jsr': 'boolean',
+        'no-node': 'boolean',
+        'jsr-cache-ttl': 'number',
+        'polyfill': 'string',
+    });
     const envConfig = getEnvConfig();
 
     const config: RuntimeConfig = {
         cacheDir: '',
-        polyfill: false,
+        polyfill: '',
         ...DEFAULTS,
         ...envConfig,
         ...userConfig,

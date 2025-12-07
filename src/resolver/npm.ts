@@ -10,7 +10,8 @@ import {
     ensureDir,
     errMsg,
     matchLatestVersion,
-    unTarGz
+    unTarGz,
+    normalizePath
 } from '../utils';
 
 const fs = import.meta.use('fs');
@@ -20,7 +21,7 @@ const console = import.meta.use('console');
 const os = import.meta.use('os');
 
 /**
- * NPM Registry 配置
+ * NPM Registry
  */
 interface NpmConfig {
     registry: string;
@@ -52,19 +53,17 @@ export class NpmResolver {
     private npmConfig: NpmConfig | null = null;
 
     constructor(private readonly config: RuntimeConfig) {
-        this.globalCacheDir = joinPaths(this.config.cacheDir, 'node_modules');
+        this.globalCacheDir = joinPaths(this.config.cacheDir, 'npm');
     }
 
     /**
      * Resolve npm package import
+     * Note: npm-module use full local path
      */
     resolve(name: string, parent: string): string {
         const { packageName, subpath } = this.parsePackageName(name);
 
-        // 查找包目录
         let packageDir = this.findPackageDir(packageName, parent);
-
-        // 如果本地找不到，尝试自动下载到全局缓存
         if (!packageDir) {
             packageDir = this.autoInstallPackage(packageName);
         }
@@ -73,7 +72,7 @@ export class NpmResolver {
             throw new Error(`Package "${packageName}" not found and auto-install failed`);
         }
 
-        // 解析子路径
+        // parse export
         if (subpath) {
             const exported = this.resolvePackageExports(packageDir, subpath);
             if (exported) {
@@ -84,26 +83,23 @@ export class NpmResolver {
             return tryResolveFile(subpathFull);
         }
 
-        // 解析包主入口
+        // main entry
         return this.resolvePackageMain(packageDir);
     }
 
     /**
-     * 自动安装 NPM 包到全局缓存
+     * auto install package to global scope(unstable)
      */
     private autoInstallPackage(packageName: string): string | null {
         try {
             if (!this.config.silent) {
-                console.log(`📦 Auto-installing ${packageName} to global cache...`);
+                console.log(`📦 npx ${packageName}`);
             }
 
-            // 获取 npm 配置
             const config = this.getNpmConfig();
-
-            // 获取包元数据
             const metadata = this.fetchPackageMetadata(packageName, config.registry);
 
-            // 获取最新版本
+            // get latest version
             const version = metadata['dist-tags'].latest;
             if (!version) {
                 throw new Error(`No latest version found for ${packageName}`);
@@ -114,47 +110,36 @@ export class NpmResolver {
                 throw new Error(`Version ${version} not found in metadata`);
             }
 
-            // 下载并解压
+            // download tarball
             const tarballUrl = versionData.dist.tarball;
             const packageDir = joinPaths(this.globalCacheDir, packageName);
-
-            // 检查是否已安装
-            if (fs.exists(packageDir)) {
-                if (!this.config.silent) {
-                    console.log(`✓ ${packageName}@${version} already cached`);
-                }
-                return packageDir;
-            }
 
             if (!this.config.silent) {
                 console.log(`  Downloading ${packageName}@${version}...`);
             }
 
-            // 下载 tarball
             const tarballData = this.downloadTarball(tarballUrl);
 
             if (!this.config.silent) {
                 console.log(`  Extracting...`);
             }
 
-            // 解压到临时目录
+            // unextract using zlib
             const files = unTarGz(tarballData);
-
-            // NPM tarball 通常包含 package/ 前缀
             ensureDir(packageDir);
-
             for (const file of files) {
-                if (file.type !== 'file') continue;
-
-                // 移除 package/ 前缀
-                let filePath = file.path;
-                if (filePath.startsWith('package/')) {
+                // remove package/ prefix
+                let filePath = normalizePath(file.path);
+                if (filePath.startsWith('package/'))
                     filePath = filePath.substring(8);
+                const targetPath = joinPaths(packageDir, filePath);
+                if (file.type == 'dir') {
+                    ensureDir(targetPath);
                 }
 
-                const targetPath = joinPaths(packageDir, filePath);
-                ensureDir(dirname(targetPath));
+                // TODO: pre-compile some files?
 
+                // create and write files
                 fs.writeFile(targetPath, file.content);
             }
 
@@ -172,21 +157,22 @@ export class NpmResolver {
     }
 
     /**
-     * 获取 NPM 配置
+     * Get NPM config(compatiable)
      */
     private getNpmConfig(): NpmConfig {
         if (this.npmConfig) {
             return this.npmConfig;
         }
 
-        // 尝试从环境变量获取
-        const envRegistry = os.getenv('NPM_CONFIG_REGISTRY');
-        if (envRegistry) {
+        // environ
+        try{
+            const envRegistry = os.getenv('NPM_CONFIG_REGISTRY');
+            if (!envRegistry) throw 0;
             this.npmConfig = { registry: envRegistry };
             return this.npmConfig;
-        }
+        }catch{}
 
-        // 尝试从 .npmrc 读取
+        // find .npmrc
         const home = os.homedir || '/root';
         const npmrcPath = joinPaths(home, '.npmrc');
 
@@ -208,13 +194,13 @@ export class NpmResolver {
             }
         }
 
-        // 默认使用 npm 官方镜像
+        // use npm default register
         this.npmConfig = { registry: 'https://registry.npmjs.org' };
         return this.npmConfig;
     }
 
     /**
-     * 获取包元数据
+     * get package meta
      */
     private fetchPackageMetadata(packageName: string, registry: string): NpmPackageMetadata {
         // 处理 scoped package
@@ -233,7 +219,7 @@ export class NpmResolver {
     }
 
     /**
-     * 下载 tarball
+     * download tarball
      */
     private downloadTarball(url: string): ArrayBuffer {
         const request = new xhr.XMLHttpRequest();
@@ -361,11 +347,17 @@ export class NpmResolver {
                         return joinPaths(packageDir, exportValue);
                     }
                     // Conditional exports
-                    if (typeof exportValue === 'object' && exportValue.default) {
-                        return joinPaths(packageDir, exportValue.default);
+                    if (typeof exportValue === 'object') {
+                        // prefer import
+                        for (const key of ['import', 'default', 'require'])
+                            if (typeof exportValue[key] == 'string')
+                                return joinPaths(packageDir, exportValue[key]);
                     }
                     return null;
                 };
+
+                // as entry?
+                if(!subpath) return checkPath(".");
 
                 // Try exact match
                 const result = checkPath(subpath);

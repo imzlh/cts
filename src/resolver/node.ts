@@ -28,6 +28,7 @@ export class NodeModuleResolver {
         const moduleName = specifier.substring(5); // Remove 'node:' prefix
 
         // Check custom resolver
+        // TODO: this will break node protocol, fix it?
         if (this.customResolver) {
             const resolved = this.customResolver(moduleName);
             if (resolved) {

@@ -53,33 +53,37 @@ export class TypeScriptRuntime {
             },
 
             init: (protocolPath: string, importMeta: Record<string, any>): void => {
-                importMeta.url = this.isRemoteProtocol(protocolPath)
-                    ? protocolPath
-                    : `file://${protocolPath}`;
-                importMeta.filename = protocolPath;
-                importMeta.dirname = dirname(protocolPath);
-
-                // No polyfill: use the original import.meta.use
-                if (!this.config.polyfill)
-                    importMeta.use = import.meta.use;
-
-                // Set main flag
-                if (!this.mainScript) {
-                    importMeta.main = true;
-                    this.mainScript = protocolPath;
-                } else {
-                    importMeta.main = false;
-                }
-
-                // add resolve function to import.meta
-                importMeta.resolve = (name: string, parent: string): string => {
-                    return this.resolver.resolve(name, parent);
-                };
-
-                // user-defined meta
-                Object.assign(importMeta, this.additionalMeta);
+                this.initModule(importMeta, protocolPath);
             }
         });
+    }
+
+    private initModule(importMeta: Record<string, any>, protocolPath: string): void {
+        importMeta.url = this.isRemoteProtocol(protocolPath)
+            ? protocolPath
+            : `file://${protocolPath}`;
+        importMeta.filename = protocolPath;
+        importMeta.dirname = dirname(protocolPath);
+
+        // No polyfill: use the original import.meta.use
+        if (!this.config.polyfill)
+            importMeta.use = import.meta.use;
+
+        // Set main flag
+        if (!this.mainScript) {
+            importMeta.main = true;
+            this.mainScript = protocolPath;
+        } else {
+            importMeta.main = false;
+        }
+
+        // add resolve function to import.meta
+        importMeta.resolve = (name: string, parent: string): string => {
+            return this.resolver.resolve(name, parent);
+        };
+
+        // user-defined meta
+        Object.assign(importMeta, this.additionalMeta);
     }
 
     /**
@@ -94,29 +98,44 @@ export class TypeScriptRuntime {
     /**
      * Load and transform a module
      */
-    private loadModule(localPath: string, protocolPath: string): string {
-        if (!fs.exists(localPath)) {
+    private loadModule(localPath: string, protocolPath: string): CModuleEngine.Module {
+        let stats;
+        try {
+            stats = fs.stat(localPath);
+        } catch {
             throw new Error(`Module not found: ${localPath}`);
         }
 
-        const stats = fs.stat(localPath);
         if (stats.isDirectory) {
             throw new Error(`Cannot load directory as module: ${localPath}`);
         }
 
-        // Read source code
-        const sourceCode = readTextFile(localPath);
+        // in user code dir, no cache
+        if (!localPath.startsWith(this.config.cacheDir)) {
+            const code = this.transformer.transform(readTextFile(localPath), localPath);
+            const mod = new engine.Module(code, protocolPath);
+            this.initModule(mod.meta, protocolPath);
+            return mod;
+        }
 
-        // Transform code
-        const transformedCode = this.transformer.transform(sourceCode, protocolPath);
-        return transformedCode;
+        // try cache
+        try {
+            stats = fs.stat(localPath + '.jsc');
+            if (!stats.isFile) throw 1;
+        } catch {
+            return this.buildCache(localPath, protocolPath);
+        }
+
+        const buf = fs.readFile(localPath + '.jsc');
+        return engine.deserialize(new Uint8Array(buf));
     }
 
-    /**
-     * Clear resolution cache
-     */
-    clearCache(): void {
-        this.resolver.clearCache();
+    private buildCache(path: string, ptcPath: string): CModuleEngine.Module {
+        // read and compile
+        const code = this.transformer.transform(readTextFile(path), path);
+        const mod = new engine.Module(code, ptcPath);
+        fs.writeFile(path + '.jsc', mod.dump());
+        return mod;
     }
 
     /**
@@ -124,6 +143,10 @@ export class TypeScriptRuntime {
      */
     getMainScript(): string | null {
         return this.mainScript;
+    }
+
+    get rtConfig(): RuntimeConfig {
+        return this.config;
     }
 }
 
