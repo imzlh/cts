@@ -63,18 +63,34 @@ export class NpmResolver extends BaseResolver {
     }
 
     /**
+     * Clean npm specifier by removing protocol prefix and handling extra slashes
+     */
+    private cleanNpmSpecifier(specifier: string): string {
+        // Remove npm: protocol prefix if present
+        let packageName = specifier.startsWith('npm:') ? specifier.substring(4) : specifier;
+        
+        // Handle case where there's an extra slash after npm: (e.g., npm:/preact@^10.27.2/jsx-runtime)
+        if (packageName.startsWith('/')) {
+            packageName = packageName.substring(1);
+        }
+        
+        return packageName;
+    }
+
+    /**
      * Resolve npm package import
      */
     resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
-        const { packageName, subpath } = this.parsePackageName(specifier);
+        const packageName = this.cleanNpmSpecifier(specifier);
+        const { packageName: pkgName, subpath } = this.parsePackageName(packageName);
 
-        let packageDir = this.findPackageDir(packageName, parent || '');
+        let packageDir = this.findPackageDir(pkgName, parent || '');
         if (!packageDir) {
-            packageDir = this.autoInstallPackage(packageName);
+            packageDir = this.autoInstallPackage(pkgName);
         }
 
         if (!packageDir) {
-            throw new Error(`Package "${packageName}" not found and auto-install failed`);
+            throw new Error(`Package "${pkgName}" not found and auto-install failed`);
         }
 
         // Resolve exports
@@ -84,7 +100,9 @@ export class NpmResolver extends BaseResolver {
                 return exported;
             }
 
-            const subpathFull = joinPaths(packageDir, subpath);
+            // Ensure subpath doesn't start with './' to avoid double slashes
+            const cleanSubpath = subpath.startsWith('./') ? subpath.substring(2) : subpath;
+            const subpathFull = joinPaths(packageDir, cleanSubpath);
             return tryResolveFile(subpathFull);
         }
 
@@ -108,10 +126,16 @@ export class NpmResolver extends BaseResolver {
             const config = this.getNpmConfig();
             const metadata = this.fetchPackageMetadata(packageName, config.registry);
 
-            // get latest version
-            const version = metadata['dist-tags'].latest;
+            // Extract version from original package name if present
+            const versionMatch = packageName.match(/@[\^~]?\d+\.\d+\.\d+$/);
+            let version = versionMatch ? versionMatch[0].substring(1) : null;
+            
+            // If no version specified, use latest
             if (!version) {
-                throw new Error(`No latest version found for ${packageName}`);
+                version = metadata['dist-tags'].latest;
+                if (!version) {
+                    throw new Error(`No latest version found for ${packageName}`);
+                }
             }
 
             const versionData = metadata.versions[version];
@@ -124,13 +148,13 @@ export class NpmResolver extends BaseResolver {
             const packageDir = joinPaths(this.globalCacheDir, packageName);
 
             if (!this.config.silent) {
-                console.log(`  Downloading ${packageName}@${version}...`);
+                console.debug(`[NPM] Downloading ${packageName}@${version}...`);
             }
 
             const tarballData = this.downloadTarball(tarballUrl);
 
             if (!this.config.silent) {
-                console.log(`  Extracting...`);
+                console.debug(`[NPM] Extracting...`);
             }
 
             // unextract using zlib
@@ -152,6 +176,7 @@ export class NpmResolver extends BaseResolver {
                         ensureDir(parentDir);
                     }
                     // create and write files
+                    console.debug(`[NPM] extract ${targetPath} (${file.size} bytes)`);
                     fs.writeFile(targetPath, file.content);
                 }
             }
@@ -234,24 +259,28 @@ export class NpmResolver extends BaseResolver {
      * Parse package name
      */
     private parsePackageName(name: string): ParsedPackageName {
-        if (name.startsWith('@')) {
+        // Remove version specifier if present (e.g., @opentelemetry/api@^1.9.0)
+        const versionMatch = name.match(/(.+?)@[\^~]?\d+\.\d+\.\d+/);
+        const packageName = versionMatch ? versionMatch[1] : name;
+        
+        if (packageName.startsWith('@')) {
             // Scoped package: @scope/pkg/sub
-            const parts = name.split('/');
+            const parts = packageName.split('/');
             if (parts.length < 2) {
                 throw new Error(`Invalid scoped package name: ${name}`);
             }
-            const packageName = `${parts[0]}/${parts[1]}`;
+            const pkgName = `${parts[0]}/${parts[1]}`;
             const subpath = parts.slice(2).join('/');
-            return { packageName, subpath: subpath ? `./${subpath}` : '' };
+            return { packageName: pkgName, subpath: subpath };
         } else {
             // Regular package
-            const firstSlash = name.indexOf('/');
+            const firstSlash = packageName.indexOf('/');
             if (firstSlash === -1) {
-                return { packageName: name, subpath: '' };
+                return { packageName: packageName, subpath: '' };
             }
-            const packageName = name.substring(0, firstSlash);
-            const subpath = name.substring(firstSlash + 1);
-            return { packageName, subpath: `./${subpath}` };
+            const pkgName = packageName.substring(0, firstSlash);
+            const subpath = packageName.substring(firstSlash + 1);
+            return { packageName: pkgName, subpath: subpath };
         }
     }
 
@@ -340,14 +369,19 @@ export class NpmResolver extends BaseResolver {
                     // @ts-ignore
                     const exportValue = pkgJson.exports![path];
                     if (typeof exportValue === 'string') {
-                        return joinPaths(packageDir, exportValue);
+                        // Clean up exportValue to remove leading ./ to avoid double slashes
+                        const cleanExportValue = exportValue.startsWith('./') ? exportValue.substring(2) : exportValue;
+                        return joinPaths(packageDir, cleanExportValue);
                     }
                     // Conditional exports
                     if (typeof exportValue === 'object') {
                         // prefer import
                         for (const key of ['import', 'default', 'require'])
-                            if (typeof exportValue[key] == 'string')
-                                return joinPaths(packageDir, exportValue[key]);
+                            if (typeof exportValue[key] == 'string') {
+                                // Clean up exportValue to remove leading ./ to avoid double slashes
+                                const cleanExportValue = exportValue[key].startsWith('./') ? exportValue[key].substring(2) : exportValue[key];
+                                return joinPaths(packageDir, cleanExportValue);
+                            }
                     }
                     return null;
                 };
