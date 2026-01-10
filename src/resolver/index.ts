@@ -1,123 +1,203 @@
-// resolver.ts - Main Module Resolver
+// resolver/index.ts - Main Module Resolver
 
-import type { RuntimeConfig, CacheEntry, NodeResolver } from '../types';
-import {
-    joinPaths,
-    dirname,
-    normalizePath,
-    tryResolveFile,
-    isAbsolutePath
-} from '../utils';
+import { type RuntimeConfig, type NodeResolver, FileType } from '../types';
+import { dirname, tryResolveFile, isAbsolutePath, normalizePath, joinPaths } from '../utils';
 import { HttpResolver } from './http';
 import { JsrResolver } from './jsr';
 import { NodeModuleResolver } from './node';
 import { NpmResolver } from './npm';
+import { FileResolver } from './file';
+import { DataResolver } from './data';
+import type { BaseResolver } from './base';
 
-const fs = import.meta.use('fs');
+const os = import.meta.use('os');
+
+interface ResolverEntry {
+    resolver: BaseResolver;
+    enabled: boolean;
+}
 
 /**
- * Main Module Resolver
+ * Main protocol resolver class
+ * Responsibility: Convert various protocol URLs to local file paths
  */
 export class ModuleResolver {
-    private readonly httpResolver: HttpResolver;
-    private readonly jsrResolver: JsrResolver;
-    private readonly nodeResolver: NodeModuleResolver;
-    private readonly npmResolver: NpmResolver;
+    private readonly resolverRegistry: Map<string, ResolverEntry> = new Map();
 
     constructor(private readonly config: RuntimeConfig) {
-        this.httpResolver = new HttpResolver(config);
-        this.jsrResolver = new JsrResolver(config);
-        this.nodeResolver = new NodeModuleResolver(config);
-        this.npmResolver = new NpmResolver(config);
+        this.registerResolvers();
     }
 
-    /**
-     * Register Node.js builtin resolver
-     */
+    private registerResolvers(): void {
+        const registrations: Array<[BaseResolver, keyof RuntimeConfig]> = [
+            [new HttpResolver(this.config), 'enableHttp'],
+            [new JsrResolver(this.config), 'enableJsr'],
+            [new NodeModuleResolver(this.config), 'enableNode'],
+            [new FileResolver(this.config), 'enableHttp'], // Use enableHttp for file:// protocol
+            [new DataResolver(this.config), 'enableHttp']  // Use enableHttp for data: protocol
+        ];
+
+        for (const [resolver, flag] of registrations) {
+            this.registerResolver(resolver, flag);
+        }
+        // npm is enabled by default
+        this.resolverRegistry.set('npm', {
+            resolver: new NpmResolver(this.config),
+            enabled: true
+        });
+    }
+
+    private registerResolver(resolver: BaseResolver, flag: keyof RuntimeConfig): void {
+        for (const protocol of resolver.protocol) {
+            this.resolverRegistry.set(protocol, {
+                resolver,
+                enabled: this.config[flag] as boolean
+            });
+        }
+    }
+
     registerNodeResolver(resolver: NodeResolver): void {
-        this.nodeResolver.registerResolver(resolver);
+        const entry = this.resolverRegistry.get('node');
+        if (entry?.resolver instanceof NodeModuleResolver) {
+            (entry.resolver as NodeModuleResolver).registerResolver(resolver);
+        }
     }
 
     /**
-     * Resolve module specifier
-     * return a protocol-absolute path(expect node protocol)
+     * Resolve module identifier to local path
      */
-    resolve(name: string, parent: string): string {
-        let resolved: string;
+    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
+        const mappedName = this.applyImportMap(specifier);
 
-        // Apply import map if available
-        const mappedName = this.applyImportMap(name);
-
-        // Handle node: protocol
-        if (mappedName.startsWith('node:')) {
-            if (!this.config.enableNode) {
-                throw new Error('Node.js compatibility layer is disabled');
-            }
-            // node prefix is removed
-            resolved = this.nodeResolver.resolve(mappedName);
-        }
-        // Handle HTTP(S) URLs
-        else if (mappedName.startsWith('http://') || mappedName.startsWith('https://')) {
-            if (!this.config.enableHttp) {
-                throw new Error('HTTP module loading is disabled');
-            }
-            resolved = this.httpResolver.resolve(mappedName);
-        }
-        // Handle JSR imports
-        else if (mappedName.startsWith('jsr:')) {
-            if (!this.config.enableJsr) {
-                throw new Error('JSR module loading is disabled');
-            }
-            resolved = this.jsrResolver.resolve(mappedName, parent);
-        }
-        // Handle relative paths
-        else if (mappedName.startsWith('./') || mappedName.startsWith('../')) {
-            resolved = this.resolveRelative(mappedName, parent);
-        }
-        // Handle absolute paths
-        else if (isAbsolutePath(mappedName)) {
-            resolved = this.resolveAbsolute(mappedName);
-        }
-        // Handle package imports
-        else {
-            resolved = this.resolvePackage(mappedName, parent);
+        if (this.isRelativePath(mappedName)) {
+            return this.resolveRelative(mappedName, parent!, attr);
         }
 
-        return resolved;
+        if (this.isAbsolutePath(mappedName)) {
+            return this.resolveAbsolute(mappedName, parent, attr);
+        }
+
+        return this.resolveByProtocol(mappedName, parent, attr);
+    }
+
+    private resolveByProtocol(name: string, parent?: string, attr?: Record<string, any>): string {
+        const protocol = this.extractProtocol(name);
+        const entry = this.resolverRegistry.get(protocol);
+
+        if (!entry) {
+            return this.resolvePackage(name, parent!, attr);
+        }
+
+        if (!entry.enabled) {
+            throw new Error(`${this.getProtocolDisplayName(protocol)} module loading is disabled`);
+        }
+
+        const { resolver } = entry;
+
+        if (protocol === 'node') {
+            return (resolver as NodeModuleResolver).resolve(name);
+        }
+
+        return resolver.resolve(name, parent, attr);
     }
 
     /**
-     * Get matched local path, to load modules exactly
+     * Get local path for protocol URL
      */
     getLocalPath(protocolPath: string): string {
-        // JSR protocol
-        if (protocolPath.startsWith('jsr:')) {
-            return this.jsrResolver.getLocalPath(protocolPath);
-        }
+        const protocol = this.extractProtocol(protocolPath);
+        const entry = this.resolverRegistry.get(protocol);
 
-        // HTTP(S) protocol
-        if (protocolPath.startsWith('http://') || protocolPath.startsWith('https://')) {
-            return this.httpResolver.getLocalPath(protocolPath);
+        return entry?.resolver.getLocalPath(protocolPath) ?? protocolPath;
+    }
+    
+    /**
+     * Get file type
+     */
+    getFileType(path: string): FileType {
+        const protocol = this.extractProtocol(path);
+        const entry = this.resolverRegistry.get(protocol);
+        
+        if (entry?.resolver) {
+            return entry.resolver.getFileType(path);
         }
-
-        // Local file path
-        return protocolPath;
+        
+        // Default file type check
+        if (path.endsWith('.wasm')) {
+            return FileType.BINARY;
+        }
+        
+        return FileType.TEXT;
     }
 
     /**
-     * Apply import map
+     * Resolve relative path
      */
+    resolveRelative(name: string, parent: string, attr?: Record<string, any>): string {
+        if (!parent) {
+            const parentDir = os.cwd;
+            return tryResolveFile(normalizePath(joinPaths(parentDir, name)));
+        }
+
+        const protocol = this.extractProtocol(parent);
+        const entry = this.resolverRegistry.get(protocol);
+
+        if (entry?.resolver) {
+            try {
+                return entry.resolver.resolve(name, parent, attr);
+            } catch {
+                // Fallback to file system resolution
+            }
+        }
+
+        const parentDir = dirname(parent);
+        return tryResolveFile(normalizePath(joinPaths(parentDir, name)));
+    }
+
+    /**
+     * Resolve absolute path
+     */
+    resolveAbsolute(name: string, parent?: string, attr?: Record<string, any>): string {
+        const aliased = this.applyPathAlias(name);
+        
+        if (aliased !== name) {
+            try {
+                return tryResolveFile(aliased);
+            } catch {
+                // Continue with original path
+            }
+        }
+
+        if (parent) {
+            const protocol = this.extractProtocol(parent);
+            const entry = this.resolverRegistry.get(protocol);
+
+            if (entry?.resolver) {
+                try {
+                    return entry.resolver.resolve(name, parent, attr);
+                } catch {
+                    // Fallback to file system resolution
+                }
+            }
+        }
+
+        return aliased;
+    }
+
+    private extractProtocol(url: string): string {
+        const match = url.match(/^([a-z]+):/);
+        return match ? `${match[1]}` : '';
+    }
+
     private applyImportMap(name: string): string {
         if (!this.config.importMap) {
             return name;
         }
 
-        // Exact match
         if (this.config.importMap[name]) {
             return this.config.importMap[name]!;
         }
 
-        // Prefix match
         for (const [key, value] of Object.entries(this.config.importMap)) {
             if (key.endsWith('/') && name.startsWith(key)) {
                 return value + name.substring(key.length);
@@ -127,56 +207,21 @@ export class ModuleResolver {
         return name;
     }
 
-    /**
-     * Resolve relative import
-     */
-    private resolveRelative(name: string, parent: string): string {
-        // JSR protocol
-        if (parent.startsWith('jsr:')) {
-            return this.jsrResolver.resolveRelative(name, parent);
-        }
-
-        // HTTP(S) protocol
-        if (parent.startsWith('http://') || parent.startsWith('https://')) {
-            return this.httpResolver.resolveRelative(name, parent);
-        }
-
-        // Local file
-        const parentDir = parent ? dirname(parent) : fs.getcwd();
-        const fullPath = normalizePath(joinPaths(parentDir, name));
-        return this.resolveAbsolute(fullPath);
-    }
-
-    /**
-     * Resolve absolute path
-     */
-    private resolveAbsolute(name: string): string {
-        const resolved = this.applyPathAlias(name);
-        return tryResolveFile(resolved);
-    }
-
-    /**
-     * Resolve package import
-     */
-    private resolvePackage(name: string, parent: string): string {
-        // Check path aliases
+    private resolvePackage(name: string, parent: string, attr?: Record<string, any>): string {
         const aliased = this.applyPathAlias(name);
+
         if (aliased !== name) {
             try {
-                tryResolveFile(aliased);
-                return aliased;
+                return tryResolveFile(aliased);
             } catch {
-                // Fall through to npm resolution
+                // Fallback to npm resolution
             }
         }
 
-        // NPM package resolution
-        return this.npmResolver.resolve(name, parent);
+        const entry = this.resolverRegistry.get('npm');
+        return entry?.resolver.resolve(name, parent, attr) ?? name;
     }
 
-    /**
-     * Apply path aliases from tsconfig.json/deno.json
-     */
     private applyPathAlias(path: string): string {
         if (!this.config.pathAliases) {
             return path;
@@ -186,19 +231,39 @@ export class ModuleResolver {
             const cleanAlias = alias.replace(/\/\*$/, '');
 
             if (path.startsWith(cleanAlias)) {
-                const target = targets[0];
-                if (!target) continue;
-
-                const cleanTarget = target.replace(/\/\*$/, '');
-                const relativePath = path.substring(cleanAlias.length);
-                const resolvedPath = this.config.baseUrl
-                    ? joinPaths(this.config.baseUrl, cleanTarget, relativePath)
-                    : joinPaths(cleanTarget, relativePath);
-
-                return resolvedPath;
+                const target = targets[0]!;
+                if (alias.endsWith('/*')) {
+                    return target + path.substring(cleanAlias.length);
+                } else {
+                    return target;
+                }
             }
         }
 
         return path;
+    }
+
+    private isRelativePath(path: string): boolean {
+        return path.startsWith('./') || path.startsWith('../');
+    }
+
+    private isAbsolutePath(path: string): boolean {
+        return isAbsolutePath(path);
+    }
+
+    private getProtocolDisplayName(protocol: string): string {
+        switch (protocol) {
+            case 'http':
+            case 'https':
+                return 'HTTP';
+            case 'jsr':
+                return 'JSR';
+            case 'npm':
+                return 'NPM';
+            case 'node':
+                return 'Node.js';
+            default:
+                return protocol.toUpperCase();
+        }
     }
 }

@@ -2,6 +2,9 @@
 
 A complete, modular TypeScript/TSX/JSX runtime for QuickJS/tjs with HTTP imports, JSR packages (with version ranges), Node.js compatibility, and automatic NPM package installation.
 
+Designed to meet the needs of modern TypeScript development, providing a smooth and efficient runtime environment.
+It is aimed to be very-lightweight Deno runtime with `@imzlh/cts` project.
+
 ## 🎯 Features
 
 - ✨ **TypeScript/TSX/JSX** - Seamless support using Sucrase
@@ -12,21 +15,34 @@ A complete, modular TypeScript/TSX/JSX runtime for QuickJS/tjs with HTTP imports
 - 🔧 **Node.js Compatibility** - Support for `node:` protocol imports
 - 📚 **NPM Packages** - Local or global `node_modules` with auto-download
 - 🗺️ **Path Aliases** - `tsconfig.json` and `deno.json` path mappings
-- ⚡ **ES2025 Syntax** - Latest JavaScript features
+- ⚡ **ES2025 Syntax** - Latest JavaScript features, eg. import attribute support
 - 🔌 **Extensible** - Modular architecture for easy extension
 
 ## 📦 Installation
 
 ```bash
-cts
+cts project
 ├── example
-│   └── findkeyword.ts
+│   ├── findkeyword.ts
+│   └── try.ts
 ├── main.ts
 ├── package.json
 ├── readme.md
 ├── src
 │   ├── config.ts
+│   ├── debug
+│   │   └── bridge.js
+│   ├── http
+│   │   ├── connection.ts
+│   │   ├── debug.ts
+│   │   ├── http.ts
+│   │   ├── process.ts
+│   │   └── url.ts
+│   ├── loader.ts
 │   ├── resolver
+│   │   ├── base.ts
+│   │   ├── data.ts
+│   │   ├── file.ts
 │   │   ├── http.ts
 │   │   ├── index.ts
 │   │   ├── jsr.ts
@@ -37,7 +53,7 @@ cts
 │   ├── types.ts
 │   └── utils.ts
 ├── tsconfig.json
-└── types
+└── types/ (alias to @imzlh/circu.js:/types/)
 ```
 
 ## 🚀 Quick Start
@@ -108,6 +124,32 @@ tjs cli.ts app.ts
 #   Extracting...
 # ✓ lodash@4.17.21 installed to ~/.tjs/cache/node_modules/lodash
 # [1, 2, 3]
+```
+
+## WASM import
+```shell
+cat << EOF > test.wat
+(module
+  (func $add (param $a i32) (param $b i32) (result i32)
+    (i32.add (local.get $a) (local.get $b)))
+  (export "add" (func $add)))
+EOF
+wat2wasm test.wat -o test.wasm
+cts app.ts
+```
+
+```typescript
+// app.ts
+import { add } from './test.wasm';
+console.log(add(2, 3)); // 5
+```
+
+## high-performance raw import
+```typescript
+// app.ts
+import binary from './bigimage.jpg' with { type: 'binary' };
+assert(binary instanceof Uint8Array);
+console.log(binary.length);
 ```
 
 ## 📖 Version Range Support

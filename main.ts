@@ -2,7 +2,7 @@
 
 import { createRuntime } from './src/runtime.js';
 import { createConfig, loadConfigFile } from './src/config.js';
-import { errMsg, dirname, readTextFile } from './src/utils.js';
+import { errMsg, dirname, readTextFile, getExtension } from './src/utils.js';
 
 const sys = import.meta.use('sys');
 const fs = import.meta.use('fs');
@@ -14,7 +14,7 @@ const engine = import.meta.use('engine');
  * Show help message
  */
 function showHelp(): void {
-    console.log('TypeScript Runtime for tjs');
+    console.log('TypeScript Runtime for tjs like deno');
     console.log('');
     console.log('Usage: cjs [options] <file.ts> [args...]');
     console.log('');
@@ -41,15 +41,6 @@ function showHelp(): void {
     console.log('  CTS_MAX_STACK_SIZE      Max stack size (e.g., 1MB)');
     console.log('  CTS_JSR_CACHE_TTL       JSR cache TTL in days');
     console.log('');
-    console.log('Built-in Features:');
-    console.log('  • TypeScript/TSX/JSX support');
-    console.log('  • HTTP(S) imports: https://deno.land/std/...');
-    console.log('  • JSR imports: jsr:@std/path');
-    console.log('  • Node.js compatibility: node:fs');
-    console.log('  • npm packages from node_modules');
-    console.log('  • Path aliases from tsconfig.json/deno.json');
-    console.log('  • Import maps from deno.json');
-    console.log('');
     console.log('Examples:');
     console.log('  cjs main.ts');
     console.log('  cjs --silent app.ts');
@@ -61,10 +52,8 @@ function showHelp(): void {
  * Main entry point
  */
 async function main(): Promise<void> {
-    const entryDir = os.cwd;
-    const fileConfig = loadConfigFile(entryDir);
-
     // Create runtime with file config
+    const fileConfig = loadConfigFile(os.cwd);
     const runtime = createRuntime(fileConfig);
 
     if (!runtime.rtConfig._) {
@@ -75,16 +64,32 @@ async function main(): Promise<void> {
 
     
     // Update sys.args to only include script arguments
-    sys.args.splice(0, runtime.rtConfig._offset -1);
+    sys.args.splice(0, runtime.rtConfig._offset);
     let entryFile = runtime.rtConfig._;
+    const basedir2 = dirname(entryFile);
+    const config2 = loadConfigFile(basedir2);
+    runtime.rtConfig = config2;
 
     // initialize polyfill
     if (runtime.rtConfig.polyfill) try{
-        const file = readTextFile(runtime.rtConfig.polyfill);
-        // will eval the code in module scope
-        const mod = new engine.Module(file, fs.realpath(runtime.rtConfig.polyfill));
-        mod.meta.use = import.meta.use;
-        await mod.eval();
+        const ext = getExtension(runtime.rtConfig.polyfill);
+        if (ext == '.js'){
+            const file = readTextFile(runtime.rtConfig.polyfill);
+            // will eval the code in module scope
+            const mod = new engine.Module(file, fs.realpath(runtime.rtConfig.polyfill));
+            mod.meta.use = import.meta.use;
+            await mod.eval();
+        } else if (ext == '.jsc'){
+            const file = fs.readFile(runtime.rtConfig.polyfill);
+            const mod = engine.deserialize(new Uint8Array(file));
+            if (!(mod instanceof engine.Module)){
+                throw new Error('Invalid JSC file');
+            }
+            mod.meta.use = import.meta.use;
+            await mod.eval();
+        } else {
+            throw new Error('Unsupported polyfill file type');
+        }
     } catch (error) {
         console.error('\n❌ Error loading polyfill:', errMsg(error));
         if (error instanceof Error && error.stack) {

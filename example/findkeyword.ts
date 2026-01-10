@@ -1,4 +1,4 @@
-import { basename } from "jsr:@std/path@1.1.3/basename.ts";
+import { basename, dirname } from "jsr:@std/path@1.1.3";
 
 const { use } = import.meta;
 const console = use('console');
@@ -9,6 +9,7 @@ const { readFile, readdir, stat } = use('fs');
 const { copyFile } = use('asyncfs');
 const { Decoder } = use('text');
 
+console.log(dirname(os.cwd));
 export async function main() {
     // 遍历文件夹，打开txt查找关键字
     args.splice(0, 2);   // exec and self
@@ -19,7 +20,7 @@ export async function main() {
         exit(1);
     }
     const mina = parseInt(minappear);
-    if(!isNaN(mina) && mina >= 1)
+    if(isNaN(mina) || mina < 1)
         throw new Error("minappear must be a number >= 1");
 
     // 搜索多次匹配的文件
@@ -76,7 +77,8 @@ export async function main() {
         }
     }
 
-    ensureDirSync('./matched');
+    const { mkdirSync } = use('fs');
+    mkdirSync('./matched', { recursive: true });
     for (const file of files) {
         // TODO: sync copy, not async
         await copyFile(file, './matched/' + file.replace('\\', '/').split('/').pop());

@@ -39,6 +39,7 @@ export interface RuntimeConfig extends Required<Omit<ConfigOptions, 'pathAliases
     importMap?: Record<string, string>;
     memoryLimit?: number;
     maxStackSize?: number;
+    verbose?: boolean;
     _?: string;  // entry
     _args?: string[];  // entry args
     _offset: number;  // entry offset
@@ -127,11 +128,28 @@ export type ModuleTransformer = (code: string, filename: string) => string;
 export type FileExtension = '.ts' | '.tsx' | '.jsx' | '.js' | '.mjs' | '.cjs' | '.json';
 
 /**
- * Import attributes (for future extensibility)
+ * File type for module loading
+ */
+export enum FileType {
+    TEXT = 'text',
+    BINARY = 'binary'
+}
+
+/**
+ * Import attributes for module loading
  */
 export interface ImportAttributes {
     type?: 'json' | 'css' | 'wasm';
     [key: string]: unknown;
+}
+
+/**
+ * Modsle file information
+ */
+export interface ModuleFile {
+    path: string;
+    type: FileType;
+    content: string | Uint8Array;
 }
 
 /**

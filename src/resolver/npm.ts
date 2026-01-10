@@ -1,6 +1,6 @@
 // resolvers/npm.ts - NPM Package Resolver with Auto-Download
 
-import type { RuntimeConfig, PackageJson, ParsedPackageName } from '../types.ts';
+import type { RuntimeConfig, PackageJson, ParsedPackageName } from '../types';
 import {
     readTextFile,
     writeTextFile,
@@ -11,8 +11,11 @@ import {
     errMsg,
     matchLatestVersion,
     unTarGz,
-    normalizePath
+    normalizePath,
+    fetchSync,
+    fetchBinary
 } from '../utils';
+import { BaseResolver } from './base.js';
 
 const fs = import.meta.use('fs');
 const sys = import.meta.use('sys');
@@ -48,22 +51,24 @@ interface NpmPackageMetadata {
 /**
  * NPM Package Resolver with Auto-Download
  */
-export class NpmResolver {
+export class NpmResolver extends BaseResolver {
     private readonly globalCacheDir: string;
     private npmConfig: NpmConfig | null = null;
 
+    readonly protocol = ['npm'];
+
     constructor(private readonly config: RuntimeConfig) {
+        super();
         this.globalCacheDir = joinPaths(this.config.cacheDir, 'npm');
     }
 
     /**
      * Resolve npm package import
-     * Note: npm-module use full local path
      */
-    resolve(name: string, parent: string): string {
-        const { packageName, subpath } = this.parsePackageName(name);
+    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
+        const { packageName, subpath } = this.parsePackageName(specifier);
 
-        let packageDir = this.findPackageDir(packageName, parent);
+        let packageDir = this.findPackageDir(packageName, parent || '');
         if (!packageDir) {
             packageDir = this.autoInstallPackage(packageName);
         }
@@ -72,7 +77,7 @@ export class NpmResolver {
             throw new Error(`Package "${packageName}" not found and auto-install failed`);
         }
 
-        // parse export
+        // Resolve exports
         if (subpath) {
             const exported = this.resolvePackageExports(packageDir, subpath);
             if (exported) {
@@ -83,12 +88,16 @@ export class NpmResolver {
             return tryResolveFile(subpathFull);
         }
 
-        // main entry
+        // Main entry
         return this.resolvePackageMain(packageDir);
     }
 
+    getLocalPath(url: string): string {
+        return url; // npm package use full local path
+    }
+
     /**
-     * auto install package to global scope(unstable)
+     * Auto install package to global scope(unstable)
      */
     private autoInstallPackage(packageName: string): string | null {
         try {
@@ -133,14 +142,18 @@ export class NpmResolver {
                 if (filePath.startsWith('package/'))
                     filePath = filePath.substring(8);
                 const targetPath = joinPaths(packageDir, filePath);
+                
                 if (file.type == 'dir') {
                     ensureDir(targetPath);
+                } else {
+                    // Ensure parent directory exists before writing file
+                    const parentDir = dirname(targetPath);
+                    if (!fs.exists(parentDir)) {
+                        ensureDir(parentDir);
+                    }
+                    // create and write files
+                    fs.writeFile(targetPath, file.content);
                 }
-
-                // TODO: pre-compile some files?
-
-                // create and write files
-                fs.writeFile(targetPath, file.content);
             }
 
             if (!this.config.silent) {
@@ -157,7 +170,7 @@ export class NpmResolver {
     }
 
     /**
-     * Get NPM config(compatiable)
+     * Get NPM config(compatible)
      */
     private getNpmConfig(): NpmConfig {
         if (this.npmConfig) {
@@ -203,35 +216,18 @@ export class NpmResolver {
      * get package meta
      */
     private fetchPackageMetadata(packageName: string, registry: string): NpmPackageMetadata {
-        // 处理 scoped package
+        // Handle scoped package
         const encodedName = packageName.replace('/', '%2F');
         const url = `${registry}/${encodedName}`;
 
-        const request = new xhr.XMLHttpRequest();
-        request.open('GET', url, false);
-        request.send();
-
-        if (request.status !== 200) {
-            throw new Error(`Failed to fetch metadata: HTTP ${request.status}`);
-        }
-
-        return JSON.parse(request.responseText);
+        return JSON.parse(fetchSync(url));
     }
 
     /**
      * download tarball
      */
     private downloadTarball(url: string): ArrayBuffer {
-        const request = new xhr.XMLHttpRequest();
-        request.open('GET', url, false);
-        request.responseType = 'arraybuffer';
-        request.send();
-
-        if (request.status !== 200) {
-            throw new Error(`Failed to download tarball: HTTP ${request.status}`);
-        }
-
-        return request.response;
+        return fetchBinary(url).buffer;
     }
 
     /**
@@ -300,7 +296,7 @@ export class NpmResolver {
         }
 
         // Add current working directory node_modules
-        const cwd = fs.getcwd();
+        const cwd = os.cwd;
         const cwdNodeModules = joinPaths(cwd, 'node_modules');
         if (!paths.includes(cwdNodeModules)) {
             paths.push(cwdNodeModules);

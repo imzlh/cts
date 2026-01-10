@@ -1,17 +1,29 @@
 // resolvers/node.ts - Node.js Module Resolver
 
-import type { RuntimeConfig, NodeResolver } from '../types.ts';
-import { joinPaths, tryResolveFile } from '../utils';
+import type { RuntimeConfig, NodeResolver } from '../types';
+import {
+    joinPaths,
+    dirname,
+    tryResolveFile,
+    normalizePath
+} from '../utils';
+import { BaseResolver } from './base.js';
 
 const fs = import.meta.use('fs');
+const sys = import.meta.use('sys');
+const os = import.meta.use('os');
 
 /**
- * Node.js Builtin Module Resolver
+ * Node.js Module Resolver
  */
-export class NodeModuleResolver {
+export class NodeModuleResolver extends BaseResolver {
     private customResolver: NodeResolver | null = null;
+    
+    readonly protocol = ['node'];
 
-    constructor(private readonly config: RuntimeConfig) { }
+    constructor(private readonly config: RuntimeConfig) {
+        super();
+    }
 
     /**
      * Register custom node resolver
@@ -21,45 +33,20 @@ export class NodeModuleResolver {
     }
 
     /**
-     * Resolve node: protocol imports
-     * Format: node:module_name
+     * Resolve node module
      */
-    resolve(specifier: string): string {
-        const moduleName = specifier.substring(5); // Remove 'node:' prefix
-
-        // Check custom resolver
-        // TODO: this will break node protocol, fix it?
-        if (this.customResolver) {
-            const resolved = this.customResolver(moduleName);
-            if (resolved) {
-                return resolved;
-            }
+    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
+        // Remove node: prefix
+        if (specifier.startsWith('node:')) {
+            specifier = specifier.substring(5);
         }
 
-        // Try default node cache directory
-        const nodeCacheDir = joinPaths(this.config.cacheDir, 'node');
-        const defaultPath = joinPaths(nodeCacheDir, moduleName);
-
-        try {
-            return tryResolveFile(defaultPath);
-        } catch {
-            throw new Error(
-                `Node.js module "${moduleName}" not found. ` +
-                `Please install it to ${nodeCacheDir}/ or register a custom resolver using runtime.registerNodeResolver()`
-            );
-        }
+        // Built-in modules are handled by the runtime
+        return `node:${specifier}`;
     }
 
-    /**
-     * Check if a Node.js module is available
-     */
-    has(moduleName: string): boolean {
-        const specifier = `node:${moduleName}`;
-        try {
-            this.resolve(specifier);
-            return true;
-        } catch {
-            return false;
-        }
+    getLocalPath(url: string): string {
+        // Node built-in modules don't have local paths
+        return url;
     }
 }

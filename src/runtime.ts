@@ -3,25 +3,30 @@
 import type { RuntimeConfig, NodeResolver } from './types.ts';
 import { createConfig } from './config';
 import { ModuleResolver } from './resolver';
+import { ModuleLoader } from './loader';
 import { CodeTransformer } from './transformer';
-import { readTextFile, dirname, errMsg } from './utils';
+import { dirname, errMsg } from './utils';
 
 const engine = import.meta.use('engine');
-const fs = import.meta.use('fs');
+const console = import.meta.use('console');
 
 /**
  * TypeScript Runtime for QuickJS/tjs
  */
 export class TypeScriptRuntime {
     private readonly resolver: ModuleResolver;
+    private readonly loader: ModuleLoader;
     private readonly transformer: CodeTransformer;
     private mainScript: string | null = null;
     private config: RuntimeConfig;
     private additionalMeta: Record<string, any> = {};
 
+    static SUPPORTED_IMPORT_ATTRS = ['type', 'raw', 'text', 'bytes'];
+
     constructor(config: RuntimeConfig) {
         this.resolver = new ModuleResolver(config);
         this.transformer = new CodeTransformer();
+        this.loader = new ModuleLoader(this.resolver, this.transformer, config);
         this.config = config;
         this.setupModuleLoader();
     }
@@ -38,23 +43,43 @@ export class TypeScriptRuntime {
      */
     private setupModuleLoader(): void {
         engine.onModule({
-            resolve: (name: string, parent: string): string => {
+            resolve: (name: string, parent: string, attr: Record<string, any>): string => {
                 try {
-                    const resolvedProtocol = this.resolver.resolve(name, parent);
+                    console.debug(`[runtime] Resolving module: name="${name}", parent="${parent}"`);
+                    const resolvedProtocol = this.resolver.resolve(name, parent, attr);
+                    console.debug(`[runtime] Resolved to: "${resolvedProtocol}"`);
+                    if (!this.mainScript) {
+                        this.mainScript = resolvedProtocol;
+                        this.loader.setMainScript(resolvedProtocol);
+                        // @ts-ignore
+                        globalThis.__mainScript = resolvedProtocol;
+                        console.debug(`[runtime] Main script set to: "${resolvedProtocol}"`);
+                    }
                     return resolvedProtocol;
                 } catch (error) {
+                    console.debug(`[runtime] Resolution failed for "${name}" from "${parent}":`, error);
                     throw new Error(`Cannot resolve module "${name}" from "${parent}": ${errMsg(error)}`);
                 }
             },
 
-            load: (modname: string) => {
+            load: (modname: string, attr?: Record<string, any>) => {
                 const localPath = this.resolver.getLocalPath(modname);
-                return this.loadModule(localPath, modname);
+                console.debug(`[runtime] Loading module: localPath="${localPath}", modname="${modname}"`);
+                const mod = this.loader.loadModule(localPath, modname, attr);
+                this.initModule(mod.meta, modname);
+                return mod;
             },
 
             init: (protocolPath: string, importMeta: Record<string, any>): void => {
                 this.initModule(importMeta, protocolPath);
-            }
+            },
+
+            attrchk: (attr) => {
+                if (Object.keys(attr).some(key => !TypeScriptRuntime.SUPPORTED_IMPORT_ATTRS.includes(key))) {
+                    // throw an error?
+                    console.trace(`Unsupported import attribute: ${JSON.stringify(attr)}`);
+                }
+            },
         });
     }
 
@@ -70,16 +95,11 @@ export class TypeScriptRuntime {
             importMeta.use = import.meta.use;
 
         // Set main flag
-        if (!this.mainScript) {
-            importMeta.main = true;
-            this.mainScript = protocolPath;
-        } else {
-            importMeta.main = false;
-        }
+        importMeta.main = this.mainScript === protocolPath;
 
         // add resolve function to import.meta
-        importMeta.resolve = (name: string, parent: string): string => {
-            return this.resolver.resolve(name, parent);
+        importMeta.resolve = (name: string, parent: string, attr?: Record<string, any>): string => {
+            return this.resolver.resolve(name, parent, attr);
         };
 
         // user-defined meta
@@ -96,49 +116,6 @@ export class TypeScriptRuntime {
     }
 
     /**
-     * Load and transform a module
-     */
-    private loadModule(localPath: string, protocolPath: string): CModuleEngine.Module {
-        let stats;
-        try {
-            stats = fs.stat(localPath);
-        } catch {
-            throw new Error(`Module not found: ${localPath}`);
-        }
-
-        if (stats.isDirectory) {
-            throw new Error(`Cannot load directory as module: ${localPath}`);
-        }
-
-        // in user code dir, no cache
-        if (!localPath.startsWith(this.config.cacheDir)) {
-            const code = this.transformer.transform(readTextFile(localPath), localPath);
-            const mod = new engine.Module(code, protocolPath);
-            this.initModule(mod.meta, protocolPath);
-            return mod;
-        }
-
-        // try cache
-        try {
-            stats = fs.stat(localPath + '.jsc');
-            if (!stats.isFile) throw 1;
-        } catch {
-            return this.buildCache(localPath, protocolPath);
-        }
-
-        const buf = fs.readFile(localPath + '.jsc');
-        return engine.deserialize(new Uint8Array(buf));
-    }
-
-    private buildCache(path: string, ptcPath: string): CModuleEngine.Module {
-        // read and compile
-        const code = this.transformer.transform(readTextFile(path), path);
-        const mod = new engine.Module(code, ptcPath);
-        fs.writeFile(path + '.jsc', mod.dump());
-        return mod;
-    }
-
-    /**
      * Get main script path
      */
     getMainScript(): string | null {
@@ -147,6 +124,10 @@ export class TypeScriptRuntime {
 
     get rtConfig(): RuntimeConfig {
         return this.config;
+    }
+
+    set rtConfig(config: Partial<RuntimeConfig>) {
+        Object.assign(this.config, config);
     }
 }
 

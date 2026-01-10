@@ -3,6 +3,19 @@
 const fs = import.meta.use('fs');
 const sys = import.meta.use('sys');
 const engine = import.meta.use('engine');
+const console = import.meta.use('console');
+
+import { URL } from "./http/url";
+import { type ConnectionConfig, connectionManager } from "./http/connection";
+import { HttpRequestBuilder, HttpResponseParser } from "./http/http";
+import { HttpProgressBar } from "./http/process";
+
+// Local assertion function
+export function assert(condition: any, message?: string): asserts condition {
+    if (!condition) {
+        throw new Error(message || 'Assertion failed');
+    }
+}
 
 /**
  * Get error message safely
@@ -245,7 +258,7 @@ export class SimpleUrl {
 /**
  * Try to resolve file with extensions
  */
-export function tryResolveFile(basePath: string, extensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json']): string {
+export function tryResolveFile(basePath: string, extensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.wasm']): string {
     // Try exact path first
     if (fs.exists(basePath)) {
         const stats = fs.stat(basePath);
@@ -533,4 +546,199 @@ export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
     }
 
     return files;
+}
+
+export function fetchBinary(url: string, maxRedirects: number = 5, showProgress: boolean = false): Uint8Array<ArrayBuffer> {
+    let currentUrl = url;
+    let redirectCount = 0;
+    
+    // Progress bar initialization
+    let progressBar: any = null;
+    const PROGRESS_THRESHOLD = 32 * 1024; // 32KB threshold for showing progress bar
+    
+    while (redirectCount <= maxRedirects) {
+        // 解析URL
+        const urlObj = new URL(currentUrl);
+        const protocol = urlObj.protocol;
+        const hostname = urlObj.hostname;
+        const port = urlObj.port ? parseInt(urlObj.port, 10) : (protocol === "https:" ? 443 : 80);
+
+        // 获取连接
+        const cfg: ConnectionConfig = {
+            hostname: hostname,
+            port: port,
+            // @ts-ignore
+            protocol
+        };
+        const conn = connectionManager.acquire(cfg);
+
+        try {
+            // 使用HttpRequestBuilder构建请求
+            const requestBuilder = new HttpRequestBuilder(urlObj, {
+                method: 'GET',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; CTS/2.0)',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Connection': 'keep-alive'
+                }
+            });
+            
+            // 发送请求
+            const requestData = requestBuilder.build();
+            conn.write(requestData);
+            console.debug('[fetch] Request sent to', currentUrl);
+
+            // 使用HttpResponseParser解析响应
+            const parser = new HttpResponseParser();
+            let responseBody: Uint8Array | null = null;
+            let statusCode: number | null = null;
+            let headers: any = null;
+            let contentLength: number | null = null;
+
+            parser.onHeadersComplete = (code, hdrs) => {
+                statusCode = code;
+                headers = hdrs;
+                
+                // Get content length for progress bar
+                if (headers && headers.has && headers.has('content-length')) {
+                    const lengthStr = headers.get('content-length');
+                    if (lengthStr) {
+                        contentLength = parseInt(lengthStr, 10);
+                    }
+                }
+                
+                // Initialize progress bar if requested and file is large enough
+                if (showProgress && contentLength && contentLength > PROGRESS_THRESHOLD) {
+                    progressBar = new HttpProgressBar({
+                        total: contentLength || 0,
+                        width: 40,
+                        showSpeed: true,
+                        showTime: true,
+                        updateInterval: 500
+                    });
+                    progressBar.start(currentUrl);
+                }
+            };
+
+            parser.onData = (chunk) => {
+                if (!responseBody) {
+                    responseBody = chunk;
+                } else {
+                    // 合并数据块
+                    const newBody = new Uint8Array(responseBody.length + chunk.length);
+                    newBody.set(responseBody);
+                    newBody.set(chunk, responseBody.length);
+                    responseBody = newBody;
+                }
+                
+                // Initialize progress bar if we don't have content-length but have received enough data
+                if (showProgress && !progressBar && responseBody.length > PROGRESS_THRESHOLD) {
+                    progressBar = new HttpProgressBar({
+                        total: 0, // Unknown total size
+                        width: 40,
+                        showSpeed: true,
+                        showTime: true,
+                        updateInterval: 500
+                    });
+                    progressBar.start(currentUrl);
+                }
+                
+                // Update progress bar
+                if (progressBar) {
+                    progressBar.update(responseBody.length);
+                }
+            };
+
+            parser.onError = (error) => {
+                throw error;
+            };
+
+            // 读取响应数据并喂给解析器
+            let attempts = 0;
+            let recv = 0;
+            const maxAttempts = 600; // Prevent infinite loop
+            
+            while (!parser.isCompleted && attempts < maxAttempts) {
+                attempts++;
+                const data = conn.read(128 * 1024, true); // 128k
+                if (!data) {
+                    console.debug(`[fetchBinary] No data available(EOF). stop (attempt ${attempts})`);
+                    break;
+                }
+                recv += data.length;
+                console.debug(`[fetchBinary] Got ${data.length} / ${recv} (attempt ${attempts})`);
+                parser.feed(data);
+            }
+
+            if (attempts >= maxAttempts) {
+                throw new Error(`Max read attempts (${maxAttempts}) reached without completing response`);
+            }
+            
+            if (!parser.isCompleted) {
+                throw new Error('Incomplete HTTP response');
+            }
+
+            // Complete progress bar if it was created
+            if (progressBar) {
+                progressBar.complete();
+            }
+
+            // 释放连接
+            connectionManager.release(cfg, conn);
+
+            // Check for redirects
+            assert(statusCode, "Status code is null");
+            if (statusCode >= 300 && statusCode < 400) {
+                let location = null;
+                
+                // Try standard Location header first
+                if (headers && headers.has && headers.has('location')) {
+                    location = headers.get('location');
+                }
+                
+                if (location) {
+                    // Handle relative redirects
+                    if (location.startsWith('/')) {
+                        const redirectUrl = new URL(location, currentUrl);
+                        currentUrl = redirectUrl.toString();
+                    } else {
+                        currentUrl = location;
+                    }
+                    
+                    redirectCount++;
+                    continue; // Continue with the next iteration
+                }
+            }
+
+            // Check for successful status
+            if (statusCode < 200 || statusCode >= 300) {
+                throw new Error(`HTTP error: ${statusCode}`);
+            }
+
+            return responseBody || new Uint8Array(0);
+        } catch (error) {
+            // 发生错误时关闭连接
+            conn.close();
+            
+            // Clean up progress bar on error
+            if (progressBar) {
+                progressBar.complete();
+            }
+            
+            throw error;
+        }
+    }
+    
+    throw new Error(`Too many redirects (${maxRedirects})`);
+}
+
+// fetchSync: always 200, return string
+export function fetchSync(url: string): string {
+    try {
+        const bodyBytes = fetchBinary(url);
+        return engine.decodeString(bodyBytes);
+    } catch (error) {
+        console.debug(`[fetch] Error fetching ${url}:`, error);
+        throw error;
+    }
 }
