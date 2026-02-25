@@ -1,11 +1,11 @@
-// config.ts - Runtime Configuration Management
+import { ModuleLoader } from './loader.js';
 import type { RuntimeConfig, ConfigOptions } from './types.ts';
-import { parseArgs } from './utils.js';
+import { ensureDir, joinPaths, parseArgs } from './utils.js';
 
 const os = import.meta.use('os');
 const sys = import.meta.use('sys');
 const fs = import.meta.use('fs');
-const console = import.meta.use('console');
+const engine = import.meta.use('engine');
 
 /**
  * Environment variable prefix for configuration
@@ -53,9 +53,11 @@ function parseMemorySize(size: string | undefined): number | undefined {
  * getenv wrapper, with error handling
  */
 function getenv(name: string): string | null {
-    try{
+    try {
         return os.getenv(name);
-    }catch{}
+    } catch {
+        // Environment variable not available
+    }
     return null;
 }
 
@@ -68,6 +70,10 @@ function getEnvConfig(): Partial<ConfigOptions> {
     // CTS_CACHE_DIR
     const cacheDir = getenv(`${ENV_PREFIX}CACHE_DIR`);
     if (cacheDir) config.cacheDir = cacheDir;
+
+    // CTS_DISABLE_CACHE
+    const disableCache = getenv(`${ENV_PREFIX}DISABLE_CACHE`);
+    if (disableCache !== null) config.disableCache = disableCache === 'true';
 
     // CTS_ENABLE_HTTP
     const enableHttp = getenv(`${ENV_PREFIX}ENABLE_HTTP`);
@@ -107,42 +113,33 @@ function getEnvConfig(): Partial<ConfigOptions> {
  * Get default cache directory (like Deno)
  */
 function getDefaultCacheDir(): string {
-    const home = os.homedir || (sys.platform === 'win32' ? 'C:\\Users\\Default' : '/root');
-    return joinPaths(home, '.cts');
-}
-
-/**
- * Join path segments
- */
-function joinPaths(...segments: string[]): string {
-    return segments.filter(Boolean).join('/').replace(/\/+/g, '/');
-}
-
-/**
- * Ensure directory exists
- */
-function ensureDir(dir: string): void {
-    if (fs.exists(dir)) return;
-
-    const parent = dirname(dir);
-    if (parent && parent !== dir && parent !== '.') {
-        ensureDir(parent);
-    }
-
+    // Determine the home directory based on the platform
+    let homeDir: string | null = null;
+    
     try {
-        fs.mkdir(dir, 0o755);
-    } catch (error) {
-        if (!fs.exists(dir)) throw error;
+        // Try to get home directory from OS module
+        if (os.homedir) {
+            homeDir = os.homedir;
+        }
+    } catch (e) {
+        // If os.homedir fails, fall back to platform-specific defaults
     }
-}
-
-/**
- * Get directory name
- */
-function dirname(path: string): string {
-    const normalized = path.replace(/\\/g, '/');
-    const lastSlash = normalized.lastIndexOf('/');
-    return lastSlash > 0 ? normalized.substring(0, lastSlash) : '.';
+    
+    // Fallback to platform-specific environment variables if needed
+    if (!homeDir) {
+        if (sys.platform === 'win32') {
+            homeDir = getenv('USERPROFILE') || getenv('HOME') || 'C:\\Users\\Default';
+        } else {
+            homeDir = getenv('HOME') || '/root';
+        }
+    }
+    
+    // Handle potential null/undefined values
+    if (!homeDir) {
+        throw new Error('Unable to determine home directory');
+    }
+    
+    return joinPaths(homeDir, '.cts');
 }
 
 /**
@@ -159,12 +156,14 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
         'no-node': 'boolean',
         'jsr-cache-ttl': 'number',
         'polyfill': 'string',
+        'disable-cache': 'boolean',
     });
     const envConfig = getEnvConfig();
 
     const config: RuntimeConfig = {
         cacheDir: '',
         polyfill: '',
+        disableCache: false,
         ...DEFAULTS,
         ...envConfig,
         ...userConfig,
@@ -176,17 +175,15 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
         config.cacheDir = getDefaultCacheDir();
     }
 
-    // Ensure cache directory exists
-    ensureDir(config.cacheDir);
+    // Verify cache directory
+    ModuleLoader.verifyCacheDir(config.cacheDir);
 
     // Apply engine limits if specified
     if (config.memoryLimit !== undefined) {
-        const engine = import.meta.use('engine');
         engine.setMemoryLimit(config.memoryLimit);
     }
 
     if (config.maxStackSize !== undefined) {
-        const engine = import.meta.use('engine');
         engine.setMaxStackSize(config.maxStackSize);
     }
 
@@ -204,7 +201,7 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
     const tsconfigPath = joinPaths(dir, 'tsconfig.json');
     if (fs.exists(tsconfigPath)) {
         try {
-            const engine = import.meta.use('engine');
+
             const buffer = fs.readFile(tsconfigPath);
             const content = engine.decodeString(buffer);
             const tsconfig = jsonc.parse(content);
@@ -226,7 +223,7 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
         const denoConfigPath = joinPaths(dir, filename);
         if (fs.exists(denoConfigPath)) {
             try {
-                const engine = import.meta.use('engine');
+    
                 const buffer = fs.readFile(denoConfigPath);
                 const content = engine.decodeString(buffer);
                 const denoConfig = jsonc.parse(content);

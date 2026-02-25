@@ -1,5 +1,3 @@
-// cli.ts - Command Line Interface
-
 import { createRuntime } from './src/runtime.js';
 import { createConfig, loadConfigFile } from './src/config.js';
 import { errMsg, dirname, readTextFile, getExtension } from './src/utils.js';
@@ -40,12 +38,6 @@ function showHelp(): void {
     console.log('  CTS_MEMORY_LIMIT        Memory limit (e.g., 256MB)');
     console.log('  CTS_MAX_STACK_SIZE      Max stack size (e.g., 1MB)');
     console.log('  CTS_JSR_CACHE_TTL       JSR cache TTL in days');
-    console.log('');
-    console.log('Examples:');
-    console.log('  cjs main.ts');
-    console.log('  cjs --silent app.ts');
-    console.log('  cjs --memory-limit 512MB script.ts');
-    console.log('  CTS_CACHE_DIR=/tmp/cache cjs app.ts');
 }
 
 /**
@@ -75,7 +67,6 @@ async function main(): Promise<void> {
         const ext = getExtension(runtime.rtConfig.polyfill);
         if (ext == '.js'){
             const file = readTextFile(runtime.rtConfig.polyfill);
-            // will eval the code in module scope
             const mod = new engine.Module(file, fs.realpath(runtime.rtConfig.polyfill));
             mod.meta.use = import.meta.use;
             await mod.eval();
@@ -104,22 +95,17 @@ async function main(): Promise<void> {
     }
 
     try {
+        console.debug(`[CJS] Entry file: ${entryFile}`);
         // Import and execute entry file
         await import(entryFile);
     } catch (error) {
-        console.error('\n❌ Runtime error:', errMsg(error));
-        if (error instanceof Error && error.stack) {
-            console.error(error.stack);
-        }
+        console.error('\n❌', error);
         os.exit(1);
     }
 }
 
 // Run main
 main().catch((error) => {
-    console.error('\n❌ Fatal error:', errMsg(error));
-    if (error instanceof Error && error.stack) {
-        console.error(error.stack);
-    }
+    console.error('\n❌ Fatal error:', error);
     os.exit(1);
 });

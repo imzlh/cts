@@ -1,9 +1,4 @@
-// resolver/jsr.ts - JSR Protocol Resolver
-
-import type {
-    RuntimeConfig,
-    ParsedJsrSpecifier
-} from '../types.ts';
+import type { RuntimeConfig, ParsedJsrSpecifier, JsrPackageMeta } from '../types';
 import {
     errMsg,
     readTextFile,
@@ -13,10 +8,10 @@ import {
     ensureDir,
     isCacheExpired,
     normalizePath,
-    fetchSync,
-    fetchBinary
+    fetchBinary,
+    matchLatestVersion
 } from '../utils';
-import { BaseResolver } from './base.js';
+import { BaseResolver, type ResolveResult, type LocalPathResult, ModuleType } from './base.js';
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const console = import.meta.use('console');
@@ -28,163 +23,77 @@ const console = import.meta.use('console');
 export class JsrResolver extends BaseResolver {
     private readonly jsrRegistry = 'https://jsr.io';
     private readonly urlMap = new Map<string, string>();
-    private readonly verbose: boolean;
 
     constructor(private readonly config: RuntimeConfig) { 
         super();
-        this.verbose = config.verbose || false;
     }
 
     readonly protocol = ['jsr'];
 
     /**
-     * Log debug information if verbose is enabled
-     */
-    private debugLog(message: string, ...args: any[]): void {
-        if (this.verbose) {
-            console.log(`[JSR:DEBUG] ${message}`, ...args);
-        }
-    }
-
-    /**
-     * Check if a path is a relative path
-     */
-    private isRelativePath(path: string): boolean {
-        return path.startsWith('./') || path.startsWith('../');
-    }
-
-    /**
-     * Resolve JSR module and return local path
+     * Main resolution entry point
      * Format: jsr:@scope/package[@version][/path]
+     * JSR modules are always ESM
      */
-    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
+    resolve(specifier: string, parent?: string, _attr?: Record<string, any>): ResolveResult {
         try {
-            this.debugLog('Resolving JSR module', { specifier, parent });
+            this.log(`Resolving: ${specifier}${parent ? ` (from ${parent})` : ''}`);
             
             // Handle relative imports within JSR modules
-            if (this.isRelativePath(specifier) && parent && parent.startsWith('jsr:')) {
-                this.debugLog('Resolving relative import within JSR module', { specifier, parent });
-                
-                const parentParsed = this.parseSpecifier(parent);
-                this.debugLog('Parsed parent JSR specifier', parentParsed);
-                
-                // Resolve relative path against parent path
-                const parentDir = dirname(parentParsed.path || '');
-                const resolvedPath = normalizePath(joinPaths(parentDir, specifier));
-                
-                this.debugLog('Resolved relative path', { parentDir, specifier, resolvedPath });
-                
-                // Update the path in the parsed specifier
-                const newParsed = {
-                    ...parentParsed,
-                    path: resolvedPath
-                };
-                
-                // Resolve file path
-                this.debugLog('Resolving file path', { 
-                    scope: newParsed.scope, 
-                    name: newParsed.name, 
-                    version: newParsed.version, 
-                    path: newParsed.path 
-                });
-                const filePath = this.resolveFile(
-                    newParsed.scope,
-                    newParsed.name,
-                    newParsed.version!,
-                    newParsed.path
-                );
-                this.debugLog('Resolved file path', filePath);
-
-                // Download file if not cached
-                this.debugLog('Downloading file if needed', filePath);
-                const localPath = this.downloadFile(
-                    newParsed.scope,
-                    newParsed.name,
-                    newParsed.version!,
-                    filePath
-                );
-                this.debugLog('File local path', localPath);
-
-                // Track URL mapping
-                const jsrUrl = `jsr:@${newParsed.scope}/${newParsed.name}@${newParsed.version}/${filePath}`;
-                this.urlMap.set(jsrUrl, localPath);
-                this.debugLog('URL mapping added', { jsrUrl, localPath });
-
-                return jsrUrl;
+            if (this.isRelativePath(specifier) && parent?.startsWith('jsr:')) {
+                const result = this.resolveRelativeImport(specifier, parent);
+                return { path: result, isCjs: false };
             }
             
+            // Parse and normalize specifier
             const parsed = this.parseSpecifier(specifier);
-            this.debugLog('Parsed JSR specifier', parsed);
-            
-            // If no version specified, use latest
             if (!parsed.version) {
-                this.debugLog('No version specified, fetching latest version');
-                const latestVersion = this.getLatestVersion(parsed.scope, parsed.name);
-                parsed.version = latestVersion;
-                this.debugLog('Using latest version', latestVersion);
+                parsed.version = this.getLatestVersion(parsed.scope, parsed.name);
+                this.log(`Resolved latest version: ${parsed.version}`);
+            } else {
+                parsed.version = this.resolveVersion(parsed.scope, parsed.name, parsed.version);
             }
 
-            // Resolve file path
-            this.debugLog('Resolving file path', { 
-                scope: parsed.scope, 
-                name: parsed.name, 
-                version: parsed.version, 
-                path: parsed.path 
-            });
-            const resolvedPath = this.resolveFile(
-                parsed.scope,
-                parsed.name,
-                parsed.version,
-                parsed.path
-            );
-            this.debugLog('Resolved file path', resolvedPath);
-
-            // Download file if not cached
-            this.debugLog('Downloading file if needed', resolvedPath);
+            // Resolve file path within package
+            const filePath = this.resolveFilePath(parsed);
+            
+            // Download if needed
             const localPath = this.downloadFile(
                 parsed.scope,
                 parsed.name,
                 parsed.version,
-                resolvedPath
+                filePath
             );
-            this.debugLog('File local path', localPath);
 
-            // Track URL mapping
-            const jsrUrl = `jsr:@${parsed.scope}/${parsed.name}@${parsed.version}/${resolvedPath}`;
+            // Track mapping
+            const jsrUrl = `jsr:@${parsed.scope}/${parsed.name}@${parsed.version}/${filePath}`;
             this.urlMap.set(jsrUrl, localPath);
-            this.debugLog('URL mapping added', { jsrUrl, localPath });
-
-            return jsrUrl;
+            
+            this.log(`Resolved to: ${jsrUrl} -> ${localPath}`);
+            // JSR modules are always ESM
+            return { path: jsrUrl, isCjs: false };
         } catch (error) {
-            this.debugLog('Error resolving JSR module', error);
-            throw new Error(`Failed to resolve JSR module ${specifier}: ${errMsg(error)}`);
+            this.log(`Failed to resolve ${specifier}: ${errMsg(error)}`);
+            throw new Error(`JSR resolution failed for ${specifier}: ${errMsg(error)}`);
         }
     }
 
     /**
-     * Get local path for JSR module
+     * JSR modules are always ESM
      */
-    getLocalPath(url: string): string {
-        this.debugLog('Getting local path for URL', url);
-        
+
+    getLocalPath(url: string): LocalPathResult {
         if (this.urlMap.has(url)) {
-            const localPath = this.urlMap.get(url)!;
-            this.debugLog('Found URL mapping', { url, localPath });
-            return localPath;
+            return { path: this.urlMap.get(url)!, moduleType: ModuleType.ESM };
         }
 
         const parsed = this.parseSpecifier(url);
-        this.debugLog('Parsed URL for local path', parsed);
-
         if (!parsed.version) {
-            throw new Error(`Version required in protocol path: ${url}`);
+            throw new Error(`[JSR] Version required in protocol path: ${url}`);
         }
 
-        // Ensure filePath doesn't start with a slash
         const filePath = parsed.path.startsWith('/') ? parsed.path.substring(1) : parsed.path;
-
-        // Build local path
-        const localPath = joinPaths(
+        const path = joinPaths(
             this.config.cacheDir,
             'jsr',
             parsed.scope,
@@ -192,323 +101,236 @@ export class JsrResolver extends BaseResolver {
             parsed.version,
             filePath
         );
-        
-        this.debugLog('Constructed local path', { url, localPath });
-        return localPath;
+          return { path, moduleType: ModuleType.ESM };
+      }
+
+    // ========== Private Helpers ==========
+
+    private isRelativePath(path: string): boolean {
+        return path.startsWith('./') || path.startsWith('../');
     }
 
-    /**
-     * Parse JSR specifier
-     */
-    private parseSpecifier(specifier: string): ParsedJsrSpecifier {
-        this.debugLog('Parsing JSR specifier', specifier);
+    private resolveRelativeImport(specifier: string, parent: string): string {
+        const parentParsed = this.parseSpecifier(parent);
+        const parentDir = dirname(parentParsed.path || '');
+        const resolvedPath = normalizePath(joinPaths(parentDir, specifier));
         
-        // Remove 'jsr:' prefix and any leading slashes
-        let rest = specifier.substring(4); // Remove 'jsr:' prefix
-        while (rest.startsWith('/')) {
-            rest = rest.substring(1);
-        }
+        this.log(`Relative path resolved: ${specifier} -> ${resolvedPath}`);
+        
+        // Re-parse with resolved path
+        const newParsed = { ...parentParsed, path: resolvedPath };
+        const filePath = this.resolveFilePath(newParsed);
+        
+        const localPath = this.downloadFile(
+            newParsed.scope,
+            newParsed.name,
+            newParsed.version!,
+            filePath
+        );
+        const jsrUrl = `jsr:@${newParsed.scope}/${newParsed.name}@${newParsed.version}/${filePath}`;
+        this.urlMap.set(jsrUrl, localPath);
+        this.log(`Mapped: ${jsrUrl} -> ${localPath}`);
+        
+        return jsrUrl;
+    }
+
+    private parseSpecifier(specifier: string): ParsedJsrSpecifier {
+        // Remove 'jsr:' prefix and leading slashes
+        let rest = specifier.substring(4);
+        while (rest.startsWith('/')) rest = rest.substring(1);
 
         if (!rest.startsWith('@')) {
-            throw new Error(`Invalid JSR specifier: ${specifier} (must start with @scope/name)`);
+            throw new Error(`[JSR] Invalid specifier (must be @scope/name): ${specifier}`);
         }
 
+        // Match: @scope/name[@version][/path]
         const match = rest.match(/^@([^\/]+)\/([^@\/]+)(?:@([^\/]+))?(\/.*)?$/);
         if (!match) {
-            throw new Error(`Invalid JSR specifier format: ${specifier}`);
+            throw new Error(`[JSR] Invalid specifier format: ${rest}`);
         }
 
         const [, scope, name, version, path] = match;
-
-        const result = {
+        return {
             scope: scope!,
             name: name!,
             version: version || null,
             path: path || ''
         };
-        
-        this.debugLog('Parsed JSR specifier result', result);
-        return result;
     }
 
-    /**
-     * Get latest version of a package
-     */
-    private getLatestVersion(scope: string, name: string): string {
-        this.debugLog('Getting latest version', { scope, name });
-        
-        const cacheDir = joinPaths(this.config.cacheDir, 'jsr', scope, name);
-        const metaFile = joinPaths(cacheDir, 'meta.json');
+    private resolveFilePath(parsed: ParsedJsrSpecifier): string {
+        const versionMeta = this.getVersionMeta(parsed.scope, parsed.name, parsed.version!);
 
-        // Check cache
-        if (fs.exists(metaFile)) {
-            this.debugLog('Found cached meta file', metaFile);
-            try {
-                const cached = JSON.parse(readTextFile(metaFile));
-                // Check cache expiration
-                if (cached._cachedAt && !isCacheExpired(cached._cachedAt, this.config.jsrCacheTTL)) {
-                    if (cached.latest) {
-                        this.debugLog('Using cached latest version', cached.latest);
-                        return cached.latest;
-                    }
-                }
-                this.debugLog('Cache expired or invalid, will refetch');
-            } catch {
-                // Cache is broken, re-fetch
-                this.debugLog('Cache is broken, will refetch');
+        // Default export
+        if (!parsed.path || parsed.path === '/' || parsed.path === '.') {
+            const defaultExport = versionMeta.exports?.['.'] || versionMeta.exports?.['./mod.ts'];
+            if (!defaultExport) {
+                throw new Error(`[JSR] No entry point found for @${parsed.scope}/${parsed.name}@${parsed.version}`);
             }
-        } else {
-            this.debugLog('No cached meta file found');
-        }
-
-        // Fetch metadata from JSR registry
-        this.logDownload(`Fetching metadata for @${scope}/${name}`);
-        const metaUrl = `${this.jsrRegistry}/@${scope}/${name}/meta.json`;
-        this.debugLog('Fetching metadata from JSR registry', metaUrl);
-        
-        const metaBytes = fetchBinary(metaUrl);
-        const metaJson = engine.decodeString(metaBytes);
-        
-        // Check if response is HTML (error page) instead of JSON
-        if (metaJson.trim().startsWith('<')) {
-            console.debug('[JSR:DEBUG] Received HTML instead of JSON for package metadata');
-            throw new Error(`Server returned HTML instead of JSON for package metadata: ${metaUrl}`);
-        }
-        
-        const meta = JSON.parse(metaJson);
-        this.debugLog('Received package metadata', meta);
-
-        // Save to cache
-        ensureDir(cacheDir);
-        const cachedMeta = {
-            ...meta,
-            _cachedAt: Date.now()
-        };
-        writeTextFile(metaFile, JSON.stringify(cachedMeta, null, 2));
-        this.debugLog('Saved metadata to cache', metaFile);
-
-        if (!meta.latest) {
-            throw new Error(`No latest version found for @${scope}/${name}`);
-        }
-
-        this.debugLog('Latest version from metadata', meta.latest);
-        return meta.latest;
-    }
-
-    /**
-     * Resolve file path within JSR package
-     */
-    private resolveFile(
-        scope: string,
-        name: string,
-        version: string,
-        path: string
-    ): string {
-        this.debugLog('Resolving file path', { scope, name, version, path });
-        
-        // Get version metadata
-        const versionMeta = this.getVersionMeta(scope, name, version);
-        this.debugLog('Got version metadata', versionMeta);
-
-        // Use default exports ('.')
-        if (!path || path === '/' || path === '.') {
-            this.debugLog('Resolving default export');
-            if (versionMeta.exports) {
-                const defaultExport = versionMeta.exports['.'] || versionMeta.exports['./mod.ts'];
-                if (defaultExport) {
-                    const exportPath = defaultExport.startsWith('./')
-                        ? defaultExport.substring(2)
-                        : defaultExport;
-                    this.debugLog('Resolved default export path', exportPath);
-                    return exportPath;
-                }
-            }
-            throw new Error(`No entry point found for @${scope}/${name}@${version}`);
+            return defaultExport.startsWith('./') ? defaultExport.substring(2) : defaultExport;
         }
 
         // Normalize path
-        const normalizedPath = normalizePath(path.startsWith('/') ? path : '/' + path);
-        this.debugLog('Normalized path', normalizedPath);
+        const normalized = normalizePath(parsed.path.startsWith('/') ? parsed.path : '/' + parsed.path);
 
-        // Match exports
-        const exportsKey = '.' + normalizedPath;
-        this.debugLog('Checking exports key', exportsKey);
-        
-        if (versionMeta.exports?.[exportsKey]) {
-            const exportPath = versionMeta.exports[exportsKey];
-            const result = exportPath.startsWith('./') ? exportPath.substring(2) : exportPath;
-            this.debugLog('Found export in exports map', { exportsKey, exportPath, result });
-            return result;
+        // Check exports map
+        const exportPath = versionMeta.exports?.['.' + normalized];
+        if (exportPath) {
+            return exportPath.startsWith('./') ? exportPath.substring(2) : exportPath;
         }
 
-        // Match manifest
-        if (versionMeta.manifest[normalizedPath]) {
-            const result = normalizedPath.startsWith('/') ? normalizedPath.substring(1) : normalizedPath;
-            this.debugLog('Found path in manifest', { normalizedPath, result });
-            return result;
+        // Check manifest
+        if (versionMeta.manifest[normalized]) {
+            return normalized.startsWith('/') ? normalized.substring(1) : normalized;
         }
 
-        // Try adding extensions
+        // Try extensions
         const extensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
-        this.debugLog('Trying extensions', extensions);
-        
         for (const ext of extensions) {
-            const pathWithExt = normalizedPath + ext;
-            if (versionMeta.manifest[pathWithExt]) {
-                const result = pathWithExt.startsWith('/') ? pathWithExt.substring(1) : pathWithExt;
-                this.debugLog('Found path with extension in manifest', { pathWithExt, result });
-                return result;
+            const withExt = normalized + ext;
+            if (versionMeta.manifest[withExt]) {
+                return withExt.startsWith('/') ? withExt.substring(1) : withExt;
             }
         }
 
-        // Try index file
-        this.debugLog('Trying index files');
+        // Try index files
         for (const ext of extensions) {
-            const indexPath = `${normalizedPath}/index${ext}`;
+            const indexPath = `${normalized}/index${ext}`;
             if (versionMeta.manifest[indexPath]) {
-                const result = indexPath.startsWith('/') ? indexPath.substring(1) : indexPath;
-                this.debugLog('Found index file in manifest', { indexPath, result });
-                return result;
+                return indexPath.startsWith('/') ? indexPath.substring(1) : indexPath;
             }
         }
 
-        // Not found
-        this.debugLog('File not found in package', { 
-            path, 
-            normalizedPath, 
-            exportsKey, 
-            availableExports: Object.keys(versionMeta.exports || {}),
-            availableManifest: Object.keys(versionMeta.manifest || {})
-        });
-        throw new Error(`Cannot find ${path} in @${scope}/${name}@${version}`);
+        throw new Error(
+            `[JSR] File not found: ${parsed.path} in @${parsed.scope}/${parsed.name}@${parsed.version}`
+        );
     }
 
-    /**
-     * Get version metadata
-     */
     private getVersionMeta(scope: string, name: string, version: string) {
-        this.debugLog('Getting version metadata', { scope, name, version });
-        
-        // Resolve version range to actual version
-        const resolvedVersion = this.resolveVersion(scope, name, version);
-        this.debugLog('Resolved version', { version, resolvedVersion });
-        
-        const versionDir = joinPaths(this.config.cacheDir, 'jsr', scope, name, resolvedVersion);
+        const versionDir = joinPaths(this.config.cacheDir, 'jsr', scope, name, version);
         const metaFile = joinPaths(versionDir, 'meta.json');
 
-        // Check cache
         if (fs.exists(metaFile)) {
-            this.debugLog('Found cached version meta file', metaFile);
             try {
                 const cached = JSON.parse(readTextFile(metaFile));
-                // Check cache expiration
                 if (cached._cachedAt && !isCacheExpired(cached._cachedAt, this.config.jsrCacheTTL)) {
-                    this.debugLog('Using cached version metadata');
                     return cached;
                 }
-                this.debugLog('Version metadata cache expired, will refetch');
-            } catch {
-                // Cache is broken, re-fetch
-                this.debugLog('Version metadata cache is broken, will refetch');
+                this.log(`Version meta cache expired for ${scope}/${name}@${version}`);
+            } catch (error) {
+                this.log(`Version meta cache broken for ${scope}/${name}@${version}: ${error}`);
             }
-        } else {
-            this.debugLog('No cached version meta file found');
         }
 
-        // Fetch metadata from JSR registry
-        this.logDownload(`Fetching metadata for @${scope}/${name}@${resolvedVersion}`);
-        const versionUrl = `${this.jsrRegistry}/@${scope}/${name}/${resolvedVersion}_meta.json`;
-        this.debugLog('Fetching version metadata from JSR registry', versionUrl);
-        
-        const versionBytes = fetchBinary(versionUrl);
-        const versionJson = engine.decodeString(versionBytes);
-        
-        // Check if response is HTML (error page) instead of JSON
-        if (versionJson.trim().startsWith('<')) {
-            console.debug('[JSR:DEBUG] Received HTML instead of JSON for version metadata');
-            throw new Error(`Server returned HTML instead of JSON for version metadata: ${versionUrl}`);
-        }
-        
-        const versionMeta = JSON.parse(versionJson);
-        this.debugLog('Received version metadata', versionMeta);
+        this.log(`Fetching version metadata: @${scope}/${name}@${version}`);
+        const url = `${this.jsrRegistry}/@${scope}/${name}/${version}_meta.json`;
+        const meta = this.fetchJsonInternal(url);
 
-        // Save to cache
         ensureDir(versionDir);
-        const cachedVersionMeta = {
-            ...versionMeta,
-            _cachedAt: Date.now()
-        };
-        writeTextFile(metaFile, JSON.stringify(cachedVersionMeta, null, 2));
-        this.debugLog('Saved version metadata to cache', metaFile);
+        writeTextFile(metaFile, JSON.stringify({ ...meta, _cachedAt: Date.now() }, null, 2));
 
-        return versionMeta;
+        return meta;
     }
 
-    /**
-     * Download file from JSR registry
-     */
-    private downloadFile(scope: string, name: string, version: string, filePath: string) {
-        this.debugLog('Downloading file', { scope, name, version, filePath });
+    private getPackageMeta(scope: string, name: string): JsrPackageMeta {
+        const cacheDir = joinPaths(this.config.cacheDir, 'jsr', scope, name);
+        const metaFile = joinPaths(cacheDir, 'meta.json');
+
+        // Return cached if valid
+        if (fs.exists(metaFile)) {
+            try {
+                const cached = JSON.parse(readTextFile(metaFile));
+                if (cached._cachedAt && !isCacheExpired(cached._cachedAt, this.config.jsrCacheTTL))
+                    return cached;
+                this.log(`Latest version cache expired for ${scope}/${name}`);
+            } catch (error) {
+                this.log(`Latest version cache broken for ${scope}/${name}: ${error}`);
+            }
+        }
+
+        // Fetch from registry
+        this.log(`Fetching package metadata: @${scope}/${name}`);
+        const url = `${this.jsrRegistry}/@${scope}/${name}/meta.json`;
+        const meta = this.fetchJsonInternal(url);
+
+        if (!meta.latest) {
+            throw new Error(`[JSR] No latest version for @${scope}/${name}`);
+        }
+
+        // Save cache
+        ensureDir(cacheDir);
+        writeTextFile(metaFile, JSON.stringify({ ...meta, _cachedAt: Date.now() }, null, 2));
+
+        return meta;
+    }
+
+    private getLatestVersion(scope: string, name: string): string {
+        const meta = this.getPackageMeta(scope, name);
+        if (!meta.latest) {
+            throw new Error(`[JSR] No latest version for @${scope}/${name}`);
+        }
+        return meta.latest;
+    }
+
+    private resolveVersion(scope: string, name: string, version: string): string {
+        if (/^\d+\.\d+\.\d+/.test(version)) {
+            return version;
+        }
         
-        // Resolve version range to actual version
-        const resolvedVersion = this.resolveVersion(scope, name, version);
-        this.debugLog('Resolved version', { version, resolvedVersion });
-        
-        const localPath = joinPaths(this.config.cacheDir, 'jsr', scope, name, resolvedVersion, filePath);
+        if (/^[\^~><=]/.test(version)) {
+            this.log(`Version range detected: ${version}, resolving to latest`);
+            return this.getLatestVersion(scope, name);
+        }
+
+        const meta = this.getPackageMeta(scope, name);
+        const v = matchLatestVersion(Object.keys(meta.versions), version);
+        if (!v) {
+            throw new Error(`[JSR] No matching version for ${version} in @${scope}/${name}`);
+        }
+        this.log(`Resolved version: ${version} -> ${v}`);
+        return v;
+    }
+
+    private downloadFile(scope: string, name: string, version: string, filePath: string): string {
+        const localPath = joinPaths(this.config.cacheDir, 'jsr', scope, name, version, filePath);
 
         if (fs.exists(localPath)) {
-            this.debugLog('File already exists locally', localPath);
-            return localPath; // Already cached
+            return localPath;
         }
 
-        this.logDownload(`Downloading @${scope}/${name}@${resolvedVersion}/${filePath}`);
+        this.log(`Downloading: @${scope}/${name}@${version}/${filePath}`);
         
-        // Ensure filePath doesn't start with a slash for the URL
         const urlPath = filePath.startsWith('/') ? filePath.substring(1) : filePath;
-        const fileUrl = `${this.jsrRegistry}/@${scope}/${name}/${resolvedVersion}/${urlPath}`;
-        this.debugLog('Fetching file from JSR registry', fileUrl);
-        
-        const fileBytes = fetchBinary(fileUrl);
-        
-        // Check if response is HTML (error page) instead of file content
-        // Only decode as string for the check, but keep original bytes for writing
-        const fileContent = engine.decodeString(fileBytes);
-        if (fileContent.trim().startsWith('<')) {
-            console.debug('[JSR:DEBUG] Received HTML instead of file content');
-            throw new Error(`Server returned HTML instead of file content: ${fileUrl}`);
-        }
-        
-        this.debugLog('Received file content', { size: fileBytes.length });
+        const url = `${this.jsrRegistry}/@${scope}/${name}/${version}/${urlPath}`;
+        const fileBytes = this.fetchBinaryInternal(url);
 
         ensureDir(dirname(localPath));
-        fs.writeFile(localPath, fileBytes.buffer);
-        this.debugLog('Saved file to local path', localPath);
+        fs.writeFile(localPath, new Uint8Array(fileBytes.buffer));
 
         return localPath;
     }
 
-    /**
-     * Resolve version range to actual version
-     */
-    private resolveVersion(scope: string, name: string, version: string): string {
-        this.debugLog('Resolving version', { scope, name, version });
+    private fetchJsonInternal(url: string): any {
+        const bytes = this.fetchBinaryInternal(url);
+        const text = engine.decodeString(bytes);
         
-        // Handle version ranges (e.g., ^1.0.0, ~1.0.0)
-        if (version.startsWith('^') || version.startsWith('~') || version.startsWith('>=') || version.startsWith('<=') || version.startsWith('>')) {
-            this.debugLog('Version range detected, fetching latest version', version);
-            return this.getLatestVersion(scope, name);
+        // Check for HTML error page
+        if (text.trim().startsWith('<')) {
+            throw new Error(`[JSR] Registry returned HTML instead of JSON: ${url}`);
         }
-        
-        // For exact versions, return as is
-        return version;
+
+        return JSON.parse(text);
     }
 
-    /**
-     * Log download
-     */
-    private logDownload(message: string): void {
-        if (!this.config.silent) {
-            console.log(`📦 ${message}`);
+    private fetchBinaryInternal(url: string): Uint8Array<ArrayBuffer> {
+        const bytes = fetchBinary(url);
+        if (!bytes || bytes.length === 0) {
+            throw new Error(`[JSR] Failed to fetch: ${url}`);
         }
+        return bytes;
+    }
+
+    private log(message: string): void {
+        console.debug(`[JSR] ${message}`);
     }
 }

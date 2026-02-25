@@ -107,12 +107,12 @@ export class HttpRequestBuilder {
         // 构建请求行
         const path = this.url.pathname + this.url.search;
         let request = `${this.method} ${path} HTTP/1.1\r\n`;
-        console.debug(`[HttpRequestBuilder] WRITE: ${this.method} ${path} HTTP/1.1`);
+        console.debug(`[http.build] WRITE: ${this.method} ${path} HTTP/1.1`);
 
         // 添加头部
         for (const [key, value] of this.headers) {
             request += `${key}: ${value}\r\n`;
-            console.debug(`[HttpRequestBuilder] WRITE: ${key}: ${value}`);
+            console.debug(`[http.build] WRITE: ${key}: ${value}`);
         }
 
         // 结束头部
@@ -126,7 +126,7 @@ export class HttpRequestBuilder {
             const combined = new Uint8Array(headerBytes.length + this.body.length);
             combined.set(headerBytes, 0);
             combined.set(this.body, headerBytes.length);
-            console.debug(`[HttpRequestBuilder] WRITE: ${this.body.length} bytes body`);
+            // console.debug(`[http.build] WRITE: ${this.body.length} bytes body`);
             return combined;
         }
 
@@ -236,12 +236,12 @@ export class HttpResponseParser {
      */
     feed(data: Uint8Array): void {
         const console = import.meta.use('console');
-        console.debug(`[HttpResponseParser:DEBUG] Feeding data: ${data.length} bytes`);
+        // console.debug(`[http.parser]Feeding data: ${data.length} bytes`);
         
         try {
             // 传ArrayBuffer，匹配callback断言
             const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.length + data.byteOffset));
-            console.debug(`[HttpResponseParser:DEBUG] Parser result: errno=${result.errno}, reason=${result.reason}`);
+            // console.debug(`[http.parser]Parser result: errno=${result.errno}, reason=${result.reason}`);
             
             if (result.errno !== 0) {
                 const error = new Error(`HTTP parse error: ${result.reason}`);
@@ -253,7 +253,7 @@ export class HttpResponseParser {
                 }
             }
             
-            console.debug(`[HttpResponseParser:DEBUG] Data fed successfully, headersComplete=${this.headersComplete}, completed=${this.completed}`);
+            // console.debug(`[http.parser]Data fed successfully, headersComplete=${this.headersComplete}, completed=${this.completed}`);
         } catch (err) {
             console.error(`[HttpResponseParser:ERROR] Exception during parsing: ${err}`);
             if (this.onError) {

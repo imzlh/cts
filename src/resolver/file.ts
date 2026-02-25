@@ -7,9 +7,10 @@ import {
     dirname,
     tryResolveFile,
     normalizePath,
-    isAbsolutePath
+    isAbsolutePath,
+    readTextFile
 } from '../utils';
-import { BaseResolver } from './base.js';
+import { BaseResolver, type ResolveResult, type LocalPathResult, ModuleType } from './base.js';
 import { FileType } from '../types';
 
 const fs = import.meta.use('fs');
@@ -30,7 +31,7 @@ export class FileResolver extends BaseResolver {
     /**
      * Resolve file:// URL to local path
      */
-    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
+    resolve(specifier: string, parent?: string, attr?: Record<string, any>): ResolveResult {
         try {
             // Extract path from file:// URL
             let filePath: string;
@@ -67,7 +68,10 @@ export class FileResolver extends BaseResolver {
                 throw new Error(`Cannot access file: ${filePath}`);
             }
             
-            return specifier;
+            // Determine module type
+            const moduleType = this.detectModuleType(filePath);
+            
+            return { path: specifier, isCjs: moduleType === ModuleType.CJS };
         } catch (error) {
             // Provide a cleaner error message for common issues
             if (error instanceof Error && error.message.includes('File not found')) {
@@ -80,12 +84,13 @@ export class FileResolver extends BaseResolver {
         }
     }
 
+
     /**
      * Get local path for file:// URL
      */
-    getLocalPath(url: string): string {
+    getLocalPath(url: string): LocalPathResult {
         if (!url.startsWith('file://')) {
-            return url;
+            return { path: url };
         }
         
         // Remove file:// prefix
@@ -96,20 +101,54 @@ export class FileResolver extends BaseResolver {
             filePath = filePath.substring(1);
         }
         
-        return normalizePath(filePath);
+        const normalizedPath = normalizePath(filePath);
+        const moduleType = this.detectModuleType(normalizedPath);
+        return { path: normalizedPath, moduleType };
     }
     
     /**
      * Get file type for file:// URL
      */
     getFileType(path: string): FileType {
-        const localPath = this.getLocalPath(path);
+        const localPathResult = this.getLocalPath(path);
         
+          const localPath = localPathResult.path;
         // Check file extension
         if (localPath.endsWith('.wasm')) {
             return FileType.BINARY;
         }
         
         return FileType.TEXT;
+    }
+    private detectModuleType(filePath: string): ModuleType {
+        const ext = filePath.substring(filePath.lastIndexOf('.'));
+
+        // .mjs is always ESM
+        if (ext === '.mjs') return ModuleType.ESM;
+        // .cjs is always CJS
+        if (ext === '.cjs') return ModuleType.CJS;
+
+        // For .js files, check package.json
+        if (ext === '.js') {
+            let dir = dirname(filePath);
+            while (dir !== '/' && dir !== '.') {
+                const pkgPath = joinPaths(dir, 'package.json');
+                if (fs.exists(pkgPath)) {
+                    try {
+                        const pkg = JSON.parse(readTextFile(pkgPath));
+                        return pkg.type === 'module' ? ModuleType.ESM : ModuleType.CJS;
+                    } catch {
+                        return ModuleType.CJS; // Default to CJS on error
+                    }
+                }
+                const parent = dirname(dir);
+                if (parent === dir) break;
+                dir = parent;
+            }
+            return ModuleType.CJS; // Default to CJS for .js files
+        }
+
+        // Default to ESM for other extensions
+        return ModuleType.ESM;
     }
 }

@@ -1,6 +1,7 @@
 // runtime.ts - TypeScript Runtime Main Class
 
-import type { RuntimeConfig, NodeResolver } from './types.ts';
+import type { RuntimeConfig, NodeResolver } from './types';
+import { ModuleType } from './types';
 import { createConfig } from './config';
 import { ModuleResolver } from './resolver';
 import { ModuleLoader } from './loader';
@@ -29,48 +30,72 @@ export class TypeScriptRuntime {
         this.loader = new ModuleLoader(this.resolver, this.transformer, config);
         this.config = config;
         this.setupModuleLoader();
-    }
 
-    /**
-     * Register Node.js builtin modules resolver
-     */
-    registerNodeResolver(resolver: NodeResolver): void {
-        this.resolver.registerNodeResolver(resolver);
+        // also register to global
+        Reflect.set(globalThis, '__core', this);
     }
 
     /**
      * Set up the QuickJS module loader hooks
      */
-    private setupModuleLoader(): void {
-        engine.onModule({
-            resolve: (name: string, parent: string, attr: Record<string, any>): string => {
-                try {
-                    console.debug(`[runtime] Resolving module: name="${name}", parent="${parent}"`);
-                    const resolvedProtocol = this.resolver.resolve(name, parent, attr);
-                    console.debug(`[runtime] Resolved to: "${resolvedProtocol}"`);
-                    if (!this.mainScript) {
-                        this.mainScript = resolvedProtocol;
-                        this.loader.setMainScript(resolvedProtocol);
-                        // @ts-ignore
-                        globalThis.__mainScript = resolvedProtocol;
-                        console.debug(`[runtime] Main script set to: "${resolvedProtocol}"`);
-                    }
-                    return resolvedProtocol;
-                } catch (error) {
-                    console.debug(`[runtime] Resolution failed for "${name}" from "${parent}":`, error);
-                    throw new Error(`Cannot resolve module "${name}" from "${parent}": ${errMsg(error)}`);
-                }
-            },
+      private setupModuleLoader(): void {
+          engine.onModule({
+              resolve: (name: string, parent: string, attr?: Record<string, any>): string => {
+                  try {
+                      console.debug(`[runtime] Resolving module: name="${name}", parent="${parent}"`);
+                      const result = this.resolver.resolveWithType(name, parent, attr);
+                      const resolvedProtocol = result.path;
+                      const isCjs = result.isCjs;
+                      console.debug(`[runtime] Resolved to: "${resolvedProtocol}", isCjs: ${isCjs}`);
+                      if (!this.mainScript) {
+                          this.mainScript = resolvedProtocol;
+                          this.loader.setMainScript(resolvedProtocol);
+                          this.resolver.setMainEntry(resolvedProtocol);
+                          // @ts-ignore
+                          globalThis.__mainScript = resolvedProtocol;
+                          console.debug(`[runtime] Main script set to: "${resolvedProtocol}"`);
+                      }
+                      this.loader.preCacheModule(
+                          this.resolver.getLocalPath(resolvedProtocol).path,
+                          this.resolver.getLocalPath(parent).path
+                      );
 
-            load: (modname: string, attr?: Record<string, any>) => {
-                const localPath = this.resolver.getLocalPath(modname);
-                console.debug(`[runtime] Loading module: localPath="${localPath}", modname="${modname}"`);
-                const mod = this.loader.loadModule(localPath, modname, attr);
-                this.initModule(mod.meta, modname);
-                return mod;
-            },
+                      // Store isCjs info for load callback
+                      // @ts-ignore
+                      globalThis.__moduleType = globalThis.__moduleType || {};
+                      // @ts-ignore
+                      globalThis.__moduleType[resolvedProtocol] = isCjs ? 'cjs' : 'esm';
 
-            init: (protocolPath: string, importMeta: Record<string, any>): void => {
+                      // also add with attribute
+                      return resolvedProtocol + (attr?.type ? `?${attr.type}` : '');
+                  } catch (error) {
+                      console.debug(`[runtime] Resolution failed for "${name}" from "${parent}":`, error);
+                      throw new Error(`Cannot resolve module "${name}" from "${parent}": ${errMsg(error)}`);
+                  }
+              },
+
+              load: (modname: string) => {
+                  const localPathResult = this.resolver.getLocalPath(modname);
+                  const localPath = localPathResult.path;
+                  let moduleType = localPathResult.moduleType;
+
+                  // Check if we have stored module type from resolve
+                  // @ts-ignore
+                  if (globalThis.__moduleType?.[modname]) {
+                      // @ts-ignore
+                      const storedType = globalThis.__moduleType[modname];
+                      if (storedType === 'cjs') {
+                          moduleType = ModuleType.CJS;
+                      } else if (storedType === 'esm') {
+                          moduleType = ModuleType.ESM;
+                      }
+                  }
+
+                  const meta = {};
+                  this.initModule(meta, modname);
+                  return this.loader.loadModule(localPath, modname, meta, moduleType);
+              },
+              init: (protocolPath: string, importMeta: Record<string, any>): void => {
                 this.initModule(importMeta, protocolPath);
             },
 
@@ -91,8 +116,11 @@ export class TypeScriptRuntime {
         importMeta.dirname = dirname(protocolPath);
 
         // No polyfill: use the original import.meta.use
-        if (!this.config.polyfill)
+        // node protocol should be a part of internal
+        if (!this.config.polyfill || protocolPath.startsWith('node:')) {
             importMeta.use = import.meta.use;
+            console.debug(`[runtime] No polyfill or node protocol, using original import.meta.use: ${importMeta.use}`);
+        }
 
         // Set main flag
         importMeta.main = this.mainScript === protocolPath;

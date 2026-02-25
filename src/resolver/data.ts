@@ -8,7 +8,7 @@ import {
     joinPaths,
     dirname
 } from '../utils';
-import { BaseResolver } from './base.js';
+import { BaseResolver, type ResolveResult, type LocalPathResult, ModuleType } from './base.js';
 import { FileType } from '../types';
 
 const fs = import.meta.use('fs');
@@ -31,7 +31,7 @@ export class DataResolver extends BaseResolver {
     /**
      * Resolve data: URL to local path
      */
-    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
+    resolve(specifier: string, parent?: string, attr?: Record<string, any>): ResolveResult {
         try {
             if (!specifier.startsWith('data:')) {
                 throw new Error(`Invalid data URL: ${specifier}`);
@@ -47,7 +47,8 @@ export class DataResolver extends BaseResolver {
             
             // Check if already cached
             if (fs.exists(cachePath)) {
-                return specifier;
+                // data: URLs are treated as ESM by default
+                return { path: specifier, isCjs: false };
             }
             
             // Ensure cache directory exists
@@ -68,27 +69,32 @@ export class DataResolver extends BaseResolver {
                 fs.writeFile(cachePath, engine.encodeString(textContent));
             }
             
-            return specifier;
+            // data: URLs are treated as ESM by default
+            return { path: specifier, isCjs: false };
         } catch (error) {
             throw new Error(`Failed to resolve data module ${specifier}: ${errMsg(error)}`);
         }
     }
 
     /**
+     * data: URLs are treated as ESM by default
+     */
+
+    /**
      * Get local path for data: URL
      */
-    getLocalPath(url: string): string {
+    getLocalPath(url: string): LocalPathResult {
         if (!url.startsWith('data:')) {
-            return url;
+            return { path: url };
         }
-        
+
         // Create cache file path
         const hash = hashString(url);
         const parsed = this.parseDataUrl(url);
         const extension = this.getExtensionFromMimeType(parsed.mimeType);
-        return joinPaths(this.config.cacheDir, 'data', `${hash}${extension}`);
+        const path = joinPaths(this.config.cacheDir, 'data', `${hash}${extension}`);
+        return { path, moduleType: ModuleType.ESM };
     }
-    
     /**
      * Get file type for data: URL
      */

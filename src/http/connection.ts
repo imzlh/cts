@@ -171,23 +171,23 @@ export class Connection implements ConnectionLike {
     /* -------------------------------------------------------------- */
     
     private readSSL(size: number, waitForData: boolean): Uint8Array | null {
-        console.debug(`[Connection] readSSL: size=${size}, waitForData=${waitForData}`);
+        // console.debug(`[Connection] readSSL: size=${size}, waitForData=${waitForData}`);
         
         const maxAttempts = waitForData ? 10 : 1;
         
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             // Step 1: Process any pending ciphertext first
             if (this.pendingCiphertext && this.pendingCiphertext.length > 0) {
-                console.debug(`[Connection] Processing ${this.pendingCiphertext.length} bytes pending ciphertext`);
+                // console.debug(`[Connection] Processing ${this.pendingCiphertext.length} bytes pending ciphertext`);
                 const consumed = this.feedCiphertext(this.pendingCiphertext);
                 
                 if (consumed > 0) {
                     if (consumed < this.pendingCiphertext.length) {
                         this.pendingCiphertext = this.pendingCiphertext.subarray(consumed);
-                        console.debug(`[Connection] ${this.pendingCiphertext.length} bytes still pending`);
+                        // console.debug(`[Connection] ${this.pendingCiphertext.length} bytes still pending`);
                     } else {
                         this.pendingCiphertext = null;
-                        console.debug(`[Connection] All pending ciphertext consumed`);
+                        // console.debug(`[Connection] All pending ciphertext consumed`);
                     }
                 }
             }
@@ -195,7 +195,7 @@ export class Connection implements ConnectionLike {
             // Step 2: Try to read plaintext from SSL pipe
             const plaintext = this.sslPipe!.read(size);
             if (plaintext && plaintext.byteLength > 0) {
-                console.debug(`[Connection] Got ${plaintext.byteLength} bytes plaintext`);
+                // console.debug(`[Connection] Got ${plaintext.byteLength} bytes plaintext`);
                 return new Uint8Array(plaintext);
             }
             
@@ -212,14 +212,14 @@ export class Connection implements ConnectionLike {
             
             if (n === 0) {
                 // EAGAIN - no data available right now
-                console.debug(`[Connection] Socket EAGAIN (attempt ${attempt + 1})`);
+                // console.debug(`[Connection] Socket EAGAIN (attempt ${attempt + 1})`);
                 
                 if (!waitForData) {
                     // Not waiting, return immediately
                     // Check if we have any plaintext after processing pending
                     const finalPlaintext = this.sslPipe!.read(size);
                     if (finalPlaintext && finalPlaintext.byteLength > 0) {
-                        console.debug(`[Connection] Got ${finalPlaintext.byteLength} bytes plaintext from pending`);
+                        // console.debug(`[Connection] Got ${finalPlaintext.byteLength} bytes plaintext from pending`);
                         return new Uint8Array(finalPlaintext);
                     }
                     return null;
@@ -233,7 +233,7 @@ export class Connection implements ConnectionLike {
             }
             
             // Step 4: Feed new ciphertext to SSL pipe
-            console.debug(`[Connection] Read ${n} bytes ciphertext from socket`);
+            // console.debug(`[Connection] Read ${n} bytes ciphertext from socket`);
             const ciphertext = cipherBuf.subarray(0, n);
             const consumed = this.feedCiphertext(ciphertext);
             
@@ -249,13 +249,13 @@ export class Connection implements ConnectionLike {
                 } else {
                     this.pendingCiphertext = unfed;
                 }
-                console.debug(`[Connection] ${this.pendingCiphertext.length} bytes pending after feed`);
+                // console.debug(`[Connection] ${this.pendingCiphertext.length} bytes pending after feed`);
             }
             
             // Step 5: Try reading plaintext again after feeding
             const newPlaintext = this.sslPipe!.read(size);
             if (newPlaintext && newPlaintext.byteLength > 0) {
-                console.debug(`[Connection] Got ${newPlaintext.byteLength} bytes plaintext after feed`);
+                // console.debug(`[Connection] Got ${newPlaintext.byteLength} bytes plaintext after feed`);
                 return new Uint8Array(newPlaintext);
             }
             
@@ -266,11 +266,11 @@ export class Connection implements ConnectionLike {
             }
             
             // Continue loop to try again
-            console.debug(`[Connection] No plaintext yet, retrying (attempt ${attempt + 1}/${maxAttempts})`);
+            // console.debug(`[Connection] No plaintext yet, retrying (attempt ${attempt + 1}/${maxAttempts})`);
         }
         
         // Exhausted all attempts
-        console.debug(`[Connection] No data after ${maxAttempts} attempts`);
+        // console.debug(`[Connection] No data after ${maxAttempts} attempts`);
         return null;
     }
 
@@ -279,7 +279,7 @@ export class Connection implements ConnectionLike {
     /* -------------------------------------------------------------- */
     
     private readPlain(size: number, waitForData: boolean): Uint8Array | null {
-        console.debug(`[Connection] readPlain: size=${size}, waitForData=${waitForData}`);
+        // console.debug(`[Connection] readPlain: size=${size}, waitForData=${waitForData}`);
         
         const buf = new Uint8Array(size);
         const n = this.socket.readSync(buf);
@@ -292,7 +292,7 @@ export class Connection implements ConnectionLike {
         
         if (n === 0) {
             // EAGAIN
-            console.debug(`[Connection] Plain socket EAGAIN`);
+            // console.debug(`[Connection] Plain socket EAGAIN`);
             
             if (!waitForData) {
                 return null;
@@ -308,7 +308,7 @@ export class Connection implements ConnectionLike {
                     return null;
                 }
                 if (retryN > 0) {
-                    console.debug(`[Connection] Got ${retryN} bytes on retry ${i + 1}`);
+                    // console.debug(`[Connection] Got ${retryN} bytes on retry ${i + 1}`);
                     return buf.subarray(0, retryN);
                 }
             }
@@ -318,7 +318,7 @@ export class Connection implements ConnectionLike {
         }
         
         // Got data
-        console.debug(`[Connection] Read ${n} bytes from plain socket`);
+        // console.debug(`[Connection] Read ${n} bytes from plain socket`);
         return buf.subarray(0, n);
     }
 
@@ -466,7 +466,7 @@ export class Connection implements ConnectionLike {
             throw new Error(`SSL feed error: ${consumed}`);
         }
         
-        console.debug(`[Connection] Fed ${consumed}/${data.length} bytes to SSL pipe`);
+        // console.debug(`[Connection] Fed ${consumed}/${data.length} bytes to SSL pipe`);
         return consumed;
     }
 

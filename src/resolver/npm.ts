@@ -1,5 +1,3 @@
-// resolvers/npm.ts - NPM Package Resolver with Auto-Download
-
 import type { RuntimeConfig, PackageJson, ParsedPackageName } from '../types';
 import {
     readTextFile,
@@ -13,27 +11,27 @@ import {
     unTarGz,
     normalizePath,
     fetchSync,
-    fetchBinary
+    fetchBinary,
+    resolveVersion
 } from '../utils';
-import { BaseResolver } from './base.js';
+import { BaseResolver, type ResolveResult, type LocalPathResult, ModuleType } from './base.js';
+import {
+    readPackageJsonNoCache,
+    resolveMainEntry as resolveMainEntryUtil,
+    resolveSubpath as resolveSubpathUtil,
+    createResolveContext
+} from '../package';
 
 const fs = import.meta.use('fs');
 const sys = import.meta.use('sys');
-const xhr = import.meta.use('xhr');
 const console = import.meta.use('console');
 const os = import.meta.use('os');
 
-/**
- * NPM Registry
- */
 interface NpmConfig {
     registry: string;
 }
 
-/**
- * NPM Package Metadata
- */
-interface NpmPackageMetadata {
+interface PackageMetadata {
     name: string;
     versions: Record<string, {
         version: string;
@@ -41,6 +39,7 @@ interface NpmPackageMetadata {
             tarball: string;
             shasum?: string;
         };
+        dependencies?: Record<string, string>;
     }>;
     'dist-tags': {
         latest: string;
@@ -48,12 +47,140 @@ interface NpmPackageMetadata {
     };
 }
 
-/**
- * NPM Package Resolver with Auto-Download
- */
+interface PackageCacheEntry {
+    pkg: ResolvedPackage;
+    lastChecked: number;
+}
+
+class ResolvedPackage {
+    private metadata: PackageMetadata | null = null;
+    private packageJson: PackageJson | null = null;
+    private installed: boolean = false;
+
+    constructor(
+        public readonly name: string,
+        public readonly version: string,
+        public readonly dir: string,
+        private readonly config: RuntimeConfig,
+        private readonly npmConfig: NpmConfig
+    ) {}
+
+    loadMetadata(): PackageMetadata {
+        if (this.metadata) return this.metadata;
+
+        const cachePath = joinPaths(this.config.cacheDir, 'npm', this.name, 'meta.json');
+
+        if (fs.exists(cachePath)) {
+            try {
+                this.metadata = JSON.parse(readTextFile(cachePath));
+                return this.metadata!;
+            } catch {
+                console.debug(`[NPM] Failed to parse cached metadata for ${this.name}`);
+            }
+        }
+
+        const url = `${this.npmConfig.registry}/${this.name}`;
+
+        try {
+            console.debug(`[NPM] Fetching metadata: ${url}`);
+            const response = fetchSync(url);
+            this.metadata = JSON.parse(response);
+
+            ensureDir(dirname(cachePath));
+            writeTextFile(cachePath, JSON.stringify(this.metadata, null, 2));
+
+            return this.metadata!;
+        } catch (error) {
+            throw new Error(`Failed to fetch metadata for ${this.name}: ${errMsg(error)}`);
+        }
+    }
+
+    setMetadata(meta: PackageMetadata): void {
+        this.metadata = meta;
+    }
+
+    install(): void {
+        if (this.installed) return;
+
+        const meta = this.loadMetadata();
+        const versionData = meta.versions[this.version];
+
+        if (!versionData) {
+            throw new Error(`Version ${this.version} not found for ${this.name}`);
+        }
+
+        console.debug(`[NPM] Installing ${this.name}@${this.version}`);
+        const tarballUrl = versionData.dist.tarball;
+        const tarballData = this.downloadTarball(tarballUrl);
+
+        console.debug(`[NPM] Extracting to ${this.dir}`);
+        const files = unTarGz(tarballData);
+        ensureDir(this.dir);
+
+        const ensuredDirs = new Set<string>();
+
+        for (const file of files) {
+            let filePath = normalizePath(file.path);
+            if (filePath.startsWith('package/')) {
+                filePath = filePath.substring(8);
+            }
+
+            const targetPath = joinPaths(this.dir, filePath);
+
+            if (file.type === 'dir') {
+                if (!ensuredDirs.has(targetPath)) {
+                    ensureDir(targetPath);
+                    ensuredDirs.add(targetPath);
+                }
+            } else {
+                const parentDir = dirname(targetPath);
+                if (!ensuredDirs.has(parentDir)) {
+                    ensureDir(parentDir);
+                    ensuredDirs.add(parentDir);
+                }
+                fs.writeFile(targetPath, file.content);
+            }
+        }
+
+        this.installed = true;
+        console.debug(`[NPM] Installed ${this.name}@${this.version}`);
+    }
+
+    private downloadTarball(url: string): ArrayBuffer {
+        try {
+            return fetchBinary(url, 5, true).buffer;
+        } catch (error) {
+            throw new Error(`Failed to download tarball: ${errMsg(error)}`);
+        }
+    }
+
+    loadPackageJson(): PackageJson {
+        if (this.packageJson) return this.packageJson;
+
+        const pkg = readPackageJsonNoCache(this.dir);
+        if (!pkg) {
+            throw new Error(`package.json not found in ${this.dir}`);
+        }
+
+        this.packageJson = pkg;
+        return this.packageJson;
+    }
+
+    resolveSubpath(subpath: string): string | null {
+        const context = createResolveContext(this.dir);
+        if (!context) {
+            throw new Error(`Failed to resolve package context for ${this.dir}`);
+        }
+
+        return resolveSubpathUtil(context, subpath);
+    }
+}
+
 export class NpmResolver extends BaseResolver {
     private readonly globalCacheDir: string;
     private npmConfig: NpmConfig | null = null;
+    private readonly packageCache = new Map<string, PackageCacheEntry>();
+    private readonly CACHE_TTL = 5 * 60 * 1000;
 
     readonly protocol = ['npm'];
 
@@ -62,384 +189,335 @@ export class NpmResolver extends BaseResolver {
         this.globalCacheDir = joinPaths(this.config.cacheDir, 'npm');
     }
 
-    /**
-     * Clean npm specifier by removing protocol prefix and handling extra slashes
-     */
-    private cleanNpmSpecifier(specifier: string): string {
-        // Remove npm: protocol prefix if present
-        let packageName = specifier.startsWith('npm:') ? specifier.substring(4) : specifier;
-        
-        // Handle case where there's an extra slash after npm: (e.g., npm:/preact@^10.27.2/jsx-runtime)
-        if (packageName.startsWith('/')) {
-            packageName = packageName.substring(1);
+    resolve(specifier: string, parent?: string, attr?: Record<string, any>): ResolveResult {
+        const cleanSpec = this.cleanSpecifier(specifier);
+        const { name, version, subpath } = this.parseSpecifier(cleanSpec);
+
+        console.debug(`[NPM] Resolving: name="${name}", version="${version}", subpath="${subpath}"`);
+
+        const pkg = this.resolvePackage(name, version, parent);
+        if (!pkg) {
+            throw new Error(`Package "${name}" not found`);
         }
-        
-        return packageName;
+
+        const resolvedPath = pkg.resolveSubpath(subpath);
+        if (!resolvedPath) {
+            throw new Error(`Cannot resolve "${subpath || 'main'}" from ${name}@${pkg.version}`);
+        }
+
+        // Check if this is a CJS module
+        const isCjs = this.detectModuleType(resolvedPath) === ModuleType.CJS;
+
+        console.debug(`[NPM] Resolved to: ${resolvedPath}, isCjs: ${isCjs}`);
+        return { path: resolvedPath, isCjs };
     }
 
     /**
-     * Resolve npm package import
+     * Check if a module is CommonJS (public API for loader)
      */
-    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
-        const packageName = this.cleanNpmSpecifier(specifier);
-        const { packageName: pkgName, subpath } = this.parsePackageName(packageName);
 
-        let packageDir = this.findPackageDir(pkgName, parent || '');
-        if (!packageDir) {
-            packageDir = this.autoInstallPackage(pkgName);
-        }
-
-        if (!packageDir) {
-            throw new Error(`Package "${pkgName}" not found and auto-install failed`);
-        }
-
-        // Resolve exports
-        if (subpath) {
-            const exported = this.resolvePackageExports(packageDir, subpath);
-            if (exported) {
-                return exported;
+    private findPackageDirFromPath(filePath: string): string | null {
+        // Try to find package.json by walking up from file path
+        let dir = dirname(filePath);
+        while (dir !== '/' && dir !== '.') {
+            if (fs.exists(joinPaths(dir, 'package.json'))) {
+                return dir;
             }
+            const parent = dirname(dir);
+            if (parent === dir) break;
+            dir = parent;
+        }
+        return null;
+    }
 
-            // Ensure subpath doesn't start with './' to avoid double slashes
-            const cleanSubpath = subpath.startsWith('./') ? subpath.substring(2) : subpath;
-            const subpathFull = joinPaths(packageDir, cleanSubpath);
-            return tryResolveFile(subpathFull);
+    getLocalPath(url: string): LocalPathResult {
+        // Extract local path from npm URL
+        const cleanSpec = this.cleanSpecifier(url);
+        const { name, version, subpath } = this.parseSpecifier(cleanSpec);
+        const pkg = this.resolvePackage(name, version);
+        if (!pkg) {
+            throw new Error(`Package not found: ${name}`);
+        }
+        const resolvedPath = pkg.resolveSubpath(subpath);
+        if (!resolvedPath) {
+            throw new Error(`Cannot resolve subpath: ${subpath}`);
         }
 
-        // Main entry
-        return this.resolvePackageMain(packageDir);
+        // Determine module type
+        const moduleType = this.detectModuleType(resolvedPath);
+
+        return { path: resolvedPath, moduleType };
     }
 
-    getLocalPath(url: string): string {
-        return url; // npm package use full local path
+    private detectModuleType(filePath: string): ModuleType {
+        const ext = filePath.substring(filePath.lastIndexOf('.'));
+        
+        // .mjs is always ESM
+        if (ext === '.mjs') return ModuleType.ESM;
+        // .cjs is always CJS
+        if (ext === '.cjs') return ModuleType.CJS;
+        
+        // For .js files, check package.json
+        if (ext === '.js') {
+            const pkgDir = this.findPackageDirFromPath(filePath);
+            if (!pkgDir) return ModuleType.UNKNOWN;
+            
+            const pkgJson = readPackageJsonNoCache(pkgDir);
+            // If type is "module", it's ESM; otherwise CJS
+            return pkgJson?.type === 'module' ? ModuleType.ESM : ModuleType.CJS;
+        }
+        
+        // Default to ESM for other extensions
+        return ModuleType.ESM;
     }
 
-    /**
-     * Auto install package to global scope(unstable)
-     */
-    private autoInstallPackage(packageName: string): string | null {
+    private cleanSpecifier(spec: string): string {
+        if (spec.startsWith('npm:')) {
+            return spec.substring(4);
+        }
+        return spec;
+    }
+
+    private parseSpecifier(spec: string): { name: string; version: string; subpath: string } {
+        let name = '';
+        let version = '';
+        let subpath = '';
+        let rest = spec;
+
+        // Handle scoped packages @scope/name
+        if (rest.startsWith('@')) {
+            const slashIndex = rest.indexOf('/');
+            if (slashIndex === -1) throw new Error(`Invalid scoped package: ${spec}`);
+
+            const scope = rest.substring(0, slashIndex);
+            rest = rest.substring(slashIndex + 1);
+
+            // Find where name ends (at @version or /subpath)
+            const atIndex = rest.indexOf('@');
+            const slashIndex2 = rest.indexOf('/');
+
+            if (atIndex !== -1 && (slashIndex2 === -1 || atIndex < slashIndex2)) {
+                // Has version: name@version/subpath
+                name = `${scope}/${rest.substring(0, atIndex)}`;
+                const afterAt = rest.substring(atIndex + 1);
+                const slashInVer = afterAt.indexOf('/');
+                version = slashInVer === -1 ? afterAt : afterAt.substring(0, slashInVer);
+                subpath = slashInVer === -1 ? '' : afterAt.substring(slashInVer + 1);
+            } else if (slashIndex2 !== -1) {
+                // Has subpath: name/subpath
+                name = `${scope}/${rest.substring(0, slashIndex2)}`;
+                subpath = rest.substring(slashIndex2 + 1);
+            } else {
+                // Just name
+                name = `${scope}/${rest}`;
+            }
+        } else {
+            // Non-scoped: name, name@version, name/subpath, name@version/subpath
+            const atIndex = rest.indexOf('@');
+            const slashIndex = rest.indexOf('/');
+
+            if (atIndex !== -1 && (slashIndex === -1 || atIndex < slashIndex)) {
+                // Has version
+                name = rest.substring(0, atIndex);
+                const afterAt = rest.substring(atIndex + 1);
+                const slashInVer = afterAt.indexOf('/');
+                version = slashInVer === -1 ? afterAt : afterAt.substring(0, slashInVer);
+                subpath = slashInVer === -1 ? '' : afterAt.substring(slashInVer + 1);
+            } else if (slashIndex !== -1) {
+                // Has subpath only
+                name = rest.substring(0, slashIndex);
+                subpath = rest.substring(slashIndex + 1);
+            } else {
+                // Just name
+                name = rest;
+            }
+        }
+
+        return { name, version: version || 'latest', subpath };
+    }
+
+    private resolvePackage(name: string, version: string, parent?: string): ResolvedPackage | null {
+        const cacheKey = `${name}@${version}`;
+        const cached = this.packageCache.get(cacheKey);
+        if (cached && (Date.now() - cached.lastChecked) < this.CACHE_TTL) {
+            return cached.pkg;
+        }
+
+        let pkgDir = this.findPackageDir(name, parent);
+        let resolvedVersion = version;
+
+        if (!pkgDir) {
+            const result = this.installPackage(name, version);
+            if (!result) return null;
+            pkgDir = result.dir;
+            resolvedVersion = result.version;
+        } else {
+            resolvedVersion = this.readVersionFromDir(pkgDir) || version;
+        }
+
+        const pkg = new ResolvedPackage(name, resolvedVersion, pkgDir, this.config, this.getNpmConfig());
+        this.packageCache.set(cacheKey, { pkg, lastChecked: Date.now() });
+        return pkg;
+    }
+
+    private readVersionFromDir(dir: string): string | null {
+        try {
+            const pkgJsonPath = joinPaths(dir, 'package.json');
+            if (fs.exists(pkgJsonPath)) {
+                return JSON.parse(readTextFile(pkgJsonPath)).version;
+            }
+        } catch {}
+        return null;
+    }
+
+    private installPackage(name: string, version: string): { dir: string; version: string } | null {
         try {
             if (!this.config.silent) {
-                console.log(`📦 npx ${packageName}`);
+                console.log(`📦 npx ${name}@${version}`);
             }
 
-            const config = this.getNpmConfig();
-            const metadata = this.fetchPackageMetadata(packageName, config.registry);
+            const npmConfig = this.getNpmConfig();
+            const tempPkg = new ResolvedPackage(name, version, '', this.config, npmConfig);
+            const metadata = tempPkg.loadMetadata();
 
-            // Extract version from original package name if present
-            const versionMatch = packageName.match(/@[\^~]?\d+\.\d+\.\d+$/);
-            let version = versionMatch ? versionMatch[0].substring(1) : null;
-            
-            // If no version specified, use latest
-            if (!version) {
-                version = metadata['dist-tags'].latest;
-                if (!version) {
-                    throw new Error(`No latest version found for ${packageName}`);
-                }
+            const resolvedVersion = this.resolveVersion(version, metadata);
+            const pkgDir = joinPaths(this.globalCacheDir, `${name}@${resolvedVersion}`);
+
+            if (fs.exists(pkgDir)) {
+                return { dir: pkgDir, version: resolvedVersion };
             }
 
-            const versionData = metadata.versions[version];
-            if (!versionData) {
-                throw new Error(`Version ${version} not found in metadata`);
-            }
+            const pkg = new ResolvedPackage(name, resolvedVersion, pkgDir, this.config, npmConfig);
+            pkg.setMetadata(metadata);
+            pkg.install();
 
-            // download tarball
-            const tarballUrl = versionData.dist.tarball;
-            const packageDir = joinPaths(this.globalCacheDir, packageName);
-
-            if (!this.config.silent) {
-                console.debug(`[NPM] Downloading ${packageName}@${version}...`);
-            }
-
-            const tarballData = this.downloadTarball(tarballUrl);
-
-            if (!this.config.silent) {
-                console.debug(`[NPM] Extracting...`);
-            }
-
-            // unextract using zlib
-            const files = unTarGz(tarballData);
-            ensureDir(packageDir);
-            for (const file of files) {
-                // remove package/ prefix
-                let filePath = normalizePath(file.path);
-                if (filePath.startsWith('package/'))
-                    filePath = filePath.substring(8);
-                const targetPath = joinPaths(packageDir, filePath);
-                
-                if (file.type == 'dir') {
-                    ensureDir(targetPath);
-                } else {
-                    // Ensure parent directory exists before writing file
-                    const parentDir = dirname(targetPath);
-                    if (!fs.exists(parentDir)) {
-                        ensureDir(parentDir);
-                    }
-                    // create and write files
-                    console.debug(`[NPM] extract ${targetPath} (${file.size} bytes)`);
-                    fs.writeFile(targetPath, file.content);
-                }
-            }
-
-            if (!this.config.silent) {
-                console.log(`✓ ${packageName}@${version} installed to ${packageDir}`);
-            }
-
-            return packageDir;
+            return { dir: pkgDir, version: resolvedVersion };
         } catch (error) {
-            if (!this.config.silent) {
-                console.error(`Failed to auto-install ${packageName}: ${errMsg(error)}`);
-            }
+            console.error(`[NPM] Failed to install ${name}@${version}:`, error);
             return null;
         }
     }
 
-    /**
-     * Get NPM config(compatible)
-     */
-    private getNpmConfig(): NpmConfig {
-        if (this.npmConfig) {
-            return this.npmConfig;
+    private resolveVersion(version: string, metadata: PackageMetadata): string {
+        if (version === 'latest' || version === '') {
+            return metadata['dist-tags']?.latest || this.getLatestVersion(metadata);
         }
-
-        // environ
-        try{
-            const envRegistry = os.getenv('NPM_CONFIG_REGISTRY');
-            if (!envRegistry) throw 0;
-            this.npmConfig = { registry: envRegistry };
-            return this.npmConfig;
-        }catch{}
-
-        // find .npmrc
-        const home = os.homedir || '/root';
-        const npmrcPath = joinPaths(home, '.npmrc');
-
-        if (fs.exists(npmrcPath)) {
-            try {
-                const content = readTextFile(npmrcPath);
-                const lines = content.split('\n');
-
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (trimmed.startsWith('registry=')) {
-                        const registry = trimmed.substring(9).trim();
-                        this.npmConfig = { registry };
-                        return this.npmConfig;
-                    }
-                }
-            } catch {
-                // Ignore
-            }
+        if (/^\d+\.\d+\.\d+/.test(version)) {
+            return version;
         }
-
-        // use npm default register
-        this.npmConfig = { registry: 'https://registry.npmjs.org' };
-        return this.npmConfig;
+        // Version range like ^1.0.0 or ~2.0.0
+        const matched = matchLatestVersion(Object.keys(metadata.versions), version);
+        return matched || version;
     }
 
-    /**
-     * get package meta
-     */
-    private fetchPackageMetadata(packageName: string, registry: string): NpmPackageMetadata {
-        // Handle scoped package
-        const encodedName = packageName.replace('/', '%2F');
-        const url = `${registry}/${encodedName}`;
-
-        return JSON.parse(fetchSync(url));
-    }
-
-    /**
-     * download tarball
-     */
-    private downloadTarball(url: string): ArrayBuffer {
-        return fetchBinary(url).buffer;
-    }
-
-    /**
-     * Parse package name
-     */
-    private parsePackageName(name: string): ParsedPackageName {
-        // Remove version specifier if present (e.g., @opentelemetry/api@^1.9.0)
-        const versionMatch = name.match(/(.+?)@[\^~]?\d+\.\d+\.\d+/);
-        const packageName = versionMatch ? versionMatch[1] : name;
-        
-        if (packageName.startsWith('@')) {
-            // Scoped package: @scope/pkg/sub
-            const parts = packageName.split('/');
-            if (parts.length < 2) {
-                throw new Error(`Invalid scoped package name: ${name}`);
-            }
-            const pkgName = `${parts[0]}/${parts[1]}`;
-            const subpath = parts.slice(2).join('/');
-            return { packageName: pkgName, subpath: subpath };
-        } else {
-            // Regular package
-            const firstSlash = packageName.indexOf('/');
-            if (firstSlash === -1) {
-                return { packageName: packageName, subpath: '' };
-            }
-            const pkgName = packageName.substring(0, firstSlash);
-            const subpath = packageName.substring(firstSlash + 1);
-            return { packageName: pkgName, subpath: subpath };
+    private getLatestVersion(metadata: PackageMetadata): string {
+        const versions = Object.keys(metadata.versions);
+        if (versions.length === 0) {
+            throw new Error('No versions available');
         }
+        return versions[versions.length - 1]!;
     }
 
-    /**
-     * Find package directory in node_modules
-     */
-    private findPackageDir(packageName: string, parent: string): string | null {
-        const searchPaths = this.getModuleSearchPaths(parent);
+    private findPackageDir(name: string, parent?: string): string | null {
+        for (const searchPath of this.getSearchPaths(parent)) {
+            // Try exact match first
+            const exactPath = joinPaths(searchPath, name);
+            if (this.isValidPackageDir(exactPath)) {
+                return exactPath;
+            }
 
-        for (const searchPath of searchPaths) {
-            const packagePath = joinPaths(searchPath, packageName);
-            if (fs.exists(packagePath)) {
-                const stats = fs.stat(packagePath);
-                if (stats.isDirectory) {
-                    return packagePath;
-                }
+            // For non-scoped packages, try versioned directories (name@version)
+            if (!name.startsWith('@')) {
+                const versioned = this.findVersionedDir(searchPath, name);
+                if (versioned) return versioned;
             }
         }
-
         return null;
     }
 
-    /**
-     * Get node_modules search paths
-     */
-    private getModuleSearchPaths(parent: string): string[] {
-        const paths: string[] = [];
+    private isValidPackageDir(dir: string): boolean {
+        try {
+            return fs.stat(dir).isDirectory && fs.exists(joinPaths(dir, 'package.json'));
+        } catch {
+            return false;
+        }
+    }
 
+    private findVersionedDir(searchPath: string, name: string): string | null {
+        try {
+            for (const entry of fs.readdir(searchPath) || []) {
+                if (entry.startsWith(name + '@')) {
+                    const entryPath = joinPaths(searchPath, entry);
+                    if (fs.stat(entryPath).isDirectory) {
+                        return entryPath;
+                    }
+                }
+            }
+        } catch {}
+        return null;
+    }
+
+    private getSearchPaths(parent?: string): string[] {
+        const paths: Set<string> = new Set();
+
+        // Walk up from parent directory
         if (parent) {
             let current = dirname(parent);
             const root = sys.platform === 'win32' ? current.split(':')[0] + ':/' : '/';
 
             while (current && current !== root) {
-                const nodeModules = joinPaths(current, 'node_modules');
-                if (fs.exists(nodeModules)) {
-                    paths.push(nodeModules);
-                }
+                paths.add(joinPaths(current, 'node_modules'));
                 const parentDir = dirname(current);
                 if (parentDir === current) break;
                 current = parentDir;
             }
         }
 
-        // Add current working directory node_modules
-        const cwd = os.cwd;
-        const cwdNodeModules = joinPaths(cwd, 'node_modules');
-        if (!paths.includes(cwdNodeModules)) {
-            paths.push(cwdNodeModules);
+        // Current working directory
+        paths.add(joinPaths(os.cwd, 'node_modules'));
+
+        // Global cache
+        if (fs.exists(this.globalCacheDir)) {
+            paths.add(this.globalCacheDir);
         }
 
-        // Add global cache node_modules
-        if (!paths.includes(this.globalCacheDir) && fs.exists(this.globalCacheDir)) {
-            paths.push(this.globalCacheDir);
-        }
-
-        return paths;
+        return Array.from(paths);
     }
 
-    /**
-     * Resolve package.json exports field
-     */
-    private resolvePackageExports(packageDir: string, subpath: string): string | null {
+    private getNpmConfig(): NpmConfig {
+        if (this.npmConfig) return this.npmConfig;
+
         try {
-            const pkgJsonPath = joinPaths(packageDir, 'package.json');
-            if (!fs.exists(pkgJsonPath)) {
-                return null;
+            const envRegistry = os.getenv('NPM_CONFIG_REGISTRY');
+            if (envRegistry) {
+                this.npmConfig = { registry: envRegistry };
+                return this.npmConfig;
             }
+        } catch {}
 
-            const pkgJson: PackageJson = JSON.parse(readTextFile(pkgJsonPath));
-
-            if (!pkgJson.exports) {
-                return null;
-            }
-
-            // String exports
-            if (typeof pkgJson.exports === 'string') {
-                if (subpath === '.' || subpath === '') {
-                    return joinPaths(packageDir, pkgJson.exports);
+        try {
+            const home = os.homedir || '/root';
+            const npmrcPath = joinPaths(home, '.npmrc');
+            if (fs.exists(npmrcPath)) {
+                const content = readTextFile(npmrcPath);
+                const match = content.match(/^registry\s*=\s*(.+)$/m);
+                if (match) {
+                    this.npmConfig = { registry: match[1]!.trim() };
+                    return this.npmConfig;
                 }
-                return null;
             }
+        } catch {}
 
-            // Object exports
-            if (typeof pkgJson.exports === 'object') {
-                const checkPath = (path: string) => {
-                    // @ts-ignore
-                    const exportValue = pkgJson.exports![path];
-                    if (typeof exportValue === 'string') {
-                        // Clean up exportValue to remove leading ./ to avoid double slashes
-                        const cleanExportValue = exportValue.startsWith('./') ? exportValue.substring(2) : exportValue;
-                        return joinPaths(packageDir, cleanExportValue);
-                    }
-                    // Conditional exports
-                    if (typeof exportValue === 'object') {
-                        // prefer import
-                        for (const key of ['import', 'default', 'require'])
-                            if (typeof exportValue[key] == 'string') {
-                                // Clean up exportValue to remove leading ./ to avoid double slashes
-                                const cleanExportValue = exportValue[key].startsWith('./') ? exportValue[key].substring(2) : exportValue[key];
-                                return joinPaths(packageDir, cleanExportValue);
-                            }
-                    }
-                    return null;
-                };
-
-                // as entry?
-                if(!subpath) return checkPath(".");
-
-                // Try exact match
-                const result = checkPath(subpath);
-                if (result) return result;
-
-                // Try with ./ prefix
-                const withDot = subpath.startsWith('./') ? subpath : `./${subpath}`;
-                return checkPath(withDot);
-            }
-        } catch {
-            // Ignore errors
-        }
-
-        return null;
+        this.npmConfig = { registry: 'https://registry.npmjs.org' };
+        return this.npmConfig;
     }
 
-    /**
-     * Resolve package main entry point
-     */
-    private resolvePackageMain(packageDir: string): string {
-        try {
-            const pkgJsonPath = joinPaths(packageDir, 'package.json');
-            if (fs.exists(pkgJsonPath)) {
-                const pkgJson: PackageJson = JSON.parse(readTextFile(pkgJsonPath));
+    resolveAndInstallSync(spec: string, parent?: string): ResolvedPackage | null {
+        const { name, version } = this.parseSpecifier(this.cleanSpecifier(spec));
+        return this.resolvePackage(name, version, parent);
+    }
 
-                // Try exports field
-                if (pkgJson.exports) {
-                    const exported = this.resolvePackageExports(packageDir, '.');
-                    if (exported) {
-                        return tryResolveFile(exported);
-                    }
-                }
-
-                // Try module field
-                if (pkgJson.module) {
-                    const modulePath = joinPaths(packageDir, pkgJson.module);
-                    if (fs.exists(modulePath)) {
-                        return modulePath;
-                    }
-                }
-
-                // Try main field
-                if (pkgJson.main) {
-                    const mainPath = joinPaths(packageDir, pkgJson.main);
-                    return tryResolveFile(mainPath);
-                }
-            }
-        } catch {
-            // Fall through
-        }
-
-        // Default to index files
-        return tryResolveFile(joinPaths(packageDir, 'index'));
+    clearCache(): void {
+        this.packageCache.clear();
     }
 }

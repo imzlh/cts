@@ -18,44 +18,6 @@ It is aimed to be very-lightweight Deno runtime with `@imzlh/cts` project.
 - ⚡ **ES2025 Syntax** - Latest JavaScript features, eg. import attribute support
 - 🔌 **Extensible** - Modular architecture for easy extension
 
-## 📦 Installation
-
-```bash
-cts project
-├── example
-│   ├── findkeyword.ts
-│   └── try.ts
-├── main.ts
-├── package.json
-├── readme.md
-├── src
-│   ├── config.ts
-│   ├── debug
-│   │   └── bridge.js
-│   ├── http
-│   │   ├── connection.ts
-│   │   ├── debug.ts
-│   │   ├── http.ts
-│   │   ├── process.ts
-│   │   └── url.ts
-│   ├── loader.ts
-│   ├── resolver
-│   │   ├── base.ts
-│   │   ├── data.ts
-│   │   ├── file.ts
-│   │   ├── http.ts
-│   │   ├── index.ts
-│   │   ├── jsr.ts
-│   │   ├── node.ts
-│   │   └── npm.ts
-│   ├── runtime.ts
-│   ├── transformer.ts
-│   ├── types.ts
-│   └── utils.ts
-├── tsconfig.json
-└── types/ (alias to @imzlh/circu.js:/types/)
-```
-
 ## 🚀 Quick Start
 
 ### Basic TypeScript
@@ -411,15 +373,6 @@ const runtime = createRuntime({
   enableNode: true,
   silent: false,
   jsrCacheTTL: 7 * 24 * 60 * 60 * 1000,  // 7 days
-});
-
-// Register custom Node.js resolver
-runtime.registerNodeResolver((name) => {
-  const builtins = {
-    'fs': '/path/to/node/fs.js',
-    'path': '/path/to/node/path.js',
-  };
-  return builtins[name] || null;
 });
 
 // Import and run

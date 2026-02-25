@@ -4,6 +4,7 @@ const fs = import.meta.use('fs');
 const sys = import.meta.use('sys');
 const engine = import.meta.use('engine');
 const console = import.meta.use('console');
+const os = import.meta.use('os');
 
 import { URL } from "./http/url";
 import { type ConnectionConfig, connectionManager } from "./http/connection";
@@ -30,14 +31,14 @@ type Template = Record<string, 'string' | 'boolean' | 'number'>;
 export function parseArgs<T extends Template>(
     argv: string[],
     tpl: T
-): { 
+): {
     [K in keyof T]?: T[K] extends 'string' ? string : T[K] extends 'number' ? number : boolean;
- } & { _?: string, _args?: string[], _offset: number } {
+} & { _?: string, _args?: string[], _offset: number } {
     const out: any = {};
 
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i]!;
-        if (!arg.startsWith('--')){
+        if (!arg.startsWith('--')) {
             // entry
             out._ = arg;
             out._args = argv.slice(i + 1);
@@ -88,6 +89,34 @@ export function readTextFile(path: string): string {
 export function writeTextFile(path: string, content: string): void {
     const encoded = engine.encodeString(content);
     fs.writeFile(path, encoded.buffer);
+}
+
+/** 
+ * Resolve a path relative to the current working directory
+ */
+export function resolvePath(...parts: string[]): string {
+    let resolved = joinPaths(...parts);
+    if (!resolved.startsWith('/')) {
+        resolved = joinPaths(os.cwd, resolved);
+    }
+
+    // Normalize path
+    const segments: string[] = [];
+    for (const segment of resolved.split('/')) {
+        if (segment === '..') {
+            segments.pop();
+        } else if (segment !== '.' && segment !== '') {
+            segments.push(segment);
+        }
+    }
+
+    return '/' + segments.join('/');
+}
+
+export function extname(p: string): string {
+    const base = basename(p);
+    const idx = base.lastIndexOf('.');
+    return idx === -1 ? '' : base.substring(idx);
 }
 
 /**
@@ -163,16 +192,50 @@ export function ensureDir(dir: string): void {
 }
 
 /**
- * Simple string hash function
+ * FNV-1a 64-bit hash function for better collision resistance
+ * Returns a hexadecimal string of the hash
  */
 export function hashString(str: string): string {
-    let hash = 0;
+    // FNV-1a 64-bit constants
+    const FNV_64_PRIME = 1099511628211n;
+    const FNV_64_OFFSET_BASIS = 14695981039346656037n;
+
+    let hash = FNV_64_OFFSET_BASIS;
+
     for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32-bit integer
+        hash ^= BigInt(str.charCodeAt(i));
+        hash *= FNV_64_PRIME;
     }
-    return Math.abs(hash).toString(36);
+
+    // Convert to hex string, ensuring positive value
+    return (hash & 0xFFFFFFFFFFFFFFFFn).toString(16).padStart(16, '0');
+}
+
+/**
+ * Create a cache-safe filename from URL
+ * Combines hostname, path hash, and original filename for debugging
+ */
+export function createCacheFilename(url: string): string {
+    try {
+        const urlObj = new URL(url);
+        const hash = hashString(url);
+
+        // Extract original filename for debugging
+        const pathname = urlObj.pathname;
+        const lastSlash = pathname.lastIndexOf('/');
+        const originalName = lastSlash >= 0 ? pathname.substring(lastSlash + 1) : pathname;
+
+        // Clean up original name (remove query strings, keep extension)
+        const cleanName = originalName.split('?')[0]!.split('#')[0]!;
+        const extMatch = cleanName.match(/\.[a-zA-Z0-9]+$/);
+        const ext = extMatch ? extMatch[0] : '';
+
+        // Format: hash.ext (for uniqueness) or hash_original.ext (for debug)
+        return ext ? `${hash}${ext}` : hash;
+    } catch {
+        // Invalid URL, fallback to simple hash
+        return hashString(url);
+    }
 }
 
 /**
@@ -190,6 +253,24 @@ export function getBasenameFromUrl(url: string): string {
 }
 
 /**
+ * Get basename from path
+ */
+export function basename(p: string, ext?: string): string {
+    // Normalize path separators to forward slashes
+    const normalized = p.replace(/\\/g, '/');
+    // Remove trailing slash
+    const trimmed = normalized.replace(/\/$/, '');
+    const lastSlashIndex = trimmed.lastIndexOf('/');
+    let result = lastSlashIndex === -1 ? trimmed : trimmed.substring(lastSlashIndex + 1);
+
+    if (ext && result.endsWith(ext)) {
+        result = result.substring(0, result.length - ext.length);
+    }
+
+    return result;
+}
+
+/**
  * Check if path is absolute
  */
 export function isAbsolutePath(path: string): boolean {
@@ -197,6 +278,57 @@ export function isAbsolutePath(path: string): boolean {
     // Windows: C:\ or C:/
     if (sys.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(path)) return true;
     return false;
+}
+
+/**
+ * Parse version string and resolve incomplete versions
+ * Handles cases like "1" -> "1.x.x", "1.0" -> "1.0.x"
+ * Returns the most specific version available from the versions list
+ */
+export function resolveVersion(version: string, availableVersions: string[]): string {
+    // If version is already complete (has at least 3 parts), return as is
+    if (version.split('.').length >= 3) {
+        return version;
+    }
+
+    // If version is a range specifier (^, ~, >=, <=, >), return as is for special handling
+    if (/^[\^~><=]/.test(version)) {
+        return version;
+    }
+
+    // Split version into parts
+    const versionParts = version.split('.').map(Number);
+
+    // Filter and sort available versions that match the pattern
+    const matchingVersions = availableVersions
+        .filter(v => {
+            const vParts = v.split('.').map(Number);
+
+            // Check if this version matches the pattern
+            for (let i = 0; i < versionParts.length; i++) {
+                if (vParts[i] !== versionParts[i]) {
+                    return false;
+                }
+            }
+            return true;
+        })
+        .sort((a, b) => {
+            // Sort versions in descending order (highest first)
+            const aParts = a.split('.').map(Number);
+            const bParts = b.split('.').map(Number);
+
+            for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
+                const aPart = aParts[i] || 0;
+                const bPart = bParts[i] || 0;
+                if (aPart !== bPart) {
+                    return bPart - aPart; // Descending order
+                }
+            }
+            return 0;
+        });
+
+    // Return the highest matching version, or the original version if no match found
+    return matchingVersions.length > 0 ? matchingVersions[0]! : version;
 }
 
 /**
@@ -297,126 +429,130 @@ export function tryResolveFile(basePath: string, extensions = ['.ts', '.tsx', '.
 }
 
 /**
- * 比较两个版本号的大小
- * @param v1 版本号1
- * @param v2 版本号2
- * @returns -1: v1 < v2, 0: v1 = v2, 1: v1 > v2
+ * Version number completion: "1" → "1.0.0", "1.2" → "1.2.0"
  */
-function compareVersions(v1: string, v2: string): number {
-    const parts1 = v1.split('.').map(part => {
-        const num = parseInt(part, 10);
-        return isNaN(num) ? 0 : num;
-    });
-    const parts2 = v2.split('.').map(part => {
-        const num = parseInt(part, 10);
-        return isNaN(num) ? 0 : num;
-    });
+function expandVersion(version: string): string {
+    const parts = version.split('.').map(p => parseInt(p, 10));
+    while (parts.length < 3) parts.push(0);
+    return parts.join('.');
+}
 
-    const maxLength = Math.max(parts1.length, parts2.length);
+function compareSemVer(v1: string, v2: string): number {
+    const [v1Core, v1Pre] = v1.split('-');
+    const [v2Core, v2Pre] = v2.split('-');
 
-    for (let i = 0; i < maxLength; i++) {
-        const part1 = parts1[i] || 0;
-        const part2 = parts2[i] || 0;
+    const v1Parts = v1Core!.split('.').map(Number);
+    const v2Parts = v2Core!.split('.').map(Number);
 
-        if (part1 > part2) return 1;
-        if (part1 < part2) return -1;
+    for (let i = 0; i < 3; i++) {
+        const part1 = v1Parts[i] || 0;
+        const part2 = v2Parts[i] || 0;
+        if (part1 !== part2) return part1 - part2;
     }
 
-    return 0;
+    if (!v1Pre && !v2Pre) return 0;
+    if (!v1Pre && v2Pre) return 1;
+    if (v1Pre && !v2Pre) return -1;
+
+    return v1Pre!.localeCompare(v2Pre!);
 }
 
 /**
- * 检查版本是否满足范围条件
- * @param version 要检查的版本
- * @param range 版本范围
- * @returns 是否满足条件
+ * Version comparison: returns -1, 0, 1
+ */
+function compareVersions(v1: string, v2: string): number {
+    const p1 = v1.split('.').map(Number);
+    const p2 = v2.split('.').map(Number);
+
+    // Pad to 3 parts
+    while (p1.length < 3) p1.push(0);
+    while (p2.length < 3) p2.push(0);
+
+    for (let i = 0; i < 3; i++) {
+        if (p1[i] !== p2[i]) return p1[i]! - p2[i]!;
+    }
+    return compareSemVer(v1, v2);
+}
+
+/**
+ * Check if version satisfies range
+ * @param version Version number (e.g. "1.2.3")
+ * @param range Version range (e.g. "^1.2.3", "~1.2.3", "1.2.x", "1.2.*")
+ * @returns Whether version satisfies the range
  */
 function satisfiesVersion(version: string, range: string): boolean {
-    // 处理固定版本
-    if (!range.includes('^') && !range.includes('~') && !range.includes('*') &&
-        !range.includes('x') && !range.includes('>') && !range.includes('<') &&
-        !range.includes('-')) {
-        return compareVersions(version, range) === 0;
+    if (!version || !range) return false;
+
+    // Complete version numbers
+    const fullVersion = expandVersion(version.trim());
+    let rangeStr = range.trim();
+
+    // Auto-complete shorthand versions: "1.2" → "1.2.x"
+    if (/^\d+(\.\d+)?$/.test(rangeStr)) {
+        rangeStr = `${rangeStr}.x`;
     }
 
-    // 处理 ^ 插入符
-    if (range.startsWith('^')) {
-        const baseVersion = range.slice(1);
-        const baseParts = baseVersion.split('.').map(part => parseInt(part, 10));
+    // Exact version match
+    if (/^\d+\.\d+\.\d+$/.test(rangeStr)) {
+        return compareVersions(fullVersion, rangeStr) === 0;
+    }
 
-        // 主版本号为0时，^行为与~相同
-        if (baseParts[0] === 0) {
-            // 对于 0.x.y，^0.x.y 表示 >=0.x.y <0.(x+1).0
-            const minVersion = baseVersion;
-            const maxVersion = `0.${baseParts[1]! + 1}.0`;
-            return compareVersions(version, minVersion) >= 0 && compareVersions(version, maxVersion) < 0;
-        } else {
-            // 对于 x.y.z，^x.y.z 表示 >=x.y.z <(x+1).0.0
-            const minVersion = baseVersion;
-            const maxVersion = `${baseParts[0]! + 1}.0.0`;
-            return compareVersions(version, minVersion) >= 0 && compareVersions(version, maxVersion) < 0;
+    // ^ caret: ^1.2.3
+    if (rangeStr.startsWith('^')) {
+        const base = expandVersion(rangeStr.slice(1));
+        const [major, minor, patch] = base.split('.').map(Number);
+
+        // Major version 0: lock minor version
+        if (major === 0) {
+            return compareVersions(fullVersion, base) >= 0 &&
+                compareVersions(fullVersion, `0.${minor! + 1}.0`) < 0;
         }
+
+        // Major version non-zero: lock major version
+        return compareVersions(fullVersion, base) >= 0 &&
+            compareVersions(fullVersion, `${major! + 1}.0.0`) < 0;
     }
 
-    // 处理 ~ 波浪符
-    if (range.startsWith('~')) {
-        const baseVersion = range.slice(1);
-        const baseParts = baseVersion.split('.').map(part => parseInt(part, 10));
+    // ~ tilde: ~1.2.3
+    if (rangeStr.startsWith('~')) {
+        const base = expandVersion(rangeStr.slice(1));
+        const [major, minor] = base.split('.').map(Number);
 
-        // ~x.y.z 表示 >=x.y.z <x.(y+1).0
-        const minVersion = baseVersion;
-        const maxVersion = `${baseParts[0]}.${baseParts[1]! + 1}.0`;
-        return compareVersions(version, minVersion) >= 0 && compareVersions(version, maxVersion) < 0;
+        return compareVersions(fullVersion, base) >= 0 &&
+            compareVersions(fullVersion, `${major}.${minor! + 1}.0`) < 0;
     }
 
-    // 处理 * 或 x 通配符
-    if (range.includes('*') || range.includes('x') || range.includes('X')) {
-        const pattern = range.replace(/\*/g, 'x').replace(/X/g, 'x');
-        const patternParts = pattern.split('.');
-        const versionParts = version.split('.');
+    // x/X/* wildcards
+    if (/x|\*/i.test(rangeStr)) {
+        const pattern = rangeStr.toLowerCase().split('.');
+        const verParts = fullVersion.split('.').map(Number);
 
-        for (let i = 0; i < patternParts.length; i++) {
-            const patternPart = patternParts[i];
-            const versionPart = versionParts[i];
-
-            if (patternPart === 'x') {
-                // 通配符匹配任何版本部分
-                continue;
-            }
-
-            if (patternPart !== versionPart) {
-                return false;
-            }
+        for (let i = 0; i < pattern.length && i < 3; i++) {
+            if (pattern[i] === 'x' || pattern[i] === '*') continue;
+            if (String(verParts[i]) !== pattern[i]) return false;
         }
         return true;
     }
 
-    // 处理版本范围 1.2.3 - 2.3.4
-    if (range.includes(' - ')) {
-        const [minRange, maxRange] = range.split(' - ').map(r => r.trim());
-        return compareVersions(version, minRange!) >= 0 && compareVersions(version, maxRange!) <= 0;
+    // Range: 1.2.3 - 2.0.0
+    if (rangeStr.includes(' - ')) {
+        const [min, max] = rangeStr.split(' - ').map(s => expandVersion(s.trim()));
+        return compareVersions(fullVersion, min!) >= 0 && compareVersions(fullVersion, max!) <= 0;
     }
 
-    // 处理比较运算符
-    if (range.startsWith('>=')) {
-        const baseVersion = range.slice(2);
-        return compareVersions(version, baseVersion) >= 0;
-    }
-    if (range.startsWith('>')) {
-        const baseVersion = range.slice(1);
-        return compareVersions(version, baseVersion) > 0;
-    }
-    if (range.startsWith('<=')) {
-        const baseVersion = range.slice(2);
-        return compareVersions(version, baseVersion) <= 0;
-    }
-    if (range.startsWith('<')) {
-        const baseVersion = range.slice(1);
-        return compareVersions(version, baseVersion) < 0;
-    }
-    if (range.startsWith('=')) {
-        const baseVersion = range.slice(1);
-        return compareVersions(version, baseVersion) === 0;
+    // Comparison operators: >=1.0.0, <2.0.0
+    const match = rangeStr.match(/^(>=?|<=?|=)\s*(.+)$/);
+    if (match) {
+        const [, op, target] = match;
+        const fullTarget = expandVersion(target!);
+        const cmp = compareVersions(fullVersion, fullTarget);
+        switch (op) {
+            case '>=': return cmp >= 0;
+            case '>': return cmp > 0;
+            case '<=': return cmp <= 0;
+            case '<': return cmp < 0;
+            case '=': return cmp === 0;
+        }
     }
 
     return false;
@@ -442,10 +578,7 @@ export function matchLatestVersion(versions: string[], range: string): string | 
     const matched = matchVersion(versions, range);
     if (matched.length === 0) return null;
 
-    // 找到最大的版本号
-    return matched.reduce((latest, current) => {
-        return compareVersions(current, latest) > 0 ? current : latest;
-    });
+    return matched.reduce((latest, current) => compareVersions(current, latest) > 0 ? current : latest);
 }
 
 // targz.ts - Tar.gz Extraction Utility
@@ -551,11 +684,11 @@ export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
 export function fetchBinary(url: string, maxRedirects: number = 5, showProgress: boolean = false): Uint8Array<ArrayBuffer> {
     let currentUrl = url;
     let redirectCount = 0;
-    
+
     // Progress bar initialization
     let progressBar: any = null;
     const PROGRESS_THRESHOLD = 32 * 1024; // 32KB threshold for showing progress bar
-    
+
     while (redirectCount <= maxRedirects) {
         // 解析URL
         const urlObj = new URL(currentUrl);
@@ -582,7 +715,7 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
                     'Connection': 'keep-alive'
                 }
             });
-            
+
             // 发送请求
             const requestData = requestBuilder.build();
             conn.write(requestData);
@@ -598,7 +731,7 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
             parser.onHeadersComplete = (code, hdrs) => {
                 statusCode = code;
                 headers = hdrs;
-                
+
                 // Get content length for progress bar
                 if (headers && headers.has && headers.has('content-length')) {
                     const lengthStr = headers.get('content-length');
@@ -606,7 +739,7 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
                         contentLength = parseInt(lengthStr, 10);
                     }
                 }
-                
+
                 // Initialize progress bar if requested and file is large enough
                 if (showProgress && contentLength && contentLength > PROGRESS_THRESHOLD) {
                     progressBar = new HttpProgressBar({
@@ -630,7 +763,7 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
                     newBody.set(chunk, responseBody.length);
                     responseBody = newBody;
                 }
-                
+
                 // Initialize progress bar if we don't have content-length but have received enough data
                 if (showProgress && !progressBar && responseBody.length > PROGRESS_THRESHOLD) {
                     progressBar = new HttpProgressBar({
@@ -642,7 +775,7 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
                     });
                     progressBar.start(currentUrl);
                 }
-                
+
                 // Update progress bar
                 if (progressBar) {
                     progressBar.update(responseBody.length);
@@ -654,26 +787,18 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
             };
 
             // 读取响应数据并喂给解析器
-            let attempts = 0;
             let recv = 0;
-            const maxAttempts = 600; // Prevent infinite loop
-            
-            while (!parser.isCompleted && attempts < maxAttempts) {
-                attempts++;
+
+            while (!parser.isCompleted) {
                 const data = conn.read(128 * 1024, true); // 128k
                 if (!data) {
-                    console.debug(`[fetchBinary] No data available(EOF). stop (attempt ${attempts})`);
+                    console.debug(`[fetchBinary] No data available(EOF). stop`);
                     break;
                 }
                 recv += data.length;
-                console.debug(`[fetchBinary] Got ${data.length} / ${recv} (attempt ${attempts})`);
                 parser.feed(data);
             }
 
-            if (attempts >= maxAttempts) {
-                throw new Error(`Max read attempts (${maxAttempts}) reached without completing response`);
-            }
-            
             if (!parser.isCompleted) {
                 throw new Error('Incomplete HTTP response');
             }
@@ -690,12 +815,12 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
             assert(statusCode, "Status code is null");
             if (statusCode >= 300 && statusCode < 400) {
                 let location = null;
-                
+
                 // Try standard Location header first
                 if (headers && headers.has && headers.has('location')) {
                     location = headers.get('location');
                 }
-                
+
                 if (location) {
                     // Handle relative redirects
                     if (location.startsWith('/')) {
@@ -704,7 +829,7 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
                     } else {
                         currentUrl = location;
                     }
-                    
+
                     redirectCount++;
                     continue; // Continue with the next iteration
                 }
@@ -719,16 +844,16 @@ export function fetchBinary(url: string, maxRedirects: number = 5, showProgress:
         } catch (error) {
             // 发生错误时关闭连接
             conn.close();
-            
+
             // Clean up progress bar on error
             if (progressBar) {
                 progressBar.complete();
             }
-            
+
             throw error;
         }
     }
-    
+
     throw new Error(`Too many redirects (${maxRedirects})`);
 }
 

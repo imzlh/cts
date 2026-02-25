@@ -5,15 +5,14 @@ import {
     errMsg,
     joinPaths,
     dirname,
-    hashString,
+    createCacheFilename,
     ensureDir,
     normalizePath,
-    getBasenameFromUrl,
     fetchSync,
     fetchBinary
 } from '../utils';
 import { URL } from '../http/url';
-import { BaseResolver } from './base';
+import { BaseResolver, type ResolveResult, type LocalPathResult, ModuleType } from './base';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -34,8 +33,9 @@ export class HttpResolver extends BaseResolver {
 
     /**
      * Resolve HTTP(S) module
+     * HTTP modules default to ESM
      */
-    resolve(specifier: string, parent?: string, attr?: Record<string, any>): string {
+    resolve(specifier: string, parent?: string, attr?: Record<string, any>): ResolveResult {
         console.debug('HttpResolver resolve - specifier:', specifier);
         console.debug('HttpResolver resolve - parent:', parent);
         
@@ -76,7 +76,8 @@ export class HttpResolver extends BaseResolver {
             if (fs.exists(cachedPath)) {
                 this.urlMap.set(cachedPath, url);
                 console.debug('HttpResolver resolve - found in cache:', url);
-                return url;
+                // HTTP modules default to ESM
+                return { path: url, isCjs: false };
             }
 
             // Log download
@@ -92,7 +93,8 @@ export class HttpResolver extends BaseResolver {
             // Track URL mapping
             this.urlMap.set(cachedPath, url);
 
-            return url;
+            // HTTP modules default to ESM
+            return { path: url, isCjs: false };
         } catch (error) {
             // For HTTP errors, provide more detailed error message
             if (error instanceof Error && error.message.includes('HTTP error:')) {
@@ -102,11 +104,15 @@ export class HttpResolver extends BaseResolver {
             throw new Error(`Failed to resolve HTTP module ${specifier}: ${errMsg(error)}`);
         }
     }
+
+    /**
+     * HTTP modules default to ESM
+     */
     
     /**
      * Resolve relative import
      */
-    private resolveRelative(relativePath: string, parentUrl: string): string {
+    private resolveRelative(relativePath: string, parentUrl: string): ResolveResult {
         console.debug('HttpResolver resolveRelative - relativePath:', relativePath);
         console.debug('HttpResolver resolveRelative - parentUrl:', parentUrl);
         
@@ -121,7 +127,7 @@ export class HttpResolver extends BaseResolver {
     /**
      * Resolve absolute path
      */
-    private resolveAbsolute(absolutePath: string, parentUrl: string): string {
+    private resolveAbsolute(absolutePath: string, parentUrl: string): ResolveResult {
         const url = new URL(parentUrl);
         
         // Create a new URL by combining the parent URL's protocol and host with the absolute path
@@ -139,10 +145,10 @@ export class HttpResolver extends BaseResolver {
     /**
      * Get local path
      */
-    getLocalPath(url: string): string {
-        if (this.urlMap.has(url))
-            return this.urlMap.get(url)!;
-        return this.getCachePath(url);
+    getLocalPath(url: string): LocalPathResult {
+          if (this.urlMap.has(url))
+              return { path: this.urlMap.get(url)!, moduleType: ModuleType.ESM };
+          return { path: this.getCachePath(url), moduleType: ModuleType.ESM };
     }
 
     /**
@@ -157,11 +163,12 @@ export class HttpResolver extends BaseResolver {
      */
     private getCachePath(url: string): string {
         const parsed = new URL(url);
-        const hash = hashString(url);
-        const ext = getBasenameFromUrl(url);
+        const filename = createCacheFilename(url);
 
-        // Create path: cacheDir/http/host/hash.ext
-        return joinPaths(this.config.cacheDir, 'http', parsed.hostname, `${hash}/${ext}`);
+        // Create path: cacheDir/http/host/filename
+        // Using first 2 chars of filename as subdirectory for better file system performance
+        const subdir = filename.substring(0, 2);
+        return joinPaths(this.config.cacheDir, 'http', parsed.hostname, subdir, filename);
     }
 
     /**

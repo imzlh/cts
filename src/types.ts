@@ -1,3 +1,5 @@
+export type { ResolveResult } from './resolver/base';
+export { ModuleType } from './resolver/base';
 // types.ts - Type Definitions
 
 /**
@@ -28,6 +30,8 @@ export interface ConfigOptions {
     importMap?: Record<string, string>;
     /** polyfill path */
     polyfill?: string;
+    /** Disable cache for remote modules */
+    disableCache?: boolean;
 }
 
 /**
@@ -63,6 +67,21 @@ export interface PackageJson {
     module?: string;
     exports?: string | Record<string, any>;
     type?: 'module' | 'commonjs';
+    imports?: Record<string, string>;
+    dependencies?: Record<string, string>;
+}
+
+export interface CommonJSModule {
+    exports: Record<string, any>;
+    require: (name: string) => any;
+    children: CommonJSModule[];
+    filename: string;
+    path: string;
+    id: string; // full name
+    isPreloading: boolean;
+    loaded: boolean;
+    parent: string; // deprecated
+    paths: string[];    // no effect
 }
 
 /**
@@ -115,7 +134,7 @@ export interface ParsedPackageName {
 /**
  * Node.js builtin resolver function
  */
-export type NodeResolver = (name: string) => string | null;
+export type NodeResolver = (name: string, parent?: string) => string | null;
 
 /**
  * Module transformer function
