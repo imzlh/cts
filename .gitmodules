@@ -1,0 +1,3 @@
+[submodule "deps/sucrase"]
+	path = deps/sucrase
+	url = https://github.com/imzlh/cts-sucrase
