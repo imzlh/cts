@@ -42,7 +42,7 @@
         "isolatedModules": true,
         // "noUncheckedSideEffectImports": true,
         "moduleDetection": "force",
-        "skipLibCheck": false,
+        "skipLibCheck": true,
         "allowJs": true
     },
     "typedocOptions": {
@@ -54,4 +54,5 @@
         "out": "../api/",
         "disableSources": true
     },
+    "exclude": ["deps/sucrase"]
 }

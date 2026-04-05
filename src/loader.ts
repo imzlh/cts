@@ -1,362 +1,283 @@
-import { type RuntimeConfig, FileType, type ModuleFile, ModuleType } from './types';
+// loader.ts — ModuleLoader  (ESM + CJS + special types)
+//
+// ESM/CJS export interop rules (applied in loadCjs):
+//   exports.__esModule === true  → Babel/tsc transpiled module:
+//     `default` export becomes exports.default (not the whole object)
+//     Named exports come from exports directly
+//   otherwise (true CJS):
+//     `default` export is the whole exports object
+//     Named exports are each enumerable key of exports
+//
+// This matches Node.js 22+ "named exports detection" heuristics.
+
+import type { RuntimeConfig, ModuleInfo } from './types';
 import { ModuleResolver } from './resolver';
-import { CodeTransformer } from './transformer';
-import { readTextFile, dirname, assert, ensureDir, writeTextFile, joinPaths } from './utils';
-import { createLoader as createCJSLoader } from './commonjs';
+import { Transformer } from './transformer';
+import { CjsLoader, type CjsDeps } from './cjs';
+import { readText, ensureDir } from './utils/io';
+import { dirname, extname } from './utils/path';
+import { assert } from './utils/misc';
+import { log } from './utils/log';
+import { fs, engine, wasm } from './utils/index';
 
-const engine = import.meta.use('engine');
-const fs = import.meta.use('fs');
-const console = import.meta.use('console');
-const wasm = import.meta.use('wasm');
-
-function deleteJscRecursive(dir: string) {
-    for (const entry of fs.readdir(dir)) {
-        const path = joinPaths(dir, entry);
-        if (fs.stat(path).isDirectory) {
-            deleteJscRecursive(path);
-        } else if (path.endsWith('.jsc')) {
-            fs.unlink(path);
-            console.debug(`[loader] Deleted cache file ${path}`);
-        }
-    }
-}
-
-// NEVER remove this line, as will cause GC and SEGV
+// Keep engine modules alive (QuickJS GC would collect them otherwise)
 const store: CModuleEngine.Module[] = [];
 
-/**
- * Module Loader
- * Responsible for loading module files and creating engine modules
- */
+// ---------------------------------------------------------------------------
+// JSC bytecode cache helpers
+// ---------------------------------------------------------------------------
+
+type Hint = 'wasm'|'bytes'|'text'|'raw'|'commonjs'|'module'|'';
+
+function hintOf(specPath: string): Hint {
+    const qi = specPath.indexOf('?');
+    return qi === -1 ? '' : specPath.slice(qi + 1) as Hint;
+}
+
+function tryReadJsc(
+    jscPath: string, srcPath: string, isRemote: boolean,
+): CModuleEngine.Module | null {
+    if (!fs.exists(jscPath)) return null;
+    try {
+        if (!isRemote) {
+            const sm = (() => { try { return (fs.stat(srcPath) as any).mtim?.getTime?.() ?? 0; } catch { return 0; } })();
+            const jm = (() => { try { return (fs.stat(jscPath) as any).mtim?.getTime?.() ?? 0; } catch { return 0; } })();
+            if (jm < sm) return null;
+        }
+        const jscBytes = fs.readFile(jscPath);
+        const cached = engine.deserialize(new Uint8Array(jscBytes));
+        return cached;
+    } catch { return null; }
+}
+
+// ---------------------------------------------------------------------------
+// ModuleLoader
+// ---------------------------------------------------------------------------
+
 export class ModuleLoader {
-    private readonly resolver: ModuleResolver;
-    private readonly transformer: CodeTransformer;
-    private mainScript: string | null = null;
-    private cjsLoader = createCJSLoader({ debug: false });
-    
-    // Cache module type to avoid repeated detection
-    private moduleTypeCache = new Map<string, ModuleType>();
-
-    static verifyCacheDir(dir: string) {
-        if (!fs.exists(dir)) {
-            this.initCacheDir(dir);
-            return;
-        }
-        assert(fs.stat(dir).isDirectory, `Cache directory exists but is not a directory: ${dir}`);
-
-        let cver = '';
-        try {
-            cver = readTextFile(joinPaths(dir, 'version'));
-        } catch {
-            // ignore
-        }
-        if (cver !== engine.versions.quickjs) {
-            deleteJscRecursive(dir);
-            writeTextFile(joinPaths(dir, 'version'), engine.versions.quickjs);
-        }
-    }
-
-    static initCacheDir(dir: string) {
-        ensureDir(dir);
-        writeTextFile(joinPaths(dir, 'version'), engine.versions.quickjs);
-    }
+    private readonly transformer = new Transformer();
+    private readonly cjs:        CjsLoader;
+    private readonly esmCache  = new Map<string, CModuleEngine.Module>();
 
     constructor(
-        resolver: ModuleResolver,
-        transformer: CodeTransformer,
-        private readonly config: RuntimeConfig
+        private readonly resolver: ModuleResolver,
+        private readonly cfg:      RuntimeConfig,
     ) {
-        this.resolver = resolver;
-        this.transformer = transformer;
+        this.cjs = new CjsLoader(this.buildCjsDeps());
+
+        let requireFn: Function | undefined;
+        Object.defineProperty(globalThis, 'require', {
+            get: () => {
+                if (!requireFn) requireFn = this.cjs.mkRequire(
+                    // @ts-ignore - entry donot has parent module
+                    resolver.entry, undefined
+                );
+                return requireFn;
+            },
+            enumerable: true,
+            configurable: true,
+        })
     }
 
-    /**
-     * Get module type with caching
-     * Now gets type from resolver.getLocalPath result
-     */
-    private getModuleTypeFromResolver(protocolPath: string): ModuleType {
-        // Check cache first
-        const cached = this.moduleTypeCache.get(protocolPath);
-        if (cached !== undefined) return cached;
+    // -------------------------------------------------------------------------
+    // Public: load a module from its ModuleInfo
+    // -------------------------------------------------------------------------
 
-          let result: ModuleType | undefined = undefined;
-        // 1. Check query string hint
-        const qIndex = protocolPath.indexOf('?');
-        if (qIndex !== -1) {
-            const typeHint = protocolPath.substring(qIndex + 1);
-            if (typeHint === 'commonjs') result = ModuleType.CJS;
-            else if (typeHint === 'module') result = ModuleType.ESM;
+    load(info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
+        const hint = hintOf(info.specPath);
+        if (hint === 'commonjs') return this.loadCjs(info, meta);
+        if (hint === 'module')   return this.loadEsm(info, meta);
+        if (hint === 'wasm')     return this.loadWasm(info);
+        if (hint === 'bytes' || hint === 'raw') return this.loadBytes(info);
+        if (hint === 'text')     return this.loadText(info);
+        switch (info.fileKind) {
+            case 'wasm':   return this.loadWasm(info);
+            case 'binary': return this.loadBytes(info);
+            case 'json':   return this.loadEsm(info, meta);  // transformer wraps as export default
+            default:
+                return info.format === 'cjs'
+                    ? this.loadCjs(info, meta)
+                    : this.loadEsm(info, meta);
         }
-        
-        // 2. Fast path: check extension
-        if (result === undefined) {
-            const ext = protocolPath.slice(protocolPath.lastIndexOf('.'));
-            if (ext === '.mjs') result = ModuleType.ESM;
-            else if (ext === '.cjs') result = ModuleType.CJS;
-        }
-        
-        // 3. Default to ESM if not determined
-        if (result === undefined) {
-            result = ModuleType.ESM;
-        }
-
-        // Cache and return
-        this.moduleTypeCache.set(protocolPath, result);
-        return result;
     }
 
-    /**
-     * Load and transform module
-     */
-    loadModule(localPath: string, protocolPath: string, injectImportMeta: Record<string, any> = {}, moduleType?: ModuleType): CModuleEngine.Module {
-        // Check if file exists
-        let stats;
+    preRegister(localPath: string, parentPath: string): void {
+        this.cjs.preRegister(localPath, parentPath);
+    }
+
+    // -------------------------------------------------------------------------
+    // ESM loading
+    // -------------------------------------------------------------------------
+
+    private loadEsm(info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
+        const hit = this.esmCache.get(info.localPath);
+        if (hit) {
+            // Only `main` can change between cache hits; skip full assign
+            if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
+            return hit;
+        }
+
+        const cacheable = !this.cfg.disableCache
+            && info.localPath.startsWith(this.cfg.cacheDir);
+        const jscPath   = info.localPath + '.jsc';
+
+        if (cacheable) {
+            const isRemote = !info.specPath.startsWith('file://');
+            const cached   = tryReadJsc(jscPath, info.localPath, isRemote);
+            if (cached) {
+                Object.assign(cached.meta, meta);
+                this.esmCache.set(info.localPath, cached);
+                store.push(cached);
+                return cached;
+            }
+        }
+
+        log.debug('loader', () => `load ${info.specPath} ${JSON.stringify(meta)}`);
+        const text = readText(info.localPath);
+        const code = this.transformer.transform(text, info.localPath);
+        let mod: CModuleEngine.Module;
         try {
-            stats = fs.stat(localPath);
-        } catch (error) {
-            throw new Error(`Module not found: ${localPath}`);
+            mod = new engine.Module(code, info.specPath);
+        } catch (e) {
+            if (e instanceof SyntaxError) throw new SyntaxError(
+                `Syntax error in ${info.localPath}: ${e.message}`,
+                { cause: { source: e, code, path: info.localPath } },
+            );
+            throw e;
         }
 
-        if (stats.isDirectory) {
-            throw new Error(`Cannot load directory as module: ${localPath}`);
+        if (cacheable) {
+            try { ensureDir(dirname(jscPath)); fs.writeFile(jscPath, mod.dump()); }
+            catch (e) { log.warn('loader', 'jsc write failed', e); }
         }
 
-        let type = '';
-        const qIndex = protocolPath.lastIndexOf('?');
-        if (qIndex != -1) {
-            type = protocolPath.substring(qIndex + 1);
-        }
-
-        // Handle explicit type hints first
-        if (type === 'commonjs') {
-            return this.loadCJSModule(localPath, protocolPath, injectImportMeta);
-        }
-        if (type === 'module') {
-            return this.loadESMModule(localPath, protocolPath, injectImportMeta);
-        }
-
-        // Handle special import types
-        let modTmp: CModuleEngine.Module | null = null;
-        switch (type) {
-            case 'wasm':
-                modTmp = this.loadWasmModule(localPath, protocolPath);
-                break;
-            case 'bytes':
-                modTmp = this.loadBytesModule(localPath, protocolPath);
-                break;
-            case 'text':
-                modTmp = this.loadTextModule(localPath, protocolPath);
-                break;
-            case 'raw':
-                modTmp = this.loadRawModule(localPath, protocolPath);
-                break;
-        }
-
-        if (modTmp) {
-            Object.assign(modTmp.meta, injectImportMeta);
-            return modTmp;
-        }
-
-        // Get file type for default handling
-        const fileType = this.resolver.getFileType(localPath);
-
-        // Handle binary files
-        if (localPath.endsWith('.wasm')) {
-            return this.loadWasmModule(localPath, protocolPath);
-        }
-        if (fileType === FileType.BINARY) {
-            return this.loadBinaryModule(localPath, protocolPath);
-        }
-
-        // Use provided module type or detect from extension
-        const modType = moduleType ?? this.getModuleTypeFromResolver(protocolPath);
-        if (modType === ModuleType.CJS) {
-            return this.loadCJSModule(localPath, protocolPath, injectImportMeta);
-        }
-        return this.loadESMModule(localPath, protocolPath, injectImportMeta);
+        Object.assign(mod.meta, meta);
+        this.esmCache.set(info.localPath, mod);
+        store.push(mod);
+        return mod;
     }
 
-    private createModule(name: string) {
-        const m = engine.Module.create(name);
-        store.push(m);      // manage lifecycle
-        return m;
-    }
+    // -------------------------------------------------------------------------
+    // CJS → ESM bridge: expose CJS exports as a proper ESM module
+    //
+    // __esModule detection (Babel/tsc interop):
+    //   When a CJS module sets exports.__esModule = true, it was transpiled from
+    //   ESM. In this case:
+    //     - `default` export = exports.default   (not the whole exports object)
+    //     - Named exports   = all other keys of exports
+    //   Without __esModule:
+    //     - `default` export = the whole exports object (true CJS)
+    //     - Named exports   = each enumerable key of exports
+    //
+    // This matches the behaviour of rollup, webpack, vite, and Node.js CJS↔ESM.
+    // -------------------------------------------------------------------------
 
-    /**
-     * Load WASM module
-     */
-    private loadWasmModule(localPath: string, protocolPath: string): CModuleEngine.Module {
-        assert(wasm, "WASM support not available");
-        console.debug(`[loader] Trying to parse: ${localPath}`);
+    private loadCjs(info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
+        const cjsMod  = this.cjs.loadAndGet(info.localPath);
+        const exports = cjsMod.exports;
 
-        const moduleFile = this.loadModuleFile(localPath);
-        const wasmBytes = moduleFile.content as Uint8Array;
+        const mod = engine.Module.create(info.specPath);
+        Object.assign(mod.meta, meta);
 
-        const mod = this.createModule(protocolPath);
+        const isTranspiledEsm =
+            exports !== null &&
+            typeof exports === 'object' &&
+            exports.__esModule === true;
 
-        try {
-            const wasmModule = new wasm.Module(wasmBytes);
-            const wasmInstance = new wasm.Instance(wasmModule, {});
-            console.debug('[loader] WASM (', protocolPath, ') exports:', wasmInstance.exports);
-            for (const item in wasmInstance.exports) {
-                console.debug('[loader] wasm export:', item, wasmInstance.exports[item]);
-                mod.export(item, wasmInstance.exports[item]);
+        if (isTranspiledEsm) {
+            // Transpiled ESM (Babel/tsc): export each key, default is exports.default
+            for (const k of Object.keys(exports)) {
+                if (k !== '__esModule') mod.export(k, exports[k]);
             }
-        } catch (error) {
-            console.debug("[loader] Failed to load WASM module:", error);
-            throw error;
-        }
-
-        return mod;
-    }
-
-    /**
-     * Load binary module
-     */
-    private loadBinaryModule(localPath: string, protocolPath: string): CModuleEngine.Module {
-        const moduleFile = this.loadModuleFile(localPath);
-        const mod = this.createModule(protocolPath);
-        mod.export('default', new Uint8Array(moduleFile.content as Uint8Array));
-
-        return mod;
-    }
-
-    /**
-     * Load bytes module
-     */
-    private loadBytesModule(localPath: string, protocolPath: string): CModuleEngine.Module {
-        const moduleFile = this.loadModuleFile(localPath);
-        const bytes = moduleFile.content as Uint8Array;
-        const mod = this.createModule(protocolPath);
-        mod.export('default', bytes);
-        return mod;
-    }
-
-    /**
-     * Load raw module
-     */
-    private loadRawModule(localPath: string, protocolPath: string): CModuleEngine.Module {
-        const fileType = this.resolver.getFileType(localPath);
-        return fileType === FileType.BINARY
-            ? this.loadBytesModule(localPath, protocolPath)
-            : this.loadTextModule(localPath, protocolPath);
-    }
-
-    private loadTextModule(localPath: string, protocolPath: string): CModuleEngine.Module {
-        const file = readTextFile(localPath);
-        const mod = this.createModule(protocolPath);
-        mod.export('default', file);
-        return mod;
-    }
-
-    /**
-     * Load ESM module (JavaScript/TypeScript)
-     */
-    private loadESMModule(localPath: string, protocolPath: string, injectImportMeta: Record<string, any>): CModuleEngine.Module {
-        const isCacheable = !this.config.disableCache && localPath.startsWith(this.config.cacheDir);
-        console.debug(`[loader] Loading ESM: ${localPath}`);
-
-        // Check JSC cache first
-        const jscPath = localPath + '.jsc';
-        if (isCacheable && fs.exists(jscPath)) {
-            const buf = fs.readFile(jscPath);
-            let mod;
-            try {
-                mod = engine.deserialize(new Uint8Array(buf));
-            } catch {
-                // Ignore, will recompile
+            // Ensure `default` is always present
+            if (!Object.prototype.hasOwnProperty.call(exports, 'default')) {
+                mod.export('default', undefined);
             }
-            if (mod) {
-                Object.assign(mod.meta, injectImportMeta);
-                return mod;
+        } else {
+            // True CJS: default = whole exports, also export each named key
+            if (exports !== null && typeof exports === 'object') {
+                for (const k of Object.keys(exports)) {
+                    // Skip prototype-inherited and non-enumerable; skip 'default'
+                    // which we set explicitly below to avoid conflicts
+                    if (k !== 'default') mod.export(k, exports[k]);
+                }
             }
+            mod.export('default', exports);
         }
 
-        // Load and compile source
-        const content = readTextFile(localPath);
-        const code = this.transformer.transform(content, localPath);
-        const mod = new engine.Module(code, protocolPath);
-
-        // Write JSC cache
-        if (isCacheable) {
-            try {
-                ensureDir(dirname(localPath));
-                fs.writeFile(jscPath, mod.dump());
-            } catch (error) {
-                console.warn(`Failed to write JSC cache for ${localPath}:`, error);
-            }
-        }
-
-        Object.assign(mod.meta, injectImportMeta);
+        store.push(mod);
         return mod;
     }
 
-    /**
-     * Load CommonJS module using commonjs.ts
-     * Wraps CJS module.exports as ESM default export
-     */
-    private loadCJSModule(localPath: string, protocolPath: string, injectImportMeta: Record<string, any>): CModuleEngine.Module {
-        console.debug(`[loader] Loading CJS: ${localPath}`);
+    // -------------------------------------------------------------------------
+    // Special file types
+    // -------------------------------------------------------------------------
 
-        // Use commonjs.ts to load the module
-        const cjsRequire = this.cjsLoader.createRequireFunction(localPath);
-
-        // Load the CJS module
-        let cjsExports: any;
-        try {
-            cjsExports = cjsRequire(localPath);
-        } catch (error) {
-            throw new Error(`Failed to load CJS module ${localPath}: ${error}`);
-        }
-
-        // Wrap CJS exports as ESM module
-        const mod = this.createModule(protocolPath);
-        Object.assign(mod.meta, injectImportMeta);
-
-        // Export all properties from CJS module
-        if (cjsExports && typeof cjsExports === 'object') {
-            for (const key of Object.keys(cjsExports)) {
-                mod.export(key, cjsExports[key]);
-            }
-        }
-
-        // Always export default as the full exports object
-        mod.export('default', cjsExports);
-
+    private loadWasm(info: ModuleInfo): CModuleEngine.Module {
+        assert(wasm, 'WASM support not available in this build');
+        const inst = new wasm.Instance(
+            new wasm.Module(new Uint8Array(fs.readFile(info.localPath))), {});
+        const mod  = engine.Module.create(info.specPath);
+        for (const k of Object.keys(inst.exports)) mod.export(k, inst.exports[k]);
+        store.push(mod);
         return mod;
     }
 
-    preCacheModule(path: string, parent: string): void {
-        // CJS pre-cache handled by commonjs.ts
+    private loadBytes(info: ModuleInfo): CModuleEngine.Module {
+        const mod = engine.Module.create(info.specPath);
+        mod.export('default', new Uint8Array(fs.readFile(info.localPath)));
+        store.push(mod);
+        return mod;
     }
 
-    /**
-     * Load module file with appropriate type handling
-     */
-    private loadModuleFile(path: string): ModuleFile {
-        const type = this.resolver.getFileType(path);
-        const content = fs.readFile(path);
+    private loadText(info: ModuleInfo): CModuleEngine.Module {
+        const mod = engine.Module.create(info.specPath);
+        mod.export('default', readText(info.localPath));
+        store.push(mod);
+        return mod;
+    }
 
+    // -------------------------------------------------------------------------
+    // CjsDeps implementation: bridges CJS loader back to ESM resolver/loader
+    // -------------------------------------------------------------------------
+
+    private buildCjsDeps(): CjsDeps {
+        const self = this;
         return {
-            path,
-            type,
-            content: type === FileType.BINARY
-                ? new Uint8Array(content)
-                : engine.decodeString(content)
+            builtinToPath(name: string, parent: string): string {
+                return self.resolver.resolve(`node:${name}`, parent).localPath;
+            },
+
+            /**
+             * Load ESM module synchronously for CJS interop.
+             * Uses engine.promiseResult to extract the result without top-level await.
+             * This works because ESM modules without top-level await evaluate synchronously
+             * in QuickJS — the Promise is already resolved when eval() returns.
+             */
+            loadEsmSync(localPath: string, specPath: string): Record<string, any> {
+                const info: ModuleInfo = { specPath, localPath, format: 'esm', fileKind: 'source' };
+                const mod = self.loadEsm(info, {});
+
+                // Drive the module evaluation synchronously
+                const p = mod.eval();
+                const ns = mod.namespace;
+
+                // If the module uses top-level await, namespace may be empty.
+                // Log a warning but don't crash — the CJS side will get an empty object.
+                if (Object.keys(ns).length === 0 && engine.promiseResult(p) === null) {
+                    log.warn('loader',
+                        () => `${specPath} uses top-level await; CJS require() may get empty exports`);
+                }
+
+                return ns;
+            },
+
+            resolveExternal(req: string, parent: string): { path: string; isCjs: boolean } | null {
+                try {
+                    const info = self.resolver.resolve(req, parent);
+                    return { path: info.localPath, isCjs: info.format === 'cjs' };
+                } catch { return null; }
+            },
         };
-    }
-
-    /**
-     * Get main script path
-     */
-    getMainScript(): string | null {
-        return this.mainScript;
-    }
-
-    /**
-     * Set main script path
-     */
-    setMainScript(path: string): void {
-        this.mainScript = path;
     }
 }

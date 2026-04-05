@@ -1,248 +1,215 @@
-import { ModuleLoader } from './loader.js';
-import type { RuntimeConfig, ConfigOptions } from './types.ts';
-import { ensureDir, joinPaths, parseArgs } from './utils.js';
+// config.ts — configuration loading
 
-const os = import.meta.use('os');
-const sys = import.meta.use('sys');
-const fs = import.meta.use('fs');
-const engine = import.meta.use('engine');
+import type { RuntimeConfig, ConfigOptions } from './types';
+import { dirname, joinPaths } from './utils/path';
+import { readText, writeText, ensureDir } from './utils/io';
+import { stripJsonc, safeParse, parseArgs } from './utils/misc';
+import { log } from './utils/log';
+import { os, sys, fs, engine } from './utils/index';
 
-/**
- * Environment variable prefix for configuration
- */
-const ENV_PREFIX = 'CTS_';
 
-/**
- * Default configuration values
- */
+// ---------------------------------------------------------------------------
+// Defaults (only truly required fields)
+// ---------------------------------------------------------------------------
+
 const DEFAULTS = {
-    enableHttp: true,
-    enableJsr: true,
-    enableNode: true,
-    silent: false,
-    jsrCacheTTL: 7 * 24 * 60 * 60 * 1000, // 1 week
-    memoryLimit: undefined,
-    maxStackSize: undefined,
+    enableHttp:  true,
+    enableJsr:   true,
+    enableNode:  true,
+    silent:      false,
+    jsrCacheTTL: 7 * 24 * 60 * 60 * 1000,
+    disableCache: false,
+    polyfill:    '',
+    cacheDir:    '',
 } as const;
 
-/**
- * Parse memory size string (e.g., "256MB", "1GB")
- */
-function parseMemorySize(size: string | undefined): number | undefined {
-    if (!size) return undefined;
+// ---------------------------------------------------------------------------
+// Memory size parser  "256MB" → bytes
+// ---------------------------------------------------------------------------
 
-    const units: Record<string, number> = {
-        'B': 1,
-        'KB': 1024,
-        'MB': 1024 * 1024,
-        'GB': 1024 * 1024 * 1024,
-    };
-
-    const match = size.match(/^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$/i);
-    if (!match) {
-        throw new Error(`Invalid memory size format: ${size}`);
-    }
-
-    const [, num, unit = 'B'] = match;
-    const multiplier = units[unit.toUpperCase()] ?? 1;
-
-    return Math.floor(parseFloat(num!) * multiplier);
+export function parseSize(s: string | undefined): number | undefined {
+    if (!s) return undefined;
+    const m = s.match(/^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$/i);
+    if (!m) throw new Error(`Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
+    const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024**2, GB: 1024**3 };
+    return Math.floor(parseFloat(m[1]!) * (units[(m[2] ?? 'B').toUpperCase()] ?? 1));
 }
 
-/**
- * getenv wrapper, with error handling
- */
-function getenv(name: string): string | null {
+// ---------------------------------------------------------------------------
+// Environment
+// ---------------------------------------------------------------------------
+
+function env(k: string): string | null { try { return os.getenv(k); } catch { return null; } }
+
+function envConfig(): Partial<ConfigOptions> {
+    const c: Partial<ConfigOptions> = {};
+    const bool = (v: string | null) => v !== null ? v === 'true' : undefined;
+    const E = 'CTS_';
+    const v = (k: string) => env(E + k);
+    const cacheDir = v('CACHE_DIR'); if (cacheDir) c.cacheDir = cacheDir;
+    const dc  = bool(v('DISABLE_CACHE')); if (dc  !== undefined) c.disableCache = dc;
+    const http = bool(v('ENABLE_HTTP')); if (http !== undefined) c.enableHttp = http;
+    const jsr  = bool(v('ENABLE_JSR'));  if (jsr  !== undefined) c.enableJsr  = jsr;
+    const node = bool(v('ENABLE_NODE')); if (node !== undefined) c.enableNode = node;
+    const sil  = bool(v('SILENT'));      if (sil  !== undefined) c.silent = sil;
+    const ml = v('MEMORY_LIMIT');   if (ml) c.memoryLimit  = parseSize(ml);
+    const ms = v('MAX_STACK_SIZE'); if (ms) c.maxStackSize = parseSize(ms);
+    const ttl = v('JSR_CACHE_TTL'); if (ttl) c.jsrCacheTTL = +ttl * 24 * 60 * 60 * 1000;
+    return c;
+}
+
+function defaultCacheDir(): string {
+    let home: string | null = null;
+    try { home = os.homedir; } catch {}
+    if (!home) home = env(sys.platform === 'win32' ? 'USERPROFILE' : 'HOME') ?? '/root';
+    return joinPaths(home, '.cts');
+}
+
+// ---------------------------------------------------------------------------
+// Cache directory
+// ---------------------------------------------------------------------------
+
+function clearJsc(dir: string): void {
     try {
-        return os.getenv(name);
-    } catch {
-        // Environment variable not available
-    }
-    return null;
-}
-
-/**
- * Get environment variable configuration
- */
-function getEnvConfig(): Partial<ConfigOptions> {
-    const config: Partial<ConfigOptions> = {};
-
-    // CTS_CACHE_DIR
-    const cacheDir = getenv(`${ENV_PREFIX}CACHE_DIR`);
-    if (cacheDir) config.cacheDir = cacheDir;
-
-    // CTS_DISABLE_CACHE
-    const disableCache = getenv(`${ENV_PREFIX}DISABLE_CACHE`);
-    if (disableCache !== null) config.disableCache = disableCache === 'true';
-
-    // CTS_ENABLE_HTTP
-    const enableHttp = getenv(`${ENV_PREFIX}ENABLE_HTTP`);
-    if (enableHttp !== null) config.enableHttp = enableHttp === 'true';
-
-    // CTS_ENABLE_JSR
-    const enableJsr = getenv(`${ENV_PREFIX}ENABLE_JSR`);
-    if (enableJsr !== null) config.enableJsr = enableJsr === 'true';
-
-    // CTS_ENABLE_NODE
-    const enableNode = getenv(`${ENV_PREFIX}ENABLE_NODE`);
-    if (enableNode !== null) config.enableNode = enableNode === 'true';
-
-    // CTS_SILENT
-    const silent = getenv(`${ENV_PREFIX}SILENT`);
-    if (silent !== null) config.silent = silent === 'true';
-
-    // CTS_MEMORY_LIMIT
-    const memoryLimit = getenv(`${ENV_PREFIX}MEMORY_LIMIT`);
-    if (memoryLimit) config.memoryLimit = parseMemorySize(memoryLimit);
-
-    // CTS_MAX_STACK_SIZE
-    const maxStackSize = getenv(`${ENV_PREFIX}MAX_STACK_SIZE`);
-    if (maxStackSize) config.maxStackSize = parseMemorySize(maxStackSize);
-
-    // CTS_JSR_CACHE_TTL (in days)
-    const jsrCacheTTL = getenv(`${ENV_PREFIX}JSR_CACHE_TTL`);
-    if (jsrCacheTTL) {
-        const days = parseInt(jsrCacheTTL, 10);
-        config.jsrCacheTTL = days * 24 * 60 * 60 * 1000;
-    }
-
-    return config;
-}
-
-/**
- * Get default cache directory (like Deno)
- */
-function getDefaultCacheDir(): string {
-    // Determine the home directory based on the platform
-    let homeDir: string | null = null;
-    
-    try {
-        // Try to get home directory from OS module
-        if (os.homedir) {
-            homeDir = os.homedir;
+        for (const e of fs.readdir(dir)) {
+            const p = joinPaths(dir, e);
+            try { if (fs.stat(p).isDirectory) clearJsc(p); else if (p.endsWith('.jsc')) fs.unlink(p); }
+            catch {}
         }
-    } catch (e) {
-        // If os.homedir fails, fall back to platform-specific defaults
-    }
-    
-    // Fallback to platform-specific environment variables if needed
-    if (!homeDir) {
-        if (sys.platform === 'win32') {
-            homeDir = getenv('USERPROFILE') || getenv('HOME') || 'C:\\Users\\Default';
-        } else {
-            homeDir = getenv('HOME') || '/root';
-        }
-    }
-    
-    // Handle potential null/undefined values
-    if (!homeDir) {
-        throw new Error('Unable to determine home directory');
-    }
-    
-    return joinPaths(homeDir, '.cts');
+    } catch {}
 }
 
-/**
- * Create runtime configuration
- */
+function verifyCacheDir(dir: string): void {
+    if (!fs.exists(dir)) {
+        ensureDir(dir);
+        writeText(joinPaths(dir, 'version'), engine.versions.quickjs);
+        return;
+    }
+    const vf = joinPaths(dir, 'version');
+    let stored = '';
+    try { stored = readText(vf); } catch {}
+    if (stored !== engine.versions.quickjs) {
+        log.debug('config', 'cache version mismatch, clearing .jsc');
+        clearJsc(dir);
+        writeText(vf, engine.versions.quickjs);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI template — all flags declared here
+// ---------------------------------------------------------------------------
+
+const CLI_TPL = {
+    'cache-dir':      'string',
+    'polyfill':       'string',
+    'lock-dir':       'string',
+    'memory-limit':   'string',
+    'max-stack-size': 'string',
+    'jsr-cache-ttl':  'number',
+    'silent':         'boolean',
+    'no-http':        'boolean',
+    'no-jsr':         'boolean',
+    'no-node':        'boolean',
+    'disable-cache':  'boolean',
+    'precache':       'boolean',
+    'no-lock':        'boolean',
+    'frozen':         'boolean',
+    'help':           'boolean',
+    'h':              'boolean',
+    'version':        'boolean',
+    'v':              'boolean',
+} satisfies Record<string, 'string'|'boolean'|'number'>;
+
 export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeConfig {
-    // Priority: CLI args > user config > env vars > defaults
-    const cliConfig = parseArgs(sys.args.slice(1), {
-        'cache-dir': 'string',
-        'silent': 'boolean',
-        'memory-limit': 'string',
-        'no-http': 'boolean',
-        'no-jsr': 'boolean',
-        'no-node': 'boolean',
-        'jsr-cache-ttl': 'number',
-        'polyfill': 'string',
-        'disable-cache': 'boolean',
-    });
-    const envConfig = getEnvConfig();
+    const cli = parseArgs(sys.args.slice(1), CLI_TPL);
+    const cfg = { ...DEFAULTS, ...envConfig(), ...userConfig } as RuntimeConfig;
 
-    const config: RuntimeConfig = {
-        cacheDir: '',
-        polyfill: '',
-        disableCache: false,
-        ...DEFAULTS,
-        ...envConfig,
-        ...userConfig,
-        ...cliConfig,
+    if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] as string;
+    if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'] as string;
+    if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] as string;
+    if (cli['disable-cache']) cfg.disableCache  = true;
+    if (cli['silent'])        cfg.silent        = true;
+    if (cli['no-http'])       cfg.enableHttp    = false;
+    if (cli['no-jsr'])        cfg.enableJsr     = false;
+    if (cli['no-node'])       cfg.enableNode    = false;
+    if (cli['no-lock'])       cfg.noLock        = true;
+    if (cli['frozen'])        cfg.frozen        = true;
+    if (cli['memory-limit'])  cfg.memoryLimit   = parseSize(cli['memory-limit'] as string);
+    if (cli['max-stack-size']) cfg.maxStackSize  = parseSize(cli['max-stack-size'] as string);
+    if (cli['jsr-cache-ttl'] !== undefined)
+        cfg.jsrCacheTTL = (cli['jsr-cache-ttl'] as number) * 24 * 60 * 60 * 1000;
+
+    cfg._ = cli._; cfg._args = cli._args; cfg._offset = cli._offset;
+
+    if (!cfg.cacheDir) cfg.cacheDir = defaultCacheDir();
+    verifyCacheDir(cfg.cacheDir);
+    if (cfg.memoryLimit  !== undefined) engine.setMemoryLimit(cfg.memoryLimit);
+    if (cfg.maxStackSize !== undefined) engine.setMaxStackSize(cfg.maxStackSize);
+    (cfg as any)._cli = cli;  // keep raw CLI args for unknown flag warning
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// loadConfigFile — reads tsconfig / deno.json / package.json
+// ---------------------------------------------------------------------------
+
+export function loadConfigFile(dir: string): Partial<ConfigOptions> {
+    const cfg: Partial<ConfigOptions> = {};
+    const dirs: string[] = [dir];
+    let cur = dir;
+    while (cur !== '/' && cur !== '.') {
+        const up = dirname(cur); if (up === cur) break;
+        dirs.push(up); cur = up;
+    }
+
+    const readJson = (p: string): Record<string, any> | null => {
+        try { return safeParse(stripJsonc(engine.decodeString(fs.readFile(p)))); }
+        catch { return null; }
     };
 
-    // Set default cache directory if not provided
-    if (!config.cacheDir) {
-        config.cacheDir = getDefaultCacheDir();
+    // tsconfig.json
+    for (const d of dirs) {
+        const p = joinPaths(d, 'tsconfig.json');
+        if (!fs.exists(p)) continue;
+        const ts = readJson(p); if (!ts) break;
+        if (ts.compilerOptions?.paths)   cfg.pathAliases = ts.compilerOptions.paths;
+        if (ts.compilerOptions?.baseUrl) cfg.baseUrl = joinPaths(d, ts.compilerOptions.baseUrl);
+        log.debug('config', () => `tsconfig: ${p}`); break;
     }
 
-    // Verify cache directory
-    ModuleLoader.verifyCacheDir(config.cacheDir);
-
-    // Apply engine limits if specified
-    if (config.memoryLimit !== undefined) {
-        engine.setMemoryLimit(config.memoryLimit);
+    // deno.json / deno.jsonc
+    for (const d of dirs) {
+        let found = false;
+        for (const name of ['deno.json', 'deno.jsonc']) {
+            const p = joinPaths(d, name);
+            if (!fs.exists(p)) continue;
+            const dc = readJson(p); if (!dc) continue;
+            if (dc.imports)                cfg.importMap  = { ...cfg.importMap,   ...dc.imports };
+            if (dc.compilerOptions?.paths) cfg.pathAliases = { ...cfg.pathAliases, ...dc.compilerOptions.paths };
+            if (typeof dc.importMap === 'string') {
+                const mp = joinPaths(d, dc.importMap);
+                if (fs.exists(mp)) {
+                    const mj = readJson(mp);
+                    if (mj?.imports) cfg.importMap = { ...cfg.importMap, ...mj.imports };
+                }
+            }
+            log.debug('config', () => `${name}: ${p}`);
+            found = true; break;
+        }
+        if (found) break;
     }
 
-    if (config.maxStackSize !== undefined) {
-        engine.setMaxStackSize(config.maxStackSize);
+    // package.json #imports (lowest priority)
+    for (const d of dirs) {
+        const p = joinPaths(d, 'package.json');
+        if (!fs.exists(p)) continue;
+        const pkg = readJson(p);
+        if (pkg?.imports && typeof pkg.imports === 'object')
+            cfg.importMap = { ...pkg.imports, ...cfg.importMap };
+        break;
     }
 
-    return config;
+    return cfg;
 }
 
-/**
- * Load configuration from file (tsconfig.json or deno.json)
- */
-export function loadConfigFile(dir: string): Partial<ConfigOptions> {
-    const jsonc = import.meta.use('jsonc');
-    const config: Partial<ConfigOptions> = {};
-
-    // Try tsconfig.json
-    const tsconfigPath = joinPaths(dir, 'tsconfig.json');
-    if (fs.exists(tsconfigPath)) {
-        try {
-
-            const buffer = fs.readFile(tsconfigPath);
-            const content = engine.decodeString(buffer);
-            const tsconfig = jsonc.parse(content);
-
-            if (tsconfig?.compilerOptions?.paths) {
-                config.pathAliases = tsconfig.compilerOptions.paths;
-            }
-
-            if (tsconfig?.compilerOptions?.baseUrl) {
-                config.baseUrl = joinPaths(dir, tsconfig.compilerOptions.baseUrl);
-            }
-        } catch {
-            // Ignore errors
-        }
-    }
-
-    // Try deno.json / deno.jsonc
-    for (const filename of ['deno.json', 'deno.jsonc']) {
-        const denoConfigPath = joinPaths(dir, filename);
-        if (fs.exists(denoConfigPath)) {
-            try {
-    
-                const buffer = fs.readFile(denoConfigPath);
-                const content = engine.decodeString(buffer);
-                const denoConfig = jsonc.parse(content);
-
-                if (denoConfig?.imports) {
-                    config.importMap = denoConfig.imports;
-                }
-
-                if (denoConfig?.compilerOptions?.paths) {
-                    config.pathAliases = denoConfig.compilerOptions.paths;
-                }
-            } catch {
-                // Ignore errors
-            }
-            break;
-        }
-    }
-
-    return config;
-}
-
-export { parseMemorySize, getDefaultCacheDir };
+export { CLI_TPL };

@@ -5,11 +5,8 @@
 
 import { Headers } from "headers-polyfill";
 import { URL } from "./url";
-import { ConnectionState } from "./connection";
+import { engine, console, http } from '../utils/index';
 
-const http = import.meta.use('http');
-const engine = import.meta.use('engine');
-const console = import.meta.use('console');
 
 // Local assertion function to avoid circular dependency
 function assert(condition: any, message?: string): asserts condition {
@@ -235,7 +232,6 @@ export class HttpResponseParser {
      * 喂入数据
      */
     feed(data: Uint8Array): void {
-        const console = import.meta.use('console');
         // console.debug(`[http.parser]Feeding data: ${data.length} bytes`);
         
         try {

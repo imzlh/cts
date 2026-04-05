@@ -1,191 +1,92 @@
-export type { ResolveResult } from './resolver/base';
-export { ModuleType } from './resolver/base';
-// types.ts - Type Definitions
+// types.ts — shared types
 
-/**
- * Runtime configuration options
- */
+export type ModuleFormat = 'esm' | 'cjs';
+export type FileKind     = 'source' | 'json' | 'wasm' | 'binary';
+
+export interface ModuleInfo {
+    specPath:  string;
+    localPath: string;
+    format:    ModuleFormat;
+    fileKind:  FileKind;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
 export interface ConfigOptions {
-    /** Cache directory for remote modules */
-    cacheDir?: string;
-    /** Enable HTTP module loading */
-    enableHttp?: boolean;
-    /** Enable JSR module loading */
-    enableJsr?: boolean;
-    /** Enable Node.js compatibility layer */
-    enableNode?: boolean;
-    /** Silent mode - suppress download logs */
-    silent?: boolean;
-    /** JSR cache TTL in milliseconds */
-    jsrCacheTTL?: number;
-    /** Memory limit in bytes */
-    memoryLimit?: number;
-    /** Max stack size in bytes */
+    cacheDir?:      string;
+    enableHttp?:    boolean;
+    enableJsr?:     boolean;
+    enableNode?:    boolean;
+    silent?:        boolean;
+    jsrCacheTTL?:   number;
+    memoryLimit?:   number;
+    maxStackSize?:  number;
+    pathAliases?:   Record<string, string[]>;
+    baseUrl?:       string;
+    importMap?:     Record<string, string>;
+    polyfill?:      string;
+    disableCache?:  boolean;
+    // Lock options
+    lockDir?:       string;   // dir containing cts.lock (default: entry file dir)
+    frozen?:        boolean;  // refuse to resolve anything not already in lock
+    noLock?:        boolean;  // disable lock entirely
+}
+
+// Fields that are always required after createConfig()
+// Optional fields remain optional (no value → feature disabled)
+export interface RuntimeConfig extends Required<Omit<ConfigOptions,
+    'pathAliases'|'baseUrl'|'importMap'|'memoryLimit'|'maxStackSize'|
+    'lockDir'|'frozen'|'noLock'>> {
+    pathAliases?:  Record<string, string[]>;
+    baseUrl?:      string;
+    importMap?:    Record<string, string>;
+    memoryLimit?:  number;
     maxStackSize?: number;
-    /** Path aliases from tsconfig.json/deno.json */
-    pathAliases?: Record<string, string[]>;
-    /** Base URL for path resolution */
-    baseUrl?: string;
-    /** Import map from deno.json */
-    importMap?: Record<string, string>;
-    /** polyfill path */
-    polyfill?: string;
-    /** Disable cache for remote modules */
-    disableCache?: boolean;
+    lockDir?:      string;
+    frozen?:       boolean;
+    noLock?:       boolean;
+    // CLI parse output
+    _?:            string;
+    _args?:        string[];
+    _offset:       number;
 }
 
-/**
- * Runtime configuration (resolved)
- */
-export interface RuntimeConfig extends Required<Omit<ConfigOptions, 'pathAliases' | 'baseUrl' | 'importMap' | 'memoryLimit' | 'maxStackSize'>> {
-    pathAliases?: Record<string, string[]>;
-    baseUrl?: string;
-    importMap?: Record<string, string>;
-    memoryLimit?: number;
-    maxStackSize?: number;
-    verbose?: boolean;
-    _?: string;  // entry
-    _args?: string[];  // entry args
-    _offset: number;  // entry offset
-}
+// ---------------------------------------------------------------------------
+// Package.json
+// ---------------------------------------------------------------------------
 
-/**
- * Module resolution cache entry
- */
-export interface CacheEntry {
-    resolved: string;
-    timestamp: number;
-}
-
-/**
- * Package.json structure
- */
 export interface PackageJson {
-    name?: string;
-    version?: string;
-    main?: string;
-    module?: string;
-    exports?: string | Record<string, any>;
-    type?: 'module' | 'commonjs';
-    imports?: Record<string, string>;
+    name?:         string;
+    version?:      string;
+    main?:         string;
+    module?:       string;
+    exports?:      string | Record<string, unknown>;
+    type?:         'module' | 'commonjs';
+    imports?:      Record<string, string>;
     dependencies?: Record<string, string>;
 }
 
-export interface CommonJSModule {
-    exports: Record<string, any>;
-    require: (name: string) => any;
-    children: CommonJSModule[];
-    filename: string;
-    path: string;
-    id: string; // full name
-    isPreloading: boolean;
-    loaded: boolean;
-    parent: string; // deprecated
-    paths: string[];    // no effect
-}
+// ---------------------------------------------------------------------------
+// JSR registry
+// ---------------------------------------------------------------------------
 
-/**
- * JSR package metadata
- */
 export interface JsrPackageMeta {
-    versions: Record<string, {
-        yanked?: boolean;
-    }>;
-    latest?: string;
+    versions: Record<string, { yanked?: boolean }>;
+    latest?:  string;
 }
 
-/**
- * JSR version metadata
- */
 export interface JsrVersionMeta {
-    manifest: Record<string, {
-        size: number;
-        checksum: string;
-    }>;
+    manifest: Record<string, { size: number; checksum: string }>;
     exports?: Record<string, string>;
 }
 
-/**
- * JSR cache metadata
- */
-export interface JsrCacheMeta {
-    latest: string;
-    timestamp: number;
-}
-
-/**
- * Parsed JSR specifier
- */
-export interface ParsedJsrSpecifier {
-    scope: string;
-    name: string;
+export interface ParsedJsrSpec {
+    scope:   string;
+    name:    string;
     version: string | null;
-    path: string;
+    path:    string;
 }
 
-/**
- * Parsed package name
- */
-export interface ParsedPackageName {
-    packageName: string;
-    subpath: string;
-}
-
-/**
- * Node.js builtin resolver function
- */
-export type NodeResolver = (name: string, parent?: string) => string | null;
-
-/**
- * Module transformer function
- */
-export type ModuleTransformer = (code: string, filename: string) => string;
-
-/**
- * Supported file extensions
- */
-export type FileExtension = '.ts' | '.tsx' | '.jsx' | '.js' | '.mjs' | '.cjs' | '.json';
-
-/**
- * File type for module loading
- */
-export enum FileType {
-    TEXT = 'text',
-    BINARY = 'binary'
-}
-
-/**
- * Import attributes for module loading
- */
-export interface ImportAttributes {
-    type?: 'json' | 'css' | 'wasm';
-    [key: string]: unknown;
-}
-
-/**
- * Modsle file information
- */
-export interface ModuleFile {
-    path: string;
-    type: FileType;
-    content: string | Uint8Array;
-}
-
-/**
- * Module load context
- */
-export interface ModuleLoadContext {
-    /** Resolved module path */
-    resolvedPath: string;
-    /** Parent module path */
-    parentPath: string;
-    /** Import attributes */
-    attributes?: ImportAttributes;
-    /** Whether this is the main module */
-    isMain: boolean;
-}
-
-/**
- * Error message helper type
- */
-export type ErrorMessage = string | Error | unknown;
+export type NodeBuiltinResolver = (name: string, parent?: string) => string | null;

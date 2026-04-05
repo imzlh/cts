@@ -1,0 +1,9 @@
+{
+  "imports": {
+    "@/": "./",
+    "@/test-module": "./test-module.ts",
+    "lodash": "npm:lodash@4.17.21",
+    "@std/": "jsr:@std/",
+    "@std/http": "jsr:@std/http@^1.0.24"
+  }
+}

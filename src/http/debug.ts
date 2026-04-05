@@ -1,4 +1,4 @@
-const console = import.meta.use('console');
+import { console } from '../utils/index';
 
 /**
  * 十六进制调试输出函数

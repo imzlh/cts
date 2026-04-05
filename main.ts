@@ -1,111 +1,228 @@
-import { createRuntime } from './src/runtime.js';
-import { createConfig, loadConfigFile } from './src/config.js';
-import { errMsg, dirname, readTextFile, getExtension } from './src/utils.js';
+// main.ts
 
-const sys = import.meta.use('sys');
-const fs = import.meta.use('fs');
-const os = import.meta.use('os');
-const console = import.meta.use('console');
-const engine = import.meta.use('engine');
+import { createConfig, loadConfigFile, CLI_TPL } from './src/config';
+import { createRuntime } from './src/runtime';
+import { loadTasks } from './src/task';
+import { fatal, formatError } from './src/errors';
+import { dirname } from './src/utils/path';
+import type { ConfigOptions, RuntimeConfig } from './src/types';
+import { os, sys, console, worker, process } from './src/utils';
+import { log } from './src/utils/log';
 
-/**
- * Show help message
- */
-function showHelp(): void {
-    console.log('TypeScript Runtime for tjs like deno');
-    console.log('');
-    console.log('Usage: cjs [options] <file.ts> [args...]');
-    console.log('');
-    console.log('Options:');
-    console.log('  --help, -h              Show this help message');
-    console.log('  --version, -v           Show version information');
-    console.log('  --cache-dir <path>      Set cache directory (default: ~/.cts/)');
-    console.log('  --no-http               Disable HTTP module loading');
-    console.log('  --no-jsr                Disable JSR module loading');
-    console.log('  --no-node               Disable Node.js compatibility');
-    console.log('  --silent                Suppress download logs');
-    console.log('  --memory-limit <size>   Set memory limit (e.g., 256MB, 1GB)');
-    console.log('  --max-stack-size <size> Set max stack size (e.g., 1MB)');
-    console.log('  --jsr-cache-ttl <days>  JSR cache TTL in days (default: 7)');
-    console.log('  --polyfill <file>       Load polyfill file before entry file');
-    console.log('');
-    console.log('Environment Variables:');
-    console.log('  CTS_CACHE_DIR           Cache directory path');
-    console.log('  CTS_ENABLE_HTTP         Enable/disable HTTP modules (true/false)');
-    console.log('  CTS_ENABLE_JSR          Enable/disable JSR modules (true/false)');
-    console.log('  CTS_ENABLE_NODE         Enable/disable Node.js compat (true/false)');
-    console.log('  CTS_SILENT              Suppress logs (true/false)');
-    console.log('  CTS_MEMORY_LIMIT        Memory limit (e.g., 256MB)');
-    console.log('  CTS_MAX_STACK_SIZE      Max stack size (e.g., 1MB)');
-    console.log('  CTS_JSR_CACHE_TTL       JSR cache TTL in days');
+// debug
+(globalThis as any).console = console;
+(globalThis as any).process = process;
+
+const VERSION = '2.5.6';
+
+interface WorkerData { __cts_entry: string; name?: string }
+
+// ---------------------------------------------------------------------------
+// Colour helpers (always applied — isTTY is checked inside C)
+// ---------------------------------------------------------------------------
+
+const isTTY = os.guessHandle(os.STDIN_FILENO) == 'tty';
+const C = {
+    bold: (s: string) => isTTY ? `\x1b[1m${s}\x1b[0m` : s,
+    cyan: (s: string) => isTTY ? `\x1b[36m${s}\x1b[0m` : s,
+    dim:  (s: string) => isTTY ? `\x1b[2m${s}\x1b[0m`  : s,
+    green:(s: string) => isTTY ? `\x1b[32m${s}\x1b[0m` : s,
+    warn: (s: string) => isTTY ? `\x1b[33m${s}\x1b[0m` : s,
+};
+
+// ---------------------------------------------------------------------------
+// Help & version
+// ---------------------------------------------------------------------------
+
+function showVersion(): void {
+    console.log(`cts/${VERSION}`);
 }
 
-/**
- * Main entry point
- */
-async function main(): Promise<void> {
-    // Create runtime with file config
-    const fileConfig = loadConfigFile(os.cwd);
-    const runtime = createRuntime(fileConfig);
+function showHelp(): void {
+    console.log(`
+${C.bold('cts2')} v${VERSION} — TypeScript runner for circu.js
 
-    if (!runtime.rtConfig._) {
-        showHelp();
-        os.exit(0);
+${C.bold('USAGE')}
+  ${C.cyan('cts')} [options] ${C.cyan('<file.ts>')} [args…]
+  ${C.cyan('cts cache')} ${C.cyan('<file.ts>')}       Pre-download all deps + write lock
+  ${C.cyan('cts task')}                  List deno.json tasks
+  ${C.cyan('cts task')} ${C.cyan('<name>')} [args…]   Run a deno.json task
+
+${C.bold('OPTIONS')}
+  ${C.cyan('--cache-dir')} <path>      Cache directory ${C.dim('(default: ~/.cts)')}
+  ${C.cyan('--polyfill')} <file>       Load a polyfill before the entry file
+  ${C.cyan('--precache')}              Pre-download deps then run
+  ${C.cyan('--no-lock')}               Disable lock file entirely
+  ${C.cyan('--frozen')}                Fail if any import is missing from lock
+  ${C.cyan('--lock-dir')} <path>       Directory for cts.lock ${C.dim('(default: entry dir)')}
+  ${C.cyan('--no-http')}               Disable http/https imports
+  ${C.cyan('--no-jsr')}                Disable jsr: imports
+  ${C.cyan('--no-node')}               Disable Node.js compatibility
+  ${C.cyan('--silent')}                Suppress download progress
+  ${C.cyan('--disable-cache')}         Skip JSC bytecode cache
+  ${C.cyan('--memory-limit')} <size>   e.g. ${C.cyan('256MB')}, ${C.cyan('1GB')}
+  ${C.cyan('--max-stack-size')} <n>    e.g. ${C.cyan('4MB')}
+  ${C.cyan('--jsr-cache-ttl')} <days>  JSR metadata TTL ${C.dim('(default: 7)')}
+  ${C.cyan('--version')}, ${C.cyan('-v')}           Print version
+  ${C.cyan('--help')}, ${C.cyan('-h')}              Print this message
+
+${C.bold('ENVIRONMENT')}
+  ${C.cyan('CTS_CACHE_DIR')}     Override cache directory
+  ${C.cyan('CTS_SILENT')}        Suppress output ${C.dim('(true/false)')}
+  ${C.cyan('CTS_ENABLE_HTTP')}   ${C.dim('true/false')}
+  ${C.cyan('CTS_ENABLE_JSR')}    ${C.dim('true/false')}
+  ${C.cyan('CTS_ENABLE_NODE')}   ${C.dim('true/false')}
+  ${C.cyan('CTS_DISABLE_CACHE')} ${C.dim('true/false')}
+  ${C.cyan('CTS_DEBUG')}         Debug categories: ${C.cyan('resolver')}, ${C.cyan('npm')}, ${C.cyan('jsr')}, ${C.cyan('lock')}, ${C.cyan('cjs')}, ${C.cyan('loader')}, ${C.cyan('config')}, ${C.cyan('stack')}, ${C.cyan('*')}
+    `.trim());
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function entryAndDir(raw: string): { entry: string; dir: string } {
+    const hasProto = /^[a-z][a-z0-9+\-.]*:/i.test(raw) && !raw.startsWith('/');
+    const entry    = (!hasProto && !raw.startsWith('/')) ? `${os.cwd}/${raw}` : raw;
+    return { entry, dir: hasProto ? os.cwd : dirname(entry) };
+}
+
+// Known flags from config — used to warn on typos
+const KNOWN_FLAGS = new Set(Object.keys(CLI_TPL));
+
+function warnUnknownFlags(parsed: Record<string, any>): void {
+    for (const k of Object.keys(parsed)) {
+        if (!k.startsWith('_') && !KNOWN_FLAGS.has(k))
+            console.error(`${C.warn('⚠')} Unknown flag ${C.cyan('--' + k)} — run ${C.cyan('cts --help')} for options`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommands
+// ---------------------------------------------------------------------------
+
+async function runCacheCmd(args: string[], baseCfg: Partial<ConfigOptions>): Promise<void> {
+    const raw = args[0];
+    if (!raw) {
+        console.error(`Usage: ${C.cyan('cts cache')} ${C.cyan('<file.ts>')}`);
+        os.exit(1); return;
+    }
+    const { entry, dir } = entryAndDir(raw);
+    const cfg            = { ...loadConfigFile(dir), ...baseCfg, silent: false, noLock: false };
+    const runtime        = createRuntime(cfg, dir);
+    const info           = runtime.resolver.resolve(entry, `${os.cwd}/<cache-cmd>`);
+    await runtime.precache(info.specPath, info.localPath);
+    const lockDir = cfg.lockDir ?? dir;
+    console.log(`${C.green('✔')} ${runtime.resolver.lockSize} modules cached`);
+    console.log(C.dim(`  Lock: ${lockDir}/cts.lock`));
+}
+
+async function runTaskCmd(args: string[]): Promise<void> {
+    const result = loadTasks(os.cwd);
+    if (!result) {
+        fatal(new Error(
+            'No deno.json with tasks found in current directory or any parent.\n' +
+            'Create a deno.json with a "tasks" field.'
+        ), 'cts task');
         return;
     }
+    const { runner, configPath } = result;
+    if (!args.length || args[0] === '--list') {
+        console.log(C.dim(`Tasks from ${configPath}`));
+        runner.list();
+        return;
+    }
+    const [name, ...rest] = args;
+    const code = await runner.run(name!, rest);
+    if (code !== 0) os.exit(code);
+}
 
-    
-    // Update sys.args to only include script arguments
-    sys.args.splice(0, runtime.rtConfig._offset);
-    let entryFile = runtime.rtConfig._;
-    const basedir2 = dirname(entryFile);
-    const config2 = loadConfigFile(basedir2);
-    runtime.rtConfig = config2;
+// ---------------------------------------------------------------------------
+// Main run
+// ---------------------------------------------------------------------------
 
-    // initialize polyfill
-    if (runtime.rtConfig.polyfill) try{
-        const ext = getExtension(runtime.rtConfig.polyfill);
-        if (ext == '.js'){
-            const file = readTextFile(runtime.rtConfig.polyfill);
-            const mod = new engine.Module(file, fs.realpath(runtime.rtConfig.polyfill));
-            mod.meta.use = import.meta.use;
-            await mod.eval();
-        } else if (ext == '.jsc'){
-            const file = fs.readFile(runtime.rtConfig.polyfill);
-            const mod = engine.deserialize(new Uint8Array(file));
-            if (!(mod instanceof engine.Module)){
-                throw new Error('Invalid JSC file');
-            }
-            mod.meta.use = import.meta.use;
-            await mod.eval();
-        } else {
-            throw new Error('Unsupported polyfill file type');
+async function run(
+    entry: string, dir: string,
+    cfg: Partial<ConfigOptions>,
+    extra: Record<string, any> = {},
+    precache = false,
+): Promise<void> {
+    const runtime = createRuntime(cfg, dir);
+
+    if (runtime.config.polyfill) {
+        try {
+            await runtime.loadPolyfill(runtime.config.polyfill);
+            log.debug('runtime', () => `polyfill: ${runtime.config.polyfill}`);
         }
-    } catch (error) {
-        console.error('\n❌ Error loading polyfill:', errMsg(error));
-        if (error instanceof Error && error.stack) {
-            console.error(error.stack);
-        }
-        os.exit(1);
+        catch (e) { fatal(e, `loading polyfill ${runtime.config.polyfill}`); }
     }
 
-    // Resolve entry file path
-    if (!entryFile.startsWith('.') && !entryFile.startsWith('/')) {
-        entryFile = fs.realpath(entryFile);
+    if (precache) {
+        try {
+            const info = runtime.resolver.resolve(entry, `${os.cwd}/<precache>`);
+            await runtime.precache(info.specPath, info.localPath);
+        } catch (e) {
+            // Non-fatal: pre-cache failure just means slower startup, not broken program
+            console.error(formatError(e, 'pre-caching'));
+        }
     }
 
     try {
-        console.debug(`[CJS] Entry file: ${entryFile}`);
-        // Import and execute entry file
-        await import(entryFile);
-    } catch (error) {
-        console.error('\n❌', error);
-        os.exit(1);
-    }
+        const mod = await runtime.loadEntry(entry, extra);
+        await mod.eval();
+    } catch (e) { fatal(e, entry); }
+
+    runtime.flushLock();
 }
 
-// Run main
-main().catch((error) => {
-    console.error('\n❌ Fatal error:', error);
-    os.exit(1);
-});
+async function runMain(): Promise<void> {
+    const cli    = createConfig({}) as RuntimeConfig & Record<string, any>;
+
+    // --help, -h
+    if (cli['help'] || cli['h']) {
+        showHelp();
+        os.exit(0);
+    }
+
+    // --version, -v
+    if (cli['version'] || cli['v']) {
+        showVersion();
+        os.exit(0);
+    }
+
+    // sub command
+    switch (cli._) {
+        case 'cache':
+            await runCacheCmd(cli._args ?? [], {
+                noLock: cli['no-lock'], lockDir: cli['lock-dir'],
+                cacheDir: cli.cacheDir, silent: cli.silent,
+            });
+            return;
+        case 'task':
+            await runTaskCmd(cli._args ?? []);
+            return;
+        case undefined:
+            showHelp();
+            os.exit(1);
+    }
+
+    // Warn on unknown flags (use raw CLI args, not normalized config)
+    warnUnknownFlags(cli._cli ?? cli);
+
+    sys.args.splice(0, cli._offset!);
+    const { entry, dir } = entryAndDir(cli._!);
+    const fileCfg = loadConfigFile(dir);
+
+    await run(entry, dir, {
+        ...fileCfg,
+        ...cli,
+    }, {}, !!cli.precache);
+}
+
+async function runWorker(): Promise<void> {
+    const data = worker.workerData as WorkerData;
+    const { entry, dir } = entryAndDir(data.__cts_entry);
+    await run(entry, dir, loadConfigFile(dir), { name: data.name });
+}
+
+(worker.isWorker ? runWorker : runMain)().catch(e => fatal(e));

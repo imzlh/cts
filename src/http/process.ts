@@ -3,10 +3,7 @@
  * Provides graphical progress bar for slow network connections
  */
 
-const engine = import.meta.use("engine");
-const timers = import.meta.use("timers");
-const fs = import.meta.use("fs");
-const os = import.meta.use("os");
+import { engine, timers, fs, os } from '../utils/index';
 
 export interface ProgressOptions {
     total?: number;          // Total bytes expected (0 = unknown)

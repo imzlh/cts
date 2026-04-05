@@ -11,12 +11,12 @@
   "author": "",
   "license": "MIT",
   "packageManager": "pnpm@10.17.1",
-  "dependencies": {
-    "headers-polyfill": "^4.0.3",
-    "sucrase": "^3.35.1"
-  },
   "devDependencies": {
+    "@jridgewell/gen-mapping": "^0.3.13",
     "esbuild": "^0.27.0",
+    "headers-polyfill": "^4.0.3",
+    "lines-and-columns": "^1.2.4",
+    "ts-interface-checker": "^1.0.2",
     "typescript": "^5.9.3"
   }
 }

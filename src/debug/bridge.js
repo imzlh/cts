@@ -1,6 +1,8 @@
-const sys = import.meta.use('sys');
-const engine = import.meta.use('engine');
-const fs = import.meta.use('fs');
+const useFN = import.meta.use;
+if (!useFN) throw new Error('not in cjs context')
+const sys = useFN('sys');
+const engine = useFN('engine');
+const fs = useFN('fs');
 const arg_0 = sys.args.splice(1, 1);
 
 const content = engine.decodeString(fs.readFile(arg_0));

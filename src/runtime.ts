@@ -1,168 +1,202 @@
-// runtime.ts - TypeScript Runtime Main Class
+// runtime.ts — TypeScriptRuntime
 
-import type { RuntimeConfig, NodeResolver } from './types';
-import { ModuleType } from './types';
-import { createConfig } from './config';
+import type { RuntimeConfig, NodeBuiltinResolver, ModuleInfo } from './types';
 import { ModuleResolver } from './resolver';
-import { ModuleLoader } from './loader';
-import { CodeTransformer } from './transformer';
-import { dirname, errMsg } from './utils';
+import { ModuleLoader }   from './loader';
+import { DepScanner }     from './deps';
+import { createConfig }   from './config';
+import { resources }      from './resources';
+import { dirname }        from './utils/path';
+import { writeText, ensureDir } from './utils/io';
+import { errMsg } from './utils/misc';
+import { console, engine, os, crypto, __use_fn } from './utils';
+import { log } from './utils/log';
 
-const engine = import.meta.use('engine');
-const console = import.meta.use('console');
+const SUPPORTED_ATTRS = new Set(['type', 'raw', 'text', 'bytes']);
 
-/**
- * TypeScript Runtime for QuickJS/tjs
- */
 export class TypeScriptRuntime {
-    private readonly resolver: ModuleResolver;
-    private readonly loader: ModuleLoader;
-    private readonly transformer: CodeTransformer;
-    private mainScript: string | null = null;
-    private config: RuntimeConfig;
-    private additionalMeta: Record<string, any> = {};
+    readonly resolver: ModuleResolver;
+    readonly loader:   ModuleLoader;
+    readonly config:   RuntimeConfig;
+    private readonly metaCache = new Map<string, Record<string, any>>();
 
-    static SUPPORTED_IMPORT_ATTRS = ['type', 'raw', 'text', 'bytes'];
-
-    constructor(config: RuntimeConfig) {
-        this.resolver = new ModuleResolver(config);
-        this.transformer = new CodeTransformer();
-        this.loader = new ModuleLoader(this.resolver, this.transformer, config);
-        this.config = config;
-        this.setupModuleLoader();
-
-        // also register to global
-        Reflect.set(globalThis, '__core', this);
+    constructor(cfg: RuntimeConfig, entryDir?: string) {
+        this.config   = cfg;
+        this.resolver = new ModuleResolver(
+            cfg,
+            cfg.noLock ? undefined : (cfg.lockDir ?? entryDir ?? os.cwd),
+            cfg.noLock ?? false,
+        );
+        this.loader = new ModuleLoader(this.resolver, cfg);
+        this.hookEngine();
+        this.hookEvents();
     }
 
-    /**
-     * Set up the QuickJS module loader hooks
-     */
-      private setupModuleLoader(): void {
-          engine.onModule({
-              resolve: (name: string, parent: string, attr?: Record<string, any>): string => {
-                  try {
-                      console.debug(`[runtime] Resolving module: name="${name}", parent="${parent}"`);
-                      const result = this.resolver.resolveWithType(name, parent, attr);
-                      const resolvedProtocol = result.path;
-                      const isCjs = result.isCjs;
-                      console.debug(`[runtime] Resolved to: "${resolvedProtocol}", isCjs: ${isCjs}`);
-                      if (!this.mainScript) {
-                          this.mainScript = resolvedProtocol;
-                          this.loader.setMainScript(resolvedProtocol);
-                          this.resolver.setMainEntry(resolvedProtocol);
-                          // @ts-ignore
-                          globalThis.__mainScript = resolvedProtocol;
-                          console.debug(`[runtime] Main script set to: "${resolvedProtocol}"`);
-                      }
-                      this.loader.preCacheModule(
-                          this.resolver.getLocalPath(resolvedProtocol).path,
-                          this.resolver.getLocalPath(parent).path
-                      );
+    // -------------------------------------------------------------------------
+    // Engine hooks
+    // -------------------------------------------------------------------------
 
-                      // Store isCjs info for load callback
-                      // @ts-ignore
-                      globalThis.__moduleType = globalThis.__moduleType || {};
-                      // @ts-ignore
-                      globalThis.__moduleType[resolvedProtocol] = isCjs ? 'cjs' : 'esm';
-
-                      // also add with attribute
-                      return resolvedProtocol + (attr?.type ? `?${attr.type}` : '');
-                  } catch (error) {
-                      console.debug(`[runtime] Resolution failed for "${name}" from "${parent}":`, error);
-                      throw new Error(`Cannot resolve module "${name}" from "${parent}": ${errMsg(error)}`);
-                  }
-              },
-
-              load: (modname: string) => {
-                  const localPathResult = this.resolver.getLocalPath(modname);
-                  const localPath = localPathResult.path;
-                  let moduleType = localPathResult.moduleType;
-
-                  // Check if we have stored module type from resolve
-                  // @ts-ignore
-                  if (globalThis.__moduleType?.[modname]) {
-                      // @ts-ignore
-                      const storedType = globalThis.__moduleType[modname];
-                      if (storedType === 'cjs') {
-                          moduleType = ModuleType.CJS;
-                      } else if (storedType === 'esm') {
-                          moduleType = ModuleType.ESM;
-                      }
-                  }
-
-                  const meta = {};
-                  this.initModule(meta, modname);
-                  return this.loader.loadModule(localPath, modname, meta, moduleType);
-              },
-              init: (protocolPath: string, importMeta: Record<string, any>): void => {
-                this.initModule(importMeta, protocolPath);
+    private hookEngine(): void {
+        engine.onModule({
+            resolve: (spec: string, parent: string, attr?: Record<string, any>): string => {
+                try {
+                    const info = this.resolver.resolve(spec, parent, attr);
+                    this.loader.preRegister(info.localPath, this.parentLocal(parent));
+                    return attr?.type ? `${info.specPath}?${attr.type}` : info.specPath;
+                } catch (e) {
+                    throw new Error(`Cannot resolve "${spec}" from "${parent}": ${errMsg(e)}`);
+                }
             },
 
-            attrchk: (attr) => {
-                if (Object.keys(attr).some(key => !TypeScriptRuntime.SUPPORTED_IMPORT_ATTRS.includes(key))) {
-                    // throw an error?
-                    console.trace(`Unsupported import attribute: ${JSON.stringify(attr)}`);
+            load: (specPath: string): CModuleEngine.Module => {
+                log.debug('runtime', () => `load hook called for ${specPath}`);
+                const info = this.resolver.getInfo(specPath);
+                const meta: Record<string, any> = {};
+                this.fillMeta(meta, info);
+                // Cache meta for init hook to apply
+                this.metaCache.set(specPath, meta);
+                try {
+                    const mod = this.loader.load(info, meta);
+                    // Clean up cache after load
+                    this.metaCache.delete(specPath);
+                    return mod;
                 }
+                catch (e) {
+                    this.metaCache.delete(specPath);
+                    if (e instanceof SyntaxError && (e.cause as any)?.source)
+                        this.reportSyntax(e);
+                    throw e;
+                }
+            },
+
+            init: (specPath: string, importMeta: Record<string, any>): void => {
+                log.debug('runtime', () => `init hook called for ${specPath}`);
+                // Apply cached meta if available (from load hook)
+                const cached = this.metaCache.get(specPath);
+                if (cached) {
+                    Object.assign(importMeta, cached);
+                    console.error(`[DEBUG] init applied cached meta, use=${typeof importMeta.use}`);
+                } else {
+                    this.fillMeta(importMeta, this.resolver.getInfo(specPath));
+                    console.error(`[DEBUG] init called fillMeta, use=${typeof importMeta.use}`);
+                }
+            },
+
+            attrchk: (attr: Record<string, any>): void => {
+                const unknown = Object.keys(attr).filter(k => !SUPPORTED_ATTRS.has(k));
+                if (unknown.length) log.debug('runtime', () => `unknown attrs: ${unknown.join(', ')}`);
             },
         });
     }
 
-    private initModule(importMeta: Record<string, any>, protocolPath: string): void {
-        importMeta.url = this.isRemoteProtocol(protocolPath)
-            ? protocolPath
-            : `file://${protocolPath}`;
-        importMeta.filename = protocolPath;
-        importMeta.dirname = dirname(protocolPath);
+    private hookEvents(): void {
+        // engine.onEvent((name: number, data: any) => {
+        //     const ET = engine.EventType;
+        //     if (name === ET.UNHANDLED_REJECTION) {
+        //         const r = Array.isArray(data) ? data[1] : data;
+        //         console.error(formatError(r, 'unhandled promise rejection'));
+        //         return false;
+        //     }
+        //     if (name === ET.JOB_EXCEPTION) {
+        //         console.error(formatError(data, 'unhandled job exception'));
+        //         return true;
+        //     }
+        //     return false;
+        // });
+    }
 
-        // No polyfill: use the original import.meta.use
-        // node protocol should be a part of internal
-        if (!this.config.polyfill || protocolPath.startsWith('node:')) {
-            importMeta.use = import.meta.use;
-            console.debug(`[runtime] No polyfill or node protocol, using original import.meta.use: ${importMeta.use}`);
+    // -------------------------------------------------------------------------
+    // import.meta
+    // -------------------------------------------------------------------------
+
+    // Reuse a single bound resolve function across all import.meta objects
+    private readonly metaResolve = (s: string, p: string, a?: Record<string, any>) =>
+        this.resolver.resolve(s, p, a).specPath;
+
+    private static isRemote(sp: string): boolean {
+        return sp.startsWith('jsr:') || sp.startsWith('http://') || sp.startsWith('https://');
+    }
+
+    private fillMeta(meta: Record<string, any>, info: ModuleInfo): void {
+        const remote  = TypeScriptRuntime.isRemote(info.specPath);
+        meta.url      = remote ? info.specPath : `file://${info.localPath}`;
+        meta.filename = info.localPath;
+        meta.dirname  = dirname(info.localPath);
+        meta.main     = info.specPath === this.resolver.entry;
+        meta.use      = __use_fn;
+        meta.resolve  = this.metaResolve;
+    }
+
+    private parentLocal(parent: string): string {
+        try { return this.resolver.getInfo(parent).localPath; }
+        catch { return parent; }
+    }
+
+    // -------------------------------------------------------------------------
+    // Pre-cache: async parallel BFS, then full resource cleanup
+    // -------------------------------------------------------------------------
+
+    async precache(entrySpecPath: string, entryLocalPath: string): Promise<void> {
+        const scanner = new DepScanner(this.resolver, this.config);
+        let result;
+        try {
+            result = await scanner.scan(entrySpecPath, entryLocalPath);
+        } finally {
+            // Always release pre-cache resources, even if scan threw
+            resources.release();
         }
-
-        // Set main flag
-        importMeta.main = this.mainScript === protocolPath;
-
-        // add resolve function to import.meta
-        importMeta.resolve = (name: string, parent: string, attr?: Record<string, any>): string => {
-            return this.resolver.resolve(name, parent, attr);
-        };
-
-        // user-defined meta
-        Object.assign(importMeta, this.additionalMeta);
+        for (const { spec, parent, error } of result.errors)
+            log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
+        this.resolver.rewriteLock();
     }
 
-    /**
-     * Check if path is a remote protocol
-     */
-    private isRemoteProtocol(path: string): boolean {
-        return path.startsWith('jsr:') ||
-            path.startsWith('http://') ||
-            path.startsWith('https://');
+    // -------------------------------------------------------------------------
+    // Polyfill + entry — release resources before handing to user code
+    // -------------------------------------------------------------------------
+
+    async loadPolyfill(path: string): Promise<void> {
+        const info = this.resolver.resolve(path, `${os.cwd}/<polyfill>`);
+        const meta = {} as Record<string, any>;
+        info.format = 'esm';    // polyfill is always ESM!
+        this.fillMeta(meta, info);
+        meta.polyfill = true;
+        await this.loader.load(info, meta).eval();
+        log.debug('runtime', () => `polyfill: ${info.specPath}`);
     }
 
-    /**
-     * Get main script path
-     */
-    getMainScript(): string | null {
-        return this.mainScript;
+    async loadEntry(path: string, extra: Record<string, any> = {}): Promise<CModuleEngine.Module> {
+        // Release any leftover pre-cache resources before user code starts.
+        // This is a no-op if precache() was never called or already cleaned up.
+        resources.release();
+
+        const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
+        const meta: Record<string, any> = { main: true, ...extra };
+        this.fillMeta(meta, info);
+        return this.loader.load(info, meta);
     }
 
-    get rtConfig(): RuntimeConfig {
-        return this.config;
+    registerNodeResolver(r: NodeBuiltinResolver): void {
+        this.resolver.registerNodeResolver(r);
     }
 
-    set rtConfig(config: Partial<RuntimeConfig>) {
-        Object.assign(this.config, config);
+    flushLock(): void   { this.resolver.flushLock(); }
+    get rtConfig(): RuntimeConfig { return this.config; }
+
+    private reportSyntax(e: SyntaxError): never {
+        const { source, code, path } = e.cause as { source: SyntaxError; code: string; path: string };
+        const hash    = crypto.hexEncode(crypto.md5(engine.encodeString(path)));
+        const logPath = `${this.config.cacheDir}/fail-${hash}.log`;
+        ensureDir(dirname(logPath));
+        writeText(logPath, [
+            `cts SyntaxError (${new Date().toISOString()})`,
+            `${source.name}: ${source.message}`, source.stack ?? '',
+            '-'.repeat(50), `File: ${path}`,
+            code.split('\n').map((l, i) => `${(i+1).toString().padStart(4)} | ${l}`).join('\n'),
+        ].join('\n'));
+        throw new SyntaxError(`${source.message} (see ${logPath})`, { cause: e.cause });
     }
 }
 
-/**
- * Create and initialize runtime with configuration
- */
-export function createRuntime(userConfig: Partial<RuntimeConfig> = {}): TypeScriptRuntime {
-    const config = createConfig(userConfig);
-    return new TypeScriptRuntime(config);
+export function createRuntime(cfg: Partial<RuntimeConfig> = {}, entryDir?: string): TypeScriptRuntime {
+    return new TypeScriptRuntime(createConfig(cfg), entryDir);
 }

@@ -12,16 +12,7 @@
  * - 0 = EAGAIN (try again, no data available now)
  * - n > 0 = bytes read
  */
-
-import { hexDump } from "./debug";
-
-const streams = import.meta.use("streams");
-const ssl     = import.meta.use("ssl");
-const dns     = import.meta.use("dns");
-const os      = import.meta.use("os");
-const timers  = import.meta.use("timers");
-const fs      = import.meta.use("fs");
-const console = import.meta.use("console");
+import { streams, ssl, dns, os, timers, fs, console } from '../utils';
 
 // Local assertion function to avoid circular dependency
 function assert(condition: any, message?: string): asserts condition {
