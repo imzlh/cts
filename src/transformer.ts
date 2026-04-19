@@ -2,10 +2,10 @@
 
 import { transform, type Transform, type Options } from '../deps/sucrase/src/index';
 import { errMsg } from './utils/misc';
-
-const smap    = __use_fn('sourcemap');
 import { log } from './utils/log';
 import { __use_fn } from './utils';
+
+const smap    = __use_fn('sourcemap');
 
 const BASE: Partial<Options> = { disableESTransforms: true, production: false };
 

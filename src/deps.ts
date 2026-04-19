@@ -4,7 +4,7 @@
 //   1. Parse a batch of already-local files simultaneously (asyncfs)
 //      → collect all import specifiers
 //   2. Resolve specifiers → split: already-cached vs needs-download
-//   3. Fire ALL downloads for this level in parallel (Promise.allSettled + curl)
+//   3. Fire ALL downloads for this level in parallel (Promise.allSettled + async TCP)
 //   4. Newly downloaded files form the next batch → repeat from 1
 //
 // Net effect: every file at the same BFS depth is downloaded concurrently.
@@ -20,7 +20,7 @@ import { ensureDir } from './utils/io';
 import { dirname, extname } from './utils/path';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';
-import { fetchAsync } from './utils/curl';
+import { fetchAsync } from './http/async_client';
 import { MultiProgress } from './utils/progress';
 import { fs, engine, asyncfs } from './utils/index';
 
@@ -76,9 +76,15 @@ function findFromString(
     tokens: ReturnType<typeof parse>['tokens'],
     start:  number,
 ): number {
-    const limit = Math.min(start + 64, tokens.length);
+    const limit = Math.min(start + 80, tokens.length);
+    let braceDepth = 0;
     for (let i = start; i < limit; i++) {
         const t = tokens[i]!;
+        // Track brace depth to skip over { Foo, Bar } in export type { ... } from '...'
+        if (t.type === tt.braceL) { braceDepth++; continue; }
+        if (t.type === tt.braceR) { braceDepth--; continue; }
+        // Only look for 'from' when not inside braces
+        if (braceDepth > 0) continue;
         if (t.type === tt.semi) break;
         if (t.type === tt.name &&
             t.contextualKeyword === ContextualKeyword._from &&
@@ -163,7 +169,7 @@ export class DepScanner {
                 batch = next;
             }
         } finally {
-            // Always stop progress display; curl pool is released by resources.ts
+            // Always stop progress display; connection pool is released by resources.ts
             prog?.stop();
         }
 
@@ -194,7 +200,7 @@ export class DepScanner {
     }
 
     // -------------------------------------------------------------------------
-    // Download a batch of files with libcurl — all concurrent
+    // Download a batch of files with async TCP — all concurrent
     // -------------------------------------------------------------------------
 
     private async downloadLevel(

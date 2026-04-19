@@ -5,8 +5,9 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { normalizePath } from '../utils/path';
 import { detectFormat } from '../pkg';
-import { sys, fs } from '../utils/index';
+import { fs, os } from '../utils/index';
 
+const osname = os.uname().sysname;
 export class FileHandler implements ProtocolHandler {
     readonly protocols = ['file'];
     constructor(_cfg: RuntimeConfig) {}
@@ -25,7 +26,7 @@ export class FileHandler implements ProtocolHandler {
 
     private strip(url: string): string {
         let p = url.startsWith('file://') ? url.slice(7) : url;
-        if (p.startsWith('/') && sys.platform === 'win32' && p.length > 2 && p[2] === ':')
+        if (p.startsWith('/') && osname === 'win32' && p.length > 2 && p[2] === ':')
             p = p.slice(1);
         return normalizePath(p);
     }

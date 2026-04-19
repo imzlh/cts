@@ -25,11 +25,17 @@ export class NodeHandler implements ProtocolHandler {
         // from node:fs/sync should resolve to node:fs/utils (not node:fs/sync/utils)
         if ((bare.startsWith('./') || bare.startsWith('../')) && parent.startsWith('node:')) {
             const parentBare = parent.slice(5); // e.g., "fs" or "fs/sync" from "node:fs" or "node:fs/sync"
-            const normalizedBare = bare.startsWith('./') ? bare.slice(2) : bare;
             const topModule = parentBare.split('/')[0]!; // e.g., "fs" from "fs/sync"
-            const joinedBare = normalizePath(joinPaths(topModule, normalizedBare)); // e.g., "path" from "fs/../path"
-            const localPath = this.findPolyfill(joinedBare);
-            const specPath  = `node:${joinedBare}`;
+            // Resolve relative path against the parent's directory within the top module
+            const parentDir = parentBare.includes('/') ? dirname(parentBare) : parentBare;
+            const resolved = normalizePath(joinPaths(parentDir, bare));
+            // Security: ensure the resolved path doesn't escape the top module's namespace
+            // e.g., fs/../path is OK (resolves to path), but fs/../../other is not
+            if (!resolved.startsWith(topModule) && !resolved.startsWith(topModule + '/')) {
+                throw new Error(`Relative import "${bare}" from "${parent}" escapes module boundary "${topModule}"`);
+            }
+            const localPath = this.findPolyfill(resolved);
+            const specPath  = `node:${resolved}`;
             return { specPath, localPath, format: detectFormat(localPath), fileKind: 'source' };
         }
 

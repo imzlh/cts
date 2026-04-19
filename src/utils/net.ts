@@ -2,14 +2,15 @@
 
 import { URL } from '../http/url';
 import { type ConnectionConfig, connectionManager } from '../http/connection';
-import { HttpRequestBuilder, HttpResponseParser } from '../http/http';
+import { HttpRequestBuilder, HttpResponseParser, type HttpVersion } from '../http/http';
 import { HttpProgressBar } from '../http/process';
-import { engine, console } from './index';
+import { engine } from './index';
+import { version } from '../../package.json';
 
 const PROGRESS_MIN  = 32 * 1024;
 const MAX_REDIRECTS = 8;
 
-export function fetchBytes(url: string, showProgress = false): Uint8Array<ArrayBuffer> {
+export function fetchBytes(url: string, showProgress = false, httpVersion: HttpVersion = '1.1'): Uint8Array<ArrayBuffer> {
     let cur = url;
     for (let n = 0; n <= MAX_REDIRECTS; n++) {
         const u    = new URL(cur);
@@ -21,12 +22,14 @@ export function fetchBytes(url: string, showProgress = false): Uint8Array<ArrayB
         try {
             conn.write(new HttpRequestBuilder(u, {
                 method: 'GET',
-                headers: { 'User-Agent': 'cts/2.0', Accept: '*/*', Connection: 'keep-alive' },
+                version: httpVersion,
+                headers: { 'User-Agent': 'cts/' + version, Accept: '*/*' },
             }).build());
 
             const parser = new HttpResponseParser();
             let status   = 0, location = '';
             let contentLength = 0;
+            let isHttp10 = false;
 
             // Pre-allocated buffer — avoids O(n²) copies when Content-Length is known
             let buf: Uint8Array | null = null;
@@ -39,6 +42,7 @@ export function fetchBytes(url: string, showProgress = false): Uint8Array<ArrayB
                 status = code;
                 location = hdrs?.get?.('location') ?? '';
                 contentLength = +(hdrs?.get?.('content-length') ?? 0);
+                isHttp10 = parser.isHttp10;
                 if (contentLength > 0) {
                     buf = new Uint8Array(contentLength);
                 } else {
@@ -72,22 +76,47 @@ export function fetchBytes(url: string, showProgress = false): Uint8Array<ArrayB
             };
             parser.onError = (e: Error) => { throw e; };
 
+            // HTTP/1.0 without Content-Length and without chunked transfer:
+            // the response body is terminated by connection close (EOF).
+            // In this case, we read until EOF (conn.read returns null).
             while (!parser.isCompleted) {
                 const d = conn.read(128 * 1024, true);
-                if (!d) break;
+                if (!d) {
+                    // EOF — connection closed by server.
+                    // For HTTP/1.0 without Content-Length, this signals end of body.
+                    // Mark the parser as completed so we can return what we have.
+                    if (isHttp10 && !contentLength && parser.isHeadersComplete && !parser.isCompleted) {
+                        // Force completion for HTTP/1.0 EOF-terminated responses
+                        break;
+                    }
+                    break;
+                }
                 parser.feed(d);
             }
-            if (!parser.isCompleted) throw new Error('Incomplete HTTP response');
+            if (!parser.isCompleted && !(isHttp10 && !contentLength)) {
+                throw new Error('Incomplete HTTP response');
+            }
             let _bar: HttpProgressBar | null = bar as any;  // type cast
             let _buf: Uint8Array<ArrayBuffer> | null = buf as any;
             _bar?.complete(); bar = null;
 
             if (status >= 300 && status < 400 && location) {
-                connectionManager.release(cfg, conn);
+                // HTTP/1.0 servers may send Connection: close with redirects
+                // Always close the connection for HTTP/1.0 redirects
+                if (isHttp10) {
+                    conn.close();
+                } else {
+                    connectionManager.release(cfg, conn);
+                }
                 cur = location.startsWith('/') ? new URL(location, cur).toString() : location;
                 continue;
             }
-            connectionManager.release(cfg, conn);
+            // HTTP/1.0 connections are not keep-alive by default
+            if (isHttp10) {
+                conn.close();
+            } else {
+                connectionManager.release(cfg, conn);
+            }
             if (status < 200 || status >= 300) throw new Error(`HTTP ${status} ${cur}`);
 
             // Return the body
@@ -108,4 +137,4 @@ export function fetchBytes(url: string, showProgress = false): Uint8Array<ArrayB
     throw new Error(`Too many redirects: ${url}`);
 }
 
-export const fetchText = (url: string) => engine.decodeString(fetchBytes(url));
+export const fetchText = (url: string, httpVersion?: HttpVersion) => engine.decodeString(fetchBytes(url, false, httpVersion));

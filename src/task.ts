@@ -11,7 +11,7 @@
 import { dirname, joinPaths } from './utils/path';
 import { readText } from './utils/io';
 import { stripJsonc, safeParse, errMsg } from './utils/misc';
-import { sys, fs, process, console } from './utils/index';
+import { fs, process, console, os } from './utils/index';
 import { log } from './utils/log';
 
 
@@ -115,6 +115,7 @@ function tokenize(cmd: string): string[] {
     return tokens;
 }
 
+const osname = os.uname().sysname;
 /**
  * Execute a single command string.
  * If it starts with `deno run`, rewrites to a cts invocation.
@@ -140,17 +141,17 @@ async function execCommand(
             return 1;
         }
         // Re-invoke ourselves: cts <stripped...> <extraArgs...>
-        prog = sys.exePath;
+        prog = os.exePath;
         argv = [...stripped, ...extraArgs];
         log.debug('task', () => `deno run → cts ${argv.join(' ')}`);
     } else if (tokens[0] === 'deno' && tokens[1] === 'task') {
         // Nested `deno task <name>` — just re-exec ourselves
-        prog = sys.exePath;
+        prog = os.exePath;
         argv = ['task', ...(tokens.slice(2)), ...extraArgs];
     } else {
         // Generic shell command
-        const shell = sys.platform === 'win32' ? 'cmd' : '/bin/sh';
-        const shellArg = sys.platform === 'win32' ? '/c' : '-c';
+        const shell = osname === 'win32' ? 'cmd' : '/bin/sh';
+        const shellArg = osname === 'win32' ? '/c' : '-c';
         // Append extra args to the command string
         const fullCmd = extraArgs.length
             ? `${cmd} ${extraArgs.map(a => JSON.stringify(a)).join(' ')}`
@@ -163,17 +164,13 @@ async function execCommand(
     const mergedEnv: Record<string, string> = {};
     // We can't enumerate the current env in QuickJS easily, so we rely on
     // spawn inheriting it and only passing the extras.
-    const child = process.spawn(prog, argv, {
+    const child = process.spawn([prog, ...argv], {
         stdin:  'inherit',
         stdout: 'inherit',
         stderr: 'inherit',
-        // env merge is not supported in all runtimes; pass extras via workaround
-        // In practice, spawn inherits the parent env automatically.
+        env,
+        cwd
     });
-
-    // Set task-local env vars before spawning isn't universally possible.
-    // For now, prefix them to the shell command.
-    // TODO: if process.spawn gains env support, use it here.
 
     const info = await child.wait();
     return info.exit_status ?? 0;

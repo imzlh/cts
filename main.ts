@@ -6,14 +6,13 @@ import { loadTasks } from './src/task';
 import { fatal, formatError } from './src/errors';
 import { dirname } from './src/utils/path';
 import type { ConfigOptions, RuntimeConfig } from './src/types';
-import { os, sys, console, worker, process } from './src/utils';
+import { os, console, worker, process } from './src/utils';
 import { log } from './src/utils/log';
+import { version } from './package.json';
 
 // debug
 (globalThis as any).console = console;
 (globalThis as any).process = process;
-
-const VERSION = '2.5.6';
 
 interface WorkerData { __cts_entry: string; name?: string }
 
@@ -35,12 +34,12 @@ const C = {
 // ---------------------------------------------------------------------------
 
 function showVersion(): void {
-    console.log(`cts/${VERSION}`);
+    console.log(`cts/${version}`);
 }
 
 function showHelp(): void {
     console.log(`
-${C.bold('cts2')} v${VERSION} — TypeScript runner for circu.js
+${C.bold('cts2')} v${version} — TypeScript runner for circu.js
 
 ${C.bold('USAGE')}
   ${C.cyan('cts')} [options] ${C.cyan('<file.ts>')} [args…]
@@ -207,7 +206,7 @@ async function runMain(): Promise<void> {
     // Warn on unknown flags (use raw CLI args, not normalized config)
     warnUnknownFlags(cli._cli ?? cli);
 
-    sys.args.splice(0, cli._offset!);
+    os.args.splice(0, cli._offset!);
     const { entry, dir } = entryAndDir(cli._!);
     const fileCfg = loadConfigFile(dir);
 

@@ -1,6 +1,6 @@
 // utils/path.ts — pure path utilities
 
-import { sys, os } from './index';
+import { os } from './index';
 
 export function basename(p: string, ext?: string): string {
     const s = p.replace(/\\/g, '/').replace(/\/$/, '');
@@ -12,7 +12,8 @@ export function basename(p: string, ext?: string): string {
 export function dirname(p: string): string {
     const s = p.replace(/\\/g, '/');
     const i = s.lastIndexOf('/');
-    return i > 0 ? s.slice(0, i) : '.';
+    if (i <= 0) return i === 0 ? '/' : '.';
+    return s.slice(0, i);
 }
 
 export function extname(p: string): string {
@@ -43,8 +44,9 @@ export function resolvePath(...parts: string[]): string {
     return normalizePath(r);
 }
 
+const sysname = os.uname().sysname;
 export function isAbsolute(p: string): boolean {
     if (p.startsWith('/')) return true;
-    if (sys.platform === 'win32' && /^[a-zA-Z]:[/\\]/.test(p)) return true;
+    if (sysname === 'win32' && /^[a-zA-Z]:[/\\]/.test(p)) return true;
     return false;
 }

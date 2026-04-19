@@ -139,5 +139,5 @@ export class LockStore {
 }
 
 function isRemote(sp: string): boolean {
-    return sp.startsWith('node:') || sp.startsWith('npm:') || sp.startsWith('jsr:') || sp.startsWith('http:') || sp.startsWith('data:');
+    return sp.startsWith('node:') || sp.startsWith('npm:') || sp.startsWith('jsr:') || sp.startsWith('http:') || sp.startsWith('https:') || sp.startsWith('data:');
 }

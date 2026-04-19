@@ -220,8 +220,9 @@ export class ModuleResolver {
         const pp = protoOf(parent);
         if (pp) { const h = this.handlers.get(pp); if (h) return h.resolve(spec, parent, attr); }
         let base = parent.startsWith('file://') ? parent.slice(7) : parent;
-        if (!base.startsWith('/')) base = dirname(base);
-        else base = dirname(base);
+        // Ensure base is an absolute path for correct relative resolution
+        if (!isAbsolute(base)) base = joinPaths(this.cfg.cacheDir, base);
+        base = dirname(base);
         const joined = base + '/' + spec;
         const localPath = resolveFile(normalizePath(joined));
         const specPath = localPath;

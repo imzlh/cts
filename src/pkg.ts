@@ -108,7 +108,12 @@ export function resolveExports(ctx: ResolveCtx, sub = '.'): string | null {
 }
 
 function conds(ctx: ResolveCtx): string[] {
-    return ctx.forceCjs ? ['require','default'] : ['import','module','default','require'];
+    // Standard condition resolution order per Node.js algorithm:
+    // ESM: import > module > default > require
+    // CJS: require > default
+    // Also include 'browser' and 'types' for broader compatibility
+    if (ctx.forceCjs) return ['require', 'default', 'browser', 'types'];
+    return ['import', 'module', 'default', 'require', 'browser', 'types'];
 }
 
 function resolvePath(ctx: ResolveCtx, p: string): string | null {

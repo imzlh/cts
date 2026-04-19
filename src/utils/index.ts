@@ -12,7 +12,6 @@ if (!useFn) throw new Error('Fatal: Not running in CJS environment');
 
 export const asyncfs = useFn('asyncfs');
 export const fs = useFn('fs');
-export const sys = useFn('sys');
 export const os = useFn('os');
 export const console = useFn('console');
 export const worker = useFn('worker');

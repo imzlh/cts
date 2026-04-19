@@ -187,21 +187,20 @@ class URLSearchParams implements URLSearchParams {
         const nameStr = String(name);
         const valueStr = String(value);
 
+        // Remove all entries with this name, keeping the first one's position
         let found = false;
-        this.#params = this.#params.filter(([k, v]) => {
+        this.#params = this.#params.filter(([k]) => {
             if (k === nameStr) {
-                if (!found) {
-                    found = true;
-                    return true;
-                }
+                if (!found) { found = true; return true; }
                 return false;
             }
             return true;
         });
 
+        // Replace the first occurrence's value, or append if not found
         if (found) {
-            const index = this.#params.findIndex(([k]) => k === nameStr);
-            this.#params[index] = [nameStr, valueStr];
+            const entry = this.#params.find(([k]) => k === nameStr);
+            entry![1] = valueStr;
         } else {
             this.#params.push([nameStr, valueStr]);
         }
@@ -375,28 +374,27 @@ class URL {
             input = authorityEnd === -1 ? '' : input.slice(authorityEnd);
 
             this.#parseAuthority(authority);
-        } else if (input.startsWith('/') && this.#scheme !== 'file') {
-            // Handle case where there's only one slash after scheme (e.g., https:/example.com)
-            // This is not standard but should be handled gracefully
-            input = input.slice(1);
-            
-            const authorityEnd = input.search(/[/?#]/);
-            const authority = authorityEnd === -1 ? input : input.slice(0, authorityEnd);
-            input = authorityEnd === -1 ? '' : input.slice(authorityEnd);
-
-            this.#parseAuthority(authority);
         } else if (baseUrl && this.#scheme === baseUrl.#scheme) {
+            // Same-scheme relative URL without authority — inherit base authority
             this.#username = baseUrl.#username;
             this.#password = baseUrl.#password;
             this.#host = baseUrl.#host;
             this.#port = baseUrl.#port;
-            
-            // For relative paths, inherit the directory path from base URL
-            // Remove the last segment (filename) from the base path
-            this.#path = [...baseUrl.#path];
-            if (this.#path.length > 0) {
-                this.#path.pop();
+
+            if (input.startsWith('/') || !input) {
+                // Absolute-path or empty: replace entire path
+                this.#path = [];
+            } else {
+                // Relative path: inherit base path directory
+                this.#path = [...baseUrl.#path];
+                if (this.#path.length > 0) {
+                    this.#path.pop();
+                }
             }
+        } else if (input.startsWith('/') && isSpecial && this.#scheme !== 'file') {
+            // Non-standard but tolerant: single slash after special scheme
+            // (e.g., https:/example.com) — treat as path, not authority
+            // This matches browser behaviour where host stays empty
         }
 
         // 解析 path
@@ -425,9 +423,14 @@ class URL {
         this.#scheme = 'file';
         path = normalizeWindowsPath(path);
 
-        // C:/aaa/bbb -> /C:/aaa/bbb
-        this.#path = path.split('/').filter(p => p);
-        this.#path.unshift(''); // 添加前导空元素以生成 /C:/aaa
+        // C:/aaa/bbb -> ['', 'C:', 'aaa', 'bbb']
+        // The leading empty string ensures pathname starts with /
+        // and toString() produces file:///C:/aaa/bbb (3 slashes)
+        const parts = path.split('/');
+        this.#path = [''];
+        for (const p of parts) {
+            if (p) this.#path.push(p);
+        }
     }
 
     #parseUnixPath(path: string): void {
@@ -500,8 +503,18 @@ class URL {
                 continue;
             }
             if (segment === '..') {
-                if (this.#path.length > 0 && this.#path[this.#path.length - 1] !== '..') {
-                    this.#path.pop();
+                if (isSpecial) {
+                    // Special schemes: compress .. (cannot go above root)
+                    if (this.#path.length > 0 && this.#path[this.#path.length - 1] !== '..') {
+                        this.#path.pop();
+                    }
+                } else {
+                    // Non-special schemes: preserve .. in path
+                    if (this.#path.length > 0 && this.#path[this.#path.length - 1] !== '..') {
+                        this.#path.pop();
+                    } else {
+                        this.#path.push('..');
+                    }
                 }
             } else {
                 this.#path.push(segment);
@@ -699,23 +712,15 @@ class URL {
 
     toString(): string {
         let result = this.#scheme + ':';
-        
-        
-        
-        
+
 
         if (this.#host || this.#scheme === 'file') {
-            // File URLs need special handling
             if (this.#scheme === 'file') {
-                // Check if the path already starts with a slash
-                const pathStr = this.pathname;
-                if (pathStr.startsWith('/')) {
-                    result += '//' + pathStr;  // Only add two slashes if path already has one
-                } else {
-                    result += '///' + pathStr;  // Add three slashes for relative paths
-                }
-                
-                // Add query and fragment if present
+                // file:// is always present; pathname already includes leading /
+                // e.g. pathname = /C:/aaa/bbb -> file:///C:/aaa/bbb
+                // e.g. pathname = /aaa/bbb   -> file:///aaa/bbb
+                result += '//' + this.pathname;
+
                 if (this.#query !== null && this.#query !== '') {
                     result += '?' + this.#query;
                 }
@@ -724,8 +729,7 @@ class URL {
                 }
                 return result;
             } else {
-                result += '//';  // Add double slash for URLs with host
-                
+                result += '//';
             }
             
             if (this.#username || this.#password) {

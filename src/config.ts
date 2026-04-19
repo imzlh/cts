@@ -5,7 +5,7 @@ import { dirname, joinPaths } from './utils/path';
 import { readText, writeText, ensureDir } from './utils/io';
 import { stripJsonc, safeParse, parseArgs } from './utils/misc';
 import { log } from './utils/log';
-import { os, sys, fs, engine } from './utils/index';
+import { os, fs, engine } from './utils/index';
 
 
 // ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ function envConfig(): Partial<ConfigOptions> {
 function defaultCacheDir(): string {
     let home: string | null = null;
     try { home = os.homedir; } catch {}
-    if (!home) home = env(sys.platform === 'win32' ? 'USERPROFILE' : 'HOME') ?? '/root';
+    if (!home) home = env(os.uname().sysname === 'win32' ? 'USERPROFILE' : 'HOME') ?? '/root';
     return joinPaths(home, '.cts');
 }
 
@@ -129,7 +129,7 @@ function getEnv(name: string): string | null {
 }
 
 export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeConfig {
-    const cli = parseArgs(sys.args.slice(1), CLI_TPL);
+    const cli = parseArgs(os.args.slice(1), CLI_TPL);
     const cfg = { ...DEFAULTS, ...envConfig(), ...userConfig } as RuntimeConfig;
 
     if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || getEnv('CTS_CACHE_DIR') || '';
@@ -215,7 +215,7 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             foundPkg = true;
         }
 
-        if (foundTsconfig && foundDeno) break;
+        if (foundTsconfig || foundDeno) break;
     }
 
     return cfg;

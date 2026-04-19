@@ -9,7 +9,9 @@ import { fetchBytes, fetchText } from '../utils/net';
 import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
 import { detectFormat, readPkgFresh, createCtx, resolveSubpath } from '../pkg';
 import { log } from '../utils/log';
-import { fs, os, sys, console } from '../utils/index';
+import { fs, os, console } from '../utils/index';
+
+const osname = os.uname().sysname;
 
 // ---------------------------------------------------------------------------
 // npm config (registry, auth)
@@ -56,31 +58,39 @@ interface ParsedNpmSpec { name: string; version: string; subpath: string }
 
 function parseNpmSpec(raw: string): ParsedNpmSpec {
     let rest = raw.startsWith('npm:') ? raw.slice(4).replace(/^\//, '') : raw;
+    // Strip leading slashes to handle npm://@scope/pkg etc.
+    while (rest.startsWith('/')) rest = rest.slice(1);
     let name = '', ver = '', sub = '';
 
     if (rest.startsWith('@')) {
         const sl = rest.indexOf('/');
-        if (sl === -1) throw new Error(`Invalid scoped package: ${raw}`);
+        if (sl === -1 || sl === 1) throw new Error(`Invalid scoped package: ${raw}`);
         const scope = rest.slice(0, sl); rest = rest.slice(sl + 1);
         const at = rest.indexOf('@'), sl2 = rest.indexOf('/');
         if (at !== -1 && (sl2 === -1 || at < sl2)) {
             name = `${scope}/${rest.slice(0, at)}`;
-            const after = rest.slice(at + 1); const sl3 = after.indexOf('/');
+            const after = rest.slice(at + 1);
+            if (!after) throw new Error(`Invalid npm specifier (empty version): ${raw}`);
+            const sl3 = after.indexOf('/');
             ver = sl3 === -1 ? after : after.slice(0, sl3);
             sub = sl3 === -1 ? '' : after.slice(sl3 + 1);
         } else if (sl2 !== -1) {
             name = `${scope}/${rest.slice(0, sl2)}`; sub = rest.slice(sl2 + 1);
         } else { name = `${scope}/${rest}`; }
     } else {
+        if (!rest) throw new Error(`Invalid npm specifier (empty): ${raw}`);
         const at = rest.indexOf('@'), sl = rest.indexOf('/');
         if (at !== -1 && (sl === -1 || at < sl)) {
             name = rest.slice(0, at);
-            const after = rest.slice(at + 1); const sl2 = after.indexOf('/');
+            const after = rest.slice(at + 1);
+            if (!after) throw new Error(`Invalid npm specifier (empty version): ${raw}`);
+            const sl2 = after.indexOf('/');
             ver = sl2 === -1 ? after : after.slice(0, sl2);
             sub = sl2 === -1 ? '' : after.slice(sl2 + 1);
         } else if (sl !== -1) { name = rest.slice(0, sl); sub = rest.slice(sl + 1); }
         else name = rest;
     }
+    if (!name) throw new Error(`Invalid npm specifier (no package name): ${raw}`);
     return { name, version: ver || 'latest', subpath: sub };
 }
 
@@ -240,7 +250,7 @@ export class NpmHandler implements ProtocolHandler {
         const search: string[] = [];
         if (parent) {
             let d = dirname(parent.startsWith('npm:') ? joinPaths(this.cacheDir, name) : parent);
-            const root = sys.platform === 'win32' ? d.split(':')[0] + ':/' : '/';
+            const root = osname === 'win32' ? d.split(':')[0] + ':/' : '/';
             while (d && d !== root) {
                 search.push(joinPaths(d, 'node_modules'));
                 const up = dirname(d); if (up === d) break; d = up;

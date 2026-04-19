@@ -5,7 +5,7 @@
 //
 // Design: explicit cleanup rather than finalizers.
 // The pre-cache phase uses:
-//   - libcurl ConnPool (async HTTP)
+//   - TCP connection pool (async HTTP via async_client.ts)
 //   - TCP connection pool in net.ts (sync HTTP, used by protocol handlers)
 //   - pkg/io resolution caches (may hold stale data from scan phase)
 //   - progress timer (setInterval)
@@ -14,7 +14,6 @@
 //   - Caches reflect post-install state
 //   - No background timers consume CPU
 
-import { closePool }          from './utils/curl';
 import { clearResolveCache }  from './utils/io';
 import { clearPkgCache }      from './pkg';
 import { connectionManager }  from './http/connection';
@@ -51,7 +50,7 @@ const mgr = new ResourceManager();
 export const resources = {
     /**
      * Register a cleanup function to be called before user code runs.
-     * Called automatically for curl pool, connection pool, caches.
+     * Called automatically for connection pool, caches.
      */
     register: (fn: Cleanup) => mgr.register(fn),
 
@@ -68,12 +67,7 @@ export const resources = {
 // ---------------------------------------------------------------------------
 
 resources.register(() => {
-    // Close libcurl pool (async HTTP used during dep scan)
-    closePool();
-});
-
-resources.register(() => {
-    // Close all keep-alive TCP connections opened by sync fetchBytes()
+    // Close all keep-alive TCP connections opened by sync/async fetch
     // (protocol handlers call this during pre-cache too)
     connectionManager.closeAll();
 });

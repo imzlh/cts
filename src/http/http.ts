@@ -27,16 +27,23 @@ export type HttpMethod =
     | 'HEAD' | 'OPTIONS' | 'CONNECT' | 'TRACE' | string;
 
 /**
+ * HTTP 版本
+ */
+export type HttpVersion = '1.0' | '1.1';
+
+/**
  * HTTP 请求构建器
  */
 export class HttpRequestBuilder {
     private method: HttpMethod = 'GET';
+    private version: HttpVersion = '1.1';
     private url: URL;
     private headers: Headers = new Headers();
     private body: Uint8Array | null = null;
 
     constructor(url: string | URL, options?: {
         method?: HttpMethod;
+        version?: HttpVersion;
         headers?: HeadersInit;
         body?: BodyInit | null;
     }) {
@@ -44,6 +51,10 @@ export class HttpRequestBuilder {
 
         if (options?.method) {
             this.method = options.method.toUpperCase() as HttpMethod;
+        }
+
+        if (options?.version) {
+            this.version = options.version;
         }
 
         if (options?.headers) {
@@ -101,9 +112,15 @@ export class HttpRequestBuilder {
             this.headers.set('user-agent', 'circu.js/cno');
         }
 
+        // HTTP/1.0 defaults to Connection: close; HTTP/1.1 defaults to keep-alive
+        // Only set if not already specified by the caller
+        if (!this.headers.has('connection')) {
+            this.headers.set('connection', this.version === '1.0' ? 'close' : 'keep-alive');
+        }
+
         // 构建请求行
         const path = this.url.pathname + this.url.search;
-        let request = `${this.method} ${path} HTTP/1.1\r\n`;
+        let request = `${this.method} ${path} HTTP/${this.version}\r\n`;
 
         for (const [key, value] of this.headers) {
             request += `${key}: ${value}\r\n`;
@@ -159,6 +176,7 @@ export class HttpResponseParser {
     private parser: CModuleHTTP.Parser;
     private statusCode: number = 0;
     private statusText: string = '';
+    private httpVersion: string = '1.1';
     private headers: Headers = new Headers();
     private bodyChunks: Uint8Array[] = [];
     private currentHeaderField: string = '';
@@ -208,6 +226,11 @@ export class HttpResponseParser {
             if(!this.statusText) {
                 this.statusText = http.strstatus(this.statusCode);
             }
+            // Detect HTTP version from parser state
+            // The http_parser sets http_major and http_minor fields
+            const major = (this.parser.state as any).http_major ?? 1;
+            const minor = (this.parser.state as any).http_minor ?? 1;
+            this.httpVersion = `${major}.${minor}`;
             this.onHeadersComplete?.(this.statusCode, this.headers);
         };
 
@@ -258,6 +281,20 @@ export class HttpResponseParser {
     }
 
     /**
+     * 获取 HTTP 版本 (e.g., "1.0", "1.1")
+     */
+    getHttpVersion(): string {
+        return this.httpVersion;
+    }
+
+    /**
+     * 是否为 HTTP/1.0 响应
+     */
+    get isHttp10(): boolean {
+        return this.httpVersion === '1.0';
+    }
+
+    /**
      * 获取状态文本
      */
     getStatusText(): string {
@@ -300,6 +337,7 @@ export class HttpResponseParser {
         this.parser.reset(http.RESPONSE);
         this.statusCode = 0;
         this.statusText = '';
+        this.httpVersion = '1.1';
         this.headers = new Headers();
         this.bodyChunks = [];
         this.currentHeaderField = '';

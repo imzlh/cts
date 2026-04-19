@@ -65,9 +65,17 @@ export class JsrHandler implements ProtocolHandler {
         let rest = spec.startsWith('jsr:') ? spec.slice(4) : spec;
         while (rest.startsWith('/')) rest = rest.slice(1);
         if (!rest.startsWith('@')) throw new Error(`Invalid JSR specifier: ${spec}`);
+        // @scope/name[@version][/subpath]
+        // Version can contain dots, dashes, plus signs (e.g., 1.0.0-beta.1)
+        // Subpath can contain slashes (e.g., /src/utils/helper.ts)
         const m = rest.match(/^@([^/]+)\/([^@/]+)(?:@([^/]+))?(\/.*)?$/);
         if (!m) throw new Error(`Cannot parse JSR specifier: ${spec}`);
-        return { scope: m[1]!, name: m[2]!, version: m[3] ?? null, path: m[4] ?? '' };
+        const version = m[3] ?? null;
+        // Validate version doesn't contain path separators if present
+        if (version && version.includes('/')) {
+            throw new Error(`Invalid version in JSR specifier: ${spec}`);
+        }
+        return { scope: m[1]!, name: m[2]!, version, path: m[4] ?? '' };
     }
 
     private resolveFilePath(p: ParsedJsrSpec): string {
