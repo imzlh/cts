@@ -7,6 +7,7 @@
 
 import type { RuntimeConfig, ModuleInfo, ParsedJsrSpec, JsrPackageMeta, JsrVersionMeta } from '../types';
 import type { ProtocolHandler } from './base';
+import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
 import { fetchBytes, fetchText } from '../utils/net';
@@ -48,7 +49,7 @@ export class JsrHandler implements ProtocolHandler {
         const localPath = this.download(parsed.scope, parsed.name, parsed.version!, filePath);
         const specPath  = `jsr:@${parsed.scope}/${parsed.name}@${parsed.version}/${filePath}`;
         this.resolved.set(specPath, localPath);
-        return { specPath, localPath, format: 'esm', fileKind: 'source' };
+        return { specPath, localPath, format: 'esm', fileKind: guessFileKind(localPath) };
     }
 
     localPath(specPath: string): string {

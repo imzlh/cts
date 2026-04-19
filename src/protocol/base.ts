@@ -9,6 +9,7 @@
 // requests.  Protocol handlers don't need to worry about the runtime cache.
 
 import type { ModuleInfo, FileKind } from '../types';
+import { extname } from '../utils';
 
 export type { ModuleInfo };
 
@@ -34,12 +35,13 @@ export interface ProtocolHandler {
 // Helpers shared by all protocol handlers
 // ---------------------------------------------------------------------------
 
-const TEXT_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.jsonc']);
+const TEXT_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.jsonc']); 
 
 export function guessFileKind(localPath: string): FileKind {
-    const ext = localPath.slice(localPath.lastIndexOf('.'));
-    if (ext === '.wasm')                        return 'wasm';
-    if (ext === '.json' || ext === '.jsonc')    return 'json';
-    if (TEXT_EXTS.has(ext))                     return 'source';
+    const ext = extname(localPath);
+    if (!ext)                                 return 'binary';
+    if (ext === '.wasm')                      return 'wasm';
+    if (ext === '.json' || ext === '.jsonc')  return 'json';
+    if (TEXT_EXTS.has(ext))                   return 'source';
     return 'binary';
 }

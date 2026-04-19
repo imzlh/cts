@@ -273,7 +273,7 @@ export class CjsLoader {
         const hit = this.builtinCache.get(cacheKey);
         if (hit) return hit.exports;
 
-        const specPath = `file://${localPath}`;
+        const specPath = localPath;
 
         const ns = this.deps.loadEsmSync(localPath, specPath);
 

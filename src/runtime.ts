@@ -71,14 +71,11 @@ export class TypeScriptRuntime {
 
             init: (specPath: string, importMeta: Record<string, any>): void => {
                 log.debug('runtime', () => `init hook called for ${specPath}`);
-                // Apply cached meta if available (from load hook)
                 const cached = this.metaCache.get(specPath);
                 if (cached) {
                     Object.assign(importMeta, cached);
-                    console.error(`[DEBUG] init applied cached meta, use=${typeof importMeta.use}`);
                 } else {
                     this.fillMeta(importMeta, this.resolver.getInfo(specPath));
-                    console.error(`[DEBUG] init called fillMeta, use=${typeof importMeta.use}`);
                 }
             },
 
@@ -119,7 +116,7 @@ export class TypeScriptRuntime {
 
     private fillMeta(meta: Record<string, any>, info: ModuleInfo): void {
         const remote  = TypeScriptRuntime.isRemote(info.specPath);
-        meta.url      = remote ? info.specPath : `file://${info.localPath}`;
+        meta.url      = remote ? info.specPath : info.localPath;
         meta.filename = info.localPath;
         meta.dirname  = dirname(info.localPath);
         meta.main     = info.specPath === this.resolver.entry;

@@ -120,22 +120,30 @@ const CLI_TPL = {
     'v':              'boolean',
 } satisfies Record<string, 'string'|'boolean'|'number'>;
 
+function getEnv(name: string): string | null {
+    try{
+        return os.getenv(name);
+    } catch {
+        return null;
+    }
+}
+
 export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeConfig {
     const cli = parseArgs(sys.args.slice(1), CLI_TPL);
     const cfg = { ...DEFAULTS, ...envConfig(), ...userConfig } as RuntimeConfig;
 
-    if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] as string;
-    if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'] as string;
-    if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] as string;
+    if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || getEnv('CTS_CACHE_DIR') || '';
+    if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'] || getEnv('CTS_POLYFILL') || '';
+    if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || getEnv('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.disableCache  = true;
-    if (cli['silent'])        cfg.silent        = true;
+    if (cli['silent'])        cfg.silent        = getEnv('CTS_SILENT') === 'true';
     if (cli['no-http'])       cfg.enableHttp    = false;
     if (cli['no-jsr'])        cfg.enableJsr     = false;
     if (cli['no-node'])       cfg.enableNode    = false;
     if (cli['no-lock'])       cfg.noLock        = true;
     if (cli['frozen'])        cfg.frozen        = true;
-    if (cli['memory-limit'])  cfg.memoryLimit   = parseSize(cli['memory-limit'] as string);
-    if (cli['max-stack-size']) cfg.maxStackSize  = parseSize(cli['max-stack-size'] as string);
+    if (cli['memory-limit'])  cfg.memoryLimit   = parseSize(cli['memory-limit'] || getEnv('CTS_MEMORY_LIMIT') || '1g');
+    if (cli['max-stack-size']) cfg.maxStackSize = parseSize(cli['max-stack-size'] || getEnv('CTS_MAX_STACK_SIZE') || '0');
     if (cli['jsr-cache-ttl'] !== undefined)
         cfg.jsrCacheTTL = (cli['jsr-cache-ttl'] as number) * 24 * 60 * 60 * 1000;
 
@@ -167,23 +175,25 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
         catch { return null; }
     };
 
-    // tsconfig.json
     for (const d of dirs) {
-        const p = joinPaths(d, 'tsconfig.json');
-        if (!fs.exists(p)) continue;
-        const ts = readJson(p); if (!ts) break;
-        if (ts.compilerOptions?.paths)   cfg.pathAliases = ts.compilerOptions.paths;
-        if (ts.compilerOptions?.baseUrl) cfg.baseUrl = joinPaths(d, ts.compilerOptions.baseUrl);
-        log.debug('config', () => `tsconfig: ${p}`); break;
-    }
+        let foundTsconfig = false, foundDeno = false, foundPkg = false;
 
-    // deno.json / deno.jsonc
-    for (const d of dirs) {
-        let found = false;
+        const tsP = joinPaths(d, 'tsconfig.json');
+        if (!foundTsconfig && fs.exists(tsP)) {
+            const ts = readJson(tsP);
+            if (ts) {
+                if (ts.compilerOptions?.paths)   cfg.pathAliases = ts.compilerOptions.paths;
+                if (ts.compilerOptions?.baseUrl) cfg.baseUrl = joinPaths(d, ts.compilerOptions.baseUrl);
+                log.debug('config', () => `tsconfig: ${tsP}`);
+            }
+            foundTsconfig = true;
+        }
+
         for (const name of ['deno.json', 'deno.jsonc']) {
+            if (foundDeno) break;
             const p = joinPaths(d, name);
             if (!fs.exists(p)) continue;
-            const dc = readJson(p); if (!dc) continue;
+            const dc = readJson(p); if (!dc) { foundDeno = true; break; }
             if (dc.imports)                cfg.importMap  = { ...cfg.importMap,   ...dc.imports };
             if (dc.compilerOptions?.paths) cfg.pathAliases = { ...cfg.pathAliases, ...dc.compilerOptions.paths };
             if (typeof dc.importMap === 'string') {
@@ -194,19 +204,18 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
                 }
             }
             log.debug('config', () => `${name}: ${p}`);
-            found = true; break;
+            foundDeno = true;
         }
-        if (found) break;
-    }
 
-    // package.json #imports (lowest priority)
-    for (const d of dirs) {
-        const p = joinPaths(d, 'package.json');
-        if (!fs.exists(p)) continue;
-        const pkg = readJson(p);
-        if (pkg?.imports && typeof pkg.imports === 'object')
-            cfg.importMap = { ...pkg.imports, ...cfg.importMap };
-        break;
+        const pkgP = joinPaths(d, 'package.json');
+        if (!foundPkg && fs.exists(pkgP)) {
+            const pkg = readJson(pkgP);
+            if (pkg?.imports && typeof pkg.imports === 'object')
+                cfg.importMap = { ...pkg.imports, ...cfg.importMap };
+            foundPkg = true;
+        }
+
+        if (foundTsconfig && foundDeno) break;
     }
 
     return cfg;

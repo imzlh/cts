@@ -210,7 +210,7 @@ export class NpmHandler implements ProtocolHandler {
         if (fs.exists(cacheFile)) {
             try {
                 const age = Date.now() - +(readText(cacheTs) || '0');
-                if (age < 60 * 60 * 1000) return safeParse<NpmMeta>(readText(cacheFile));
+                if (age < 24 * 60 * 60 * 1000) return safeParse<NpmMeta>(readText(cacheFile));
             } catch {}
         }
         const meta = safeParse<NpmMeta>(fetchText(`${registry}/${name}`));

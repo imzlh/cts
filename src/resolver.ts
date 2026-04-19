@@ -19,7 +19,8 @@ import { DataHandler }  from './protocol/data';
 import { LockStore }    from './lock';
 import { normalizePath, joinPaths, isAbsolute, dirname } from './utils/path';
 import { resolveFile } from './utils/io';
-import { detectFormat, guessFileKind } from './pkg';
+import { detectFormat } from './pkg';
+import { guessFileKind } from './protocol/base';
 import { assert } from './utils/misc';
 import { log } from './utils/log';
 import { os } from './utils/index';
@@ -218,10 +219,12 @@ export class ModuleResolver {
     private resolveRelative(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         const pp = protoOf(parent);
         if (pp) { const h = this.handlers.get(pp); if (h) return h.resolve(spec, parent, attr); }
-        const base      = dirname(parent.startsWith('file://') ? parent.slice(7) : parent);
-        const joined    = base + '/' + spec;
+        let base = parent.startsWith('file://') ? parent.slice(7) : parent;
+        if (!base.startsWith('/')) base = dirname(base);
+        else base = dirname(base);
+        const joined = base + '/' + spec;
         const localPath = resolveFile(normalizePath(joined));
-        const specPath  = localPath;
+        const specPath = localPath;
         return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
     }
 

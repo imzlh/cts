@@ -5,7 +5,7 @@
 
 import { Headers } from "headers-polyfill";
 import { URL } from "./url";
-import { engine, console, http } from '../utils/index';
+import { engine, http } from '../utils/index';
 
 
 // Local assertion function to avoid circular dependency
@@ -104,12 +104,9 @@ export class HttpRequestBuilder {
         // 构建请求行
         const path = this.url.pathname + this.url.search;
         let request = `${this.method} ${path} HTTP/1.1\r\n`;
-        console.debug(`[http.build] WRITE: ${this.method} ${path} HTTP/1.1`);
 
-        // 添加头部
         for (const [key, value] of this.headers) {
             request += `${key}: ${value}\r\n`;
-            console.debug(`[http.build] WRITE: ${key}: ${value}`);
         }
 
         // 结束头部
@@ -232,26 +229,18 @@ export class HttpResponseParser {
      * 喂入数据
      */
     feed(data: Uint8Array): void {
-        // console.debug(`[http.parser]Feeding data: ${data.length} bytes`);
-        
         try {
-            // 传ArrayBuffer，匹配callback断言
             const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.length + data.byteOffset));
-            // console.debug(`[http.parser]Parser result: errno=${result.errno}, reason=${result.reason}`);
             
             if (result.errno !== 0) {
                 const error = new Error(`HTTP parse error: ${result.reason}`);
-                console.error(`[HttpResponseParser:ERROR] Parse error: ${error.message}`);
                 if (this.onError) {
                     this.onError(error);
                 } else {
                     throw error;
                 }
             }
-            
-            // console.debug(`[http.parser]Data fed successfully, headersComplete=${this.headersComplete}, completed=${this.completed}`);
         } catch (err) {
-            console.error(`[HttpResponseParser:ERROR] Exception during parsing: ${err}`);
             if (this.onError) {
                 this.onError(err as Error);
             } else {

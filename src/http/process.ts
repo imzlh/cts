@@ -34,7 +34,7 @@ export class HttpProgressBar {
         this.width = options.width || 40;
         this.showSpeed = options.showSpeed !== false;
         this.showTime = options.showTime !== false;
-        this.updateInterval = options.updateInterval || 500;
+        this.updateInterval = options.updateInterval || 1000;
     }
 
     /**

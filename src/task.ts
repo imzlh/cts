@@ -196,7 +196,7 @@ export class TaskRunner {
     list(): void {
         const names = Object.keys(this.tasks);
         if (!names.length) {
-            console.log('  [2mNo tasks defined in this config.[0m');
+            console.log('  \x1b[2mNo tasks defined in this config.\x1b[0m');
             return;
         }
         const maxLen = names.reduce((m, n) => Math.max(m, n.length), 0);
@@ -214,11 +214,11 @@ export class TaskRunner {
         const def = this.tasks[name];
         if (!def) {
             const names = Object.keys(this.tasks);
-            console.error(`[31m✖ Unknown task:[0m [36m${name}[0m`);
+            console.error(`\x1b[31m✖ Unknown task:\x1b[0m ${name}`);
             if (names.length) {
-                console.error(`  Available: ${names.map(n => `[36m${n}[0m`).join(', ')}`);
+                console.error(`  Available: ${names.map(n => `\x1b[36m${n}\x1b[0m`).join(', ')}`);
             } else {
-                console.error(`  No tasks defined. Add a "tasks" field to deno.json.`);
+                console.error(`  \x1b[2mNo tasks defined. Add a "tasks" field to deno.json.\x1b[0m`);
             }
             return 1;
         }
@@ -232,7 +232,7 @@ export class TaskRunner {
             if (this.done.has(dep)) continue;
             const code = await this.run(dep);
             if (code !== 0) {
-                console.error(`[31m✖ Dependency task [36m${dep}[0m[31m failed (exit ${code})[0m`);
+                console.error(`\x1b[31m✖ Dependency task \x1b[36m${dep}\x1b[0m\x1b[31m failed (exit ${code})\x1b[0m`);
                 return code;
             }
         }
@@ -240,10 +240,10 @@ export class TaskRunner {
         if (this.done.has(name)) return 0;
         this.done.add(name);
 
-        console.log(`\n$ ${command}`);
+        console.log(`\n\x1b[32m$ ${command}\x1b[0m`);
         // Only pass extra args to the leaf task, not to dependencies
         const code = await execCommand(command, env, this.cwd, extraArgs);
-        if (code !== 0) console.error(`[31m✖ Task [36m${name}[0m[31m exited with code ${code}[0m`);
+        if (code !== 0) console.error(`\x1b[31m✖ Task \x1b[36m${name}\x1b[0m\x1b[31m exited with code ${code}\x1b[0m`);
         return code;
     }
 }

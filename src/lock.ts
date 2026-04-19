@@ -69,7 +69,7 @@ export class LockStore {
             if (o.q !== undefined) {
                 this.sources.set(o.q, o.v); srcs++;
             } else if (o.s && o.l && o.f && o.k) {
-                if (!isLocal(o.s) && !fs.exists(o.l)) { skip++; continue; }
+                if (isRemote(o.s) && !fs.exists(o.l)) { skip++; continue; }
                 this.modules.set(o.s, { specPath: o.s, localPath: o.l, format: o.f, fileKind: o.k });
                 mods++;
             }
@@ -138,6 +138,6 @@ export class LockStore {
     get dirtyCount(): number { return this.dirtyMods.size + this.dirtySrcs.size; }
 }
 
-function isLocal(sp: string): boolean {
-    return sp.startsWith('file://') || sp.startsWith('node:') || sp.startsWith('data:');
+function isRemote(sp: string): boolean {
+    return sp.startsWith('node:') || sp.startsWith('npm:') || sp.startsWith('jsr:') || sp.startsWith('http:') || sp.startsWith('data:');
 }

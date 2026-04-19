@@ -1,7 +1,7 @@
 // utils/misc.ts — hash, semver, tar.gz, JSONC, arg parsing
 
 import { URL } from "../http/url";
-import { zlib } from './index';
+import { basename, crypto, dirname, extname, zlib } from './index';
 
 // ---------------------------------------------------------------------------
 // Misc
@@ -27,11 +27,14 @@ export function hashString(s: string): string {
     return h.toString(16).padStart(8, '0');
 }
 
-/** Build a stable cache filename from a URL, preserving extension for readability. */
+/** Build a stable cache filename from a URL, preserving path structure and extension. */
 export function cacheFilename(url: string): string {
     try {
-        const ext = new URL(url).pathname.match(/\.[a-zA-Z0-9]+$/)?.[0] ?? '';
-        return hashString(url) + ext;
+        const u = new URL(url);
+        let pathname = u.pathname;
+        const dirHash = hashString(pathname).slice(0, 8);
+        const name = extname(pathname) || '.js';
+        return `${dirHash}${name}`
     } catch {
         return hashString(url);
     }

@@ -72,7 +72,6 @@ export class MultiProgress {
         this.total++;
         if (!this.timer) this.startRender();
     }
-
     update(key: string, done: number, total = 0): void {
         const item = this.items.get(key);
         if (!item || item.finished) return;
@@ -88,19 +87,31 @@ export class MultiProgress {
         this.completed++;
     }
 
-    /** Call when all downloads are done. Idempotent. */
     stop(): void {
         if (this.timer) { clearInterval(this.timer); this.timer = null; }
-        if (!isatty) return;
+        if (!isatty) {
+            const elapsed = ((Date.now() - this.startMs) / 1000).toFixed(1);
+            const e = this.items.size - this.completed;
+            if (e > 0) {
+                write(`${this.completed}/${this.total} modules done, ${e} failed  ${elapsed}s\n`);
+            }
+            return;
+        }
         const drawn = (this as any)._lastLines as number | undefined;
         if (drawn) this.clearLines(drawn);
-        write('\n');
+        const elapsed = ((Date.now() - this.startMs) / 1000).toFixed(1);
+        const failed = this.items.size - this.completed;
+        if (failed > 0) {
+            write(`${this.completed}/${this.total} modules done, ${failed} failed  ${elapsed}s\n`);
+        } else {
+            write(`${this.completed}/${this.total} modules  ${elapsed}s\n`);
+        }
         (this as any)._lastLines = 0;
     }
 
     private startRender(): void {
         if (!isatty) return;
-        this.timer = setInterval(() => this.render(), 100);
+        this.timer = setInterval(() => this.render(), 200);
     }
 
     private clearLines(n: number): void {

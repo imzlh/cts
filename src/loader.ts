@@ -85,6 +85,8 @@ export class ModuleLoader {
 
     load(info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
         const hint = hintOf(info.specPath);
+        log.debug('loader', () => `load ${info.specPath} hint=${hint} kind=${info.fileKind} format=${info.format}`);
+        log.debug('loader', () => `alias: ${info.specPath} -> ${info.localPath}`);
         if (hint === 'commonjs') return this.loadCjs(info, meta);
         if (hint === 'module')   return this.loadEsm(info, meta);
         if (hint === 'wasm')     return this.loadWasm(info);
@@ -112,17 +114,15 @@ export class ModuleLoader {
     private loadEsm(info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
         const hit = this.esmCache.get(info.localPath);
         if (hit) {
-            // Only `main` can change between cache hits; skip full assign
             if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
             return hit;
         }
 
-        const cacheable = !this.cfg.disableCache
-            && info.localPath.startsWith(this.cfg.cacheDir);
+        const cacheable = !this.cfg.disableCache;
         const jscPath   = info.localPath + '.jsc';
 
         if (cacheable) {
-            const isRemote = !info.specPath.startsWith('file://');
+            const isRemote = info.specPath.startsWith('http://') || info.specPath.startsWith('https://') || info.specPath.startsWith('jsr:') || info.specPath.startsWith('npm:');
             const cached   = tryReadJsc(jscPath, info.localPath, isRemote);
             if (cached) {
                 Object.assign(cached.meta, meta);
@@ -132,7 +132,6 @@ export class ModuleLoader {
             }
         }
 
-        log.debug('loader', () => `load ${info.specPath} ${JSON.stringify(meta)}`);
         const text = readText(info.localPath);
         const code = this.transformer.transform(text, info.localPath);
         let mod: CModuleEngine.Module;

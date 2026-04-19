@@ -69,10 +69,9 @@ ${C.bold('OPTIONS')}
 ${C.bold('ENVIRONMENT')}
   ${C.cyan('CTS_CACHE_DIR')}     Override cache directory
   ${C.cyan('CTS_SILENT')}        Suppress output ${C.dim('(true/false)')}
-  ${C.cyan('CTS_ENABLE_HTTP')}   ${C.dim('true/false')}
-  ${C.cyan('CTS_ENABLE_JSR')}    ${C.dim('true/false')}
-  ${C.cyan('CTS_ENABLE_NODE')}   ${C.dim('true/false')}
-  ${C.cyan('CTS_DISABLE_CACHE')} ${C.dim('true/false')}
+  ${C.cyan('CTS_POLYFILL')}      Specific polyfill to use. Especially useful with \`${C.cyan('cno task')}\`
+  ${C.cyan('CTS_MEMORY_LIMIT')}  Memory limit ${C.dim('(default: 1GB)')}
+  ${C.cyan('CTS_MAX_STACK_SIZE')}  Max stack size ${C.dim('(default: 0)')}
   ${C.cyan('CTS_DEBUG')}         Debug categories: ${C.cyan('resolver')}, ${C.cyan('npm')}, ${C.cyan('jsr')}, ${C.cyan('lock')}, ${C.cyan('cjs')}, ${C.cyan('loader')}, ${C.cyan('config')}, ${C.cyan('stack')}, ${C.cyan('*')}
     `.trim());
 }
@@ -124,7 +123,6 @@ async function runTaskCmd(args: string[]): Promise<void> {
             'No deno.json with tasks found in current directory or any parent.\n' +
             'Create a deno.json with a "tasks" field.'
         ), 'cts task');
-        return;
     }
     const { runner, configPath } = result;
     if (!args.length || args[0] === '--list') {
