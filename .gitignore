@@ -6,3 +6,4 @@ cjs
 node_modules/
 types/
 .codeartsdoer
+*.lock

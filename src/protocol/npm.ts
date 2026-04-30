@@ -118,18 +118,19 @@ export class NpmHandler implements ProtocolHandler {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
     }
 
-    resolve(spec: string, parent: string): ModuleInfo {
+    resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
+        const forceCjs = attr?.cjs === true || (attr?.type !== 'module' && !parent.startsWith('npm:'));
         // Relative import within an npm module
         if ((spec.startsWith('./') || spec.startsWith('../')) && parent.startsWith('npm:')) {
-            return this.resolveRelative(spec, parent);
+            return this.resolveRelative(spec, parent, forceCjs);
         }
         // require('.') means "the main entry of the current package"
         if (spec === '.' && parent.startsWith('npm:')) {
-            return this.resolveRelative('.', parent);
+            return this.resolveRelative('.', parent, forceCjs);
         }
         const { name, version, subpath } = parseNpmSpec(spec);
         const pkg = this.ensureInstalled(name, version, parent);
-        return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath);
+        return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
     }
 
     localPath(specPath: string): string {
@@ -142,15 +143,37 @@ export class NpmHandler implements ProtocolHandler {
 
     // ---------------------------------------------------------------------------
 
-    private resolveRelative(spec: string, parent: string): ModuleInfo {
+    private resolveRelative(spec: string, parent: string, forceCjs: boolean): ModuleInfo {
         const { name, version, subpath } = parseNpmSpec(parent);
-        const relPath = normalizePath(joinPaths(dirname(subpath || ''), spec));
         const dir = joinPaths(this.cacheDir, `${name}@${version}`);
-        return this.resolvePkg(dir, version, name, relPath);
+        const ctx = createCtx(dir, { forceCjs });
+        if (!ctx) throw new Error(`package.json not found in ${dir}`);
+
+        // Resolve relative import using the parent's actual localPath on disk,
+        // not the subpath from the specifier. This is critical because:
+        //   - parent "npm:hono@4.12.14" has subpath="" but localPath=".../dist/index.js"
+        //   - import "./hono.js" must resolve relative to dist/, not the package root
+        const parentLocal = resolveSubpath(ctx, subpath || '.');
+        if (!parentLocal) throw new Error(`Cannot resolve parent "${subpath || '.'}" in ${name}@${version}`);
+
+        const targetLocal = normalizePath(joinPaths(dirname(parentLocal), spec));
+        // Verify the target file exists
+        const resolvedLocal = resolveFile(targetLocal);
+        if (!resolvedLocal) throw new Error(`Cannot resolve "${spec}" from "${parent}": file not found at ${targetLocal}`);
+
+        // Compute the subpath relative to pkgDir for the canonical specPath
+        const relToDir = normalizePath(resolvedLocal.slice(dir.length + 1));
+        const specPath = `npm:${name}@${version}` + (relToDir ? `/${relToDir}` : '');
+        return {
+            specPath,
+            localPath: resolvedLocal,
+            format: detectFormat(resolvedLocal),
+            fileKind: guessFileKind(resolvedLocal),
+        };
     }
 
-    private resolvePkg(dir: string, ver: string, name: string, subpath: string): ModuleInfo {
-        const ctx = createCtx(dir, { forceCjs: false });
+    private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
+        const ctx = createCtx(dir, { forceCjs });
         if (!ctx) throw new Error(`package.json not found in ${dir}`);
         const localPath = resolveSubpath(ctx, subpath);
         if (!localPath) throw new Error(`Cannot resolve "${subpath || '.'}" in ${name}@${ver}`);

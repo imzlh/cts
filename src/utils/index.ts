@@ -26,4 +26,5 @@ export const ssl = useFn('ssl');
 export const dns = useFn('dns');
 export const http = useFn('http');
 export const zlib = useFn('zlib');
+export const pty = useFn('pty');
 export const __use_fn = useFn;

@@ -1,5 +1,5 @@
 #!/bin/sh
-file=dist.min.js
+file=dist.js
 if [ ! -e $file ]; then
     npm run build
 fi

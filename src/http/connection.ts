@@ -109,6 +109,7 @@ export class Connection implements ConnectionLike {
             assert(addr, `No IP address found for ${this.config.hostname}`);
 
             this.socket.connectSync({ ip: addr.ip, port: this.config.port });
+            this.socket.setBlocking(true);
 
             if (this.config.protocol === "https:") {
                 this.performTLSHandshake();

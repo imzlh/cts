@@ -223,7 +223,7 @@ export class ModuleResolver {
         // Ensure base is an absolute path for correct relative resolution
         if (!isAbsolute(base)) base = joinPaths(this.cfg.cacheDir, base);
         base = dirname(base);
-        const joined = base + '/' + spec;
+        const joined = joinPaths(base, spec);
         const localPath = resolveFile(normalizePath(joined));
         const specPath = localPath;
         return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
@@ -244,7 +244,9 @@ export class ModuleResolver {
                 const localPath = resolveFile(aliased);
                 const specPath  = localPath;
                 return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
-            } catch {}
+            } catch (e) {
+                throw new Error(`Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`);
+            }
         }
         const npm = this.handlers.get('npm');
         if (npm) return npm.resolve(spec, parent, attr);

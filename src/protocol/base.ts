@@ -45,3 +45,8 @@ export function guessFileKind(localPath: string): FileKind {
     if (TEXT_EXTS.has(ext))                   return 'source';
     return 'binary';
 }
+
+/** Check if a path is a TypeScript type declaration file (.d.ts, .d.mts, .d.cts) */
+export function isTypeDecl(localPath: string): boolean {
+    return localPath.endsWith('.d.ts') || localPath.endsWith('.d.mts') || localPath.endsWith('.d.cts');
+}

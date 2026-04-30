@@ -1,8 +1,4 @@
 // http/async_client.ts — async HTTP client using async TCP + SSL
-//
-// Replaces the libcurl-based curl.ts for the pre-cache phase.
-// Uses the same connection pool, request builder, and response parser
-// as the sync path, but with async TCP read/write for concurrency.
 
 import { URL } from './url';
 import { HttpRequestBuilder, HttpResponseParser, type HttpVersion } from './http';
@@ -45,6 +41,15 @@ async function connectAsync(cfg: ConnectionConfig): Promise<AsyncConn> {
     if (cfg.protocol === 'https:') {
         sslPipe = await performTLSHandshake(socket, cfg.hostname);
     }
+
+    const readFromSocket = () => new Promise<Uint8Array | null>((rs, rj) => {
+        socket.onread = (res, err) => {
+            if (!res || err) return rj(err ?? new Error('EOF'));
+            rs(res);
+            socket.stopRead();
+        }
+        socket.startRead();
+    });
 
     return {
         socket,

@@ -1,6 +1,7 @@
 // runtime.ts — TypeScriptRuntime
 
 import type { RuntimeConfig, NodeBuiltinResolver, ModuleInfo } from './types';
+import type { ScanResult } from './deps';
 import { ModuleResolver } from './resolver';
 import { ModuleLoader }   from './loader';
 import { DepScanner }     from './deps';
@@ -119,7 +120,10 @@ export class TypeScriptRuntime {
         meta.url      = remote ? info.specPath : info.localPath;
         meta.filename = info.localPath;
         meta.dirname  = dirname(info.localPath);
-        meta.main     = info.specPath === this.resolver.entry;
+        // Compare base specPath (strip ?type=... suffix) with resolver.entry
+        // to correctly identify the main entry module
+        const baseSpec = info.specPath.includes('?') ? info.specPath.slice(0, info.specPath.indexOf('?')) : info.specPath;
+        meta.main     = baseSpec === this.resolver.entry;
         meta.use      = __use_fn;
         meta.resolve  = this.metaResolve;
     }
@@ -133,7 +137,7 @@ export class TypeScriptRuntime {
     // Pre-cache: async parallel BFS, then full resource cleanup
     // -------------------------------------------------------------------------
 
-    async precache(entrySpecPath: string, entryLocalPath: string): Promise<void> {
+    async precache(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
         const scanner = new DepScanner(this.resolver, this.config);
         let result;
         try {
@@ -145,6 +149,7 @@ export class TypeScriptRuntime {
         for (const { spec, parent, error } of result.errors)
             log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
         this.resolver.rewriteLock();
+        return result;
     }
 
     // -------------------------------------------------------------------------
@@ -167,8 +172,11 @@ export class TypeScriptRuntime {
         resources.release();
 
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
-        const meta: Record<string, any> = { main: true, ...extra };
+        const meta: Record<string, any> = { ...extra };
         this.fillMeta(meta, info);
+        // Force main=true for the entry module — fillMeta may set it incorrectly
+        // if the specPath has a ?type= suffix that doesn't match resolver.entry
+        meta.main = true;
         return this.loader.load(info, meta);
     }
 

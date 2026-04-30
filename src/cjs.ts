@@ -11,6 +11,7 @@
 import { dirname, joinPaths, isAbsolute, extname } from './utils/path';
 import { resolveFile } from './utils/io';
 import { safeParse } from './utils/misc';
+import { detectFormat } from './pkg';
 import { log } from './utils/log';
 import { fs, engine } from './utils/index';
 
@@ -327,20 +328,27 @@ export class CjsLoader {
 
         // Absolute path
         if (isAbsolute(id)) {
-            try { return { path: resolveFile(id), isCjs: true }; } catch { return null; }
+            try {
+                const path = resolveFile(id);
+                return { path, isCjs: detectFormat(path) === 'cjs' };
+            } catch { return null; }
         }
 
         // Relative path (includes '.' which means "the directory containing this file")
         if (id.startsWith('./') || id.startsWith('../') || id === '.') {
             const base = id === '.' ? dirname(parentPath) : joinPaths(dirname(parentPath), id);
             try {
-                return { path: resolveFile(base), isCjs: true };
+                const path = resolveFile(base);
+                return { path, isCjs: detectFormat(path) === 'cjs' };
             } catch { return null; }
         }
 
         // node_modules walk
         for (const dir of buildPaths(dirname(parentPath))) {
-            try { return { path: resolveFile(joinPaths(dir, id)), isCjs: true }; } catch {}
+            try {
+                const path = resolveFile(joinPaths(dir, id));
+                return { path, isCjs: detectFormat(path) === 'cjs' };
+            } catch {}
         }
         return null;
     }

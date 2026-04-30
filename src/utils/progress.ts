@@ -4,32 +4,45 @@
 // to overwrite the same lines without console.log adding newlines.
 // Falls back to plain console.log if not a TTY.
 
-import { streams, engine, timers } from './index';
+import { engine, timers, os, fs, pty } from './index';
 const { setInterval, clearInterval } = timers;
+
+// ---------------------------------------------------------------------------
+// Color constants for better UI
+// ---------------------------------------------------------------------------
+
+const C = {
+    red: (s: string) => isatty ? `\x1b[31m${s}\x1b[0m` : s,
+    green: (s: string) => isatty ? `\x1b[32m${s}\x1b[0m` : s,
+};
 
 // ---------------------------------------------------------------------------
 // TTY write helper
 // ---------------------------------------------------------------------------
 
-let stdout: CModuleStreams.TTY | null = null;
 let isatty = false;
 let termWidth = 80;
 
 function initTty(): void {
-    if (stdout !== null) return;
-    try {
-        stdout  = new streams.TTY(1, false);
-        isatty  = true;
-        termWidth = stdout.getWinSize().width || 80;
-    } catch {
-        stdout  = null;
-        isatty  = false;
+    // Use os.guessHandle like in main.ts to detect TTY
+    isatty = os.guessHandle(os.STDOUT_FILENO) === 'tty';
+    if (isatty) {
+        try {
+            const winSize = pty.getwinsize(os.STDOUT_FILENO);
+            termWidth = winSize.cols || 80;
+        } catch {
+            termWidth = 80;
+        }
     }
 }
 
 function write(s: string): void {
-    if (stdout) {
-        stdout.writeSync(engine.encodeString(s));
+    if (isatty) {
+        const buffer = engine.encodeString(s);
+        fs.write(os.STDOUT_FILENO, buffer);
+    } else {
+        // Fallback to console.log for non-TTY environments
+        globalThis.console.log(s);
     }
 }
 
@@ -62,6 +75,7 @@ export class MultiProgress {
 
     constructor(private readonly maxLines = 5) {
         initTty();
+        console.log(`[DEBUG MultiProgress] created, isatty: ${isatty}`);
     }
 
     add(key: string, label: string, totalBytes = 0): void {
@@ -130,18 +144,18 @@ export class MultiProgress {
         const visible  = [...active.slice(0, this.maxLines - 1), ...finished.slice(-1)];
 
         const elapsed  = ((Date.now() - this.startMs) / 1000).toFixed(1);
-        const summary  = `${spin} ${this.completed}/${this.total} modules  ${elapsed}s`;
+        const summary  = `${spin} Precaching dependencies: ${this.completed}/${this.total} modules (${elapsed}s)`;
         const lines    = [summary];
 
         for (const key of visible.slice(0, this.maxLines)) {
             const item  = this.items.get(key)!;
-            const short = truncate(item.label, termWidth - 20);
+            const short = truncate(item.label, termWidth - 25);
             if (item.error) {
-                lines.push(`  ✗ ${short}`);
+                lines.push(`  ${C.red('✗')} ${short}`);
             } else if (item.finished) {
-                lines.push(`  ✓ ${short}`);
+                lines.push(`  ${C.green('✓')} ${short}`);
             } else {
-                const bar   = item.total ? renderBar(item.done, item.total, 12) : '???';
+                const bar   = item.total ? renderBar(item.done, item.total, 10) : 'waiting...';
                 const bytes = fmtBytes(item.done);
                 lines.push(`  ${spin} ${short} ${bar} ${bytes}`);
             }

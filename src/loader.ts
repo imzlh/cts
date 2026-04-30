@@ -14,6 +14,7 @@ import type { RuntimeConfig, ModuleInfo } from './types';
 import { ModuleResolver } from './resolver';
 import { Transformer } from './transformer';
 import { CjsLoader, type CjsDeps } from './cjs';
+import { isTypeDecl } from './protocol/base';
 import { readText, ensureDir } from './utils/io';
 import { dirname, extname } from './utils/path';
 import { assert } from './utils/misc';
@@ -84,6 +85,9 @@ export class ModuleLoader {
     // -------------------------------------------------------------------------
 
     load(info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
+        if (isTypeDecl(info.localPath)) {
+            throw new Error(`Cannot load type declaration file "${info.localPath}" as a module. Type declaration files (.d.ts) are not executable.`);
+        }
         const hint = hintOf(info.specPath);
         log.debug('loader', () => `load ${info.specPath} hint=${hint} kind=${info.fileKind} format=${info.format}`);
         log.debug('loader', () => `alias: ${info.specPath} -> ${info.localPath}`);
@@ -118,11 +122,13 @@ export class ModuleLoader {
             return hit;
         }
 
-        const cacheable = !this.cfg.disableCache;
+        const isRemote = info.specPath.startsWith('http://') || info.specPath.startsWith('https://') || info.specPath.startsWith('jsr:') || info.specPath.startsWith('npm:');
+        // JSC bytecode cache: only for remote/cached modules, not local source files.
+        // Local files change frequently and .jsc files would litter the project directory.
+        const cacheable = !this.cfg.disableCache && isRemote;
         const jscPath   = info.localPath + '.jsc';
 
         if (cacheable) {
-            const isRemote = info.specPath.startsWith('http://') || info.specPath.startsWith('https://') || info.specPath.startsWith('jsr:') || info.specPath.startsWith('npm:');
             const cached   = tryReadJsc(jscPath, info.localPath, isRemote);
             if (cached) {
                 Object.assign(cached.meta, meta);
@@ -214,12 +220,146 @@ export class ModuleLoader {
 
     private loadWasm(info: ModuleInfo): CModuleEngine.Module {
         assert(wasm, 'WASM support not available in this build');
-        const inst = new wasm.Instance(
-            new wasm.Module(new Uint8Array(fs.readFile(info.localPath))), {});
+
+        const raw = fs.readFile(info.localPath);
+        const wmod = wasm.parseModule(raw);
+
+        // Resolve imports: bridge WASM import requirements to JS functions
+        const imports = wasm.moduleImports(wmod);
+        if (imports.length > 0) {
+            const funcDescs: CModuleWASM.ImportFunctionDescriptor[] = [];
+            const globalDescs: CModuleWASM.GlobalImportDescriptor[] = [];
+            for (const imp of imports) {
+                if (imp.kind === 'function') {
+                    // Provide a no-op stub for unresolved function imports.
+                    // Users can override via the `wasmImports` export before calling.
+                    funcDescs.push({
+                        module: imp.module,
+                        name:   imp.name,
+                        func:   (..._args: CModuleWASM.WasmValue[]) => 0,
+                    });
+                } else if (imp.kind === 'global') {
+                    // Default global import: i32(0), immutable
+                    globalDescs.push({
+                        module:  imp.module,
+                        name:    imp.name,
+                        value:   0,
+                        type:    'i32',
+                        mutable: false,
+                    });
+                }
+                // 'memory' and 'table' imports are handled internally by WAMR
+            }
+            if (funcDescs.length > 0)  wasm.resolveImports(wmod, funcDescs);
+            if (globalDescs.length > 0) wasm.resolveGlobalImports(wmod, globalDescs);
+        }
+
+        // Set default WASI options (empty args/env/preopens)
+        wasm.setWasiOptions(wmod, [], null, null);
+
+        const inst = wasm.buildInstance(wmod);
+        const exp  = wasm.moduleExports(wmod);
         const mod  = engine.Module.create(info.specPath);
-        for (const k of Object.keys(inst.exports)) mod.export(k, inst.exports[k]);
+
+        // Build a namespace object that mirrors the standard WebAssembly.Instance.exports
+        const ns: Record<string, any> = {};
+
+        for (const e of exp) {
+            switch (e.kind) {
+                case 'function': {
+                    const fn = (...args: any[]): CModuleWASM.WasmValue | CModuleWASM.WasmValue[] => {
+                        const wargs: CModuleWASM.WasmValue[] = args.map(a => this.toWasmValue(a));
+                        return inst.callFunction(e.name, ...wargs);
+                    };
+                    ns[e.name] = fn;
+                    mod.export(e.name, fn);
+                    break;
+                }
+                case 'memory': {
+                    const mem = {
+                        get buffer(): ArrayBuffer {
+                            return wasm!.getMemoryBuffer(inst);
+                        },
+                        grow(delta: number): number {
+                            return wasm!.growMemory(inst, delta);
+                        },
+                    };
+                    ns[e.name] = mem;
+                    mod.export(e.name, mem);
+                    break;
+                }
+                case 'global': {
+                    const gl = {
+                        get value(): CModuleWASM.WasmValue {
+                            return wasm!.getGlobal(inst, e.name);
+                        },
+                        set value(v: CModuleWASM.WasmValue) {
+                            wasm!.setGlobal(inst, e.name, v);
+                        },
+                        get info(): CModuleWASM.GlobalInfo {
+                            return wasm!.getGlobalInfo(inst, e.name);
+                        },
+                    };
+                    ns[e.name] = gl;
+                    mod.export(e.name, gl);
+                    break;
+                }
+                case 'table': {
+                    const tbl = {
+                        get length(): number {
+                            return wasm!.tableSize(inst, e.name);
+                        },
+                        get info(): CModuleWASM.TableInfo {
+                            return wasm!.getTableInfo(inst, e.name);
+                        },
+                        get(index: number): number | null {
+                            return wasm!.tableGet(inst, e.name, index) as number | null;
+                        },
+                        set(index: number, value: number | null): void {
+                            wasm!.tableSet(inst, e.name, index, value);
+                        },
+                        grow(delta: number): number {
+                            return wasm!.tableGrow(inst, e.name, delta);
+                        },
+                    };
+                    ns[e.name] = tbl;
+                    mod.export(e.name, tbl);
+                    break;
+                }
+            }
+        }
+
+        // Export the full namespace as `default` for `import ns from './mod.wasm'`
+        mod.export('default', ns);
+
+        // Expose the raw instance for advanced usage (memory, globals, tables, funcByIndex)
+        mod.export('instance', inst);
+
         store.push(mod);
         return mod;
+    }
+
+    /**
+     * Convert a JS value to a WASM-compatible value (number | bigint).
+     * - number  → number (i32/f32/f64)
+     * - bigint  → bigint (i64)
+     * - boolean → 0 | 1  (i32)
+     * - string  → parseInt/BigInt  (best-effort)
+     * - null/undefined → 0
+     */
+    private toWasmValue(v: unknown): CModuleWASM.WasmValue {
+        if (typeof v === 'number')  return v;
+        if (typeof v === 'bigint')  return v;
+        if (typeof v === 'boolean') return v ? 1 : 0;
+        if (v === null || v === undefined) return 0;
+        if (typeof v === 'string') {
+            // Try integer parse first, then float
+            const s = v as string;
+            if (s === '') return 0;
+            if (/^-?\d+n?$/.test(s)) return BigInt(s.replace(/n$/, ''));
+            return Number(s);
+        }
+        return 0;
     }
 
     private loadBytes(info: ModuleInfo): CModuleEngine.Module {
@@ -273,7 +413,7 @@ export class ModuleLoader {
 
             resolveExternal(req: string, parent: string): { path: string; isCjs: boolean } | null {
                 try {
-                    const info = self.resolver.resolve(req, parent);
+                    const info = self.resolver.resolve(req, parent, { cjs: true });
                     return { path: info.localPath, isCjs: info.format === 'cjs' };
                 } catch { return null; }
             },
