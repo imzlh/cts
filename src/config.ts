@@ -133,10 +133,10 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     const cfg = { ...DEFAULTS, ...envConfig(), ...userConfig } as RuntimeConfig;
 
     if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || getEnv('CTS_CACHE_DIR') || '';
-    if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'] || getEnv('CTS_POLYFILL') || '';
+    if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'];
     if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || getEnv('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.disableCache  = true;
-    if (cli['silent'])        cfg.silent        = getEnv('CTS_SILENT') === 'true';
+    if (cli['silent'])        cfg.silent        = true;
     if (cli['no-http'])       cfg.enableHttp    = false;
     if (cli['no-jsr'])        cfg.enableJsr     = false;
     if (cli['no-node'])       cfg.enableNode    = false;

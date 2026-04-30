@@ -10,7 +10,7 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchBytes, fetchText } from '../utils/net';
+import { fetchBytes, fetchText } from '../http/fetch';
 import { isCacheExpired, matchLatestVersion, safeParse, errMsg } from '../utils/misc';
 import { fs, engine } from '../utils/index';
 import { log } from '../utils/log';

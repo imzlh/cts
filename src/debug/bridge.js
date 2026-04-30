@@ -1,3 +1,8 @@
+/**
+ * Circu.js Debug Bridge
+ * Attach me to your cjs binary to dynamically load and run cts loader.
+ */
+
 const useFN = import.meta.use;
 if (!useFN) throw new Error('not in cjs context')
 const os = useFN('os');

@@ -17,7 +17,7 @@ import { NpmHandler }   from './protocol/npm';
 import { NodeHandler }  from './protocol/node';
 import { DataHandler }  from './protocol/data';
 import { LockStore }    from './lock';
-import { normalizePath, joinPaths, isAbsolute, dirname } from './utils/path';
+import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath } from './utils/path';
 import { resolveFile } from './utils/io';
 import { detectFormat } from './pkg';
 import { guessFileKind } from './protocol/base';
@@ -221,7 +221,7 @@ export class ModuleResolver {
         if (pp) { const h = this.handlers.get(pp); if (h) return h.resolve(spec, parent, attr); }
         let base = parent.startsWith('file://') ? parent.slice(7) : parent;
         // Ensure base is an absolute path for correct relative resolution
-        if (!isAbsolute(base)) base = joinPaths(this.cfg.cacheDir, base);
+        if (!isAbsolute(base)) base = resolvePath(base);
         base = dirname(base);
         const joined = joinPaths(base, spec);
         const localPath = resolveFile(normalizePath(joined));

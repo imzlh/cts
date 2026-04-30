@@ -4,7 +4,7 @@
 // to overwrite the same lines without console.log adding newlines.
 // Falls back to plain console.log if not a TTY.
 
-import { engine, timers, os, fs, pty } from './index';
+import { engine, timers, os, fs, pty, console } from './index';
 const { setInterval, clearInterval } = timers;
 
 // ---------------------------------------------------------------------------
@@ -37,20 +37,15 @@ function initTty(): void {
 }
 
 function write(s: string): void {
-    if (isatty) {
-        const buffer = engine.encodeString(s);
-        fs.write(os.STDOUT_FILENO, buffer);
-    } else {
-        // Fallback to console.log for non-TTY environments
-        globalThis.console.log(s);
-    }
+    const buffer = engine.encodeString(s);
+    fs.write(os.STDOUT_FILENO, buffer);
 }
 
 // ---------------------------------------------------------------------------
 // Spinner frames
 // ---------------------------------------------------------------------------
 
-const SPINNER = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 // ---------------------------------------------------------------------------
 // MultiProgress — N concurrent download slots shown on screen
@@ -65,13 +60,13 @@ export interface ProgressItem {
 }
 
 export class MultiProgress {
-    private items  = new Map<string, ProgressItem>(); // key → item
+    private items = new Map<string, ProgressItem>(); // key → item
     private order: string[] = [];
-    private tick   = 0;
+    private tick = 0;
     private timer: ReturnType<typeof setInterval> | null = null;
     private completed = 0;
-    private total     = 0;
-    private startMs   = Date.now();
+    private total = 0;
+    private startMs = Date.now();
 
     constructor(private readonly maxLines = 5) {
         initTty();
@@ -89,7 +84,7 @@ export class MultiProgress {
     update(key: string, done: number, total = 0): void {
         const item = this.items.get(key);
         if (!item || item.finished) return;
-        item.done  = done;
+        item.done = done;
         if (total) item.total = total;
     }
 
@@ -97,7 +92,7 @@ export class MultiProgress {
         const item = this.items.get(key);
         if (!item || item.finished) return;
         item.finished = true;
-        item.error    = error;
+        item.error = error;
         this.completed++;
     }
 
@@ -139,23 +134,23 @@ export class MultiProgress {
         const spin = SPINNER[this.tick]!;
 
         // Show at most maxLines active items (prioritise in-progress)
-        const active   = this.order.filter(k => !this.items.get(k)!.finished);
-        const finished = this.order.filter(k =>  this.items.get(k)!.finished);
-        const visible  = [...active.slice(0, this.maxLines - 1), ...finished.slice(-1)];
+        const active = this.order.filter(k => !this.items.get(k)!.finished);
+        const finished = this.order.filter(k => this.items.get(k)!.finished);
+        const visible = [...active.slice(0, this.maxLines - 1), ...finished.slice(-1)];
 
-        const elapsed  = ((Date.now() - this.startMs) / 1000).toFixed(1);
-        const summary  = `${spin} Precaching dependencies: ${this.completed}/${this.total} modules (${elapsed}s)`;
-        const lines    = [summary];
+        const elapsed = ((Date.now() - this.startMs) / 1000).toFixed(1);
+        const summary = `${spin} Precaching dependencies: ${this.completed}/${this.total} modules (${elapsed}s)`;
+        const lines = [summary];
 
         for (const key of visible.slice(0, this.maxLines)) {
-            const item  = this.items.get(key)!;
+            const item = this.items.get(key)!;
             const short = truncate(item.label, termWidth - 25);
             if (item.error) {
                 lines.push(`  ${C.red('✗')} ${short}`);
             } else if (item.finished) {
                 lines.push(`  ${C.green('✓')} ${short}`);
             } else {
-                const bar   = item.total ? renderBar(item.done, item.total, 10) : 'waiting...';
+                const bar = item.total ? renderBar(item.done, item.total, 10) : 'waiting...';
                 const bytes = fmtBytes(item.done);
                 lines.push(`  ${spin} ${short} ${bar} ${bytes}`);
             }
@@ -181,9 +176,9 @@ export class LineProgress {
     }
     update(done: number, total: number): void {
         if (!isatty) return;
-        const bar   = total ? renderBar(done, total, 20) : '';
-        const pct   = total ? `${Math.floor(done / total * 100)}%` : fmtBytes(done);
-        const s     = `\r  ${this.label} ${bar} ${pct}`;
+        const bar = total ? renderBar(done, total, 20) : '';
+        const pct = total ? `${Math.floor(done / total * 100)}%` : fmtBytes(done);
+        const s = `\r  ${this.label} ${bar} ${pct}`;
         write(truncate(s, termWidth));
     }
     stop(): void {
@@ -196,13 +191,13 @@ export class LineProgress {
 // ---------------------------------------------------------------------------
 
 function renderBar(done: number, total: number, width: number): string {
-    const pct   = Math.min(1, done / total);
+    const pct = Math.min(1, done / total);
     const filled = Math.floor(pct * width);
     return '[' + '█'.repeat(filled) + '░'.repeat(width - filled) + ']';
 }
 
 function fmtBytes(n: number): string {
-    if (n < 1024)        return `${n}B`;
+    if (n < 1024) return `${n}B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
     return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }

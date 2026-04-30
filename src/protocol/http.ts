@@ -6,7 +6,7 @@ import { guessFileKind } from './base';
 import { joinPaths, dirname } from '../utils/path';
 import { ensureDir } from '../utils/io';
 import { cacheFilename } from '../utils/misc';
-import { fetchBytes } from '../utils/net';
+import { fetchBytes } from '../http/fetch';
 import { URL } from '../http/url';
 import { fs } from '../utils/index';
 import { log } from '../utils/log';
@@ -25,7 +25,7 @@ export class HttpHandler implements ProtocolHandler {
             const cachePath = this.cachePath(url);
             if (!fs.exists(cachePath)) {
                 if (!this.cfg.silent) log.info(`📦 ${url}`);
-                const bytes = fetchBytes(url, !this.cfg.silent);
+                const bytes = fetchBytes(url);
                 ensureDir(dirname(cachePath));
                 fs.writeFile(cachePath, bytes);
             }

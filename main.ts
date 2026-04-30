@@ -206,8 +206,8 @@ async function runMain(): Promise<void> {
     // Warn on unknown flags (use raw CLI args, not normalized config)
     warnUnknownFlags(cli._cli ?? cli);
 
-    os.args.splice(0, cli._offset!);
     const { entry, dir } = entryAndDir(cli._!);
+    // Note: os.args modification removed to avoid affecting runtime behavior
     const fileCfg = loadConfigFile(dir);
 
     await run(entry, dir, {

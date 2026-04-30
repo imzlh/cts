@@ -1,15 +1,3 @@
-// deps.ts — parallel async BFS dependency scanner
-//
-// Algorithm: level-by-level BFS.
-//   1. Parse a batch of already-local files simultaneously (asyncfs)
-//      → collect all import specifiers
-//   2. Resolve specifiers → split: already-cached vs needs-download
-//   3. Fire ALL downloads for this level in parallel (Promise.allSettled + async TCP)
-//   4. Newly downloaded files form the next batch → repeat from 1
-//
-// Net effect: every file at the same BFS depth is downloaded concurrently.
-// Only the unavoidable inter-level dependency remains serialised.
-
 import { parse } from '../deps/sucrase/src/parser';
 import { TokenType as tt } from '../deps/sucrase/src/parser/tokenizer/types';
 import { ContextualKeyword } from '../deps/sucrase/src/parser/tokenizer/keywords';
@@ -20,9 +8,9 @@ import { ensureDir } from './utils/io';
 import { dirname, extname } from './utils/path';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';
-import { fetchAsync } from './http/async_client';
 import { MultiProgress } from './utils/progress';
 import { fs, engine, asyncfs } from './utils/index';
+import { fetchAsync } from './http/fetch';
 
 // ---------------------------------------------------------------------------
 // Import specifier extraction — sucrase token-based, no regex

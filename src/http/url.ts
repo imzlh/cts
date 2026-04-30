@@ -1,7 +1,4 @@
-// URL API Polyfill for QuickJS ng
-// 完整实现 URL 和 URLSearchParams，支持特殊路径格式
-
-// ==================== 工具函数 ====================
+// Fast and Simple URL polyfill
 
 const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 const DIGIT = '0123456789';

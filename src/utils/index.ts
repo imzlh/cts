@@ -1,7 +1,6 @@
 // utils/index.ts — re-export everything
 export * from './path';
 export * from './io';
-export * from './net';
 export * from './misc';
 
 // export all cjs internals

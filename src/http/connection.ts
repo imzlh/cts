@@ -1,25 +1,9 @@
 /**
  * HTTP/HTTPS Connection Manager
  * Implements Keep-Alive pooling with connection reuse and automatic cleanup.
- *
- * Critical OpenSSL BIO behavior:
- * - feed() returns bytes consumed (may be < input length)
- * - read() returns 0 when no data buffered (NOT an error)
- * - handshake() must be called repeatedly until complete
- *
- * Socket read semantics:
- * - null = EOF (connection closed)
- * - 0 = EAGAIN (try again, no data available now)
- * - n > 0 = bytes read
  */
-import { streams, ssl, dns, os, timers, fs } from '../utils';
+import { streams, ssl, dns, os, timers, fs, assert } from '../utils';
 import { log } from '../utils/log';
-
-function assert(condition: any, message?: string): asserts condition {
-    if (!condition) {
-        throw new Error(message || 'Assertion failed');
-    }
-}
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -34,14 +18,14 @@ function findSystemCaPath(): string | null {
         "/etc/ssl/ca-bundle.pem",
         "/etc/pki/tls/cert.pem",
         "/etc/ssl/cert.pem",
+        "/etc/ca-certificates.crt"
     ] : sysname === 'Darwin' ? [
         "/etc/ssl/cert.pem",
         "/usr/local/etc/openssl/cert.pem",
         "/opt/homebrew/etc/openssl/cert.pem",
     ] : [
         "C:\\Windows\\cacert.pem",
-        "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt",
-        "C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem",
+        "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt"
     ];
     for (const p of candidates) {
         try { if (fs.stat(p).isFile) { _caPath = p; return p; } } catch {}
@@ -74,13 +58,32 @@ export interface ConnectionLike {
     lastUsed: number;
     requests: number;
     connect(): void;
+    connectAsync(): Promise<void>;
     write(data: Uint8Array): void;
+    writeAsync(data: Uint8Array): Promise<void>;
     read(size?: number, waitForData?: boolean): Uint8Array | null;
+    readAsync(size?: number, waitForData?: boolean): Promise<Uint8Array | null>;
     markActive(): void;
     markIdle(): void;
     close(): void;
     isAvailable(): boolean;
     isClosed(): boolean;
+}
+
+const dnsCache: Map<string, CModuleStreams.AddressInfo[]> = new Map();
+
+function resolveDNSSync(hostname: string, family = os.AF_UNSPEC): CModuleStreams.AddressInfo[] { 
+    if (dnsCache.has(hostname)) return dnsCache.get(hostname)!;
+    const addrs = dns.resolveSync(hostname, { family });
+    dnsCache.set(hostname, addrs);
+    return addrs;
+}
+
+async function resolveDNS(hostname: string, family = os.AF_UNSPEC) {
+    if (dnsCache.has(hostname)) return dnsCache.get(hostname)!;
+    const addrs = await dns.resolve(hostname, { family });
+    dnsCache.set(hostname, addrs);
+    return addrs;
 }
 
 export class Connection implements ConnectionLike {
@@ -101,7 +104,7 @@ export class Connection implements ConnectionLike {
 
     connect(): void {
         try {
-            const addrs = dns.resolveSync(this.config.hostname, { family: os.AF_UNSPEC });
+            const addrs = resolveDNSSync(this.config.hostname);
             if (!addrs || !addrs.length) {
                 throw new Error(`DNS resolution failed for ${this.config.hostname}`);
             }
@@ -112,7 +115,31 @@ export class Connection implements ConnectionLike {
             this.socket.setBlocking(true);
 
             if (this.config.protocol === "https:") {
-                this.performTLSHandshake();
+                this.syncDriver(this.performTLSHanddshake());
+            }
+
+            this.state = ConnectionState.IDLE;
+            this.startIdleTimer();
+        } catch (err) {
+            this.state = ConnectionState.CLOSED;
+            try { this.socket.close(); } catch {}
+            throw err;
+        }
+    }
+
+    async connectAsync(): Promise<void> {
+        try {
+            const addrs = await resolveDNS(this.config.hostname);
+            if (!addrs || !addrs.length) {
+                throw new Error(`DNS resolution failed for ${this.config.hostname}`);
+            }
+            const addr = addrs.find(a => a.family === 4) || addrs[0];
+            assert(addr, `No IP address found for ${this.config.hostname}`);
+
+            await this.socket.connect({ ip: addr.ip, port: this.config.port });
+
+            if (this.config.protocol === "https:") {
+                await this.asyncDriver(this.performTLSHanddshake());
             }
 
             this.state = ConnectionState.IDLE;
@@ -139,13 +166,34 @@ export class Connection implements ConnectionLike {
         }
     }
 
-    read(size = 16384, waitForData = false): Uint8Array | null {
-        return this.sslPipe
-            ? this.readSSL(size, waitForData)
-            : this.readPlain(size, waitForData);
+    async writeAsync(data: Uint8Array): Promise<void> {
+        if (this.sslPipe) {
+            const written = this.sslPipe.write(data);
+            if (written < 0) {
+                throw new Error(`SSL_write failed: ${written}`);
+            }
+            const encrypted = this.sslPipe.getOutput();
+            if (encrypted) {
+                await this.socket.write(new Uint8Array(encrypted));
+            }
+        } else {
+            await this.socket.write(data);
+        }
     }
 
-    private readSSL(size: number, waitForData: boolean): Uint8Array | null {
+    read(size = 16384, waitForData = false): Uint8Array | null {
+        return this.syncDriver(this.sslPipe
+            ? this.readSSL(size, waitForData)
+            : this.readPlain(size, waitForData));
+    }
+
+    readAsync(size = 16384, waitForData = false): Promise<Uint8Array | null> {
+        return this.asyncDriver(this.sslPipe
+            ? this.readSSL(size, waitForData)
+            : this.readPlain(size, waitForData));
+    }
+
+    private *readSSL(size: number, waitForData: boolean): Generator<Uint8Array, Uint8Array | null> {
         const maxAttempts = waitForData ? 10 : 1;
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -164,7 +212,7 @@ export class Connection implements ConnectionLike {
             }
 
             const cipherBuf = new Uint8Array(size);
-            const n = this.socket.readSync(cipherBuf);
+            const n = yield cipherBuf;
 
             if (n === null) return null;
 
@@ -175,9 +223,6 @@ export class Connection implements ConnectionLike {
                         return new Uint8Array(finalPlaintext);
                     }
                     return null;
-                }
-                if (attempt < maxAttempts - 1) {
-                    this.sleep(10);
                 }
                 continue;
             }
@@ -202,16 +247,15 @@ export class Connection implements ConnectionLike {
         return null;
     }
 
-    private readPlain(size: number, waitForData: boolean): Uint8Array | null {
+    private *readPlain(size: number, waitForData: boolean): Generator<Uint8Array, Uint8Array | null> {
         const buf = new Uint8Array(size);
-        const n = this.socket.readSync(buf);
+        const n = yield(buf);
 
         if (n === null) return null;
         if (n === 0) {
             if (!waitForData) return null;
             for (let i = 0; i < 3; i++) {
-                this.sleep(10);
-                const retryN = this.socket.readSync(buf);
+                const retryN = yield(buf);
                 if (retryN === null) return null;
                 if (retryN > 0) return buf.subarray(0, retryN);
             }
@@ -251,7 +295,31 @@ export class Connection implements ConnectionLike {
     isAvailable(): boolean { return this.state === ConnectionState.IDLE; }
     isClosed(): boolean    { return this.state === ConnectionState.CLOSED; }
 
-    private performTLSHandshake(): void {
+    private async asyncDriver<T>(gen: Generator<Uint8Array, T>): Promise<T> { 
+        let next = gen.next();
+        while (!next.done) try {
+            const buf = next.value as Uint8Array;
+            const n = await this.socket.read(buf);
+            next = gen.next(n);
+        } catch (e) {
+            next = gen.throw(e);
+        }
+        return next.value;
+    }
+    
+    private syncDriver<T>(gen: Generator<Uint8Array, T>): T { 
+        let next = gen.next();
+        while (!next.done) try {
+            const buf = next.value as Uint8Array;
+            const n = this.socket.readSync(buf);
+            next = gen.next(n);
+        } catch (e) {
+            next = gen.throw(e);
+        }
+        return next.value;
+    }
+
+    private *performTLSHanddshake(): Generator<Uint8Array, void> {
         const caPath = findSystemCaPath();
         const ctx = new ssl.Context({
             mode  : "client",
@@ -273,7 +341,7 @@ export class Connection implements ConnectionLike {
 
         while (!this.sslPipe.handshakeComplete) {
             const buf = new Uint8Array(16384);
-            const n = this.socket.readSync(buf);
+            const n = yield buf;
 
             if (n === null) throw new Error("TLS handshake failed: connection closed (EOF)");
             if (n === 0)    throw new Error("TLS handshake failed: no data available (EAGAIN)");
@@ -300,11 +368,6 @@ export class Connection implements ConnectionLike {
         const consumed = this.sslPipe.feed(data);
         if (consumed < 0) throw new Error(`SSL feed error: ${consumed}`);
         return consumed;
-    }
-
-    private sleep(ms: number): void {
-        const start = Date.now();
-        while (Date.now() - start < ms) {}
     }
 
     private startIdleTimer(): void {

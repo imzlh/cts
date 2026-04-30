@@ -5,7 +5,7 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchBytes, fetchText } from '../utils/net';
+import { fetchBytes, fetchText } from '../http/fetch';
 import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
 import { detectFormat, readPkgFresh, createCtx, resolveSubpath } from '../pkg';
 import { log } from '../utils/log';
@@ -257,7 +257,7 @@ export class NpmHandler implements ProtocolHandler {
         const meta    = this.fetchMeta(name);
         const tarball = meta.versions[ver]?.dist.tarball;
         if (!tarball) throw new Error(`Version ${ver} not found for ${name}`);
-        const files = unTarGz(fetchBytes(tarball, true).buffer);
+        const files = unTarGz(fetchBytes(tarball).buffer);
         ensureDir(dir);
         const seen = new Set<string>();
         for (const f of files) {

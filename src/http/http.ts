@@ -5,15 +5,7 @@
 
 import { Headers } from "headers-polyfill";
 import { URL } from "./url";
-import { engine, http } from '../utils/index';
-
-
-// Local assertion function to avoid circular dependency
-function assert(condition: any, message?: string): asserts condition {
-    if (!condition) {
-        throw new Error(message || 'Assertion failed');
-    }
-}
+import { assert, engine, http } from '../utils/index';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type HeadersInit = Record<string, string | string[]>;
@@ -32,6 +24,16 @@ export type HttpMethod =
 export type HttpVersion = '1.0' | '1.1';
 
 /**
+ * HTTP 请求初始化选项
+ */
+export interface ReqInit {
+    method?: HttpMethod;
+    version?: HttpVersion;
+    headers?: HeadersInit;
+    body?: BodyInit | null;
+}
+
+/**
  * HTTP 请求构建器
  */
 export class HttpRequestBuilder {
@@ -41,12 +43,7 @@ export class HttpRequestBuilder {
     private headers: Headers = new Headers();
     private body: Uint8Array | null = null;
 
-    constructor(url: string | URL, options?: {
-        method?: HttpMethod;
-        version?: HttpVersion;
-        headers?: HeadersInit;
-        body?: BodyInit | null;
-    }) {
+    constructor(url: string | URL, options?: ReqInit) {
         this.url = typeof url === 'string' ? new URL(url) : url;
 
         if (options?.method) {
@@ -86,13 +83,6 @@ export class HttpRequestBuilder {
                 this.headers.set('content-type', 'application/json');
             }
         }
-    }
-
-    /**
-     * 异步设置请求体（用于 Blob/FormData）
-     */
-    private async setBodyAsync(body: BodyInit): Promise<void> {
-        this.setBody(body);
     }
 
     /**
@@ -142,16 +132,6 @@ export class HttpRequestBuilder {
         }
 
         return headerBytes;
-    }
-
-    /**
-     * 构建 HTTP 请求（异步，支持 Blob/FormData）
-     */
-    async buildAsync(body?: BodyInit): Promise<Uint8Array> {
-        if (body !== undefined) {
-            await this.setBodyAsync(body);
-        }
-        return this.build();
     }
 
     /**
@@ -223,7 +203,7 @@ export class HttpResponseParser {
             // update status
             this.statusCode = this.parser.state.status;
             this.headersComplete = true;
-            if(!this.statusText) {
+            if (!this.statusText) {
                 this.statusText = http.strstatus(this.statusCode);
             }
             // Detect HTTP version from parser state
@@ -237,7 +217,7 @@ export class HttpResponseParser {
         // 响应体数据
         this.parser.onBody = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            if(!this.onData) this.bodyChunks.push(view);    // 缓存
+            if (!this.onData) this.bodyChunks.push(view);    // 缓存
             this.onData?.(view);
         };
 
@@ -254,7 +234,7 @@ export class HttpResponseParser {
     feed(data: Uint8Array): void {
         try {
             const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.length + data.byteOffset));
-            
+
             if (result.errno !== 0) {
                 const error = new Error(`HTTP parse error: ${result.reason}`);
                 if (this.onError) {
@@ -345,8 +325,8 @@ export class HttpResponseParser {
         this.headersComplete = false;
 
         // 重置回调
-        this.onComplete = this.onData = 
-        this.onError = this.onHeadersComplete = undefined;
+        this.onComplete = this.onData =
+            this.onError = this.onHeadersComplete = undefined;
     }
 }
 
