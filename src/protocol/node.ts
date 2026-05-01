@@ -6,6 +6,7 @@ import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { detectFormat } from '../pkg';
 
 import { log } from '../utils/log';
+import { fs } from '../utils/index';
 
 export class NodeHandler implements ProtocolHandler {
     readonly protocols = ['node'];
@@ -64,8 +65,10 @@ export class NodeHandler implements ProtocolHandler {
         }
         const nodeDir = joinPaths(this.cfg.cacheDir, 'node');
         // e.g. fs/promises → node/fs/promises.ts; fs → node/fs/index.ts
-        return bare.includes('/')
+        const localPath = bare.includes('/')
             ? joinPaths(nodeDir, `${bare}.ts`)
             : joinPaths(nodeDir, bare, 'index.ts');
+        if (!fs.exists(localPath)) throw new Error(`Node.js builtin "${bare}" has no polyfill at ${localPath}`);
+        return localPath;
     }
 }

@@ -7,9 +7,10 @@ import { ModuleLoader }   from './loader';
 import { DepScanner }     from './deps';
 import { createConfig }   from './config';
 import { resources }      from './resources';
-import { dirname }        from './utils/path';
-import { writeText, ensureDir } from './utils/io';
+import { dirname, normalizePath, isAbsolute, joinPaths } from './utils/path';
+import { writeText, ensureDir, resolveFile } from './utils/io';
 import { errMsg } from './utils/misc';
+import { guessFileKind } from './protocol/base';
 import { console, engine, os, crypto, __use_fn } from './utils';
 import { log } from './utils/log';
 
@@ -157,13 +158,35 @@ export class TypeScriptRuntime {
     // -------------------------------------------------------------------------
 
     async loadPolyfill(path: string): Promise<void> {
-        const info = this.resolver.resolve(path, `${os.cwd}/<polyfill>`);
-        const meta = {} as Record<string, any>;
-        info.format = 'esm';    // polyfill is always ESM!
+        // Resolve the polyfill path directly — skip the full resolver chain
+        // (import map, lock lookup, protocol dispatch) since polyfills are
+        // always local files and resolving them through the full pipeline is
+        // both slow and fragile (e.g. lock writes with synthetic parents).
+        const localPath = this.resolvePolyfillPath(path);
+        const specPath  = localPath;   // local file → specPath === localPath
+        const info: ModuleInfo = {
+            specPath,
+            localPath,
+            format: 'esm',           // polyfill is always treated as ESM
+            fileKind: guessFileKind(localPath),
+        };
+        const meta: Record<string, any> = {};
         this.fillMeta(meta, info);
         meta.polyfill = true;
         await this.loader.load(info, meta).eval();
-        log.debug('runtime', () => `polyfill: ${info.specPath}`);
+        log.debug('runtime', () => `polyfill: ${specPath}`);
+    }
+
+    /** Resolve a polyfill path to an absolute local file path. */
+    private resolvePolyfillPath(path: string): string {
+        // Already absolute
+        if (isAbsolute(path)) return resolveFile(normalizePath(path));
+        // Relative to cwd
+        if (path.startsWith('./') || path.startsWith('../')) {
+            return resolveFile(normalizePath(joinPaths(os.cwd, path)));
+        }
+        // Bare path segment — treat as relative to cwd
+        return resolveFile(normalizePath(joinPaths(os.cwd, path)));
     }
 
     async loadEntry(path: string, extra: Record<string, any> = {}): Promise<CModuleEngine.Module> {

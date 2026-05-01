@@ -94,6 +94,7 @@ function doFetch(
         const headers = parser.getHeaders();
 
         if (status >= 300 && status < 400 && location) {
+            if (maxRedirects <= 0) throw new Error(`Too many redirects (>${MAX_REDIRECTS}) following ${url}`);
             if (isHttp10) conn.close();
             else connectionManager.release(config, conn);
             const nextUrl = location.startsWith('/') ? new URL(location, url).toString() : location;
@@ -162,12 +163,14 @@ async function doFetchAsync(
         await conn.writeAsync(req);
 
         let status = 0, contentLength = 0;
+        let isHttp10 = false;
         const chunks: Uint8Array[] = [];
         let loaded = 0;
 
         parser.onHeadersComplete = (code: number, hdrs: any) => {
             status = code;
             contentLength = +(hdrs?.get?.('content-length') ?? 0);
+            isHttp10 = parser.isHttp10;
         };
 
         parser.onData = (chunk: Uint8Array) => {
@@ -180,19 +183,30 @@ async function doFetchAsync(
 
         while (!parser.isCompleted) {
             const d = await conn.readAsync(128 * 1024, true);
-            if (!d) break;
+            if (!d) {
+                // HTTP/1.0 without content-length: connection close = end of response
+                if (isHttp10 && !contentLength && parser.isHeadersComplete) break;
+                break;
+            }
             parser.feed(d);
+        }
+        if (!parser.isCompleted && !(isHttp10 && !contentLength)) {
+            throw new Error('Incomplete HTTP response');
         }
 
         const headers = parser.getHeaders();
         const location = headers.get('location') ?? '';
 
-        connectionManager.release(config, conn);
-
         if (status >= 300 && status < 400 && location) {
+            if (maxRedirects <= 0) throw new Error(`Too many redirects (>${MAX_REDIRECTS}) following ${url}`);
+            if (isHttp10) conn.close();
+            else connectionManager.release(config, conn);
             const nextUrl = location.startsWith('/') ? new URL(location, url).toString() : location;
             return doFetchAsync(nextUrl, onProgress, options, maxRedirects - 1);
         }
+
+        if (isHttp10) conn.close();
+        else connectionManager.release(config, conn);
 
         if (status < 200 || status >= 300) throw new Error(`HTTP ${status} ${url}`);
 

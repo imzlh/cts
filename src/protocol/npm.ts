@@ -135,7 +135,10 @@ export class NpmHandler implements ProtocolHandler {
 
     localPath(specPath: string): string {
         const { name, version, subpath } = parseNpmSpec(specPath);
-        const dir = joinPaths(this.cacheDir, `${name}@${version}`);
+        // Resolve the actual installed version — the spec may contain a range
+        // like "latest" that doesn't match the on-disk directory name.
+        const exactVer = this.resolveVersion(name, version);
+        const dir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         const ctx = createCtx(dir);
         if (!ctx) throw new Error(`Package not installed: ${specPath}`);
         return resolveSubpath(ctx, subpath) ?? (() => { throw new Error(`Cannot resolve ${subpath} in ${name}`); })();
@@ -143,9 +146,18 @@ export class NpmHandler implements ProtocolHandler {
 
     // ---------------------------------------------------------------------------
 
+    /** Build a canonical npm specPath: npm:name@version/subpath */
+    private static specPath(name: string, version: string, subpath: string): string {
+        return `npm:${name}@${version}` + (subpath ? `/${subpath}` : '');
+    }
+
     private resolveRelative(spec: string, parent: string, forceCjs: boolean): ModuleInfo {
         const { name, version, subpath } = parseNpmSpec(parent);
-        const dir = joinPaths(this.cacheDir, `${name}@${version}`);
+        // Use ensureInstalled to resolve the actual installed directory.
+        // The version from the parent specifier may be a range (e.g. "latest",
+        // "^1.0.0") that doesn't match the actual directory name on disk.
+        const pkg = this.ensureInstalled(name, version, parent);
+        const dir = pkg.dir;
         const ctx = createCtx(dir, { forceCjs });
         if (!ctx) throw new Error(`package.json not found in ${dir}`);
 
@@ -154,7 +166,7 @@ export class NpmHandler implements ProtocolHandler {
         //   - parent "npm:hono@4.12.14" has subpath="" but localPath=".../dist/index.js"
         //   - import "./hono.js" must resolve relative to dist/, not the package root
         const parentLocal = resolveSubpath(ctx, subpath || '.');
-        if (!parentLocal) throw new Error(`Cannot resolve parent "${subpath || '.'}" in ${name}@${version}`);
+        if (!parentLocal) throw new Error(`Cannot resolve parent "${subpath || '.'}" in ${name}@${pkg.resolvedVer}`);
 
         const targetLocal = normalizePath(joinPaths(dirname(parentLocal), spec));
         // Verify the target file exists
@@ -163,9 +175,8 @@ export class NpmHandler implements ProtocolHandler {
 
         // Compute the subpath relative to pkgDir for the canonical specPath
         const relToDir = normalizePath(resolvedLocal.slice(dir.length + 1));
-        const specPath = `npm:${name}@${version}` + (relToDir ? `/${relToDir}` : '');
         return {
-            specPath,
+            specPath: NpmHandler.specPath(name, pkg.resolvedVer, relToDir),
             localPath: resolvedLocal,
             format: detectFormat(resolvedLocal),
             fileKind: guessFileKind(resolvedLocal),
@@ -177,10 +188,8 @@ export class NpmHandler implements ProtocolHandler {
         if (!ctx) throw new Error(`package.json not found in ${dir}`);
         const localPath = resolveSubpath(ctx, subpath);
         if (!localPath) throw new Error(`Cannot resolve "${subpath || '.'}" in ${name}@${ver}`);
-        // Build canonical specPath that includes resolved version
-        const specPath = `npm:${name}@${ver}` + (subpath ? `/${subpath}` : '');
         return {
-            specPath,
+            specPath: NpmHandler.specPath(name, ver, subpath),
             localPath,
             format: detectFormat(localPath),
             fileKind: guessFileKind(localPath),
@@ -272,7 +281,16 @@ export class NpmHandler implements ProtocolHandler {
     private findLocal(name: string, parent?: string): string | null {
         const search: string[] = [];
         if (parent) {
-            let d = dirname(parent.startsWith('npm:') ? joinPaths(this.cacheDir, name) : parent);
+            let startDir: string;
+            if (parent.startsWith('npm:')) {
+                // Parent is in the global cache (e.g. npm:lodash@4.17.21).
+                // Look for sibling node_modules under the cache directory,
+                // since npm hoists nested deps to the cache root.
+                startDir = this.cacheDir;
+            } else {
+                startDir = dirname(parent);
+            }
+            let d = startDir;
             const root = osname === 'win32' ? d.split(':')[0] + ':/' : '/';
             while (d && d !== root) {
                 search.push(joinPaths(d, 'node_modules'));

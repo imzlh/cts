@@ -142,8 +142,10 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     if (cli['no-node'])       cfg.enableNode    = false;
     if (cli['no-lock'])       cfg.noLock        = true;
     if (cli['frozen'])        cfg.frozen        = true;
-    if (cli['memory-limit'])  cfg.memoryLimit   = parseSize(cli['memory-limit'] || getEnv('CTS_MEMORY_LIMIT') || '1g');
-    if (cli['max-stack-size']) cfg.maxStackSize = parseSize(cli['max-stack-size'] || getEnv('CTS_MAX_STACK_SIZE') || '0');
+    if (cli['memory-limit'] !== undefined)
+        cfg.memoryLimit = parseSize(cli['memory-limit'] || getEnv('CTS_MEMORY_LIMIT') || '1g');
+    if (cli['max-stack-size'] !== undefined)
+        cfg.maxStackSize = parseSize(cli['max-stack-size'] || getEnv('CTS_MAX_STACK_SIZE') || '0');
     if (cli['jsr-cache-ttl'] !== undefined)
         cfg.jsrCacheTTL = (cli['jsr-cache-ttl'] as number) * 24 * 60 * 60 * 1000;
 
@@ -185,8 +187,8 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
                 if (ts.compilerOptions?.paths)   cfg.pathAliases = ts.compilerOptions.paths;
                 if (ts.compilerOptions?.baseUrl) cfg.baseUrl = joinPaths(d, ts.compilerOptions.baseUrl);
                 log.debug('config', () => `tsconfig: ${tsP}`);
+                foundTsconfig = true;
             }
-            foundTsconfig = true;
         }
 
         for (const name of ['deno.json', 'deno.jsonc']) {
@@ -210,9 +212,11 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
         const pkgP = joinPaths(d, 'package.json');
         if (!foundPkg && fs.exists(pkgP)) {
             const pkg = readJson(pkgP);
-            if (pkg?.imports && typeof pkg.imports === 'object')
-                cfg.importMap = { ...pkg.imports, ...cfg.importMap };
-            foundPkg = true;
+            if (pkg) {
+                if (pkg.imports && typeof pkg.imports === 'object')
+                    cfg.importMap = { ...pkg.imports, ...cfg.importMap };
+                foundPkg = true;
+            }
         }
 
         if (foundTsconfig || foundDeno) break;

@@ -11,7 +11,7 @@
 import { dirname, joinPaths, isAbsolute, extname } from './utils/path';
 import { resolveFile } from './utils/io';
 import { safeParse } from './utils/misc';
-import { detectFormat } from './pkg';
+import { detectFormat, resolveMain, createCtx } from './pkg';
 import { log } from './utils/log';
 import { fs, engine } from './utils/index';
 
@@ -278,19 +278,15 @@ export class CjsLoader {
 
         const ns = this.deps.loadEsmSync(localPath, specPath);
 
-        // Synthesise a CJS-compatible exports:
-        //   { default, ...namedExports }
-        // Then return the value that `require()` would get in Node.js:
-        //   - If namespace only has `default` and `__esModule`, return the default
-        //   - Otherwise return the whole namespace (named exports accessible as ns.foo)
+        // Synthesise a CJS-compatible exports object that mirrors the ESM namespace.
+        // Node.js compat: require('esm-pkg') returns ns.default when present,
+        // otherwise the full namespace (named exports accessible as ns.foo).
         const synthetic = Object.assign(Object.create(null), ns);
+        const result = 'default' in ns ? ns.default : synthetic;
         const mod = this.synth(localPath);
-        mod.exports = synthetic;
+        mod.exports = result;
         this.builtinCache.set(cacheKey, mod);
-
-        // Node.js compat: if the ESM has a default, that's what require() returns
-        if ('default' in ns) return ns.default;
-        return synthetic;
+        return result;
     }
 
     // -------------------------------------------------------------------------
@@ -334,11 +330,23 @@ export class CjsLoader {
             } catch { return null; }
         }
 
-        // Relative path (includes '.' which means "the directory containing this file")
-        if (id.startsWith('./') || id.startsWith('../') || id === '.') {
-            const base = id === '.' ? dirname(parentPath) : joinPaths(dirname(parentPath), id);
+        // Relative path
+        if (id.startsWith('./') || id.startsWith('../')) {
+            const base = joinPaths(dirname(parentPath), id);
             try {
                 const path = resolveFile(base);
+                return { path, isCjs: detectFormat(path) === 'cjs' };
+            } catch { return null; }
+        }
+
+        // require('.') — resolve to the package's main entry (package.json "main"),
+        // falling back to directory index (index.js etc.) if no package.json exists.
+        if (id === '.') {
+            const dir = dirname(parentPath);
+            try {
+                const ctx = createCtx(dir);
+                const mainPath = ctx ? resolveMain(ctx) : null;
+                const path = mainPath ?? resolveFile(dir);
                 return { path, isCjs: detectFormat(path) === 'cjs' };
             } catch { return null; }
         }

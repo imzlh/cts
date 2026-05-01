@@ -424,6 +424,8 @@ export class ConnectionManager {
 
         const maxSockets = fullCfg.maxSockets || 10;
         if (pool.length >= maxSockets) {
+            // Close idle connections to make room; if all are active, allow
+            // one extra connection rather than blocking (graceful degradation).
             this.closeIdleConnections(key);
         }
 

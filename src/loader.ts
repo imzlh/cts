@@ -91,20 +91,26 @@ export class ModuleLoader {
         const hint = hintOf(info.specPath);
         log.debug('loader', () => `load ${info.specPath} hint=${hint} kind=${info.fileKind} format=${info.format}`);
         log.debug('loader', () => `alias: ${info.specPath} -> ${info.localPath}`);
-        if (hint === 'commonjs') return this.loadCjs(info, meta);
-        if (hint === 'module')   return this.loadEsm(info, meta);
-        if (hint === 'wasm')     return this.loadWasm(info);
-        if (hint === 'bytes' || hint === 'raw') return this.loadBytes(info);
-        if (hint === 'text')     return this.loadText(info);
+
+        // Hint-based dispatch (?type=...) takes priority.
+        switch (hint) {
+            case 'commonjs': return this.loadCjs(info, meta);
+            case 'module':   return this.loadEsm(info, meta);
+            case 'wasm':     return this.loadWasm(info);
+            case 'bytes':
+            case 'raw':      return this.loadBytes(info);
+            case 'text':     return this.loadText(info);
+        }
+
+        // File-kind / format based dispatch.
         switch (info.fileKind) {
             case 'wasm':   return this.loadWasm(info);
             case 'binary': return this.loadBytes(info);
             case 'json':   return this.loadEsm(info, meta);  // transformer wraps as export default
-            default:
-                return info.format === 'cjs'
-                    ? this.loadCjs(info, meta)
-                    : this.loadEsm(info, meta);
         }
+        return info.format === 'cjs'
+            ? this.loadCjs(info, meta)
+            : this.loadEsm(info, meta);
     }
 
     preRegister(localPath: string, parentPath: string): void {

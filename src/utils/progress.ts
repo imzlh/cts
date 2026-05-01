@@ -70,7 +70,6 @@ export class MultiProgress {
 
     constructor(private readonly maxLines = 5) {
         initTty();
-        console.log(`[DEBUG MultiProgress] created, isatty: ${isatty}`);
     }
 
     add(key: string, label: string, totalBytes = 0): void {
