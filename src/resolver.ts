@@ -10,6 +10,7 @@
 
 import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver } from './types';
 import type { ProtocolHandler } from './protocol/base';
+import { err, ErrorKind } from './errors';
 import { FileHandler } from './protocol/file';
 import { HttpHandler }  from './protocol/http';
 import { JsrHandler }   from './protocol/jsr';
@@ -170,7 +171,7 @@ export class ModuleResolver {
         // L3 — full dispatch (downloads, package.json reads, etc.)
         // --frozen: refuse to resolve anything not already in the lock
         if (this.cfg.frozen) {
-            throw new Error(
+            throw err(ErrorKind.LockFrozen,
                 `Module not in lock: "${mapped}"\n` +
                 `  Run [36mcts cache <entry>[0m to update the lock, then retry with --frozen.`
             );
@@ -206,9 +207,9 @@ export class ModuleResolver {
     private dispatch(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         const proto = protoOf(spec);
         if (proto) {
-            if (this.disabled.has(proto)) throw new Error(`Protocol "${proto}:" is disabled`);
+            if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
             const h = this.handlers.get(proto);
-            if (!h) throw new Error(`No handler for protocol "${proto}:"`);
+            if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
             return h.resolve(spec, parent, attr);
         }
         if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelative(spec, parent, attr);
@@ -246,12 +247,12 @@ export class ModuleResolver {
                 const specPath  = localPath;
                 return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
             } catch (e) {
-                throw new Error(`Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`);
+                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`);
             }
         }
         const npm = this.handlers.get('npm');
         if (npm) return npm.resolve(spec, parent, attr);
-        throw new Error(`Cannot resolve bare specifier: "${spec}"`);
+        throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
 
     // -------------------------------------------------------------------------

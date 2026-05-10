@@ -2,6 +2,7 @@
 
 import { URL } from "../http/url";
 import { basename, crypto, dirname, extname, zlib } from './index';
+import { err, ErrorKind } from '../errors';
 
 // ---------------------------------------------------------------------------
 // Misc
@@ -9,7 +10,7 @@ import { basename, crypto, dirname, extname, zlib } from './index';
 
 export const errMsg = (e: unknown) => e instanceof Error ? e.message : String(e);
 export function assert(c: unknown, msg?: string): asserts c {
-    if (!c) throw new Error(msg ?? 'Assertion failed');
+    if (!c) throw err(ErrorKind.Generic, msg ?? 'Assertion failed');
 }
 
 // ---------------------------------------------------------------------------
@@ -161,9 +162,9 @@ export function safeParse<T = unknown>(json: string): T {
             const ln = +m[1]!;
             const ctx = json.split(/\r?\n/).slice(Math.max(0, ln - 2), ln + 2)
                 .map((l, i) => `  ${(i + ln - 1).toString().padStart(4)} | ${l}`).join('\n');
-            throw new Error(msg + '\n' + ctx);
+            throw err(ErrorKind.SyntaxError, msg + '\n' + ctx);
         }
-        throw new Error(msg);
+        throw err(ErrorKind.SyntaxError, msg);
     }
 }
 

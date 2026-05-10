@@ -14,6 +14,7 @@ import { safeParse } from './utils/misc';
 import { detectFormat, resolveMain, createCtx } from './pkg';
 import { log } from './utils/log';
 import { fs, engine } from './utils/index';
+import { err, ErrorKind } from './errors';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,7 +151,7 @@ export class CjsLoader {
     private exec(mod: CjsModule): void {
         const ext = extname(mod.filename);
         if (ext === '.json') { this.execJson(mod); return; }
-        if (ext === '.node') throw new Error(`Native (.node) modules not supported: ${mod.filename}`);
+        if (ext === '.node') throw err(ErrorKind.ModuleNotFound, `Native (.node) modules not supported: ${mod.filename}`);
         this.execJs(mod);
     }
 
@@ -160,7 +161,7 @@ export class CjsLoader {
             mod.loaded  = true;
         } catch (e) {
             this.cache.delete(mod.filename);
-            throw new Error(`JSON parse error in '${mod.filename}': ${e}`);
+            throw err(ErrorKind.SyntaxError, `JSON parse error in '${mod.filename}': ${e}`);
         }
     }
 
@@ -198,7 +199,7 @@ export class CjsLoader {
             log.debug('cjs', () => `loaded: ${mod.filename}`);
         } catch (e) {
             this.cache.delete(mod.filename);
-            throw new Error(`Error loading '${mod.filename}': ${e}`);
+            throw err(ErrorKind.Generic, `Error loading '${mod.filename}': ${e}`);
         } finally {
             Reflect.deleteProperty(globalThis, key);
             this.loading.delete(mod.filename);
@@ -219,7 +220,7 @@ export class CjsLoader {
 
             // 2. Resolve
             const resolved = self.resolveId(id, parentPath);
-            if (!resolved) throw new Error(`Cannot find module '${id}' from '${parentPath}'`);
+            if (!resolved) throw err(ErrorKind.ModuleNotFound, `Cannot find module '${id}' from '${parentPath}'`);
 
             const { path, isCjs } = resolved;
 
@@ -248,7 +249,7 @@ export class CjsLoader {
                 const r = self.resolveId(id, p);
                 if (r) return r.path;
             }
-            throw new Error(`Cannot resolve module '${id}'`);
+            throw err(ErrorKind.ModuleNotFound, `Cannot resolve module '${id}'`);
         };
         require.cache      = self.cache;
         require.main       = null;

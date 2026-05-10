@@ -3,6 +3,7 @@
 import { dirname, joinPaths } from './path';
 import { LRU } from './lru';
 import { fs, engine } from './index';
+import { err, ErrorKind } from '../errors';
 
 export const readText  = (p: string) => engine.decodeString(fs.readFile(p));
 export const writeText = (p: string, s: string) => fs.writeFile(p, engine.encodeString(s));
@@ -15,7 +16,7 @@ export function ensureDir(dir: string): void {
     try {
         fs.mkdir(dir, 0o755);
     } catch {
-        if (!fs.exists(dir)) throw new Error(`Failed to create directory: ${dir}`);
+        if (!fs.exists(dir)) throw err(ErrorKind.PermissionError, `Failed to create directory: ${dir}`);
     }
 }
 
@@ -61,7 +62,7 @@ function _resolve(base: string, exts: string[]): string {
         const r = tryFile(joinPaths(base, 'index' + e));
         if (r) return r;
     }
-    throw new Error(`Cannot resolve: ${base}`);
+    throw err(ErrorKind.FileNotFound, `Cannot resolve: ${base}`);
 }
 
 export function clearResolveCache(): void { cache.clear(); }

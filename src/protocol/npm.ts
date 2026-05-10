@@ -8,6 +8,7 @@ import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
 import { fetchBytes, fetchText } from '../http/fetch';
 import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
 import { detectFormat, readPkgFresh, createCtx, resolveSubpath } from '../pkg';
+import { err, ErrorKind } from '../errors';
 import { log } from '../utils/log';
 import { fs, os, console } from '../utils/index';
 
@@ -64,13 +65,13 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
 
     if (rest.startsWith('@')) {
         const sl = rest.indexOf('/');
-        if (sl === -1 || sl === 1) throw new Error(`Invalid scoped package: ${raw}`);
+        if (sl === -1 || sl === 1) throw err(ErrorKind.InvalidSpecifier, `Invalid scoped package: ${raw}`);
         const scope = rest.slice(0, sl); rest = rest.slice(sl + 1);
         const at = rest.indexOf('@'), sl2 = rest.indexOf('/');
         if (at !== -1 && (sl2 === -1 || at < sl2)) {
             name = `${scope}/${rest.slice(0, at)}`;
             const after = rest.slice(at + 1);
-            if (!after) throw new Error(`Invalid npm specifier (empty version): ${raw}`);
+            if (!after) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (empty version): ${raw}`);
             const sl3 = after.indexOf('/');
             ver = sl3 === -1 ? after : after.slice(0, sl3);
             sub = sl3 === -1 ? '' : after.slice(sl3 + 1);
@@ -78,19 +79,19 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
             name = `${scope}/${rest.slice(0, sl2)}`; sub = rest.slice(sl2 + 1);
         } else { name = `${scope}/${rest}`; }
     } else {
-        if (!rest) throw new Error(`Invalid npm specifier (empty): ${raw}`);
+        if (!rest) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (empty): ${raw}`);
         const at = rest.indexOf('@'), sl = rest.indexOf('/');
         if (at !== -1 && (sl === -1 || at < sl)) {
             name = rest.slice(0, at);
             const after = rest.slice(at + 1);
-            if (!after) throw new Error(`Invalid npm specifier (empty version): ${raw}`);
+            if (!after) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (empty version): ${raw}`);
             const sl2 = after.indexOf('/');
             ver = sl2 === -1 ? after : after.slice(0, sl2);
             sub = sl2 === -1 ? '' : after.slice(sl2 + 1);
         } else if (sl !== -1) { name = rest.slice(0, sl); sub = rest.slice(sl + 1); }
         else name = rest;
     }
-    if (!name) throw new Error(`Invalid npm specifier (no package name): ${raw}`);
+    if (!name) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (no package name): ${raw}`);
     return { name, version: ver || 'latest', subpath: sub };
 }
 
@@ -140,8 +141,8 @@ export class NpmHandler implements ProtocolHandler {
         const exactVer = this.resolveVersion(name, version);
         const dir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         const ctx = createCtx(dir);
-        if (!ctx) throw new Error(`Package not installed: ${specPath}`);
-        return resolveSubpath(ctx, subpath) ?? (() => { throw new Error(`Cannot resolve ${subpath} in ${name}`); })();
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `Package not installed: ${specPath}`);
+        return resolveSubpath(ctx, subpath) ?? (() => { throw err(ErrorKind.ModuleNotFound, `Cannot resolve ${subpath} in ${name}`); })();
     }
 
     // ---------------------------------------------------------------------------
@@ -159,19 +160,19 @@ export class NpmHandler implements ProtocolHandler {
         const pkg = this.ensureInstalled(name, version, parent);
         const dir = pkg.dir;
         const ctx = createCtx(dir, { forceCjs });
-        if (!ctx) throw new Error(`package.json not found in ${dir}`);
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
 
         // Resolve relative import using the parent's actual localPath on disk,
         // not the subpath from the specifier. This is critical because:
         //   - parent "npm:hono@4.12.14" has subpath="" but localPath=".../dist/index.js"
         //   - import "./hono.js" must resolve relative to dist/, not the package root
         const parentLocal = resolveSubpath(ctx, subpath || '.');
-        if (!parentLocal) throw new Error(`Cannot resolve parent "${subpath || '.'}" in ${name}@${pkg.resolvedVer}`);
+        if (!parentLocal) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath || '.'}" in ${name}@${pkg.resolvedVer}`);
 
         const targetLocal = normalizePath(joinPaths(dirname(parentLocal), spec));
         // Verify the target file exists
         const resolvedLocal = resolveFile(targetLocal);
-        if (!resolvedLocal) throw new Error(`Cannot resolve "${spec}" from "${parent}": file not found at ${targetLocal}`);
+        if (!resolvedLocal) throw err(ErrorKind.FileNotFound, `Cannot resolve "${spec}" from "${parent}": file not found at ${targetLocal}`);
 
         // Compute the subpath relative to pkgDir for the canonical specPath
         const relToDir = normalizePath(resolvedLocal.slice(dir.length + 1));
@@ -185,9 +186,9 @@ export class NpmHandler implements ProtocolHandler {
 
     private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
         const ctx = createCtx(dir, { forceCjs });
-        if (!ctx) throw new Error(`package.json not found in ${dir}`);
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
         const localPath = resolveSubpath(ctx, subpath);
-        if (!localPath) throw new Error(`Cannot resolve "${subpath || '.'}" in ${name}@${ver}`);
+        if (!localPath) throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${subpath || '.'}" in ${name}@${ver}`);
         return {
             specPath: NpmHandler.specPath(name, ver, subpath),
             localPath,
@@ -265,7 +266,7 @@ export class NpmHandler implements ProtocolHandler {
     private install(name: string, ver: string, dir: string): void {
         const meta    = this.fetchMeta(name);
         const tarball = meta.versions[ver]?.dist.tarball;
-        if (!tarball) throw new Error(`Version ${ver} not found for ${name}`);
+        if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
         const files = unTarGz(fetchBytes(tarball).buffer);
         ensureDir(dir);
         const seen = new Set<string>();
@@ -291,7 +292,7 @@ export class NpmHandler implements ProtocolHandler {
                 startDir = dirname(parent);
             }
             let d = startDir;
-            const root = osname === 'win32' ? d.split(':')[0] + ':/' : '/';
+            const root = osname.includes('Windows') ? d.split(':')[0] + ':/' : '/';
             while (d && d !== root) {
                 search.push(joinPaths(d, 'node_modules'));
                 const up = dirname(d); if (up === d) break; d = up;

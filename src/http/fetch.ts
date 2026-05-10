@@ -2,6 +2,7 @@ import { Headers } from "headers-polyfill";
 import { connectionManager, type ConnectionConfig } from "./connection";
 import { HttpRequestBuilder, HttpResponseParser, type ReqInit, type HttpVersion } from "./http";
 import { URL } from "./url";
+import { err, ErrorKind } from '../errors';
 import { engine } from "../utils/index";
 import { version } from "../../package.json";
 
@@ -47,6 +48,7 @@ function doFetch(
         let chunks: Uint8Array[] = [];
         let chunksTotal = 0;
         let useBuf = false;
+        let parseError: Error | null = null;
 
         parser.onHeadersComplete = (code: number, hdrs: any) => {
             status = code;
@@ -77,24 +79,39 @@ function doFetch(
             onProgress?.(useBuf ? bufPos : chunksTotal, contentLength);
         };
 
-        parser.onError = (e: Error) => { throw e; };
+        // Capture parse errors via flag instead of throwing inside a callback
+        // (throw in a callback is not caught by the surrounding while loop)
+        parser.onError = (e: Error) => { parseError = e; };
 
-        while (!parser.isCompleted) {
+        while (!parser.isCompleted && !parseError) {
             const d = conn.read(128 * 1024, true);
             if (!d) {
-                if (isHttp10 && !contentLength && parser.isHeadersComplete) break;
+                // Connection closed by server — end of response for:
+                //   HTTP/1.0: always (connection close = end of response)
+                //   HTTP/1.1: when no Content-Length and no Transfer-Encoding: chunked
+                //              (server signals end by closing the connection)
                 break;
             }
             parser.feed(d);
         }
-        if (!parser.isCompleted && !(isHttp10 && !contentLength)) {
-            throw new Error('Incomplete HTTP response');
+
+        if (parseError) throw parseError;
+        if (!parser.isCompleted) {
+            // If the parser didn't see a complete message, the response is only
+            // valid when the connection was closed by the server (no data remaining).
+            // This happens with HTTP/1.0 or HTTP/1.1 without Content-Length/chunked.
+            // Re-raise as a network error with a clear message.
+            if (!parser.isHeadersComplete) {
+                throw err(ErrorKind.NetworkError, `Incomplete HTTP response from ${url}: no headers received`);
+            }
+            // Headers received but message not marked complete — server likely
+            // closed the connection to signal end-of-body. Accept the data we got.
         }
 
         const headers = parser.getHeaders();
 
         if (status >= 300 && status < 400 && location) {
-            if (maxRedirects <= 0) throw new Error(`Too many redirects (>${MAX_REDIRECTS}) following ${url}`);
+            if (maxRedirects <= 0) throw err(ErrorKind.NetworkError, `Too many redirects (>${MAX_REDIRECTS}) following ${url}`);
             if (isHttp10) conn.close();
             else connectionManager.release(config, conn);
             const nextUrl = location.startsWith('/') ? new URL(location, url).toString() : location;
@@ -104,7 +121,7 @@ function doFetch(
         if (isHttp10) conn.close();
         else connectionManager.release(config, conn);
 
-        if (status < 200 || status >= 300) throw new Error(`HTTP ${status} ${url}`);
+        if (status < 200 || status >= 300) throw err(ErrorKind.NetworkError, `HTTP ${status} ${url}`);
 
         const body = useBuf && buf
             ? (bufPos === buf.length ? buf : buf.slice(0, bufPos))
@@ -157,7 +174,7 @@ async function doFetchAsync(
         port: url.port ? +url.port : (url.protocol === 'https:' ? 443 : 80),
         protocol: url.protocol as any,
     };
-    const conn = connectionManager.acquire(config);
+    const conn = await connectionManager.acquireAsync(config);
 
     try {
         await conn.writeAsync(req);
@@ -166,6 +183,7 @@ async function doFetchAsync(
         let isHttp10 = false;
         const chunks: Uint8Array[] = [];
         let loaded = 0;
+        let parseError: Error | null = null;
 
         parser.onHeadersComplete = (code: number, hdrs: any) => {
             status = code;
@@ -179,26 +197,34 @@ async function doFetchAsync(
             onProgress?.(loaded, contentLength);
         };
 
-        parser.onError = (e: Error) => { throw e; };
+        // Capture parse errors via flag instead of throwing inside a callback
+        parser.onError = (e: Error) => { parseError = e; };
 
-        while (!parser.isCompleted) {
+        while (!parser.isCompleted && !parseError) {
             const d = await conn.readAsync(128 * 1024, true);
             if (!d) {
-                // HTTP/1.0 without content-length: connection close = end of response
-                if (isHttp10 && !contentLength && parser.isHeadersComplete) break;
+                // Connection closed by server — end of response for:
+                //   HTTP/1.0: always (connection close = end of response)
+                //   HTTP/1.1: when no Content-Length and no Transfer-Encoding: chunked
                 break;
             }
             parser.feed(d);
         }
-        if (!parser.isCompleted && !(isHttp10 && !contentLength)) {
-            throw new Error('Incomplete HTTP response');
+
+        if (parseError) throw parseError;
+        if (!parser.isCompleted) {
+            if (!parser.isHeadersComplete) {
+                throw err(ErrorKind.NetworkError, `Incomplete HTTP response from ${url}: no headers received`);
+            }
+            // Headers received but message not marked complete — server likely
+            // closed the connection to signal end-of-body. Accept the data we got.
         }
 
         const headers = parser.getHeaders();
         const location = headers.get('location') ?? '';
 
         if (status >= 300 && status < 400 && location) {
-            if (maxRedirects <= 0) throw new Error(`Too many redirects (>${MAX_REDIRECTS}) following ${url}`);
+            if (maxRedirects <= 0) throw err(ErrorKind.NetworkError, `Too many redirects (>${MAX_REDIRECTS}) following ${url}`);
             if (isHttp10) conn.close();
             else connectionManager.release(config, conn);
             const nextUrl = location.startsWith('/') ? new URL(location, url).toString() : location;
@@ -208,7 +234,7 @@ async function doFetchAsync(
         if (isHttp10) conn.close();
         else connectionManager.release(config, conn);
 
-        if (status < 200 || status >= 300) throw new Error(`HTTP ${status} ${url}`);
+        if (status < 200 || status >= 300) throw err(ErrorKind.NetworkError, `HTTP ${status} ${url}`);
 
         return { status, headers, body: mergeChunks(chunks) };
     } catch (e) {

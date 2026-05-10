@@ -6,6 +6,7 @@ import { guessFileKind } from './base';
 import { normalizePath } from '../utils/path';
 import { detectFormat } from '../pkg';
 import { fs, os } from '../utils/index';
+import { err, ErrorKind } from '../errors';
 
 const osname = os.uname().sysname;
 export class FileHandler implements ProtocolHandler {
@@ -17,8 +18,8 @@ export class FileHandler implements ProtocolHandler {
         // Single stat() call replaces exists() + stat() (2 syscalls → 1)
         let st;
         try { st = fs.stat(localPath); }
-        catch { throw new Error(`File not found: ${localPath}`); }
-        if (!st.isFile) throw new Error(`Not a file: ${localPath}`);
+        catch { throw err(ErrorKind.FileNotFound, `File not found: ${localPath}`); }
+        if (!st.isFile) throw err(ErrorKind.FileNotFound, `Not a file: ${localPath}`);
         return { specPath: spec, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
     }
 
@@ -26,7 +27,7 @@ export class FileHandler implements ProtocolHandler {
 
     private strip(url: string): string {
         let p = url.startsWith('file://') ? url.slice(7) : url;
-        if (p.startsWith('/') && osname === 'win32' && p.length > 2 && p[2] === ':')
+        if (p.startsWith('/') && osname.includes('Windows') && p.length > 2 && p[2] === ':')
             p = p.slice(1);
         return normalizePath(p);
     }

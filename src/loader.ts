@@ -18,6 +18,7 @@ import { isTypeDecl } from './protocol/base';
 import { readText, ensureDir } from './utils/io';
 import { dirname, extname } from './utils/path';
 import { assert } from './utils/misc';
+import { err, ErrorKind } from './errors';
 import { log } from './utils/log';
 import { fs, engine, wasm } from './utils/index';
 
@@ -86,7 +87,7 @@ export class ModuleLoader {
 
     load(info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
         if (isTypeDecl(info.localPath)) {
-            throw new Error(`Cannot load type declaration file "${info.localPath}" as a module. Type declaration files (.d.ts) are not executable.`);
+            throw err(ErrorKind.FileNotFound, `Cannot load type declaration file "${info.localPath}" as a module. Type declaration files (.d.ts) are not executable.`);
         }
         const hint = hintOf(info.specPath);
         log.debug('loader', () => `load ${info.specPath} hint=${hint} kind=${info.fileKind} format=${info.format}`);
@@ -150,10 +151,12 @@ export class ModuleLoader {
         try {
             mod = new engine.Module(code, info.specPath);
         } catch (e) {
-            if (e instanceof SyntaxError) throw new SyntaxError(
-                `Syntax error in ${info.localPath}: ${e.message}`,
-                { cause: { source: e, code, path: info.localPath } },
-            );
+            if (e instanceof SyntaxError) {
+                const ne = err(ErrorKind.SyntaxError,
+                    `Syntax error in ${info.localPath}: ${e.message}`);
+                (ne as any).cause = { source: e, code, path: info.localPath };
+                throw ne;
+            }
             throw e;
         }
 

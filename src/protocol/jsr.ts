@@ -14,6 +14,7 @@ import { fetchBytes, fetchText } from '../http/fetch';
 import { isCacheExpired, matchLatestVersion, safeParse, errMsg } from '../utils/misc';
 import { fs, engine } from '../utils/index';
 import { log } from '../utils/log';
+import { err, ErrorKind } from '../errors';
 
 const JSR = 'https://jsr.io';
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
@@ -64,16 +65,16 @@ export class JsrHandler implements ProtocolHandler {
     private parseSpec(spec: string): ParsedJsrSpec {
         let rest = spec.startsWith('jsr:') ? spec.slice(4) : spec;
         while (rest.startsWith('/')) rest = rest.slice(1);
-        if (!rest.startsWith('@')) throw new Error(`Invalid JSR specifier: ${spec}`);
+        if (!rest.startsWith('@')) throw err(ErrorKind.InvalidSpecifier, `Invalid JSR specifier: ${spec}`);
         // @scope/name[@version][/subpath]
         // Version can contain dots, dashes, plus signs (e.g., 1.0.0-beta.1)
         // Subpath can contain slashes (e.g., /src/utils/helper.ts)
         const m = rest.match(/^@([^/]+)\/([^@/]+)(?:@([^/]+))?(\/.*)?$/);
-        if (!m) throw new Error(`Cannot parse JSR specifier: ${spec}`);
+        if (!m) throw err(ErrorKind.InvalidSpecifier, `Cannot parse JSR specifier: ${spec}`);
         const version = m[3] ?? null;
         // Validate version doesn't contain path separators if present
         if (version && version.includes('/')) {
-            throw new Error(`Invalid version in JSR specifier: ${spec}`);
+            throw err(ErrorKind.InvalidSpecifier, `Invalid version in JSR specifier: ${spec}`);
         }
         return { scope: m[1]!, name: m[2]!, version, path: m[4] ?? '' };
     }
@@ -82,7 +83,7 @@ export class JsrHandler implements ProtocolHandler {
         const meta = this.versionMeta(p.scope, p.name, p.version!);
         if (!p.path || p.path === '/' || p.path === '.') {
             const e = meta.exports?.['.'];
-            if (!e) throw new Error(`No entry point in @${p.scope}/${p.name}@${p.version}`);
+            if (!e) throw err(ErrorKind.ModuleNotFound, `No entry point in @${p.scope}/${p.name}@${p.version}`);
             return e.startsWith('./') ? e.slice(2) : e;
         }
         const norm = p.path.startsWith('/') ? p.path : '/' + p.path;
@@ -93,12 +94,12 @@ export class JsrHandler implements ProtocolHandler {
             const w = norm + ext;
             if (meta.manifest[w]) return w.slice(1);
         }
-        throw new Error(`File not found: ${p.path} in @${p.scope}/${p.name}@${p.version}`);
+        throw err(ErrorKind.FileNotFound, `File not found: ${p.path} in @${p.scope}/${p.name}@${p.version}`);
     }
 
     private latestVersion(scope: string, name: string): string {
         const meta = this.pkgMeta(scope, name);
-        if (!meta.latest) throw new Error(`No latest version for @${scope}/${name}`);
+        if (!meta.latest) throw err(ErrorKind.VersionNotFound, `No latest version for @${scope}/${name}`);
         return meta.latest;
     }
 
@@ -107,7 +108,7 @@ export class JsrHandler implements ProtocolHandler {
         const meta = this.pkgMeta(scope, name);
         const all = Object.keys(meta.versions);
         const resolved = matchLatestVersion(all, ver);
-        if (!resolved) throw new Error(`No version matching "${ver}" in @${scope}/${name}`);
+        if (!resolved) throw err(ErrorKind.VersionNotFound, `No version matching "${ver}" in @${scope}/${name}`);
         return resolved;
     }
 
@@ -121,7 +122,7 @@ export class JsrHandler implements ProtocolHandler {
             } catch {}
         }
         const meta = safeParse<JsrPackageMeta>(fetchText(`${JSR}/@${scope}/${name}/meta.json`));
-        if (!meta.latest) throw new Error(`@${scope}/${name}: registry returned no latest`);
+        if (!meta.latest) throw err(ErrorKind.VersionNotFound, `@${scope}/${name}: registry returned no latest`);
         ensureDir(dir);
         writeText(file, JSON.stringify({ ...meta, _at: Date.now() }, null, 2));
         return meta;

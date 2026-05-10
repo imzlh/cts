@@ -150,8 +150,8 @@ async function execCommand(
         argv = ['task', ...(tokens.slice(2)), ...extraArgs];
     } else {
         // Generic shell command
-        const shell = osname === 'win32' ? 'cmd' : '/bin/sh';
-        const shellArg = osname === 'win32' ? '/c' : '-c';
+        const shell = osname.includes('Windows') ? 'cmd' : '/bin/sh';
+        const shellArg = osname.includes('Windows') ? '/c' : '-c';
         // Append extra args to the command string
         const fullCmd = extraArgs.length
             ? `${cmd} ${extraArgs.map(a => JSON.stringify(a)).join(' ')}`

@@ -10,6 +10,7 @@ import { resources }      from './resources';
 import { dirname, normalizePath, isAbsolute, joinPaths } from './utils/path';
 import { writeText, ensureDir, resolveFile } from './utils/io';
 import { errMsg } from './utils/misc';
+import { err, ErrorKind } from './errors';
 import { guessFileKind } from './protocol/base';
 import { console, engine, os, crypto, __use_fn } from './utils';
 import { log } from './utils/log';
@@ -46,7 +47,7 @@ export class TypeScriptRuntime {
                     this.loader.preRegister(info.localPath, this.parentLocal(parent));
                     return attr?.type ? `${info.specPath}?${attr.type}` : info.specPath;
                 } catch (e) {
-                    throw new Error(`Cannot resolve "${spec}" from "${parent}": ${errMsg(e)}`);
+                    throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${spec}" from "${parent}": ${errMsg(e)}`);
                 }
             },
 
@@ -179,14 +180,13 @@ export class TypeScriptRuntime {
 
     /** Resolve a polyfill path to an absolute local file path. */
     private resolvePolyfillPath(path: string): string {
+        // Normalize Windows backslashes to forward slashes first
+        const normalized = path.replace(/\\/g, '/');
         // Already absolute
-        if (isAbsolute(path)) return resolveFile(normalizePath(path));
-        // Relative to cwd
-        if (path.startsWith('./') || path.startsWith('../')) {
-            return resolveFile(normalizePath(joinPaths(os.cwd, path)));
-        }
-        // Bare path segment — treat as relative to cwd
-        return resolveFile(normalizePath(joinPaths(os.cwd, path)));
+        if (isAbsolute(normalized)) return resolveFile(normalizePath(normalized));
+        // Relative to cwd — also normalize os.cwd on Windows
+        const cwd = String(os.cwd).replace(/\\/g, '/');
+        return resolveFile(normalizePath(joinPaths(cwd, normalized)));
     }
 
     async loadEntry(path: string, extra: Record<string, any> = {}): Promise<CModuleEngine.Module> {

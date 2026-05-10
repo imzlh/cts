@@ -1,3 +1,5 @@
+import { err, ErrorKind } from '../errors';
+
 // Fast and Simple URL polyfill
 
 const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
@@ -762,11 +764,11 @@ class URL {
     }
 
     static createObjectURL(blob: any): string {
-        throw new Error('createObjectURL is not implemented');
+        throw err(ErrorKind.Generic, 'createObjectURL is not implemented');
     }
 
     static revokeObjectURL(url: string): void {
-        throw new Error('revokeObjectURL is not implemented');
+        throw err(ErrorKind.Generic, 'revokeObjectURL is not implemented');
     }
 }
 

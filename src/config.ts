@@ -5,6 +5,7 @@ import { dirname, joinPaths } from './utils/path';
 import { readText, writeText, ensureDir } from './utils/io';
 import { stripJsonc, safeParse, parseArgs } from './utils/misc';
 import { log } from './utils/log';
+import { err, ErrorKind } from './errors';
 import { os, fs, engine } from './utils/index';
 
 
@@ -30,7 +31,7 @@ const DEFAULTS = {
 export function parseSize(s: string | undefined): number | undefined {
     if (!s) return undefined;
     const m = s.match(/^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$/i);
-    if (!m) throw new Error(`Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
+    if (!m) throw err(ErrorKind.InvalidSpecifier, `Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
     const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024**2, GB: 1024**3 };
     return Math.floor(parseFloat(m[1]!) * (units[(m[2] ?? 'B').toUpperCase()] ?? 1));
 }
@@ -61,7 +62,7 @@ function envConfig(): Partial<ConfigOptions> {
 function defaultCacheDir(): string {
     let home: string | null = null;
     try { home = os.homedir; } catch {}
-    if (!home) home = env(os.uname().sysname === 'win32' ? 'USERPROFILE' : 'HOME') ?? '/root';
+    if (!home) home = env(os.uname().sysname.includes('Windows') ? 'USERPROFILE' : 'HOME') ?? '/root';
     return joinPaths(home, '.cts');
 }
 

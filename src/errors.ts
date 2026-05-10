@@ -5,14 +5,59 @@
 //   - Never show an internal stack trace as the primary message
 //   - Colour is used where available (same TTY detection as progress.ts)
 //   - Actionable suggestions tailored to the error kind
+//
+// Error classification:
+//   Internal errors carry a `.kind` property (ErrorKind) set at the throw site.
+//   External errors (from user code, engines, or dependencies) have no `.kind`
+//   and fall back to message-based heuristics — but those are best-effort only.
 
 import { os, engine, streams, console, fs } from './utils/index';
+
+// ---------------------------------------------------------------------------
+// ErrorKind — the single source of truth for error categories
+// ---------------------------------------------------------------------------
+
+export enum ErrorKind {
+    ModuleNotFound  = 'module-not-found',
+    SyntaxError     = 'syntax-error',
+    NetworkError    = 'network-error',
+    PermissionError = 'permission-error',
+    VersionNotFound = 'version-not-found',
+    LockFrozen      = 'lock-frozen',
+    TaskNotFound    = 'task-not-found',
+    TransformError  = 'transform-error',
+    ProtocolDisabled = 'protocol-disabled',
+    InvalidSpecifier = 'invalid-specifier',
+    FileNotFound    = 'file-not-found',
+    Generic         = 'generic',
+}
+
+// Extend Error so every error can optionally carry a kind
+declare global {
+    interface Error {
+        kind?: ErrorKind;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: create an Error with .kind attached
+// ---------------------------------------------------------------------------
+
+/**
+ * Create an Error with a .kind field.
+ * Use this instead of `new Error(...)` at internal throw sites so that
+ * formatError can display the correct category without guessing.
+ */
+export function err(kind: ErrorKind, msg: string): Error {
+    const e = new Error(msg);
+    e.kind = kind;
+    return e;
+}
 
 // ---------------------------------------------------------------------------
 // Terminal colour helpers (graceful degradation)
 // ---------------------------------------------------------------------------
 
-// Check stderr (fd 2) for TTY
 const _isTTY: boolean = (() => {
     try { new (streams as any).TTY(2, false); return true; }
     catch { return false; }
@@ -29,86 +74,68 @@ const C = {
 };
 
 // ---------------------------------------------------------------------------
-// Error kinds and suggestions
+// Labels and suggestions
 // ---------------------------------------------------------------------------
 
-type ErrorKind =
-    | 'module-not-found'
-    | 'syntax-error'
-    | 'network-error'
-    | 'permission-error'
-    | 'version-not-found'
-    | 'lock-frozen'
-    | 'task-not-found'
-    | 'generic';
-
-interface DiagInfo {
-    kind:        ErrorKind;
-    title:       string;
-    detail?:     string;
-    hint?:       string;
-    location?:   { file: string; line?: number; col?: number };
-    cause?:      Error;
+function label(kind: ErrorKind): string {
+    switch (kind) {
+        case ErrorKind.SyntaxError:      return 'Syntax Error';
+        case ErrorKind.ModuleNotFound:   return 'Module Not Found';
+        case ErrorKind.FileNotFound:     return 'File Not Found';
+        case ErrorKind.NetworkError:     return 'Network Error';
+        case ErrorKind.VersionNotFound:  return 'Version Not Found';
+        case ErrorKind.LockFrozen:       return 'Lock Frozen';
+        case ErrorKind.TaskNotFound:     return 'Task Not Found';
+        case ErrorKind.TransformError:   return 'Transform Error';
+        case ErrorKind.ProtocolDisabled: return 'Protocol Disabled';
+        case ErrorKind.InvalidSpecifier: return 'Invalid Specifier';
+        case ErrorKind.PermissionError:  return 'Permission Error';
+        default:                         return 'Error';
+    }
 }
 
-function suggest(kind: ErrorKind, detail: string): string {
+function suggest(kind: ErrorKind, msg: string): string {
     switch (kind) {
-        case 'module-not-found':
-            if (detail.includes('npm:') || detail.includes('node_modules'))
+        case ErrorKind.ModuleNotFound:
+            if (msg.includes('npm:') || msg.includes('node_modules'))
                 return `Run ${C.cyan('cts cache <entry>')} to pre-fetch dependencies.`;
-            if (detail.includes('jsr:'))
+            if (msg.includes('jsr:'))
                 return `Check the package name at ${C.cyan('https://jsr.io')} and try ${C.cyan('cts cache <entry>')}.`;
-            if (detail.includes('./') || detail.includes('../'))
-                return 'Check the relative path and file extension.';
             return `Is the package name correct? Try ${C.cyan('cts cache <entry>')} to pre-fetch.`;
 
-        case 'syntax-error':
+        case ErrorKind.FileNotFound:
+            return 'Check the file path and extension.';
+
+        case ErrorKind.SyntaxError:
             return 'Check the highlighted file for TypeScript/JavaScript syntax errors.';
 
-        case 'network-error':
+        case ErrorKind.TransformError:
+            return 'Check the file for unsupported syntax or report a bug.';
+
+        case ErrorKind.NetworkError:
             return `Check your internet connection. Use ${C.cyan('--no-http')} to disable remote modules.`;
 
-        case 'version-not-found':
+        case ErrorKind.VersionNotFound:
             return `Try a different version range or ${C.cyan('latest')}. Check the registry for available versions.`;
 
-        case 'lock-frozen':
+        case ErrorKind.LockFrozen:
             return `Run ${C.cyan('cts cache <entry>')} to update the lock file, then retry with ${C.cyan('--frozen')}.`;
 
-        case 'task-not-found':
+        case ErrorKind.TaskNotFound:
             return `Run ${C.cyan('cts task --list')} to see all available tasks.`;
 
-        case 'permission-error':
+        case ErrorKind.PermissionError:
             return 'Check file permissions or run with appropriate privileges.';
+
+        case ErrorKind.ProtocolDisabled:
+            return 'Enable the protocol in your config or use a different module source.';
+
+        case ErrorKind.InvalidSpecifier:
+            return 'Check the module specifier format.';
 
         default:
             return '';
     }
-}
-
-// ---------------------------------------------------------------------------
-// Classifier — infer ErrorKind from error message
-// ---------------------------------------------------------------------------
-
-function classify(msg: string): ErrorKind {
-    const m = msg.toLowerCase();
-    if (m.includes('cannot find module') || m.includes('cannot resolve') ||
-        m.includes('module not found') || m.includes('file not found'))
-        return 'module-not-found';
-    if (m.includes('syntax error') || m.includes('unexpected token') ||
-        m.includes('unexpected end') || m.includes('unterminated'))
-        return 'syntax-error';
-    if (m.includes('econnrefused') || m.includes('http ') || m.includes('network') ||
-        m.includes('timeout') || m.includes('ssl') || m.includes('dns'))
-        return 'network-error';
-    if (m.includes('eacces') || m.includes('eperm') || m.includes('permission'))
-        return 'permission-error';
-    if (m.includes('version') && (m.includes('not found') || m.includes('no matching')))
-        return 'version-not-found';
-    if (m.includes('frozen') || m.includes('lock'))
-        return 'lock-frozen';
-    if (m.includes('unknown task') || m.includes('task not found'))
-        return 'task-not-found';
-    return 'generic';
 }
 
 // ---------------------------------------------------------------------------
@@ -142,40 +169,36 @@ function sourceContext(file: string, line: number, col: number): string {
 // Main formatting function
 // ---------------------------------------------------------------------------
 
-const debugEnv = (() => { try { 
+const debugEnv = (() => { try {
     const str = os.getenv('CTS_DEBUG') ?? '';
     if (str == '*') return true;
     if (str.includes('stack')) return true;
-} catch { return false; } })()
+} catch { return false; } })();
 
 export function formatError(e: unknown, context?: string): string {
-    const err     = e instanceof Error ? e : new Error(String(e));
-    const msg     = err.message;
-    const kind    = classify(msg);
-    const hint    = suggest(kind, msg);
+    const error = e instanceof Error ? e : new Error(String(e));
+    const msg   = error.message;
+
+    // 1. Use .kind if available (set by internal throw sites via `err()`)
+    // 2. Fall back to message heuristics for external errors
+    const kind = error.kind ?? classifyFallback(msg);
+    const hint = suggest(kind, msg);
 
     const lines: string[] = [];
 
     // Header
-    const label = kind === 'syntax-error' ? 'Syntax Error' :
-                  kind === 'module-not-found' ? 'Module Not Found' :
-                  kind === 'network-error' ? 'Network Error' :
-                  kind === 'version-not-found' ? 'Version Not Found' :
-                  kind === 'lock-frozen' ? 'Lock Frozen' :
-                  kind === 'task-not-found' ? 'Task Not Found' : 'Error';
+    lines.push(C.bold(C.red(`✖ ${label(kind)}` + (context ? `  in ${context} ` : ''))));
 
-    lines.push(C.bold(C.red(`✖ ${label}` + (context ? `  in ${context} ` : ''))));
-
-    // Clean up the message — remove redundant prefixes that come from nested wrapping
+    // Clean up the message — remove redundant prefixes from nested wrapping
     let cleanMsg = msg
         .replace(/^Error loading '.*?':\s*/i, '')
         .replace(/^Error:\s*/, '')
-        .replace(/\(see .*?\.log\)$/, '');  // replaced by our own suggestion
+        .replace(/\(see .*?\.log\)$/, '');
     lines.push(`  ${cleanMsg}`);
 
     // Source context for syntax errors
-    if (err instanceof SyntaxError && (err as any).cause) {
-        const cause = (err as any).cause as { source?: SyntaxError; path?: string };
+    if (error instanceof SyntaxError && (error as any).cause) {
+        const cause = (error as any).cause as { source?: SyntaxError; path?: string };
         if (cause.path) {
             const locMatch = cause.source?.message?.match(/(\d+):(\d+)/);
             const line = locMatch ? +locMatch[1]! : 0;
@@ -186,23 +209,63 @@ export function formatError(e: unknown, context?: string): string {
     }
 
     // Debug stack (only if CTS_DEBUG includes 'stack')
-    if (debugEnv && err.stack) {
+    if (debugEnv && error.stack) {
         lines.push('', C.dim(' Stack:'));
-        for (const l of err.stack.split('\n').slice(1, 6))
+        for (const l of error.stack.split('\n').slice(1, 6))
             lines.push(C.dim(`  ${l.trim()}`));
-    } else if (err.stack) {
-        // show first line
-        const line = err.stack.split('\n').filter(e => !e.includes('(native)'));
-        if (line[0]) {
-            // remove "at "
-            lines.push('    ' + C.dim(line[0].trim().substring(3)));
+    } else if (error.stack) {
+        const stackLines = error.stack.split('\n').filter(s => !s.includes('(native)'));
+        if (stackLines[0]) {
+            lines.push('    ' + C.dim(stackLines[0].trim().substring(3)));
         }
     }
-    
+
     // Suggestion
     if (hint) lines.push('', `  ${C.yellow('→')} ${hint}`);
 
     return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Fallback classifier — only used when .kind is absent (external errors)
+// ---------------------------------------------------------------------------
+
+function classifyFallback(msg: string): ErrorKind {
+    const m = msg.toLowerCase();
+
+    if (m.includes('syntax error') || m.includes('unexpected token') ||
+        m.includes('unexpected end') || m.includes('unterminated'))
+        return ErrorKind.SyntaxError;
+
+    if (m.includes('cannot find module') || m.includes('module not found'))
+        return ErrorKind.ModuleNotFound;
+
+    if (m.includes('cannot resolve'))
+        return ErrorKind.ModuleNotFound;
+
+    if (m.includes('file not found'))
+        return ErrorKind.FileNotFound;
+
+    if (m.includes('econnrefused') || m.includes('network') ||
+        m.includes('timeout') || m.includes('ssl') || m.includes('dns'))
+        return ErrorKind.NetworkError;
+
+    if (m.includes('http '))
+        return ErrorKind.NetworkError;
+
+    if (m.includes('eacces') || m.includes('eperm') || m.includes('permission'))
+        return ErrorKind.PermissionError;
+
+    if (m.includes('version') && (m.includes('not found') || m.includes('no matching')))
+        return ErrorKind.VersionNotFound;
+
+    if (/\bfrozen\b/.test(m) || /\block\b/.test(m))
+        return ErrorKind.LockFrozen;
+
+    if (m.includes('unknown task') || m.includes('task not found'))
+        return ErrorKind.TaskNotFound;
+
+    return ErrorKind.Generic;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,5 +276,5 @@ export function fatal(e: unknown, context?: string): never {
     const msg = formatError(e, context) + '\n';
     console.error(msg);
     os.exit(1);
-    throw new Error('unreachable'); // 确保返回 never 类型，满足类型检查器
+    throw new Error('unreachable');
 }

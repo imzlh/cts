@@ -1,16 +1,47 @@
 /**
  * HTTP/HTTPS Connection Manager
  * Implements Keep-Alive pooling with connection reuse and automatic cleanup.
+ *
+ * Cross-platform note:
+ *   Windows uses IOCP for sockets; readSync/writeSync/connectSync/setBlocking
+ *   are unreliable or unavailable. The sync path uses engine.waitPromise() to
+ *   synchronously await async I/O, which works on all platforms (IOCP, epoll,
+ *   kqueue). The async path uses native await.
+ *   The generator-based I/O uses IOOp to uniformly express read/write requests,
+ *   allowing syncDriver/asyncDriver to dispatch to the correct method.
  */
-import { streams, ssl, dns, os, timers, fs, assert } from '../utils';
+import { streams, ssl, dns, os, timers, fs, engine, assert } from '../utils';
 import { log } from '../utils/log';
+import { err, ErrorKind } from '../errors';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
+// ---------------------------------------------------------------------------
+// IO Operation type — allows generators to express both read AND write
+// ---------------------------------------------------------------------------
+
+interface IORead  { tag: 'read';  buf: Uint8Array }
+interface IOWrite { tag: 'write'; data: Uint8Array }
+type IOOp = IORead | IOWrite;
+
+function ioRead(buf: Uint8Array): IORead  { return { tag: 'read', buf }; }
+function ioWrite(data: Uint8Array): IOWrite { return { tag: 'write', data }; }
+
+// ---------------------------------------------------------------------------
+// CA certificate path
+// ---------------------------------------------------------------------------
 
 let _caPath: string | null | undefined = undefined;
 
 function findSystemCaPath(): string | null {
     if (_caPath !== undefined) return _caPath;
+
+    // Check environment variables first (cross-platform)
+    try {
+        const envCa = os.getenv?.('SSL_CERT_FILE') ?? os.getenv?.('CURL_CA_BUNDLE');
+        if (envCa) { try { if (fs.stat(envCa).isFile) { _caPath = envCa; return envCa; } } catch {} }
+    } catch {}
+
     const sysname = os.uname().sysname;
     const candidates = sysname === 'Linux' ? [
         "/etc/ssl/certs/ca-certificates.crt",
@@ -24,8 +55,15 @@ function findSystemCaPath(): string | null {
         "/usr/local/etc/openssl/cert.pem",
         "/opt/homebrew/etc/openssl/cert.pem",
     ] : [
-        "C:\\Windows\\cacert.pem",
-        "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt"
+        // Windows: Git for Windows, MSYS2, Cygwin, OpenSSL-Win64
+        "C:\\Program Files\\Git\\mingw64\\ssl\\certs\\ca-bundle.crt",
+        "C:\\Program Files\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt",
+        "C:\\Program Files (x86)\\Git\\mingw64\\ssl\\certs\\ca-bundle.crt",
+        "C:\\msys64\\usr\\ssl\\certs\\ca-bundle.crt",
+        "C:\\cygwin64\\usr\\ssl\\certs\\ca-bundle.crt",
+        "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt",
+        "C:\\Program Files (x86)\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt",
+        "C:\\ProgramData\\chocolatey\\lib\\openssl\\tools\\certs\\ca-bundle.crt",
     ];
     for (const p of candidates) {
         try { if (fs.stat(p).isFile) { _caPath = p; return p; } } catch {}
@@ -33,6 +71,49 @@ function findSystemCaPath(): string | null {
     _caPath = null;
     return null;
 }
+
+// ---------------------------------------------------------------------------
+// DNS cache with TTL
+// ---------------------------------------------------------------------------
+
+const DNS_CACHE_TTL = 60_000;
+
+interface DnsCacheEntry {
+    addrs: CModuleStreams.AddressInfo[];
+    ts: number;
+}
+
+const dnsCache: Map<string, DnsCacheEntry> = new Map();
+
+function clearDnsCache(): void {
+    dnsCache.clear();
+}
+
+function isDnsCacheFresh(entry: DnsCacheEntry | undefined): boolean {
+    return !!entry && (Date.now() - entry.ts) < DNS_CACHE_TTL;
+}
+
+function resolveDNSSync(hostname: string, family = os.AF_UNSPEC): CModuleStreams.AddressInfo[] {
+    const cached = dnsCache.get(hostname);
+    if (isDnsCacheFresh(cached)) return cached!.addrs;
+    // Use async dns.resolve + waitPromise for cross-platform compatibility
+    // (dns.resolveSync uses getaddrinfo which may garble on Windows)
+    const addrs = engine.waitPromise(dns.resolve(hostname, { family }));
+    dnsCache.set(hostname, { addrs, ts: Date.now() });
+    return addrs;
+}
+
+async function resolveDNS(hostname: string, family = os.AF_UNSPEC) {
+    const cached = dnsCache.get(hostname);
+    if (isDnsCacheFresh(cached)) return cached!.addrs;
+    const addrs = await dns.resolve(hostname, { family });
+    dnsCache.set(hostname, { addrs, ts: Date.now() });
+    return addrs;
+}
+
+// ---------------------------------------------------------------------------
+// ConnectionConfig / ConnectionState / ConnectionLike
+// ---------------------------------------------------------------------------
 
 export interface ConnectionConfig {
     hostname: string;
@@ -70,21 +151,9 @@ export interface ConnectionLike {
     isClosed(): boolean;
 }
 
-const dnsCache: Map<string, CModuleStreams.AddressInfo[]> = new Map();
-
-function resolveDNSSync(hostname: string, family = os.AF_UNSPEC): CModuleStreams.AddressInfo[] { 
-    if (dnsCache.has(hostname)) return dnsCache.get(hostname)!;
-    const addrs = dns.resolveSync(hostname, { family });
-    dnsCache.set(hostname, addrs);
-    return addrs;
-}
-
-async function resolveDNS(hostname: string, family = os.AF_UNSPEC) {
-    if (dnsCache.has(hostname)) return dnsCache.get(hostname)!;
-    const addrs = await dns.resolve(hostname, { family });
-    dnsCache.set(hostname, addrs);
-    return addrs;
-}
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
 
 export class Connection implements ConnectionLike {
     public socket:   CModuleStreams.TCP;
@@ -102,17 +171,22 @@ export class Connection implements ConnectionLike {
         this.socket = new streams.TCP();
     }
 
+    // -----------------------------------------------------------------------
+    // Connect (sync) — uses engine.waitPromise for cross-platform compat
+    // -----------------------------------------------------------------------
+
     connect(): void {
         try {
             const addrs = resolveDNSSync(this.config.hostname);
             if (!addrs || !addrs.length) {
-                throw new Error(`DNS resolution failed for ${this.config.hostname}`);
+                throw err(ErrorKind.NetworkError, `DNS resolution failed for ${this.config.hostname}`);
             }
             const addr = addrs.find(a => a.family === 4) || addrs[0];
             assert(addr, `No IP address found for ${this.config.hostname}`);
 
-            this.socket.connectSync({ ip: addr.ip, port: this.config.port });
-            this.socket.setBlocking(true);
+            // Use async connect + waitPromise instead of connectSync.
+            // connectSync + setBlocking fails on Windows IOCP.
+            engine.waitPromise(this.socket.connect({ ip: addr.ip, port: this.config.port }));
 
             if (this.config.protocol === "https:") {
                 this.syncDriver(this.performTLSHanddshake());
@@ -127,11 +201,15 @@ export class Connection implements ConnectionLike {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Connect (async)
+    // -----------------------------------------------------------------------
+
     async connectAsync(): Promise<void> {
         try {
             const addrs = await resolveDNS(this.config.hostname);
             if (!addrs || !addrs.length) {
-                throw new Error(`DNS resolution failed for ${this.config.hostname}`);
+                throw err(ErrorKind.NetworkError, `DNS resolution failed for ${this.config.hostname}`);
             }
             const addr = addrs.find(a => a.family === 4) || addrs[0];
             assert(addr, `No IP address found for ${this.config.hostname}`);
@@ -151,26 +229,34 @@ export class Connection implements ConnectionLike {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Write (sync) — uses engine.waitPromise
+    // -----------------------------------------------------------------------
+
     write(data: Uint8Array) {
         if (this.sslPipe) {
             const written = this.sslPipe.write(data);
             if (written < 0) {
-                throw new Error(`SSL_write failed: ${written}`);
+                throw err(ErrorKind.NetworkError, `SSL_write failed: ${written}`);
             }
             const encrypted = this.sslPipe.getOutput();
             if (encrypted) {
-                this.socket.writeSync(new Uint8Array(encrypted));
+                engine.waitPromise(this.socket.write(new Uint8Array(encrypted)));
             }
         } else {
-            this.socket.writeSync(data);
+            engine.waitPromise(this.socket.write(data));
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Write (async)
+    // -----------------------------------------------------------------------
 
     async writeAsync(data: Uint8Array): Promise<void> {
         if (this.sslPipe) {
             const written = this.sslPipe.write(data);
             if (written < 0) {
-                throw new Error(`SSL_write failed: ${written}`);
+                throw err(ErrorKind.NetworkError, `SSL_write failed: ${written}`);
             }
             const encrypted = this.sslPipe.getOutput();
             if (encrypted) {
@@ -180,6 +266,10 @@ export class Connection implements ConnectionLike {
             await this.socket.write(data);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Read (sync/async) — dispatch to generator + driver
+    // -----------------------------------------------------------------------
 
     read(size = 16384, waitForData = false): Uint8Array | null {
         return this.syncDriver(this.sslPipe
@@ -193,7 +283,11 @@ export class Connection implements ConnectionLike {
             : this.readPlain(size, waitForData));
     }
 
-    private *readSSL(size: number, waitForData: boolean): Generator<Uint8Array, Uint8Array | null> {
+    // -----------------------------------------------------------------------
+    // SSL read generator — yields IOOp (read or write)
+    // -----------------------------------------------------------------------
+
+    private *readSSL(size: number, waitForData: boolean): Generator<IOOp, Uint8Array | null> {
         const maxAttempts = waitForData ? 10 : 1;
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -212,7 +306,7 @@ export class Connection implements ConnectionLike {
             }
 
             const cipherBuf = new Uint8Array(size);
-            const n = yield cipherBuf;
+            const n = yield ioRead(cipherBuf);
 
             if (n === null) return null;
 
@@ -247,15 +341,19 @@ export class Connection implements ConnectionLike {
         return null;
     }
 
-    private *readPlain(size: number, waitForData: boolean): Generator<Uint8Array, Uint8Array | null> {
+    // -----------------------------------------------------------------------
+    // Plain read generator — yields IOOp (read)
+    // -----------------------------------------------------------------------
+
+    private *readPlain(size: number, waitForData: boolean): Generator<IOOp, Uint8Array | null> {
         const buf = new Uint8Array(size);
-        const n = yield(buf);
+        const n = yield ioRead(buf);
 
         if (n === null) return null;
         if (n === 0) {
             if (!waitForData) return null;
             for (let i = 0; i < 3; i++) {
-                const retryN = yield(buf);
+                const retryN = yield ioRead(buf);
                 if (retryN === null) return null;
                 if (retryN > 0) return buf.subarray(0, retryN);
             }
@@ -263,6 +361,10 @@ export class Connection implements ConnectionLike {
         }
         return buf.subarray(0, n);
     }
+
+    // -----------------------------------------------------------------------
+    // State transitions
+    // -----------------------------------------------------------------------
 
     markActive(): void {
         this.stopIdleTimer();
@@ -295,31 +397,55 @@ export class Connection implements ConnectionLike {
     isAvailable(): boolean { return this.state === ConnectionState.IDLE; }
     isClosed(): boolean    { return this.state === ConnectionState.CLOSED; }
 
-    private async asyncDriver<T>(gen: Generator<Uint8Array, T>): Promise<T> { 
+    // -----------------------------------------------------------------------
+    // I/O drivers
+    //
+    // syncDriver: uses engine.waitPromise() to synchronously await async I/O.
+    //   This is the cross-platform compatible approach — works on Windows IOCP,
+    //   Linux epoll, and macOS kqueue without needing setBlocking/connectSync.
+    //
+    // asyncDriver: uses native await for truly async execution.
+    // -----------------------------------------------------------------------
+
+    private async asyncDriver<T>(gen: Generator<IOOp, T>): Promise<T> {
         let next = gen.next();
         while (!next.done) try {
-            const buf = next.value as Uint8Array;
-            const n = await this.socket.read(buf);
-            next = gen.next(n);
-        } catch (e) {
-            next = gen.throw(e);
-        }
-        return next.value;
-    }
-    
-    private syncDriver<T>(gen: Generator<Uint8Array, T>): T { 
-        let next = gen.next();
-        while (!next.done) try {
-            const buf = next.value as Uint8Array;
-            const n = this.socket.readSync(buf);
-            next = gen.next(n);
+            const op = next.value as IOOp;
+            if (op.tag === 'read') {
+                const n = await this.socket.read(op.buf);
+                next = gen.next(n);
+            } else {
+                await this.socket.write(op.data);
+                next = gen.next(undefined);
+            }
         } catch (e) {
             next = gen.throw(e);
         }
         return next.value;
     }
 
-    private *performTLSHanddshake(): Generator<Uint8Array, void> {
+    private syncDriver<T>(gen: Generator<IOOp, T>): T {
+        let next = gen.next();
+        while (!next.done) try {
+            const op = next.value as IOOp;
+            if (op.tag === 'read') {
+                const n = engine.waitPromise(this.socket.read(op.buf));
+                next = gen.next(n);
+            } else {
+                engine.waitPromise(this.socket.write(op.data));
+                next = gen.next(undefined);
+            }
+        } catch (e) {
+            next = gen.throw(e);
+        }
+        return next.value;
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS handshake generator — yields IOOp for both read AND write
+    // -----------------------------------------------------------------------
+
+    private *performTLSHanddshake(): Generator<IOOp, void> {
         const caPath = findSystemCaPath();
         const ctx = new ssl.Context({
             mode  : "client",
@@ -336,21 +462,21 @@ export class Connection implements ConnectionLike {
 
         const initialData = this.sslPipe.getOutput();
         if (initialData) {
-            this.socket.writeSync(new Uint8Array(initialData));
+            yield ioWrite(new Uint8Array(initialData));
         }
 
         while (!this.sslPipe.handshakeComplete) {
             const buf = new Uint8Array(16384);
-            const n = yield buf;
+            const n = yield ioRead(buf);
 
-            if (n === null) throw new Error("TLS handshake failed: connection closed (EOF)");
-            if (n === 0)    throw new Error("TLS handshake failed: no data available (EAGAIN)");
+            if (n === null) throw err(ErrorKind.NetworkError, "TLS handshake failed: connection closed (EOF)");
+            if (n === 0)    throw err(ErrorKind.NetworkError, "TLS handshake failed: no data available (EAGAIN)");
 
             let toFeed = buf.subarray(0, n);
             while (toFeed.length > 0) {
                 const consumed = this.feedCiphertext(toFeed);
                 if (consumed === 0) break;
-                if (consumed < 0) throw new Error(`SSL feed failed during handshake: consumed=${consumed}`);
+                if (consumed < 0) throw err(ErrorKind.NetworkError, `SSL feed failed during handshake: consumed=${consumed}`);
                 toFeed = toFeed.subarray(consumed);
             }
 
@@ -358,17 +484,25 @@ export class Connection implements ConnectionLike {
 
             const responseData = this.sslPipe.getOutput();
             if (responseData) {
-                this.socket.writeSync(new Uint8Array(responseData));
+                yield ioWrite(new Uint8Array(responseData));
             }
         }
     }
 
+    // -----------------------------------------------------------------------
+    // SSL helpers
+    // -----------------------------------------------------------------------
+
     private feedCiphertext(data: Uint8Array): number {
         if (!this.sslPipe) return 0;
         const consumed = this.sslPipe.feed(data);
-        if (consumed < 0) throw new Error(`SSL feed error: ${consumed}`);
+        if (consumed < 0) throw err(ErrorKind.NetworkError, `SSL feed error: ${consumed}`);
         return consumed;
     }
+
+    // -----------------------------------------------------------------------
+    // Idle timer
+    // -----------------------------------------------------------------------
 
     private startIdleTimer(): void {
         if (!this.config.keepAlive) return;
@@ -386,6 +520,10 @@ export class Connection implements ConnectionLike {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ConnectionManager
+// ---------------------------------------------------------------------------
 
 export class ConnectionManager {
     private pools = new Map<string, Connection[]>();
@@ -424,13 +562,39 @@ export class ConnectionManager {
 
         const maxSockets = fullCfg.maxSockets || 10;
         if (pool.length >= maxSockets) {
-            // Close idle connections to make room; if all are active, allow
-            // one extra connection rather than blocking (graceful degradation).
             this.closeIdleConnections(key);
         }
 
         const conn = new Connection(fullCfg);
         conn.connect();
+        conn.markActive();
+
+        pool.push(conn);
+        this.pools.set(key, pool);
+        return conn;
+    }
+
+    async acquireAsync(cfg: ConnectionConfig): Promise<Connection> {
+        const fullCfg = { ...this.defaultConfig, ...cfg } as ConnectionConfig;
+        const key = this.getKey(fullCfg);
+
+        this.cleanupPool(key);
+
+        const pool = this.pools.get(key) || [];
+        const available = pool.find(c => c.isAvailable());
+
+        if (available) {
+            available.markActive();
+            return available;
+        }
+
+        const maxSockets = fullCfg.maxSockets || 10;
+        if (pool.length >= maxSockets) {
+            this.closeIdleConnections(key);
+        }
+
+        const conn = new Connection(fullCfg);
+        await conn.connectAsync();
         conn.markActive();
 
         pool.push(conn);
@@ -482,3 +646,5 @@ export class ConnectionManager {
 }
 
 export const connectionManager = new ConnectionManager();
+
+export { clearDnsCache };

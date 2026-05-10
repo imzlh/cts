@@ -4,7 +4,7 @@ import { createConfig, loadConfigFile, CLI_TPL } from './src/config';
 import { createRuntime } from './src/runtime';
 import { loadTasks } from './src/task';
 import { fatal, formatError } from './src/errors';
-import { dirname } from './src/utils/path';
+import { dirname, normalizePath, isAbsolute, joinPaths } from './src/utils/path';
 import type { ConfigOptions, RuntimeConfig } from './src/types';
 import { os, console, worker, process } from './src/utils';
 import { log } from './src/utils/log';
@@ -81,7 +81,15 @@ ${C.bold('ENVIRONMENT')}
 
 function entryAndDir(raw: string): { entry: string; dir: string } {
     const hasProto = /^[a-z][a-z0-9+\-.]*:/i.test(raw) && !raw.startsWith('/');
-    const entry    = (!hasProto && !raw.startsWith('/')) ? `${os.cwd}/${raw}` : raw;
+    // Normalize the raw path: resolve relative to cwd, normalize separators
+    let entry: string;
+    if (hasProto || raw.startsWith('/') || isAbsolute(raw)) {
+        entry = raw;
+    } else {
+        // Relative path: resolve against cwd, normalize to forward slashes
+        const cwd = String(os.cwd).replace(/\\/g, '/');
+        entry = normalizePath(joinPaths(cwd, raw.replace(/\\/g, '/')));
+    }
     return { entry, dir: hasProto ? os.cwd : dirname(entry) };
 }
 
@@ -149,7 +157,6 @@ async function run(
     if (runtime.config.polyfill) {
         try {
             await runtime.loadPolyfill(runtime.config.polyfill);
-            log.debug('runtime', () => `polyfill: ${runtime.config.polyfill}`);
         }
         catch (e) { fatal(e, `loading polyfill ${runtime.config.polyfill}`); }
     }

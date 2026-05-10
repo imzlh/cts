@@ -47,6 +47,6 @@ export function resolvePath(...parts: string[]): string {
 const sysname = os.uname().sysname;
 export function isAbsolute(p: string): boolean {
     if (p.startsWith('/')) return true;
-    if (sysname === 'win32' && /^[a-zA-Z]:[/\\]/.test(p)) return true;
+    if (sysname.includes('Windows') && /^[a-zA-Z]:[/\\]/.test(p)) return true;
     return false;
 }

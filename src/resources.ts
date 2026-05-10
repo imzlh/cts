@@ -16,7 +16,7 @@
 
 import { clearResolveCache }  from './utils/io';
 import { clearPkgCache }      from './pkg';
-import { connectionManager }  from './http/connection';
+import { connectionManager, clearDnsCache }  from './http/connection';
 
 import { log } from './utils/log';
 
@@ -70,6 +70,11 @@ resources.register(() => {
     // Close all keep-alive TCP connections opened by sync/async fetch
     // (protocol handlers call this during pre-cache too)
     connectionManager.closeAll();
+});
+
+resources.register(() => {
+    // Clear DNS cache so stale entries don't survive across pre-cache phases
+    clearDnsCache();
 });
 
 resources.register(() => {

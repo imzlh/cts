@@ -5,6 +5,7 @@
 
 import { Headers } from "headers-polyfill";
 import { URL } from "./url";
+import { err, ErrorKind } from '../errors';
 import { assert, engine, http } from '../utils/index';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -69,7 +70,7 @@ export class HttpRequestBuilder {
     private setBody(body: BodyInit): void {
         if (body instanceof Uint8Array) {
             if (body.buffer instanceof SharedArrayBuffer)
-                throw new Error('SharedArrayBuffer is not supported here');
+                throw err(ErrorKind.InvalidSpecifier, 'SharedArrayBuffer is not supported here');
             // @ts-ignore
             this.body = body;
         } else if (body instanceof ArrayBuffer) {
@@ -337,7 +338,7 @@ export function parseURL(url: string, base?: string): URL {
     try {
         return new URL(url, base);
     } catch (err) {
-        throw new Error(`Invalid URL: ${url}`);
+        throw err(ErrorKind.InvalidSpecifier, `Invalid URL: ${url}`);
     }
 }
 
@@ -352,7 +353,7 @@ export function normalizeMethod(method: string): HttpMethod {
     ];
 
     if (!validMethods.includes(normalized as HttpMethod)) {
-        throw new Error(`Invalid HTTP method: ${method}`);
+        throw err(ErrorKind.InvalidSpecifier, `Invalid HTTP method: ${method}`);
     }
 
     return normalized as HttpMethod;

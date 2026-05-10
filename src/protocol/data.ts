@@ -8,15 +8,16 @@ import type { ProtocolHandler } from './base';
 import { joinPaths, dirname } from '../utils/path';
 import { ensureDir } from '../utils/io';
 import { hashString, errMsg } from '../utils/misc';
+import { err, ErrorKind } from '../errors';
 import { fs, engine, crypto } from '../utils/index';
 
 interface DataParsed { mime: string; isBase64: boolean; data: string }
 
 function parseDataUrl(url: string): DataParsed {
-    if (!url.startsWith('data:')) throw new Error(`Not a data URL: ${url}`);
+    if (!url.startsWith('data:')) throw err(ErrorKind.InvalidSpecifier, `Not a data URL: ${url}`);
     const rest = url.slice(5);
     const ci = rest.indexOf(',');
-    if (ci === -1) throw new Error(`Invalid data URL: ${url}`);
+    if (ci === -1) throw err(ErrorKind.InvalidSpecifier, `Invalid data URL: ${url}`);
     const meta = rest.slice(0, ci), data = rest.slice(ci + 1);
     const isBase64 = meta.endsWith(';base64');
     const mime = isBase64 ? meta.slice(0, -7) : (meta || 'text/plain');
@@ -63,7 +64,7 @@ export class DataHandler implements ProtocolHandler {
             ensureDir(dirname(localPath));
             if (parsed.isBase64) {
                 try { fs.writeFile(localPath, crypto.base64Decode(parsed.data)); }
-                catch (e) { throw new Error(`data: base64 decode failed: ${errMsg(e)}`); }
+                catch (e) { throw err(ErrorKind.Generic, `data: base64 decode failed: ${errMsg(e)}`); }
             } else {
                 fs.writeFile(localPath, engine.encodeString(decodeURIComponent(parsed.data)));
             }
