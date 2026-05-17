@@ -8,8 +8,9 @@
 // lock.modules IS the live in-process cache — no separate runCache needed.
 // lock.setModule() writes to both lock.modules and lock.dirtyModules.
 
-import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver } from './types';
+import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver, FileKind } from './types';
 import type { ProtocolHandler } from './protocol/base';
+import type { ProgressCallback } from './http/fetch';
 import { err, ErrorKind } from './errors';
 import { FileHandler } from './protocol/file';
 import { HttpHandler }  from './protocol/http';
@@ -21,7 +22,7 @@ import { LockStore }    from './lock';
 import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath } from './utils/path';
 import { resolveFile } from './utils/io';
 import { detectFormat } from './pkg';
-import { guessFileKind } from './protocol/base';
+import { guessFileKind, applyAttrType } from './protocol/base';
 import { assert } from './utils/misc';
 import { log } from './utils/log';
 import { os } from './utils/index';
@@ -86,9 +87,11 @@ export class ModuleResolver {
     private readonly handlers    = new Map<string, ProtocolHandler>();
     private readonly disabled    = new Set<string>();
     private readonly lock:         LockStore;
+    get lockStore(): LockStore { return this.lock; }
     private readonly importIndex:  ImportMapIndex | null;
     private readonly aliasIndex:   PathAliasEntry[];
     private mainEntry = '';
+    private readonly fileKindCache = new Map<string, FileKind>();
 
     constructor(
         private readonly cfg: RuntimeConfig,
@@ -129,6 +132,91 @@ export class ModuleResolver {
     }
 
     // -------------------------------------------------------------------------
+    // Async resolution — used by DepScanner during precache for parallel downloads
+    // Falls back to sync resolve when no async handler available (file, data, node).
+    // -------------------------------------------------------------------------
+
+    async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+        log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
+
+        const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
+
+        // L1
+        const srcKey = this.lock.getSource(mapped, parent);
+        if (srcKey) {
+            const cached = this.lock.getModule(srcKey);
+            if (cached) {
+                const fileKind = applyAttrType(cached.fileKind, attr);
+                const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
+                this.fileKindCache.set(final.specPath, final.fileKind);
+                if (!this.mainEntry) this.mainEntry = final.specPath;
+                return final;
+            }
+        }
+
+        // L2
+        const proto = protoOf(mapped);
+        if (proto && proto !== 'file') {
+            const lockHit = this.lock.getModule(mapped);
+            if (lockHit) {
+                const fileKind = applyAttrType(lockHit.fileKind, attr);
+                const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
+                this.fileKindCache.set(final.specPath, final.fileKind);
+                this.lock.setSource(mapped, parent, final.specPath);
+                if (!this.mainEntry) this.mainEntry = final.specPath;
+                return final;
+            }
+        }
+
+        if (this.cfg.frozen) {
+            throw err(ErrorKind.LockFrozen, `Module not in lock: "${mapped}"`);
+        }
+
+        // L3 — dispatch async if handler supports it, else sync
+        const info = await this.dispatchAsync(mapped, parent, attr, onProgress);
+        this.fileKindCache.set(info.specPath, info.fileKind);
+
+        this.lock.setModule(info);
+        this.lock.setSource(mapped, parent, info.specPath);
+        if (!this.mainEntry) { this.mainEntry = info.specPath; log.debug('resolver', () => `main: "${info.specPath}"`); }
+        return info;
+    }
+
+    private async dispatchAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+        const proto = protoOf(spec);
+        if (proto) {
+            if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
+            const h = this.handlers.get(proto);
+            if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
+            if (h.resolveAsync) return h.resolveAsync(spec, parent, attr, onProgress);
+            return h.resolve(spec, parent, attr);
+        }
+        if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelative(spec, parent, attr);
+        if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
+        return this.resolveBareAsync(spec, parent, attr, onProgress);
+    }
+
+    private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+        if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
+        const aliased = this.applyPathAlias(spec);
+        if (aliased !== spec) {
+            try {
+                const localPath = resolveFile(aliased);
+                const specPath  = localPath;
+                return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
+            } catch (e) {
+                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`);
+            }
+        }
+        const npm = this.handlers.get('npm');
+        if (npm) {
+            if (npm.resolveAsync) return npm.resolveAsync(spec, parent, attr, onProgress);
+            return npm.resolve(spec, parent, attr);
+        }
+        throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
+    }
+
+    // -------------------------------------------------------------------------
     // Main resolution — three-level cache
     // -------------------------------------------------------------------------
 
@@ -139,16 +227,15 @@ export class ModuleResolver {
         const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
 
-        const hint = attr?.type as string | undefined;
-
         // L1 — source index: (mapped, parent) → specPath we've seen before
         const srcKey = this.lock.getSource(mapped, parent);
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
             if (cached) {
                 log.debug('resolver', () => `L1 hit: "${mapped}" → "${srcKey}"`);
-                const specPath = hint ? `${cached.specPath}?${hint}` : cached.specPath;
-                const final = specPath !== cached.specPath ? { ...cached, specPath } : cached;
+                const fileKind = applyAttrType(cached.fileKind, attr);
+                const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
+                this.fileKindCache.set(final.specPath, final.fileKind);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
             }
@@ -160,8 +247,9 @@ export class ModuleResolver {
             const lockHit = this.lock.getModule(mapped);
             if (lockHit) {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
-                const specPath = hint ? `${lockHit.specPath}?${hint}` : lockHit.specPath;
-                const final = specPath !== lockHit.specPath ? { ...lockHit, specPath } : lockHit;
+                const fileKind = applyAttrType(lockHit.fileKind, attr);
+                const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
+                this.fileKindCache.set(final.specPath, final.fileKind);
                 this.lock.setSource(mapped, parent, final.specPath);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
@@ -176,20 +264,23 @@ export class ModuleResolver {
                 `  Run [36mcts cache <entry>[0m to update the lock, then retry with --frozen.`
             );
         }
-        const info     = this.dispatch(mapped, parent, attr);
-        const specPath = hint ? `${info.specPath}?${hint}` : info.specPath;
-        const final: ModuleInfo = specPath !== info.specPath ? { ...info, specPath } : info;
+        const info = this.dispatch(mapped, parent, attr);
+        this.fileKindCache.set(info.specPath, info.fileKind);
 
-        this.lock.setModule(final);
-        this.lock.setSource(mapped, parent, final.specPath);
-        if (!this.mainEntry) { this.mainEntry = final.specPath; log.debug('resolver', () => `main: "${final.specPath}"`); }
-        return final;
+        this.lock.setModule(info);
+        this.lock.setSource(mapped, parent, info.specPath);
+        if (!this.mainEntry) { this.mainEntry = info.specPath; log.debug('resolver', () => `main: "${info.specPath}"`); }
+        return info;
     }
 
     getInfo(specPath: string): ModuleInfo {
-        const base = specPath.includes('?') ? specPath.slice(0, specPath.indexOf('?')) : specPath;
-        const hit  = this.lock.getModule(specPath) ?? this.lock.getModule(base);
-        if (hit) return specPath !== hit.specPath ? { ...hit, specPath } : hit;
+        const cachedKind = this.fileKindCache.get(specPath);
+        const hit = this.lock.getModule(specPath);
+        if (hit) {
+            if (cachedKind && cachedKind !== hit.fileKind) return { ...hit, fileKind: cachedKind };
+            return hit;
+        }
+        if (cachedKind) return { specPath, localPath: specPath, format: 'esm', fileKind: cachedKind };
         const h = this.handlers.get(protoOf(specPath));
         if (h) return { specPath, localPath: h.localPath(specPath), format: 'esm', fileKind: 'source' };
         return { specPath, localPath: specPath, format: 'esm', fileKind: 'source' };
@@ -213,7 +304,7 @@ export class ModuleResolver {
             return h.resolve(spec, parent, attr);
         }
         if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelative(spec, parent, attr);
-        if (isAbsolute(spec)) return this.resolveAbsolute(spec);
+        if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
         return this.resolveBare(spec, parent, attr);
     }
 
@@ -228,14 +319,14 @@ export class ModuleResolver {
         const joined = joinPaths(base, spec);
         const localPath = resolveFile(normalizePath(joined));
         const specPath = localPath;
-        return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+        return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
     }
 
-    private resolveAbsolute(spec: string): ModuleInfo {
+    private resolveAbsolute(spec: string, attr?: Record<string, any>): ModuleInfo {
         const aliased   = this.applyPathAlias(spec);
         const localPath = resolveFile(aliased !== spec ? aliased : spec);
         const specPath  = localPath;
-        return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+        return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
     }
 
     private resolveBare(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
@@ -245,7 +336,7 @@ export class ModuleResolver {
             try {
                 const localPath = resolveFile(aliased);
                 const specPath  = localPath;
-                return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+                return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
             } catch (e) {
                 throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`);
             }

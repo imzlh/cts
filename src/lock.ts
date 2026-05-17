@@ -4,6 +4,10 @@
 //   Module entry: {"s":"specPath","l":"localPath","f":"esm","k":"source"}
 //   Source entry: {"q":"spec\0parent","v":"specPath"}
 //
+// Lock is the single source of truth for module resolution.
+// It does NOT store dependency edges or compilation artifacts —
+// those belong to the JSC cache (jsc.ts) and the BFS scanner (deps.ts).
+//
 // Load: wraps all data lines in [] → single JSON.parse() instead of N calls.
 // Flush: opens file with 'a' flag → pure append, never reads existing content.
 
@@ -18,7 +22,6 @@ interface SourceEntry  { q: string; v: string }
 
 const HEADER = '// cts.lock v2\n';
 
-// Fast serialisers for fixed-schema objects — avoids JSON.stringify key overhead
 function serMod(i: ModuleInfo): string {
     return `{"s":${JSON.stringify(i.specPath)},"l":${JSON.stringify(i.localPath)},"f":"${i.format}","k":"${i.fileKind}"}\n`;
 }
@@ -38,7 +41,7 @@ export class LockStore {
     }
 
     // -------------------------------------------------------------------------
-    // Load — single JSON.parse for all lines
+    // Load — single JSON.parse for all lines, zero I/O beyond the read
     // -------------------------------------------------------------------------
 
     load(): void {
@@ -47,7 +50,6 @@ export class LockStore {
         try { raw = engine.decodeString(fs.readFile(this.path)); }
         catch { log.warn('lock', 'read failed'); return; }
 
-        // Collect data lines, wrap in array, parse once
         const lines: string[] = [];
         for (const line of raw.split('\n')) {
             const l = line.trim();
@@ -59,22 +61,22 @@ export class LockStore {
         try {
             rows = JSON.parse('[' + lines.join(',') + ']');
         } catch {
-            // Truncation recovery: parse line by line
             rows = [];
-            for (const l of lines) { try { rows.push(JSON.parse(l)); } catch {} }
+            let badLines = 0;
+            for (const l of lines) { try { rows.push(JSON.parse(l)); } catch { badLines++; } }
+            if (badLines > 0) log.warn('lock', `truncated lock file: ${badLines} corrupt line(s) skipped`);
         }
 
-        let mods = 0, srcs = 0, skip = 0;
+        let mods = 0, srcs = 0;
         for (const o of rows) {
             if (o.q !== undefined) {
                 this.sources.set(o.q, o.v); srcs++;
             } else if (o.s && o.l && o.f && o.k) {
-                if (isCachedRemote(o.s) && !fs.exists(o.l)) { skip++; continue; }
                 this.modules.set(o.s, { specPath: o.s, localPath: o.l, format: o.f, fileKind: o.k });
                 mods++;
             }
         }
-        log.debug('lock', () => `loaded ${mods}M ${srcs}S skip=${skip}`);
+        log.debug('lock', () => `loaded ${mods}M ${srcs}S`);
     }
 
     getModule(sp: string): ModuleInfo | undefined { return this.modules.get(sp); }
@@ -136,8 +138,4 @@ export class LockStore {
 
     get size(): number { return this.modules.size; }
     get dirtyCount(): number { return this.dirtyMods.size + this.dirtySrcs.size; }
-}
-
-function isCachedRemote(sp: string): boolean {
-    return sp.startsWith('npm:') || sp.startsWith('jsr:') || sp.startsWith('http:') || sp.startsWith('https:') || sp.startsWith('data:');
 }

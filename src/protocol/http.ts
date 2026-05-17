@@ -6,10 +6,11 @@ import { guessFileKind } from './base';
 import { joinPaths, dirname } from '../utils/path';
 import { ensureDir } from '../utils/io';
 import { cacheFilename } from '../utils/misc';
-import { fetchBytes } from '../http/fetch';
+import { fetchBytes, fetchAsync, type ProgressCallback } from '../http/fetch';
 import { URL } from '../http/url';
 import { fs } from '../utils/index';
 import { log } from '../utils/log';
+import { isatty } from '../utils/progress';
 
 export class HttpHandler implements ProtocolHandler {
     readonly protocols = ['http', 'https'];
@@ -24,7 +25,7 @@ export class HttpHandler implements ProtocolHandler {
         if (!this.resolved.has(url)) {
             const cachePath = this.cachePath(url);
             if (!fs.exists(cachePath)) {
-                if (!this.cfg.silent) log.info(`📦 ${url}`);
+                if (!this.cfg.silent && !isatty) log.info(`📦 ${url}`);
                 const bytes = fetchBytes(url);
                 ensureDir(dirname(cachePath));
                 fs.writeFile(cachePath, bytes);
@@ -37,6 +38,22 @@ export class HttpHandler implements ProtocolHandler {
 
     localPath(specPath: string): string {
         return this.resolved.get(specPath) ?? this.cachePath(specPath);
+    }
+
+    async resolveAsync(spec: string, parent: string, _attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+        const url = this.normalizeUrl(spec, parent);
+        if (!this.resolved.has(url)) {
+            const cachePath = this.cachePath(url);
+            if (!fs.exists(cachePath)) {
+                if (!this.cfg.silent && !isatty) log.info(`📦 ${url}`);
+                const { body } = await fetchAsync(url, onProgress);
+                ensureDir(dirname(cachePath));
+                fs.writeFile(cachePath, body);
+            }
+            this.resolved.set(url, cachePath);
+        }
+        const localPath = this.resolved.get(url)!;
+        return { specPath: url, localPath, format: 'esm', fileKind: guessFileKind(localPath) };
     }
 
     private normalizeUrl(spec: string, parent: string): string {

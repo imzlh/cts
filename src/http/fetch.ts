@@ -43,7 +43,7 @@ function doFetch(
         conn.write(req);
 
         let status = 0, location = '', contentLength = 0, isHttp10 = false;
-        let buf: Uint8Array | null = null;
+        let buf: Uint8Array | null = null as any;
         let bufPos = 0;
         let chunks: Uint8Array[] = [];
         let chunksTotal = 0;

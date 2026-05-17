@@ -11,7 +11,7 @@
 import { dirname, joinPaths } from './utils/path';
 import { readText } from './utils/io';
 import { stripJsonc, safeParse, errMsg } from './utils/misc';
-import { fs, process, console, os } from './utils/index';
+import { fs, process, console, os, uname } from './utils/index';
 import { log } from './utils/log';
 
 
@@ -115,7 +115,6 @@ function tokenize(cmd: string): string[] {
     return tokens;
 }
 
-const osname = os.uname().sysname;
 /**
  * Execute a single command string.
  * If it starts with `deno run`, rewrites to a cts invocation.
@@ -150,8 +149,8 @@ async function execCommand(
         argv = ['task', ...(tokens.slice(2)), ...extraArgs];
     } else {
         // Generic shell command
-        const shell = osname.includes('Windows') ? 'cmd' : '/bin/sh';
-        const shellArg = osname.includes('Windows') ? '/c' : '-c';
+        const shell = uname.sysname.includes('Windows') ? 'cmd' : '/bin/sh';
+        const shellArg = uname.sysname.includes('Windows') ? '/c' : '-c';
         // Append extra args to the command string
         const fullCmd = extraArgs.length
             ? `${cmd} ${extraArgs.map(a => JSON.stringify(a)).join(' ')}`

@@ -15,51 +15,22 @@ import { ModuleResolver } from './resolver';
 import { Transformer } from './transformer';
 import { CjsLoader, type CjsDeps } from './cjs';
 import { isTypeDecl } from './protocol/base';
-import { readText, ensureDir } from './utils/io';
-import { dirname, extname } from './utils/path';
-import { assert } from './utils/misc';
+import { readText } from './utils/io';
 import { err, ErrorKind } from './errors';
 import { log } from './utils/log';
-import { fs, engine, wasm } from './utils/index';
+import { fs, engine, errMsg } from './utils/index';
+import { JscCache, isRemote } from './jsc';
 
-// Keep engine modules alive (QuickJS GC would collect them otherwise)
 const store: CModuleEngine.Module[] = [];
 
-// ---------------------------------------------------------------------------
-// JSC bytecode cache helpers
-// ---------------------------------------------------------------------------
-
-type Hint = 'wasm'|'bytes'|'text'|'raw'|'commonjs'|'module'|'';
-
-function hintOf(specPath: string): Hint {
-    const qi = specPath.indexOf('?');
-    return qi === -1 ? '' : specPath.slice(qi + 1) as Hint;
-}
-
-function tryReadJsc(
-    jscPath: string, srcPath: string, isRemote: boolean,
-): CModuleEngine.Module | null {
-    if (!fs.exists(jscPath)) return null;
-    try {
-        if (!isRemote) {
-            const sm = (() => { try { return (fs.stat(srcPath) as any).mtim?.getTime?.() ?? 0; } catch { return 0; } })();
-            const jm = (() => { try { return (fs.stat(jscPath) as any).mtim?.getTime?.() ?? 0; } catch { return 0; } })();
-            if (jm < sm) return null;
-        }
-        const jscBytes = fs.readFile(jscPath);
-        const cached = engine.deserialize(new Uint8Array(jscBytes));
-        return cached;
-    } catch { return null; }
-}
-
-// ---------------------------------------------------------------------------
-// ModuleLoader
-// ---------------------------------------------------------------------------
+import { buildWasmModule, type WasmImportSource } from './wasm';
 
 export class ModuleLoader {
     private readonly transformer = new Transformer();
     private readonly cjs:        CjsLoader;
-    private readonly esmCache  = new Map<string, CModuleEngine.Module>();
+    private readonly esmCache    = new Map<string, CModuleEngine.Module>();
+    private readonly wasmCache   = new Map<string, CModuleEngine.Module>();
+    readonly jsc                 = new JscCache();
 
     constructor(
         private readonly resolver: ModuleResolver,
@@ -89,29 +60,24 @@ export class ModuleLoader {
         if (isTypeDecl(info.localPath)) {
             throw err(ErrorKind.FileNotFound, `Cannot load type declaration file "${info.localPath}" as a module. Type declaration files (.d.ts) are not executable.`);
         }
-        const hint = hintOf(info.specPath);
-        log.debug('loader', () => `load ${info.specPath} hint=${hint} kind=${info.fileKind} format=${info.format}`);
+        log.debug('loader', () => `load ${info.specPath} kind=${info.fileKind} format=${info.format}`);
         log.debug('loader', () => `alias: ${info.specPath} -> ${info.localPath}`);
 
-        // Hint-based dispatch (?type=...) takes priority.
-        switch (hint) {
-            case 'commonjs': return this.loadCjs(info, meta);
-            case 'module':   return this.loadEsm(info, meta);
-            case 'wasm':     return this.loadWasm(info);
-            case 'bytes':
-            case 'raw':      return this.loadBytes(info);
-            case 'text':     return this.loadText(info);
-        }
-
-        // File-kind / format based dispatch.
         switch (info.fileKind) {
-            case 'wasm':   return this.loadWasm(info);
             case 'binary': return this.loadBytes(info);
-            case 'json':   return this.loadEsm(info, meta);  // transformer wraps as export default
+            case 'text':   return this.loadText(info);
+            case 'json':   return this.loadEsm(info, meta);
+            case 'wasm':   return this.loadWasm(info);
         }
         return info.format === 'cjs'
             ? this.loadCjs(info, meta)
             : this.loadEsm(info, meta);
+    }
+
+    loadSource(code: string, info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
+        log.debug('loader', () => `loadSource ${info.specPath} kind=${info.fileKind}`);
+        if (info.fileKind === 'text') return this.loadTextSource(code, info);
+        return this.loadEsmSource(code, info, meta);
     }
 
     preRegister(localPath: string, parentPath: string): void {
@@ -129,14 +95,12 @@ export class ModuleLoader {
             return hit;
         }
 
-        const isRemote = info.specPath.startsWith('http://') || info.specPath.startsWith('https://') || info.specPath.startsWith('jsr:') || info.specPath.startsWith('npm:');
-        // JSC bytecode cache: only for remote/cached modules, not local source files.
-        // Local files change frequently and .jsc files would litter the project directory.
-        const cacheable = !this.cfg.disableCache && isRemote;
-        const jscPath   = info.localPath + '.jsc';
+        const remote = isRemote(info.specPath);
+        const cacheable = !this.cfg.disableCache && remote;
 
+        // 1) JSC cache: in-memory (from precompile) → on-disk .jsc (remote only)
         if (cacheable) {
-            const cached   = tryReadJsc(jscPath, info.localPath, isRemote);
+            const cached = this.jsc.load(info.localPath, remote);
             if (cached) {
                 Object.assign(cached.meta, meta);
                 this.esmCache.set(info.localPath, cached);
@@ -145,6 +109,7 @@ export class ModuleLoader {
             }
         }
 
+        // 2) Fallback: read + transform + compile on main thread
         const text = readText(info.localPath);
         const code = this.transformer.transform(text, info.localPath);
         let mod: CModuleEngine.Module;
@@ -161,8 +126,7 @@ export class ModuleLoader {
         }
 
         if (cacheable) {
-            try { ensureDir(dirname(jscPath)); fs.writeFile(jscPath, mod.dump()); }
-            catch (e) { log.warn('loader', 'jsc write failed', e); }
+            this.jsc.persist(info.localPath, mod);
         }
 
         Object.assign(mod.meta, meta);
@@ -171,48 +135,69 @@ export class ModuleLoader {
         return mod;
     }
 
+    private loadEsmSource(code: string, info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
+        const hit = this.esmCache.get(info.localPath);
+        if (hit) {
+            if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
+            return hit;
+        }
+        const transformed = this.transformer.transform(code, info.localPath);
+        let mod: CModuleEngine.Module;
+        try {
+            mod = new engine.Module(transformed, info.specPath);
+        } catch (e) {
+            if (e instanceof SyntaxError) {
+                const ne = err(ErrorKind.SyntaxError,
+                    `Syntax error in ${info.localPath}: ${e.message}`);
+                (ne as any).cause = { source: e, code, path: info.localPath };
+                throw ne;
+            }
+            throw e;
+        }
+        Object.assign(mod.meta, meta);
+        this.esmCache.set(info.localPath, mod);
+        store.push(mod);
+        return mod;
+    }
+
+    private loadCjsSource(code: string, info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
+        const transformed = this.transformer.transform(code, info.localPath);
+        const cjsMod = this.cjs.loadSourceAndGet(transformed, info.localPath);
+        return this.bridgeCjsToEsm(info, meta, cjsMod.exports);
+    }
+
+    private loadTextSource(code: string, info: ModuleInfo): CModuleEngine.Module {
+        const mod = engine.Module.create(info.specPath);
+        mod.export('default', code);
+        store.push(mod);
+        return mod;
+    }
+
     // -------------------------------------------------------------------------
-    // CJS → ESM bridge: expose CJS exports as a proper ESM module
-    //
-    // __esModule detection (Babel/tsc interop):
-    //   When a CJS module sets exports.__esModule = true, it was transpiled from
-    //   ESM. In this case:
-    //     - `default` export = exports.default   (not the whole exports object)
-    //     - Named exports   = all other keys of exports
-    //   Without __esModule:
-    //     - `default` export = the whole exports object (true CJS)
-    //     - Named exports   = each enumerable key of exports
-    //
-    // This matches the behaviour of rollup, webpack, vite, and Node.js CJS↔ESM.
+    // CJS → ESM bridge
     // -------------------------------------------------------------------------
 
     private loadCjs(info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
-        const cjsMod  = this.cjs.loadAndGet(info.localPath);
-        const exports = cjsMod.exports;
+        const cjsMod = this.cjs.loadAndGet(info.localPath);
+        return this.bridgeCjsToEsm(info, meta, cjsMod.exports);
+    }
 
+    private bridgeCjsToEsm(
+        info: ModuleInfo, meta: Record<string, any>, exports: any,
+    ): CModuleEngine.Module {
         const mod = engine.Module.create(info.specPath);
         Object.assign(mod.meta, meta);
 
-        const isTranspiledEsm =
-            exports !== null &&
-            typeof exports === 'object' &&
-            exports.__esModule === true;
-
-        if (isTranspiledEsm) {
-            // Transpiled ESM (Babel/tsc): export each key, default is exports.default
+        if (exports !== null && typeof exports === 'object' && exports.__esModule === true) {
             for (const k of Object.keys(exports)) {
                 if (k !== '__esModule') mod.export(k, exports[k]);
             }
-            // Ensure `default` is always present
             if (!Object.prototype.hasOwnProperty.call(exports, 'default')) {
                 mod.export('default', undefined);
             }
         } else {
-            // True CJS: default = whole exports, also export each named key
             if (exports !== null && typeof exports === 'object') {
                 for (const k of Object.keys(exports)) {
-                    // Skip prototype-inherited and non-enumerable; skip 'default'
-                    // which we set explicitly below to avoid conflicts
                     if (k !== 'default') mod.export(k, exports[k]);
                 }
             }
@@ -227,148 +212,74 @@ export class ModuleLoader {
     // Special file types
     // -------------------------------------------------------------------------
 
+    private readonly wasmLoading = new Set<string>();
+    private readonly pendingWasm  = new Map<string, Record<string, any>>();
+
     private loadWasm(info: ModuleInfo): CModuleEngine.Module {
-        assert(wasm, 'WASM support not available in this build');
+        const hit = this.wasmCache.get(info.localPath);
+        if (hit) return hit;
 
-        const raw = fs.readFile(info.localPath);
-        const wmod = wasm.parseModule(raw);
+        if (this.wasmLoading.has(info.localPath)) {
+            // Circular dependency (wasm-bindgen: JS glue imports from .wasm,
+            // .wasm imports table/memory from JS glue).
+            // Return a placeholder whose exports will be populated after the
+            // WASM instance is built.  The JS glue receives a live object that
+            // gains properties once instantiation completes.
+            log.debug('wasm', () => `cycle: ${info.specPath} — returning placeholder`);
+            const shared: Record<string, any> = {};
+            const placeholder = engine.Module.create(info.specPath);
+            placeholder.export('default', shared);
+            this.wasmCache.set(info.localPath, placeholder);
+            this.pendingWasm.set(info.localPath, shared);
+            return placeholder;
+        }
 
-        // Resolve imports: bridge WASM import requirements to JS functions
-        const imports = wasm.moduleImports(wmod);
-        if (imports.length > 0) {
-            const funcDescs: CModuleWASM.ImportFunctionDescriptor[] = [];
-            const globalDescs: CModuleWASM.GlobalImportDescriptor[] = [];
-            for (const imp of imports) {
-                if (imp.kind === 'function') {
-                    // Provide a no-op stub for unresolved function imports.
-                    // Users can override via the `wasmImports` export before calling.
-                    funcDescs.push({
-                        module: imp.module,
-                        name:   imp.name,
-                        func:   (..._args: CModuleWASM.WasmValue[]) => 0,
-                    });
-                } else if (imp.kind === 'global') {
-                    // Default global import: i32(0), immutable
-                    globalDescs.push({
-                        module:  imp.module,
-                        name:    imp.name,
-                        value:   0,
-                        type:    'i32',
-                        mutable: false,
-                    });
+        this.wasmLoading.add(info.localPath);
+
+        const importSource: WasmImportSource = {
+            require: (spec, parentPath) => {
+                try {
+                    const resolved = this.resolver.resolve(spec, parentPath);
+                    const loaded = this.load(resolved, {});
+                    loaded.eval();
+                    const ns = loaded.namespace;
+                    log.debug('wasm', () => `import "${spec}" resolved → ${resolved.specPath} (${Object.keys(ns).length} exports)`);
+                    return ns;
+                } catch (e) {
+                    log.debug('wasm', () => `import "${spec}" from "${parentPath}" failed: ${errMsg(e)}`);
+                    return null;
                 }
-                // 'memory' and 'table' imports are handled internally by WAMR
+            },
+        };
+
+        const result = buildWasmModule(info, importSource);
+        this.wasmLoading.delete(info.localPath);
+
+        if (!result) throw err(ErrorKind.Generic, `WASM load failed: ${info.localPath}`);
+
+        // If a placeholder was created during circular resolution, populate it
+        // with the real exports now that the WASM instance is built.
+        const pending = this.pendingWasm.get(info.localPath);
+        if (pending) {
+            const ns = result.mod.namespace;
+            Object.assign(pending, ns);
+
+            // Also register named exports on the placeholder module so that
+            // `import * as wasm from "./bg.wasm"` → `wasm.memory` works
+            // (not just `wasm.default.memory`).
+            const placeholder = this.wasmCache.get(info.localPath)!;
+            for (const key of Object.keys(ns)) {
+                try { placeholder.export(key, ns[key]); } catch { /* ok */ }
             }
-            if (funcDescs.length > 0)  wasm.resolveImports(wmod, funcDescs);
-            if (globalDescs.length > 0) wasm.resolveGlobalImports(wmod, globalDescs);
+
+            this.pendingWasm.delete(info.localPath);
+            log.debug('wasm', () => `populated placeholder: ${info.specPath} (${Object.keys(pending).length} exports)`);
+            return placeholder;
         }
 
-        // Set default WASI options (empty args/env/preopens)
-        wasm.setWasiOptions(wmod, [], null, null);
-
-        const inst = wasm.buildInstance(wmod);
-        const exp  = wasm.moduleExports(wmod);
-        const mod  = engine.Module.create(info.specPath);
-
-        // Build a namespace object that mirrors the standard WebAssembly.Instance.exports
-        const ns: Record<string, any> = {};
-
-        for (const e of exp) {
-            switch (e.kind) {
-                case 'function': {
-                    const fn = (...args: any[]): CModuleWASM.WasmValue | CModuleWASM.WasmValue[] => {
-                        const wargs: CModuleWASM.WasmValue[] = args.map(a => this.toWasmValue(a));
-                        return inst.callFunction(e.name, ...wargs);
-                    };
-                    ns[e.name] = fn;
-                    mod.export(e.name, fn);
-                    break;
-                }
-                case 'memory': {
-                    const mem = {
-                        get buffer(): ArrayBuffer {
-                            return wasm!.getMemoryBuffer(inst);
-                        },
-                        grow(delta: number): number {
-                            return wasm!.growMemory(inst, delta);
-                        },
-                    };
-                    ns[e.name] = mem;
-                    mod.export(e.name, mem);
-                    break;
-                }
-                case 'global': {
-                    const gl = {
-                        get value(): CModuleWASM.WasmValue {
-                            return wasm!.getGlobal(inst, e.name);
-                        },
-                        set value(v: CModuleWASM.WasmValue) {
-                            wasm!.setGlobal(inst, e.name, v);
-                        },
-                        get info(): CModuleWASM.GlobalInfo {
-                            return wasm!.getGlobalInfo(inst, e.name);
-                        },
-                    };
-                    ns[e.name] = gl;
-                    mod.export(e.name, gl);
-                    break;
-                }
-                case 'table': {
-                    const tbl = {
-                        get length(): number {
-                            return wasm!.tableSize(inst, e.name);
-                        },
-                        get info(): CModuleWASM.TableInfo {
-                            return wasm!.getTableInfo(inst, e.name);
-                        },
-                        get(index: number): number | null {
-                            return wasm!.tableGet(inst, e.name, index) as number | null;
-                        },
-                        set(index: number, value: number | null): void {
-                            wasm!.tableSet(inst, e.name, index, value);
-                        },
-                        grow(delta: number): number {
-                            return wasm!.tableGrow(inst, e.name, delta);
-                        },
-                    };
-                    ns[e.name] = tbl;
-                    mod.export(e.name, tbl);
-                    break;
-                }
-            }
-        }
-
-        // Export the full namespace as `default` for `import ns from './mod.wasm'`
-        mod.export('default', ns);
-
-        // Expose the raw instance for advanced usage (memory, globals, tables, funcByIndex)
-        mod.export('instance', inst);
-
-        store.push(mod);
-        return mod;
-    }
-
-    /**
-     * Convert a JS value to a WASM-compatible value (number | bigint).
-     * - number  → number (i32/f32/f64)
-     * - bigint  → bigint (i64)
-     * - boolean → 0 | 1  (i32)
-     * - string  → parseInt/BigInt  (best-effort)
-     * - null/undefined → 0
-     */
-    private toWasmValue(v: unknown): CModuleWASM.WasmValue {
-        if (typeof v === 'number')  return v;
-        if (typeof v === 'bigint')  return v;
-        if (typeof v === 'boolean') return v ? 1 : 0;
-        if (v === null || v === undefined) return 0;
-        if (typeof v === 'string') {
-            // Try integer parse first, then float
-            const s = v as string;
-            if (s === '') return 0;
-            if (/^-?\d+n?$/.test(s)) return BigInt(s.replace(/n$/, ''));
-            return Number(s);
-        }
-        return 0;
+        this.wasmCache.set(info.localPath, result.mod);
+        store.push(result.mod);
+        return result.mod;
     }
 
     private loadBytes(info: ModuleInfo): CModuleEngine.Module {
@@ -386,7 +297,7 @@ export class ModuleLoader {
     }
 
     // -------------------------------------------------------------------------
-    // CjsDeps implementation: bridges CJS loader back to ESM resolver/loader
+    // CjsDeps implementation
     // -------------------------------------------------------------------------
 
     private buildCjsDeps(): CjsDeps {
@@ -396,22 +307,13 @@ export class ModuleLoader {
                 return self.resolver.resolve(`node:${name}`, parent).localPath;
             },
 
-            /**
-             * Load ESM module synchronously for CJS interop.
-             * Uses engine.promiseResult to extract the result without top-level await.
-             * This works because ESM modules without top-level await evaluate synchronously
-             * in QuickJS — the Promise is already resolved when eval() returns.
-             */
             loadEsmSync(localPath: string, specPath: string): Record<string, any> {
                 const info: ModuleInfo = { specPath, localPath, format: 'esm', fileKind: 'source' };
                 const mod = self.loadEsm(info, {});
 
-                // Drive the module evaluation synchronously
                 const p = mod.eval();
                 const ns = mod.namespace;
 
-                // If the module uses top-level await, namespace may be empty.
-                // Log a warning but don't crash — the CJS side will get an empty object.
                 if (Object.keys(ns).length === 0 && engine.promiseResult(p) === null) {
                     log.warn('loader',
                         () => `${specPath} uses top-level await; CJS require() may get empty exports`);

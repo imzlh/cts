@@ -6,7 +6,7 @@ import { readText, writeText, ensureDir } from './utils/io';
 import { stripJsonc, safeParse, parseArgs } from './utils/misc';
 import { log } from './utils/log';
 import { err, ErrorKind } from './errors';
-import { os, fs, engine } from './utils/index';
+import { os, fs, engine, uname, timers } from './utils/index';
 
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ function envConfig(): Partial<ConfigOptions> {
 function defaultCacheDir(): string {
     let home: string | null = null;
     try { home = os.homedir; } catch {}
-    if (!home) home = env(os.uname().sysname.includes('Windows') ? 'USERPROFILE' : 'HOME') ?? '/root';
+    if (!home) home = env(uname.sysname.includes('Windows') ? 'USERPROFILE' : 'HOME') ?? '/root';
     return joinPaths(home, '.cts');
 }
 
@@ -71,10 +71,24 @@ function defaultCacheDir(): string {
 // ---------------------------------------------------------------------------
 
 function clearJsc(dir: string): void {
+    // Delete .jsc files in a background timer so we don't block startup.
+    // The old bytecode is stale anyway — it'll be overwritten on next cache write.
+    timers.setTimeout(() => {
+        try {
+            for (const e of fs.readdir(dir)) {
+                const p = joinPaths(dir, e);
+                try { if (fs.stat(p).isDirectory) clearJscSync(p); else if (p.endsWith('.jsc')) fs.unlink(p); }
+                catch {}
+            }
+        } catch {}
+    }, 0);
+}
+
+function clearJscSync(dir: string): void {
     try {
         for (const e of fs.readdir(dir)) {
             const p = joinPaths(dir, e);
-            try { if (fs.stat(p).isDirectory) clearJsc(p); else if (p.endsWith('.jsc')) fs.unlink(p); }
+            try { if (fs.stat(p).isDirectory) clearJscSync(p); else if (p.endsWith('.jsc')) fs.unlink(p); }
             catch {}
         }
     } catch {}
@@ -107,6 +121,7 @@ const CLI_TPL = {
     'memory-limit':   'string',
     'max-stack-size': 'string',
     'jsr-cache-ttl':  'number',
+    'eval':           'string',
     'silent':         'boolean',
     'no-http':        'boolean',
     'no-jsr':         'boolean',
@@ -135,6 +150,7 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
 
     if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || getEnv('CTS_CACHE_DIR') || '';
     if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'];
+    if (cli['eval'])          cfg.eval           = cli['eval'];
     if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || getEnv('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.disableCache  = true;
     if (cli['silent'])        cfg.silent        = true;

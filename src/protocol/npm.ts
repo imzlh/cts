@@ -5,14 +5,14 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchBytes, fetchText } from '../http/fetch';
+import { fetchBytes, fetchText, fetchAsync, type ProgressCallback } from '../http/fetch';
 import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
-import { detectFormat, readPkgFresh, createCtx, resolveSubpath } from '../pkg';
+import { detectFormat, readPkgFresh, createCtx, resolveSubpath, resolveImports } from '../pkg';
 import { err, ErrorKind } from '../errors';
 import { log } from '../utils/log';
-import { fs, os, console } from '../utils/index';
-
-const osname = os.uname().sysname;
+import { isatty } from '../utils/progress';
+import { fs, os, uname, engine } from '../utils/index';
+import { version } from '../../package.json';
 
 // ---------------------------------------------------------------------------
 // npm config (registry, auth)
@@ -129,6 +129,10 @@ export class NpmHandler implements ProtocolHandler {
         if (spec === '.' && parent.startsWith('npm:')) {
             return this.resolveRelative('.', parent, forceCjs);
         }
+        // Subpath imports (e.g. "#minpath") — resolve within the parent package
+        if (spec.startsWith('#') && parent.startsWith('npm:')) {
+            return this.resolveSubpathImport(spec, parent, forceCjs);
+        }
         const { name, version, subpath } = parseNpmSpec(spec);
         const pkg = this.ensureInstalled(name, version, parent);
         return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
@@ -162,11 +166,15 @@ export class NpmHandler implements ProtocolHandler {
         const ctx = createCtx(dir, { forceCjs });
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
 
-        // Resolve relative import using the parent's actual localPath on disk,
-        // not the subpath from the specifier. This is critical because:
-        //   - parent "npm:hono@4.12.14" has subpath="" but localPath=".../dist/index.js"
-        //   - import "./hono.js" must resolve relative to dist/, not the package root
-        const parentLocal = resolveSubpath(ctx, subpath || '.');
+        // Resolve the parent's actual localPath on disk.
+        let parentLocal = resolveSubpath(ctx, subpath || '.');
+        if (!parentLocal) {
+            // Fallback: subpath may be a Deno-rewritten path (e.g. "b/index.js"
+            // mapping to "lib/index.js"). Search the package directory for a file
+            // with the same basename and compatible extension.
+            const targetName = subpath.split('/').pop()!;
+            parentLocal = this.findFileByBasename(dir, targetName, subpath);
+        }
         if (!parentLocal) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath || '.'}" in ${name}@${pkg.resolvedVer}`);
 
         const targetLocal = normalizePath(joinPaths(dirname(parentLocal), spec));
@@ -184,11 +192,68 @@ export class NpmHandler implements ProtocolHandler {
         };
     }
 
+    /** Resolve a subpath import ("#xxx") within the parent npm package. */
+    private resolveSubpathImport(spec: string, parent: string, forceCjs: boolean): ModuleInfo {
+        const { name, version } = parseNpmSpec(parent);
+        const pkg = this.ensureInstalled(name, version, parent);
+        const ctx = createCtx(pkg.dir, { forceCjs });
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
+        const localPath = resolveImports(ctx, spec);
+        if (!localPath) throw err(ErrorKind.ModuleNotFound,
+            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} — not found in package.json "imports"`);
+        return {
+            specPath: NpmHandler.specPath(name, pkg.resolvedVer, localPath.slice(pkg.dir.length + 1)),
+            localPath,
+            format: detectFormat(localPath),
+            fileKind: guessFileKind(localPath),
+        };
+    }
+
+    /** Find a file in dir matching basename, preferring paths that end with subpath's suffix. */
+    private findFileByBasename(dir: string, basename: string, subpath: string): string | null {
+        const subSuffix = subpath.includes('/') ? subpath.slice(0, subpath.lastIndexOf('/')) : '';
+        const results: string[] = [];
+        const walk = (d: string) => {
+            let entries: string[];
+            try { entries = fs.readdir(d); } catch { return; }
+            for (const e of entries) {
+                const p = joinPaths(d, e);
+                try {
+                    if (fs.stat(p).isDirectory) {
+                        // Skip node_modules to avoid deep recursion
+                        if (e !== 'node_modules') walk(p);
+                    } else if (e === basename) {
+                        results.push(p);
+                    }
+                } catch {}
+            }
+        };
+        walk(dir);
+        if (!results.length) return null;
+        // Prefer result whose relative path ends with the subpath directory prefix
+        if (subSuffix) {
+            for (const r of results) {
+                const rel = normalizePath(r.slice(dir.length + 1));
+                if (rel.endsWith(subSuffix + '/' + basename)) return r;
+            }
+        }
+        return results[0]!;
+    }
+
     private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
         const ctx = createCtx(dir, { forceCjs });
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
         const localPath = resolveSubpath(ctx, subpath);
-        if (!localPath) throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${subpath || '.'}" in ${name}@${ver}`);
+        if (!localPath) {
+            const pkg = ctx.pkg;
+            const hint = pkg.exports
+                ? `(exports: ${JSON.stringify(pkg.exports)})`
+                : pkg.main ? `(main: "${pkg.main}")` : '(no main field)';
+            throw err(ErrorKind.ModuleNotFound,
+                `Cannot resolve "${subpath || '.'}" in ${name}@${ver} — ${hint}\n` +
+                `  The package may not expose a default entry point. ` +
+                `Try importing a specific subpath like npm:${name}@${ver}/<file>`);
+        }
         return {
             specPath: NpmHandler.specPath(name, ver, subpath),
             localPath,
@@ -209,7 +274,7 @@ export class NpmHandler implements ProtocolHandler {
         const exactVer = this.resolveVersion(name, version);
         const pkgDir   = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         if (!fs.exists(pkgDir)) {
-            if (!this.cfg.silent) log.info(`📦 ${name}@${exactVer}`);
+            if (!this.cfg.silent && !isatty) log.info(`📦 ${name}@${exactVer}`);
             this.install(name, exactVer, pkgDir);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
@@ -292,7 +357,7 @@ export class NpmHandler implements ProtocolHandler {
                 startDir = dirname(parent);
             }
             let d = startDir;
-            const root = osname.includes('Windows') ? d.split(':')[0] + ':/' : '/';
+            const root = uname.sysname.includes('Windows') ? d.split(':')[0] + ':/' : '/';
             while (d && d !== root) {
                 search.push(joinPaths(d, 'node_modules'));
                 const up = dirname(d); if (up === d) break; d = up;
@@ -308,5 +373,141 @@ export class NpmHandler implements ProtocolHandler {
 
     private getNpmCfg(): NpmConfig {
         return (this.npmCfg ??= loadNpmConfig());
+    }
+
+    // -------------------------------------------------------------------------
+    // async resolve — parallel precache path (uses fetchAsync, no engine.waitPromise)
+    // -------------------------------------------------------------------------
+
+    async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+        const forceCjs = attr?.cjs === true || (attr?.type !== 'module' && !parent.startsWith('npm:'));
+        if ((spec.startsWith('./') || spec.startsWith('../')) && parent.startsWith('npm:')) {
+            return this.resolveRelativeAsync(spec, parent, forceCjs);
+        }
+        if (spec === '.' && parent.startsWith('npm:')) {
+            return this.resolveRelativeAsync('.', parent, forceCjs);
+        }
+        if (spec.startsWith('#') && parent.startsWith('npm:')) {
+            return this.resolveSubpathImportAsync(spec, parent, forceCjs);
+        }
+        const { name, version, subpath } = parseNpmSpec(spec);
+        const pkg = await this.ensureInstalledAsync(name, version, parent, onProgress);
+        return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
+    }
+
+    private async resolveRelativeAsync(spec: string, parent: string, forceCjs: boolean): Promise<ModuleInfo> {
+        const { name, version, subpath } = parseNpmSpec(parent);
+        const pkg = await this.ensureInstalledAsync(name, version, parent);
+        const dir = pkg.dir;
+        const ctx = createCtx(dir, { forceCjs });
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
+        let parentLocal = resolveSubpath(ctx, subpath || '.');
+        if (!parentLocal) {
+            const targetName = subpath.split('/').pop()!;
+            parentLocal = this.findFileByBasename(dir, targetName, subpath);
+        }
+        if (!parentLocal) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath || '.'}" in ${name}@${pkg.resolvedVer}`);
+        const targetLocal = normalizePath(joinPaths(dirname(parentLocal), spec));
+        const resolvedLocal = resolveFile(targetLocal);
+        if (!resolvedLocal) throw err(ErrorKind.FileNotFound, `Cannot resolve "${spec}" from "${parent}": file not found at ${targetLocal}`);
+        const relToDir = normalizePath(resolvedLocal.slice(dir.length + 1));
+        return {
+            specPath: NpmHandler.specPath(name, pkg.resolvedVer, relToDir),
+            localPath: resolvedLocal,
+            format: detectFormat(resolvedLocal),
+            fileKind: guessFileKind(resolvedLocal),
+        };
+    }
+
+    private async resolveSubpathImportAsync(spec: string, parent: string, forceCjs: boolean): Promise<ModuleInfo> {
+        const { name, version } = parseNpmSpec(parent);
+        const pkg = await this.ensureInstalledAsync(name, version, parent);
+        const ctx = createCtx(pkg.dir, { forceCjs });
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
+        const localPath = resolveImports(ctx, spec);
+        if (!localPath) throw err(ErrorKind.ModuleNotFound,
+            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} — not found in package.json "imports"`);
+        return {
+            specPath: NpmHandler.specPath(name, pkg.resolvedVer, localPath.slice(pkg.dir.length + 1)),
+            localPath,
+            format: detectFormat(localPath),
+            fileKind: guessFileKind(localPath),
+        };
+    }
+
+    private async ensureInstalledAsync(name: string, version: string, parent?: string, onProgress?: ProgressCallback): Promise<{ dir: string; resolvedVer: string }> {
+        const local = this.findLocal(name, parent);
+        if (local) {
+            const pkg = readPkgFresh(local);
+            return { dir: local, resolvedVer: pkg?.version ?? version };
+        }
+        const exactVer = await this.resolveVersionAsync(name, version);
+        const pkgDir   = joinPaths(this.cacheDir, `${name}@${exactVer}`);
+        if (!fs.exists(pkgDir)) {
+            if (!this.cfg.silent && !isatty) log.info(`📦 ${name}@${exactVer}`);
+            await this.installAsync(name, exactVer, pkgDir, onProgress);
+        }
+        return { dir: pkgDir, resolvedVer: exactVer };
+    }
+
+    private async resolveVersionAsync(name: string, range: string): Promise<string> {
+        const key = `${name}@${range}`;
+        if (this.verCache.has(key)) return this.verCache.get(key)!;
+        const meta = await this.fetchMetaAsync(name);
+        const tags  = meta['dist-tags'] ?? {};
+        let resolved: string;
+        if (!range || range === 'latest') {
+            resolved = tags.latest ?? this.highestVersion(meta);
+        } else if (tags[range]) {
+            resolved = tags[range]!;
+        } else if (/^\d+\.\d+\.\d+/.test(range) && meta.versions[range]) {
+            resolved = range;
+        } else {
+            resolved = matchLatestVersion(Object.keys(meta.versions), range)
+                ?? tags.latest ?? this.highestVersion(meta);
+        }
+        this.verCache.set(key, resolved);
+        return resolved;
+    }
+
+    private async fetchMetaAsync(name: string): Promise<NpmMeta> {
+        const cfg      = this.getNpmCfg();
+        const registry = (name.startsWith('@') && cfg.scopeRegistries[name.split('/')[0]!])
+            ? cfg.scopeRegistries[name.split('/')[0]!]!
+            : cfg.registry;
+        const cacheFile = joinPaths(this.cacheDir, name, 'meta.json');
+        const cacheTs   = cacheFile + '.ts';
+        if (fs.exists(cacheFile)) {
+            try {
+                const age = Date.now() - +(readText(cacheTs) || '0');
+                if (age < 24 * 60 * 60 * 1000) return safeParse<NpmMeta>(readText(cacheFile));
+            } catch {}
+        }
+        const { body } = await fetchAsync(`${registry}/${name}`, undefined, {
+            method: 'GET',
+            headers: { 'User-Agent': 'cts/' + version, Accept: 'application/json' },
+        });
+        const meta = safeParse<NpmMeta>(engine.decodeString(new Uint8Array(body)));
+        ensureDir(dirname(cacheFile));
+        writeText(cacheFile, JSON.stringify(meta, null, 2));
+        writeText(cacheTs, String(Date.now()));
+        return meta;
+    }
+
+    private async installAsync(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Promise<void> {
+        const meta    = await this.fetchMetaAsync(name);
+        const tarball = meta.versions[ver]?.dist.tarball;
+        if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
+        const { body } = await fetchAsync(tarball, onProgress);
+        const files = unTarGz(new Uint8Array(body).buffer);
+        ensureDir(dir);
+        const seen = new Set<string>();
+        for (const f of files) {
+            let p = f.path;
+            if (p.startsWith('package/')) p = p.slice(8);
+            const target = joinPaths(dir, p);
+            if (f.type === 'dir') { if (!seen.has(target)) { ensureDir(target); seen.add(target); } }
+            else { const d = dirname(target); if (!seen.has(d)) { ensureDir(d); seen.add(d); } fs.writeFile(target, f.content); }
+        }
     }
 }

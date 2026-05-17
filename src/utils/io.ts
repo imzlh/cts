@@ -29,22 +29,45 @@ export function ensureDir(dir: string): void {
 
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.wasm'];
 const cache = new LRU<string, string>(2048);
+const negCache = new Set<string>();  // paths known not to exist
 
 export function resolveFile(base: string, exts = EXTS): string {
     const hit = cache.get(base);
     if (hit) return hit;
+    if (negCache.has(base)) throw err(ErrorKind.FileNotFound, `Cannot resolve: ${base}`);
     const found = _resolve(base, exts);
     cache.set(base, found);
     if (found !== base) cache.set(found, found); // identity shortcut
     return found;
 }
 
+/** Mark a path as definitively non-existent (stat failed). */
+function markMissing(p: string): void { negCache.add(p); }
+
 function tryFile(p: string): string | null {
+    if (negCache.has(p)) return null;
     try {
         const st = fs.stat(p);
         if (st.isFile) return p;
-        if (st.isDirectory) return resolveFile(joinPaths(p, 'index'));
-    } catch {}
+        if (st.isDirectory) {
+            // For directory index lookup, always use full EXTS (not caller's exts)
+            const idx = tryIndex(joinPaths(p, 'index'), EXTS);
+            if (idx) return idx;
+        }
+    } catch {
+        markMissing(p);
+    }
+    return null;
+}
+
+function tryIndex(base: string, exts: string[]): string | null {
+    for (const e of exts) {
+        const p = base + e;
+        if (negCache.has(p)) continue;
+        try {
+            if (fs.stat(p).isFile) return p;
+        } catch { markMissing(p); }
+    }
     return null;
 }
 
@@ -57,12 +80,11 @@ function _resolve(base: string, exts: string[]): string {
         const r = tryFile(base + e);
         if (r) return r;
     }
-    // index.<ext>
-    for (const e of exts) {
-        const r = tryFile(joinPaths(base, 'index' + e));
-        if (r) return r;
-    }
+    // index.<ext> — always use full extension list for index files
+    const idx = tryIndex(joinPaths(base, 'index'), EXTS);
+    if (idx) return idx;
+    markMissing(base);
     throw err(ErrorKind.FileNotFound, `Cannot resolve: ${base}`);
 }
 
-export function clearResolveCache(): void { cache.clear(); }
+export function clearResolveCache(): void { cache.clear(); negCache.clear(); }

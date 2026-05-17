@@ -2,15 +2,13 @@ import { parse } from '../deps/sucrase/src/parser';
 import { TokenType as tt } from '../deps/sucrase/src/parser/tokenizer/types';
 import { ContextualKeyword } from '../deps/sucrase/src/parser/tokenizer/keywords';
 
-import type { RuntimeConfig, ModuleInfo } from './types';
+import type { RuntimeConfig } from './types';
 import { ModuleResolver } from './resolver';
-import { ensureDir } from './utils/io';
-import { dirname, extname } from './utils/path';
+import { extname } from './utils/path';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';
-import { MultiProgress } from './utils/progress';
+import { PrecacheProgress } from './utils/progress';
 import { fs, engine, asyncfs } from './utils/index';
-import { fetchAsync } from './http/fetch';
 
 // ---------------------------------------------------------------------------
 // Import specifier extraction — sucrase token-based, no regex
@@ -19,6 +17,9 @@ import { fetchAsync } from './http/fetch';
 const SCANNABLE = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
 
 export function extractImports(source: string, isTs = true): string[] {
+    // Fast path: skip parse if source has no import/export/require keywords.
+    // These substrings appear in every valid import/export/require statement.
+    if (!source.includes('import') && !source.includes('export') && !source.includes('require')) return [];
     let tokens;
     try {
         const file = parse(source, true, isTs, false);
@@ -82,90 +83,89 @@ function findFromString(
 }
 
 // ---------------------------------------------------------------------------
-// Parallel BFS
+// Parallel BFS — full scan, no lock deps shortcut
 // ---------------------------------------------------------------------------
-
-interface DownloadTask {
-    url:       string;
-    cachePath: string;
-    info:      ModuleInfo;
-}
 
 export interface ScanResult {
     visited:    number;
     downloaded: number;
     errors: Array<{ spec: string; parent: string; error: string }>;
+    modules:    Array<{ specPath: string; localPath: string }>;
 }
 
 export class DepScanner {
     private readonly seen  = new Set<string>();
     private readonly errs: ScanResult['errors'] = [];
+    private readonly found: ScanResult['modules'] = [];
     private downloaded = 0;
 
     constructor(
         private readonly resolver: ModuleResolver,
         private readonly cfg:      RuntimeConfig,
+        private readonly prog:     PrecacheProgress | null = null,
     ) {}
 
     async scan(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
         this.seen.clear();
         this.errs.length = 0;
+        this.found.length = 0;
         this.downloaded  = 0;
 
-        const prog = this.cfg.silent ? null : new MultiProgress(6);
         let batch: Array<{ specPath: string; localPath: string }> =
             [{ specPath: entrySpecPath, localPath: entryLocalPath }];
 
         try {
             while (batch.length > 0) {
-                // Phase 1 — parse this level's files concurrently (asyncfs)
                 const specifiers = await this.parseLevel(batch);
+                const next: typeof batch = [];
 
-                // Phase 2 — resolve; classify cached vs needs-download
-                const tasks: DownloadTask[] = [];
-                const next:  typeof batch   = [];
+                const promises = specifiers.map(({ spec, parent }) => {
+                    let didDownload = false;
+                    const baseProgress = this.prog?.onDownloadProgress(spec);
+                    const onProgress = baseProgress
+                        ? (now: number, total: number) => { didDownload = true; baseProgress(now, total); }
+                        : undefined;
 
-                for (const { spec, parent } of specifiers) {
-                    let info: ModuleInfo;
-                    try   { info = this.resolver.resolve(spec, parent); }
-                    catch (e) { this.errs.push({ spec, parent, error: errMsg(e) }); continue; }
+                    return this.resolver.resolveAsync(spec, parent, undefined, onProgress).then(
+                        info => {
+                            if (didDownload) this.downloaded++;
+                            this.prog?.bumpResolved();
+                            this.prog?.finishDownload(spec);
+                            return { ok: true, info, spec, parent } as const;
+                        },
+                        e => {
+                            this.prog?.bumpResolved();
+                            this.prog?.finishDownload(spec, errMsg(e));
+                            return { ok: false, error: e, spec, parent } as const;
+                        },
+                    );
+                });
 
+                const results = await Promise.all(promises);
+
+                for (const r of results) {
+                    if (!r.ok) {
+                        this.errs.push({ spec: (r as any).spec, parent: (r as any).parent, error: errMsg((r as any).error) });
+                        continue;
+                    }
+                    const info = r.info;
                     if (this.seen.has(info.specPath)) continue;
                     this.seen.add(info.specPath);
+                    this.found.push({ specPath: info.specPath, localPath: info.localPath });
 
-                    if (fs.exists(info.localPath)) {
-                        if (SCANNABLE.has(extname(info.localPath)))
-                            next.push({ specPath: info.specPath, localPath: info.localPath });
-                    } else {
-                        const url = this.urlFor(info);
-                        if (url) {
-                            tasks.push({ url, cachePath: info.localPath, info });
-                            prog?.add(info.specPath, short(info.specPath));
-                        }
-                        // No URL (npm tarball etc.) — resolver already handled it
-                    }
-                }
-
-                // Phase 3 — download this level in parallel
-                if (tasks.length > 0) {
-                    const fresh = await this.downloadLevel(tasks, prog);
-                    for (const info of fresh)
-                        if (SCANNABLE.has(extname(info.localPath)))
-                            next.push({ specPath: info.specPath, localPath: info.localPath });
+                    if (fs.exists(info.localPath) && SCANNABLE.has(extname(info.localPath)))
+                        next.push({ specPath: info.specPath, localPath: info.localPath });
                 }
 
                 batch = next;
             }
-        } finally {
-            // Always stop progress display; connection pool is released by resources.ts
-            prog?.stop();
-        }
+        } finally {}
 
         if (!this.cfg.silent) {
             const e = this.errs.length ? `, ${this.errs.length} error(s)` : '';
-            log.info(`✅ ${this.seen.size} modules (${this.downloaded} downloaded)${e}`);
+            log.info(`✅ ${this.seen.size} modules${e}`);
         }
-        return { visited: this.seen.size, downloaded: this.downloaded, errors: [...this.errs] };
+        return { visited: this.seen.size, downloaded: this.downloaded, errors: [...this.errs], modules: this.found };
     }
 
     // -------------------------------------------------------------------------
@@ -186,54 +186,4 @@ export class DepScanner {
         }));
         return results.flat();
     }
-
-    // -------------------------------------------------------------------------
-    // Download a batch of files with async TCP — all concurrent
-    // -------------------------------------------------------------------------
-
-    private async downloadLevel(
-        tasks: DownloadTask[],
-        prog:  MultiProgress | null,
-    ): Promise<ModuleInfo[]> {
-        const done: ModuleInfo[] = [];
-
-        await Promise.allSettled(tasks.map(async (t) => {
-            try {
-                const { body } = await fetchAsync(
-                    t.url,
-                    (now, total) => prog?.update(t.info.specPath, now, total),
-                );
-                ensureDir(dirname(t.cachePath));
-                fs.writeFile(t.cachePath, body);
-                prog?.finish(t.info.specPath);
-                this.downloaded++;
-                done.push(t.info);
-            } catch (e) {
-                prog?.finish(t.info.specPath, errMsg(e));
-                this.errs.push({ spec: t.info.specPath, parent: '<download>', error: errMsg(e) });
-            }
-        }));
-
-        return done;
-    }
-
-    // -------------------------------------------------------------------------
-    // Determine the direct download URL for a ModuleInfo, or null
-    // -------------------------------------------------------------------------
-
-    private urlFor(info: ModuleInfo): string | null {
-        const sp = info.specPath;
-        // HTTP/HTTPS — specPath is the URL
-        if (sp.startsWith('http://') || sp.startsWith('https://')) return sp;
-        // JSR — reconstruct from canonical specPath: jsr:@scope/name@ver/file
-        const m = sp.match(/^jsr:@([^/]+)\/([^@]+)@([^/]+)\/(.+)$/);
-        if (m) return `https://jsr.io/@${m[1]}/${m[2]}/${m[3]}/${m[4]}`;
-        // npm tarballs are handled by the npm resolver (tarball fetch + extract);
-        // we can't trivially replicate that here, so fall through to resolver.
-        return null;
-    }
-}
-
-function short(sp: string): string {
-    return sp.length <= 55 ? sp : '…' + sp.slice(-54);
 }

@@ -6,6 +6,8 @@ import { ModuleResolver } from './resolver';
 import { ModuleLoader }   from './loader';
 import { DepScanner }     from './deps';
 import { createConfig }   from './config';
+import { PrecompileDriver, isCompilerWorker, runCompilerWorker } from './precompile';
+import { PrecacheProgress } from './utils/progress';
 import { resources }      from './resources';
 import { dirname, normalizePath, isAbsolute, joinPaths } from './utils/path';
 import { writeText, ensureDir, resolveFile } from './utils/io';
@@ -14,6 +16,7 @@ import { err, ErrorKind } from './errors';
 import { guessFileKind } from './protocol/base';
 import { console, engine, os, crypto, __use_fn } from './utils';
 import { log } from './utils/log';
+import { isRemote } from './jsc';
 
 const SUPPORTED_ATTRS = new Set(['type', 'raw', 'text', 'bytes']);
 
@@ -45,7 +48,7 @@ export class TypeScriptRuntime {
                 try {
                     const info = this.resolver.resolve(spec, parent, attr);
                     this.loader.preRegister(info.localPath, this.parentLocal(parent));
-                    return attr?.type ? `${info.specPath}?${attr.type}` : info.specPath;
+                    return info.specPath;
                 } catch (e) {
                     throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${spec}" from "${parent}": ${errMsg(e)}`);
                 }
@@ -113,19 +116,12 @@ export class TypeScriptRuntime {
     private readonly metaResolve = (s: string, p: string, a?: Record<string, any>) =>
         this.resolver.resolve(s, p, a).specPath;
 
-    private static isRemote(sp: string): boolean {
-        return sp.startsWith('jsr:') || sp.startsWith('http://') || sp.startsWith('https://');
-    }
-
     private fillMeta(meta: Record<string, any>, info: ModuleInfo): void {
-        const remote  = TypeScriptRuntime.isRemote(info.specPath);
+        const remote  = isRemote(info.specPath);
         meta.url      = remote ? info.specPath : info.localPath;
         meta.filename = info.localPath;
         meta.dirname  = dirname(info.localPath);
-        // Compare base specPath (strip ?type=... suffix) with resolver.entry
-        // to correctly identify the main entry module
-        const baseSpec = info.specPath.includes('?') ? info.specPath.slice(0, info.specPath.indexOf('?')) : info.specPath;
-        meta.main     = baseSpec === this.resolver.entry;
+        meta.main     = info.specPath === this.resolver.entry;
         meta.use      = __use_fn;
         meta.resolve  = this.metaResolve;
     }
@@ -140,17 +136,45 @@ export class TypeScriptRuntime {
     // -------------------------------------------------------------------------
 
     async precache(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
-        const scanner = new DepScanner(this.resolver, this.config);
+        const prog = this.config.silent ? null : new PrecacheProgress(6);
+        const scanner = new DepScanner(this.resolver, this.config, prog);
         let result;
         try {
             result = await scanner.scan(entrySpecPath, entryLocalPath);
         } finally {
-            // Always release pre-cache resources, even if scan threw
             resources.release();
         }
         for (const { spec, parent, error } of result.errors)
             log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
         this.resolver.rewriteLock();
+
+        const scannable = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+        const toCompile = result.modules.filter(m => {
+            const dot = m.localPath.lastIndexOf('.');
+            return dot !== -1 && scannable.has(m.localPath.slice(dot));
+        });
+
+        if (toCompile.length > 0) {
+            try {
+                const driver = new PrecompileDriver();
+                prog?.setCompileProgress(0, toCompile.length);
+                const bytecodes = await driver.precompile(toCompile, (done, total) => {
+                    prog?.setCompileProgress(done, total);
+                });
+                for (const [localPath, bc] of bytecodes)
+                    this.loader.jsc.setMemory(localPath, bc);
+                for (const m of toCompile) {
+                    if (isRemote(m.specPath))
+                        this.loader.jsc.persistMemory(m.localPath);
+                }
+                await driver.terminate();
+                log.debug('precompile', () => `${bytecodes.size}/${toCompile.length} modules precompiled`);
+            } catch (e) {
+                log.debug('precompile', () => `failed: ${errMsg(e)}`);
+            }
+        }
+
+        prog?.stop();
         return result;
     }
 
@@ -197,8 +221,6 @@ export class TypeScriptRuntime {
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
         const meta: Record<string, any> = { ...extra };
         this.fillMeta(meta, info);
-        // Force main=true for the entry module — fillMeta may set it incorrectly
-        // if the specPath has a ?type= suffix that doesn't match resolver.entry
         meta.main = true;
         return this.loader.load(info, meta);
     }

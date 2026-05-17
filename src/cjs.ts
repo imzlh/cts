@@ -107,6 +107,19 @@ export class CjsLoader {
         return mod;
     }
 
+    /** Load CJS source code from a string (for -e / --eval). */
+    loadSourceAndGet(code: string, filename: string, parentPath?: string): CjsModule {
+        const cached = this.cache.get(filename);
+        if (cached?.loaded) return cached;
+
+        const parent = parentPath ? (this.cache.get(parentPath) ?? null) : null;
+        const mod    = cached ?? this.make(filename, parent);
+        if (!cached) this.cache.set(filename, mod);
+
+        this.execWithSource(mod, code);
+        return mod;
+    }
+
     /** Pre-register a module stub so circular deps find it in cache. */
     preRegister(filename: string, parentPath: string): void {
         if (this.cache.has(filename)) return;
@@ -167,24 +180,19 @@ export class CjsLoader {
 
     private execJs(mod: CjsModule): void {
         let src = engine.decodeString(fs.readFile(mod.filename));
+        this.execWithSource(mod, src);
+    }
+
+    private execWithSource(mod: CjsModule, src: string): void {
         if (src.startsWith('#!')) src = src.slice(src.indexOf('\n'));
 
-        // Use a counter key — avoids regex on every module load
-        const key  = `__cts${_ctxId++}`;
-        const dir  = dirname(mod.filename);
-
-        // Inject CJS globals. Includes:
-        //   global   — many Node.js packages reference global instead of globalThis
-        //   exports  — reference to mod.exports (may be replaced by module.exports=X)
-        //   module   — the module object itself
-        //   require  — this module's require function
-        //   __filename, __dirname
+        const key = `__cts${_ctxId++}`;
         const ctx = {
-            exports:     mod.exports,
-            require:     mod.require,
-            module:      mod,
-            __filename:  mod.filename,
-            __dirname:   dir,
+            exports:    mod.exports,
+            require:    mod.require,
+            module:     mod,
+            __filename: mod.filename,
+            __dirname:  dirname(mod.filename),
         };
         Reflect.set(globalThis, key, ctx);
         this.loading.add(mod.filename);

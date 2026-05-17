@@ -116,7 +116,13 @@ export interface TarFile { path: string; content: Uint8Array; size: number; type
 export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
     const bytes = new Uint8Array(zlib.gunzip(data));
     const str = (off: number, len: number) => {
-        let s = ''; for (let i = 0; i < len; i++) { const c = bytes[off + i]; if (!c) break; s += String.fromCharCode(c); } return s;
+        // Decode bytes to string, stopping at the first NUL (tar header padding).
+        const slice = bytes.subarray(off, off + len);
+        const n = slice.indexOf(0);
+        const relevant = n === -1 ? slice : slice.subarray(0, n);
+        // Bulk convert via spread — safe because tar header fields are ≤ 100 bytes
+        // (well below the ~65536 arg limit of Function.prototype.apply)
+        return String.fromCharCode(...relevant);
     };
     const oct  = (off: number, len: number) => { const s = str(off, len).trim(); return s ? parseInt(s, 8) : 0; };
     const zero = (off: number) => { for (let i = 0; i < 512; i++) if (bytes[off + i]) return false; return true; };

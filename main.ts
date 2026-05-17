@@ -1,12 +1,13 @@
 // main.ts
 
+import { isCompilerWorker, runCompilerWorker } from './src/precompile';
 import { createConfig, loadConfigFile, CLI_TPL } from './src/config';
 import { createRuntime } from './src/runtime';
 import { loadTasks } from './src/task';
 import { fatal, formatError } from './src/errors';
 import { dirname, normalizePath, isAbsolute, joinPaths } from './src/utils/path';
-import type { ConfigOptions, RuntimeConfig } from './src/types';
-import { os, console, worker, process } from './src/utils';
+import type { ConfigOptions, RuntimeConfig, ModuleInfo } from './src/types';
+import { os, console, worker, process, engine } from './src/utils';
 import { log } from './src/utils/log';
 import { version } from './package.json';
 
@@ -46,6 +47,7 @@ ${C.bold('USAGE')}
   ${C.cyan('cts cache')} ${C.cyan('<file.ts>')}       Pre-download all deps + write lock
   ${C.cyan('cts task')}                  List deno.json tasks
   ${C.cyan('cts task')} ${C.cyan('<name>')} [args…]   Run a deno.json task
+  ${C.cyan('cts --eval')} ${C.cyan('<code>')}         Evaluate inline TypeScript code
 
 ${C.bold('OPTIONS')}
   ${C.cyan('--cache-dir')} <path>      Cache directory ${C.dim('(default: ~/.cts)')}
@@ -62,6 +64,7 @@ ${C.bold('OPTIONS')}
   ${C.cyan('--memory-limit')} <size>   e.g. ${C.cyan('256MB')}, ${C.cyan('1GB')}
   ${C.cyan('--max-stack-size')} <n>    e.g. ${C.cyan('4MB')}
   ${C.cyan('--jsr-cache-ttl')} <days>  JSR metadata TTL ${C.dim('(default: 7)')}
+  ${C.cyan('--eval')} ${C.cyan('<code>')}           Evaluate inline TypeScript code
   ${C.cyan('--version')}, ${C.cyan('-v')}           Print version
   ${C.cyan('--help')}, ${C.cyan('-h')}              Print this message
 
@@ -73,6 +76,9 @@ ${C.bold('ENVIRONMENT')}
   ${C.cyan('CTS_MAX_STACK_SIZE')}  Max stack size ${C.dim('(default: 0)')}
   ${C.cyan('CTS_DEBUG')}         Debug categories: ${C.cyan('resolver')}, ${C.cyan('npm')}, ${C.cyan('jsr')}, ${C.cyan('lock')}, ${C.cyan('cjs')}, ${C.cyan('loader')}, ${C.cyan('config')}, ${C.cyan('stack')}, ${C.cyan('*')}
     `.trim());
+
+    if (!isTTY)
+        console.warn('Note: You are running in a non-TTY environment. Some output may be suppressed.');
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +185,33 @@ async function run(
     runtime.flushLock();
 }
 
+async function runEval(code: string, baseCfg: Partial<ConfigOptions>): Promise<void> {
+    const evalPath = joinPaths(os.cwd, '<eval>.ts');
+    const fileCfg  = loadConfigFile(os.cwd);
+    const cfg      = { ...fileCfg, ...baseCfg };
+    const runtime  = createRuntime(cfg, os.cwd);
+
+    if (runtime.config.polyfill) {
+        try { await runtime.loadPolyfill(runtime.config.polyfill); }
+        catch (e) { fatal(e, `loading polyfill ${runtime.config.polyfill}`); }
+    }
+
+    const info: ModuleInfo = {
+        specPath: evalPath,
+        localPath: evalPath,
+        format: 'esm',
+        fileKind: 'source',
+    };
+
+    const meta: Record<string, any> = { main: true };
+    try {
+        const mod = runtime.loader.loadSource(code, info, meta);
+        await mod.eval();
+    } catch (e) { fatal(e, '<eval>'); }
+
+    runtime.flushLock();
+}
+
 async function runMain(): Promise<void> {
     const cli    = createConfig({}) as RuntimeConfig & Record<string, any>;
 
@@ -192,6 +225,21 @@ async function runMain(): Promise<void> {
     if (cli['version'] || cli['v']) {
         showVersion();
         os.exit(0);
+    }
+
+    // --eval <code>
+    if (cli['eval']) {
+        const code = cli['eval'];
+        if (!code || typeof code !== 'string') {
+            console.error('Usage: cts -e "<code>"');
+            os.exit(1);
+        }
+        await runEval(code, {
+            noLock: cli['no-lock'], lockDir: cli['lock-dir'],
+            cacheDir: cli.cacheDir, silent: cli.silent,
+            polyfill: cli.polyfill,
+        });
+        return;
     }
 
     // sub command
@@ -229,4 +277,13 @@ async function runWorker(): Promise<void> {
     await run(entry, dir, loadConfigFile(dir), { name: data.name });
 }
 
-(worker.isWorker ? runWorker : runMain)().catch(e => fatal(e));
+{
+    if (worker.isWorker) {
+        log.debug('worker', () => `worker start, userdata=`, worker.workerData);
+    }
+    
+    const boot = worker.isWorker
+        ? (isCompilerWorker() ? runCompilerWorker() : runWorker())
+        : runMain();
+    boot.catch(e => fatal(e));
+}

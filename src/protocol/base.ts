@@ -9,25 +9,15 @@
 // requests.  Protocol handlers don't need to worry about the runtime cache.
 
 import type { ModuleInfo, FileKind } from '../types';
+import type { ProgressCallback } from '../http/fetch';
 import { extname } from '../utils';
 
 export type { ModuleInfo };
 
 export interface ProtocolHandler {
-    /** List of protocol prefixes this handler owns, e.g. ['http', 'https']. */
     readonly protocols: string[];
-
-    /**
-     * Fully resolve a specifier to a ModuleInfo.
-     * Downloads remote content to the cache if necessary.
-     */
     resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo;
-
-    /**
-     * Return the local file path for a canonical specPath.
-     * Called during the load phase; the specPath was produced by resolve().
-     * Must be fast (no network I/O).
-     */
+    resolveAsync?(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo>;
     localPath(specPath: string): string;
 }
 
@@ -44,6 +34,17 @@ export function guessFileKind(localPath: string): FileKind {
     if (ext === '.json' || ext === '.jsonc')  return 'json';
     if (TEXT_EXTS.has(ext))                   return 'source';
     return 'binary';
+}
+
+/**
+ * Override fileKind based on import attribute `type`.
+ * Supports `import ... with { type: 'text' }` and `with { type: 'json' }`.
+ */
+export function applyAttrType(kind: FileKind, attr?: Record<string, any>): FileKind {
+    const t = attr?.type;
+    if (t === 'text') return 'text';
+    if (t === 'json') return 'json';
+    return kind;
 }
 
 /** Check if a path is a TypeScript type declaration file (.d.ts, .d.mts, .d.cts) */

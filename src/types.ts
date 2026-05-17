@@ -1,7 +1,7 @@
 // types.ts — shared types
 
 export type ModuleFormat = 'esm' | 'cjs';
-export type FileKind     = 'source' | 'json' | 'wasm' | 'binary';
+export type FileKind     = 'source' | 'json' | 'wasm' | 'binary' | 'text';
 
 export interface ModuleInfo {
     specPath:  string;
@@ -28,6 +28,7 @@ export interface ConfigOptions {
     importMap?:     Record<string, string>;
     polyfill?:      string;
     disableCache?:  boolean;
+    eval?:          string;   // inline code to evaluate (-e / --eval)
     // Lock options
     lockDir?:       string;   // dir containing cts.lock (default: entry file dir)
     frozen?:        boolean;  // refuse to resolve anything not already in lock
@@ -38,7 +39,7 @@ export interface ConfigOptions {
 // Optional fields remain optional (no value → feature disabled)
 export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     'pathAliases'|'baseUrl'|'importMap'|'memoryLimit'|'maxStackSize'|
-    'lockDir'|'frozen'|'noLock'>> {
+    'lockDir'|'frozen'|'noLock'|'eval'>> {
     pathAliases?:  Record<string, string[]>;
     baseUrl?:      string;
     importMap?:    Record<string, string>;
@@ -47,6 +48,7 @@ export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     lockDir?:      string;
     frozen?:       boolean;
     noLock?:       boolean;
+    eval?:         string;
     // CLI parse output
     _?:            string;
     _args?:        string[];

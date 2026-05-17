@@ -10,7 +10,7 @@
  *   The generator-based I/O uses IOOp to uniformly express read/write requests,
  *   allowing syncDriver/asyncDriver to dispatch to the correct method.
  */
-import { streams, ssl, dns, os, timers, fs, engine, assert } from '../utils';
+import { streams, ssl, dns, os, timers, fs, engine, assert, uname } from '../utils';
 import { log } from '../utils/log';
 import { err, ErrorKind } from '../errors';
 
@@ -42,7 +42,7 @@ function findSystemCaPath(): string | null {
         if (envCa) { try { if (fs.stat(envCa).isFile) { _caPath = envCa; return envCa; } } catch {} }
     } catch {}
 
-    const sysname = os.uname().sysname;
+    const sysname = uname.sysname;
     const candidates = sysname === 'Linux' ? [
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
