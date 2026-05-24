@@ -48,7 +48,7 @@ export interface CjsDeps {
 // Built-in module names (no protocol prefix)
 // ---------------------------------------------------------------------------
 
-const BUILTINS = new Set([
+export const BUILTINS = new Set([
     'assert','buffer','child_process','cluster','console','constants',
     'crypto','dgram','dns','domain','events','fs','http','http2','https',
     'module','net','os','path','perf_hooks','process','punycode',

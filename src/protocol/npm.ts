@@ -5,7 +5,9 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchBytes, fetchText, fetchAsync, type ProgressCallback } from '../http/fetch';
+import { fetchBytes, fetchText, fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
+// URL polyfill — CNO runtime provides global URL
+declare const URL: any;
 import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
 import { detectFormat, readPkgFresh, createCtx, resolveSubpath, resolveImports } from '../pkg';
 import { err, ErrorKind } from '../errors';

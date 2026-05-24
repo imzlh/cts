@@ -16,7 +16,8 @@
 
 import { clearResolveCache }  from './utils/io';
 import { clearPkgCache }      from './pkg';
-import { connectionManager, clearDnsCache }  from './http/connection';
+import { connectionManager } from '@cnojs/http/connection';
+import { clearDnsCache }      from '@cnojs/http/dns-cache';
 
 import { log } from './utils/log';
 

@@ -9,7 +9,7 @@
 // requests.  Protocol handlers don't need to worry about the runtime cache.
 
 import type { ModuleInfo, FileKind } from '../types';
-import type { ProgressCallback } from '../http/fetch';
+import type { ProgressCallback } from '@cnojs/http';
 import { extname } from '../utils';
 
 export type { ModuleInfo };

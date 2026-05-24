@@ -10,7 +10,7 @@
 
 import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver, FileKind } from './types';
 import type { ProtocolHandler } from './protocol/base';
-import type { ProgressCallback } from './http/fetch';
+import type { ProgressCallback } from '@cnojs/http';
 import { err, ErrorKind } from './errors';
 import { FileHandler } from './protocol/file';
 import { HttpHandler }  from './protocol/http';

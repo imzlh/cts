@@ -1,6 +1,7 @@
 // utils/misc.ts — hash, semver, tar.gz, JSONC, arg parsing
 
-import { URL } from "../http/url";
+// URL polyfill — CNO runtime provides global URL
+declare const URL: any;
 import { basename, crypto, dirname, extname, zlib } from './index';
 import { err, ErrorKind } from '../errors';
 

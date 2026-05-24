@@ -13,6 +13,9 @@
   "author": "",
   "license": "MIT",
   "packageManager": "pnpm@10.17.1",
+  "dependencies": {
+    "@cnojs/http": "workspace:../http"
+  },
   "devDependencies": {
     "@jridgewell/gen-mapping": "^0.3.13",
     "esbuild": "^0.27.0",

@@ -6,8 +6,9 @@ import { guessFileKind } from './base';
 import { joinPaths, dirname } from '../utils/path';
 import { ensureDir } from '../utils/io';
 import { cacheFilename } from '../utils/misc';
-import { fetchBytes, fetchAsync, type ProgressCallback } from '../http/fetch';
-import { URL } from '../http/url';
+import { fetchBytes, fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
+// URL polyfill — CNO runtime provides global URL
+declare const URL: any;
 import { fs } from '../utils/index';
 import { log } from '../utils/log';
 import { isatty } from '../utils/progress';

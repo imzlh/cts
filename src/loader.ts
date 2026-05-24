@@ -13,7 +13,7 @@
 import type { RuntimeConfig, ModuleInfo } from './types';
 import { ModuleResolver } from './resolver';
 import { Transformer } from './transformer';
-import { CjsLoader, type CjsDeps } from './cjs';
+import { CjsLoader, type CjsDeps, BUILTINS } from './cjs';
 import { isTypeDecl } from './protocol/base';
 import { readText } from './utils/io';
 import { err, ErrorKind } from './errors';
@@ -29,6 +29,8 @@ export class ModuleLoader {
     private readonly transformer = new Transformer();
     private readonly cjs:        CjsLoader;
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
+    /** Modules currently being compiled (circular dep detection). */
+    private readonly esmLoading  = new Set<string>();
     private readonly wasmCache   = new Map<string, CModuleEngine.Module>();
     readonly jsc                 = new JscCache();
 
@@ -49,6 +51,18 @@ export class ModuleLoader {
             },
             enumerable: true,
             configurable: true,
+        })
+
+        const CTS_INTERNAL = Symbol.for('cts.internal');
+        Object.defineProperty(globalThis, CTS_INTERNAL, {
+            value: {
+                mkRequire: this.cjs.mkRequire.bind(this.cjs),
+                builtinModules: [...BUILTINS],
+                cache: this.cjs.cache,
+            },
+            writable: false,
+            enumerable: false,
+            configurable: false,
         })
     }
 
@@ -95,6 +109,19 @@ export class ModuleLoader {
             return hit;
         }
 
+        // Circular dependency guard: if this module is already being compiled,
+        // return a placeholder. The real exports will be populated after the
+        // outer compile finishes. This matches Deno / Node.js ESM circular dep
+        // semantics.
+        if (this.esmLoading.has(info.localPath)) {
+            log.debug('loader', () => `cycle: ${info.specPath} — returning placeholder`);
+            const placeholder = engine.Module.create(info.specPath);
+            // Register immediately so subsequent circular refs get this object
+            this.esmCache.set(info.localPath, placeholder);
+            store.push(placeholder);
+            return placeholder;
+        }
+
         const remote = isRemote(info.specPath);
         const cacheable = !this.cfg.disableCache && remote;
 
@@ -110,12 +137,15 @@ export class ModuleLoader {
         }
 
         // 2) Fallback: read + transform + compile on main thread
+        this.esmLoading.add(info.localPath);
         const text = readText(info.localPath);
         const code = this.transformer.transform(text, info.localPath);
         let mod: CModuleEngine.Module;
         try {
             mod = new engine.Module(code, info.specPath);
         } catch (e) {
+            this.esmLoading.delete(info.localPath);
+            this.esmCache.delete(info.localPath);
             if (e instanceof SyntaxError) {
                 const ne = err(ErrorKind.SyntaxError,
                     `Syntax error in ${info.localPath}: ${e.message}`);
@@ -124,6 +154,7 @@ export class ModuleLoader {
             }
             throw e;
         }
+        this.esmLoading.delete(info.localPath);
 
         if (cacheable) {
             this.jsc.persist(info.localPath, mod);

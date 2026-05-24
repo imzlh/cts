@@ -25,6 +25,9 @@ export class TypeScriptRuntime {
     readonly loader:   ModuleLoader;
     readonly config:   RuntimeConfig;
     private readonly metaCache = new Map<string, Record<string, any>>();
+    /** Load dedup: specPath → Module. Ensures the engine never loads the same
+     *  module twice (QuickJS does not cache dynamic import() results). */
+    private readonly loadedModules = new Map<string, CModuleEngine.Module>();
 
     constructor(cfg: RuntimeConfig, entryDir?: string) {
         this.config   = cfg;
@@ -56,6 +59,11 @@ export class TypeScriptRuntime {
 
             load: (specPath: string): CModuleEngine.Module => {
                 log.debug('runtime', () => `load hook called for ${specPath}`);
+                // Dedup: QuickJS does not cache dynamic import() results, so the
+                // same specPath may arrive multiple times. Return the already
+                // compiled Module on repeat calls.
+                const dedup = this.loadedModules.get(specPath);
+                if (dedup) return dedup;
                 const info = this.resolver.getInfo(specPath);
                 const meta: Record<string, any> = {};
                 this.fillMeta(meta, info);
@@ -63,6 +71,8 @@ export class TypeScriptRuntime {
                 this.metaCache.set(specPath, meta);
                 try {
                     const mod = this.loader.load(info, meta);
+                    // Register in dedup cache so repeat loads return the same Module
+                    this.loadedModules.set(specPath, mod);
                     // Clean up cache after load
                     this.metaCache.delete(specPath);
                     return mod;
