@@ -18,7 +18,7 @@ import { isTypeDecl } from './protocol/base';
 import { readText } from './utils/io';
 import { err, ErrorKind } from './errors';
 import { log } from './utils/log';
-import { fs, engine, errMsg } from './utils/index';
+import { fs, engine } from './utils/index';
 import { JscCache, isRemote } from './jsc';
 
 const store: CModuleEngine.Module[] = [];
@@ -269,17 +269,12 @@ export class ModuleLoader {
 
         const importSource: WasmImportSource = {
             require: (spec, parentPath) => {
-                try {
-                    const resolved = this.resolver.resolve(spec, parentPath);
-                    const loaded = this.load(resolved, {});
-                    loaded.eval();
-                    const ns = loaded.namespace;
-                    log.debug('wasm', () => `import "${spec}" resolved → ${resolved.specPath} (${Object.keys(ns).length} exports)`);
-                    return ns;
-                } catch (e) {
-                    log.debug('wasm', () => `import "${spec}" from "${parentPath}" failed: ${errMsg(e)}`);
-                    return null;
-                }
+                const resolved = this.resolver.resolve(spec, parentPath);
+                const loaded = this.load(resolved, {});
+                loaded.eval();
+                const ns = loaded.namespace;
+                log.debug('wasm', () => `import "${spec}" resolved → ${resolved.specPath} (${Object.keys(ns).length} exports)`);
+                return ns;
             },
         };
 

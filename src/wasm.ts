@@ -52,10 +52,24 @@ const ENV_MODULE: Record<string, Function> = {
     min_f32: Math.fround,
     max_f32: Math.fround,
     memory:  () => 0,
+    // Timing — wasm-bindgen / emscripten ship glue that ultimately reads
+    // host time; in the absence of a glue file (./env.js etc.) we satisfy
+    // the import directly so deno-dom and friends boot.
+    now:     Date.now,
+    // @ts-ignore - cts has performance
+    emscripten_get_now: () => performance?.now?.() ?? Date.now(),
 };
 
 // WASI module names — handled by setWasiOptions, skip in manual resolution
 const WASI_MODULES = new Set(['wasi_unstable', 'wasi_snapshot_preview1']);
+
+/**
+ * Heuristic match for "the env module" no matter how it was spelled in
+ * the import section: `env`, `./env.js`, `env.js`. wasm-bindgen / emscripten
+ * use the relative-path form when they expect glue, but if the glue file is
+ * missing we can still satisfy the well-known symbols.
+ */
+const RE_ENV_MODULE = /^(?:\.\/)?env(?:\.js)?$/;
 
 // ---------------------------------------------------------------------------
 // Import resolver
@@ -90,6 +104,7 @@ function resolveImportFunc(
 
     // 1. JS module resolution — treat modName as a specifier
     //    Covers: wasm-bindgen ("./foo_bg.js"), WASI, any JS import
+    let resolveErr: unknown = null;
     try {
         const exports = importSource.require(modName, parentPath);
         if (exports) {
@@ -98,16 +113,22 @@ function resolveImportFunc(
             if (fn !== undefined) return () => fn;
         }
     } catch (e) {
-        log.debug('wasm', () => `import resolve "${modName}" failed: ${errMsg(e)}`);
+        resolveErr = e;
+        log.debug('wasm', () => `import resolve "${modName}" failed: ${errMsg(e)}\n${(e as Error)?.stack ?? ''}`);
     }
 
-    // 2. Built-in "env" module (Math, etc.)
-    if (modName === 'env') {
+    // 2. Built-in "env" module — match `env`, `./env.js`, `env.js`.
+    //    Used both as the canonical env target and as a graceful fallback
+    //    when wasm-bindgen-style ./env.js glue is missing.
+    if (RE_ENV_MODULE.test(modName)) {
         const fn = ENV_MODULE[fnName];
         if (fn) return fn as any;
     }
 
     // 3. No resolution found — caller will throw LinkError (V8/Deno behavior)
+    if (resolveErr) {
+        log.warn('wasm', () => `unresolved ${modName}::${fnName}: ${errMsg(resolveErr)}`);
+    }
     return null;
 }
 

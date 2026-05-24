@@ -77,7 +77,12 @@ function stripDenoRunFlags(tokens: string[]): string[] {
         if (DENO_VALUE_FLAGS.has(flag)) {
             // Skip flag + value (unless already attached with =)
             if (eq === -1) i++;
-        } else if (!DENO_BOOL_FLAGS.has(flag)) {
+        } else if (DENO_BOOL_FLAGS.has(flag)
+                || /^--unstable(-|$)/.test(flag)   // all --unstable-* variants
+                || /^--allow-/.test(flag)           // --allow-X not in the static list
+                || /^--deny-/.test(flag)) {         // --deny-X not in the static list
+            // Known deno-only flag — drop silently
+        } else {
             // Unknown flag — pass through (might be cts flags like --silent)
             out.push(t);
         }
@@ -160,14 +165,17 @@ async function execCommand(
     }
 
     // Merge env
-    const mergedEnv: Record<string, string> = {};
+    const mergedEnv: Record<string, string> = {
+        ...os.environ(),
+        ...env
+    }
     // We can't enumerate the current env in QuickJS easily, so we rely on
     // spawn inheriting it and only passing the extras.
     const child = process.spawn([prog, ...argv], {
         stdin:  'inherit',
         stdout: 'inherit',
         stderr: 'inherit',
-        env,
+        env: mergedEnv,
         cwd
     });
 

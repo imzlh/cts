@@ -8,13 +8,16 @@ import { extname } from './utils/path';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';
 import { PrecacheProgress } from './utils/progress';
-import { fs, engine, asyncfs } from './utils/index';
+import { fs, engine, asyncfs, wasm } from './utils/index';
 
 // ---------------------------------------------------------------------------
 // Import specifier extraction — sucrase token-based, no regex
 // ---------------------------------------------------------------------------
 
 const SCANNABLE = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+const WASM_EXT  = '.wasm';
+// WASI module names — provided by the runtime, no JS resolution needed.
+const WASI_MODS = new Set(['wasi_unstable', 'wasi_snapshot_preview1']);
 
 export function extractImports(source: string, isTs = true): string[] {
     // Fast path: skip parse if source has no import/export/require keywords.
@@ -153,7 +156,7 @@ export class DepScanner {
                     this.seen.add(info.specPath);
                     this.found.push({ specPath: info.specPath, localPath: info.localPath });
 
-                    if (fs.exists(info.localPath) && SCANNABLE.has(extname(info.localPath)))
+                    if (fs.exists(info.localPath) && (SCANNABLE.has(extname(info.localPath)) || extname(info.localPath) === WASM_EXT))
                         next.push({ specPath: info.specPath, localPath: info.localPath });
                 }
 
@@ -176,7 +179,30 @@ export class DepScanner {
         batch: Array<{ specPath: string; localPath: string }>,
     ): Promise<Array<{ spec: string; parent: string }>> {
         const results = await Promise.all(batch.map(async ({ specPath, localPath }) => {
-            if (!SCANNABLE.has(extname(localPath))) return [];
+            const ext = extname(localPath);
+            if (ext === WASM_EXT) {
+                // wasm imports are baked into the binary, not the surrounding
+                // JS — extract them so JSR/HTTP-hosted glue modules (./wbg.js,
+                // ./env.js …) get precached. Without this they're only
+                // discovered at sync wasm-link time, which can't refresh.
+                if (!wasm) return [];
+                try {
+                    const bytes = await asyncfs.readFile(localPath);
+                    const wmod  = wasm.parseModule(new Uint8Array(bytes));
+                    const seen  = new Set<string>();
+                    for (const imp of wasm.moduleImports(wmod)) {
+                        if (WASI_MODS.has(imp.module)) continue;
+                        if (imp.module === 'env') continue;          // built-in fallback
+                        if (seen.has(imp.module)) continue;
+                        seen.add(imp.module);
+                    }
+                    return [...seen].map(spec => ({ spec, parent: specPath }));
+                } catch (e) {
+                    log.debug('deps', () => `wasm scan failed for ${localPath}: ${errMsg(e)}`);
+                    return [];
+                }
+            }
+            if (!SCANNABLE.has(ext)) return [];
             try {
                 const bytes = await asyncfs.readFile(localPath);
                 const src   = engine.decodeString(bytes);
