@@ -6,10 +6,10 @@ import { guessFileKind } from './base';
 import { joinPaths, dirname } from '../utils/path';
 import { ensureDir } from '../utils/io';
 import { cacheFilename } from '../utils/misc';
-import { fetchBytes, fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
+import { fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
 // URL polyfill — CNO runtime provides global URL
 declare const URL: any;
-import { fs } from '../utils/index';
+import { fs, engine } from '../utils/index';
 import { log } from '../utils/log';
 import { isatty } from '../utils/progress';
 
@@ -21,15 +21,31 @@ export class HttpHandler implements ProtocolHandler {
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
+    private fetchOptions() {
+        return { timeout: this.cfg.requestTimeout };
+    }
+
+    private fetchBytesSync(url: string): Uint8Array {
+        const result = engine.waitPromise(
+            fetchAsync(url, undefined, this.fetchOptions())
+                .then(({ body }) => body)
+                .catch((error) => ({ __fetchError: error }))
+        ) as Uint8Array | { __fetchError: unknown };
+        if (result && typeof result === 'object' && '__fetchError' in result) {
+            throw result.__fetchError;
+        }
+        return result as Uint8Array;
+    }
+
     resolve(spec: string, parent: string, _attr?: Record<string, any>): ModuleInfo {
         const url = this.normalizeUrl(spec, parent);
         if (!this.resolved.has(url)) {
             const cachePath = this.cachePath(url);
             if (!fs.exists(cachePath)) {
                 if (!this.cfg.silent && !isatty) log.info(`📦 ${url}`);
-                const bytes = fetchBytes(url);
+                const body = this.fetchBytesSync(url);
                 ensureDir(dirname(cachePath));
-                fs.writeFile(cachePath, bytes);
+                fs.writeFile(cachePath, body);
             }
             this.resolved.set(url, cachePath);
         }
@@ -47,7 +63,7 @@ export class HttpHandler implements ProtocolHandler {
             const cachePath = this.cachePath(url);
             if (!fs.exists(cachePath)) {
                 if (!this.cfg.silent && !isatty) log.info(`📦 ${url}`);
-                const { body } = await fetchAsync(url, onProgress);
+                const { body } = await fetchAsync(url, onProgress, this.fetchOptions());
                 ensureDir(dirname(cachePath));
                 fs.writeFile(cachePath, body);
             }

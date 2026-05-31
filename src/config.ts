@@ -19,6 +19,7 @@ const DEFAULTS = {
     enableNode:  true,
     silent:      false,
     jsrCacheTTL: 7 * 24 * 60 * 60 * 1000,
+    requestTimeout: 30000,
     disableCache: false,
     polyfill:    '',
     cacheDir:    '',
@@ -56,6 +57,7 @@ function envConfig(): Partial<ConfigOptions> {
     const ml = v('MEMORY_LIMIT');   if (ml) c.memoryLimit  = parseSize(ml);
     const ms = v('MAX_STACK_SIZE'); if (ms) c.maxStackSize = parseSize(ms);
     const ttl = v('JSR_CACHE_TTL'); if (ttl) c.jsrCacheTTL = +ttl * 24 * 60 * 60 * 1000;
+    const rt = v('REQUEST_TIMEOUT'); if (rt) c.requestTimeout = +rt;
     return c;
 }
 

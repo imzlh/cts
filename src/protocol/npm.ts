@@ -5,7 +5,7 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchBytes, fetchText, fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
+import { fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
 // URL polyfill — CNO runtime provides global URL
 declare const URL: any;
 import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
@@ -119,6 +119,25 @@ export class NpmHandler implements ProtocolHandler {
 
     constructor(private readonly cfg: RuntimeConfig) {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
+    }
+
+    private fetchOptions(headers?: Record<string, string>) {
+        return {
+            timeout: this.cfg.requestTimeout,
+            ...(headers ? { headers } : {}),
+        };
+    }
+
+    private fetchBytesSync(url: string, headers?: Record<string, string>): Uint8Array {
+        const result = engine.waitPromise(
+            fetchAsync(url, undefined, this.fetchOptions(headers))
+                .then(({ body }) => body)
+                .catch((error) => ({ __fetchError: error }))
+        ) as Uint8Array | { __fetchError: unknown };
+        if (result && typeof result === 'object' && '__fetchError' in result) {
+            throw result.__fetchError;
+        }
+        return result as Uint8Array;
     }
 
     resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
@@ -323,7 +342,8 @@ export class NpmHandler implements ProtocolHandler {
                 if (age < 24 * 60 * 60 * 1000) return safeParse<NpmMeta>(readText(cacheFile));
             } catch {}
         }
-        const meta = safeParse<NpmMeta>(fetchText(`${registry}/${name}`));
+        const body = this.fetchBytesSync(`${registry}/${name}`);
+        const meta = safeParse<NpmMeta>(engine.decodeString(body as any));
         ensureDir(dirname(cacheFile));
         writeText(cacheFile, JSON.stringify(meta, null, 2));
         writeText(cacheTs, String(Date.now()));
@@ -334,7 +354,8 @@ export class NpmHandler implements ProtocolHandler {
         const meta    = this.fetchMeta(name);
         const tarball = meta.versions[ver]?.dist.tarball;
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
-        const files = unTarGz(fetchBytes(tarball).buffer);
+        const body = this.fetchBytesSync(tarball);
+        const files = unTarGz(body as any);
         ensureDir(dir);
         const seen = new Set<string>();
         for (const f of files) {
@@ -342,7 +363,7 @@ export class NpmHandler implements ProtocolHandler {
             if (p.startsWith('package/')) p = p.slice(8);
             const target = joinPaths(dir, p);
             if (f.type === 'dir') { if (!seen.has(target)) { ensureDir(target); seen.add(target); } }
-            else { const d = dirname(target); if (!seen.has(d)) { ensureDir(d); seen.add(d); } fs.writeFile(target, f.content); }
+            else { const d = dirname(target); if (!seen.has(d)) { ensureDir(d); seen.add(d); } fs.writeFile(target, f.content as any); }
         }
     }
 
@@ -487,7 +508,7 @@ export class NpmHandler implements ProtocolHandler {
         }
         const { body } = await fetchAsync(`${registry}/${name}`, undefined, {
             method: 'GET',
-            headers: { 'User-Agent': 'cts/' + version, Accept: 'application/json' },
+            ...this.fetchOptions({ 'User-Agent': 'cts/' + version, Accept: 'application/json' }),
         });
         const meta = safeParse<NpmMeta>(engine.decodeString(new Uint8Array(body)));
         ensureDir(dirname(cacheFile));
@@ -500,7 +521,7 @@ export class NpmHandler implements ProtocolHandler {
         const meta    = await this.fetchMetaAsync(name);
         const tarball = meta.versions[ver]?.dist.tarball;
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
-        const { body } = await fetchAsync(tarball, onProgress);
+        const { body } = await fetchAsync(tarball, onProgress, this.fetchOptions());
         const files = unTarGz(new Uint8Array(body).buffer);
         ensureDir(dir);
         const seen = new Set<string>();

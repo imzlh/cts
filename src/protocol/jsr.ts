@@ -10,7 +10,7 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchBytes, fetchText, fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
+import { fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
 // URL polyfill — CNO runtime provides global URL
 declare const URL: any;
 import { isCacheExpired, matchLatestVersion, safeParse, errMsg } from '../utils/misc';
@@ -27,6 +27,22 @@ export class JsrHandler implements ProtocolHandler {
     private readonly resolved = new Map<string, string>(); // specPath → localPath
 
     constructor(private readonly cfg: RuntimeConfig) {}
+
+    private fetchOptions() {
+        return { timeout: this.cfg.requestTimeout };
+    }
+
+    private fetchBytesSync(url: string): Uint8Array {
+        const result = engine.waitPromise(
+            fetchAsync(url, undefined, this.fetchOptions())
+                .then(({ body }) => body)
+                .catch((error) => ({ __fetchError: error }))
+        ) as Uint8Array | { __fetchError: unknown };
+        if (result && typeof result === 'object' && '__fetchError' in result) {
+            throw result.__fetchError;
+        }
+        return result as Uint8Array;
+    }
 
     resolve(spec: string, parent: string): ModuleInfo {
         let parsed: ParsedJsrSpec;
@@ -124,7 +140,8 @@ export class JsrHandler implements ProtocolHandler {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
             } catch {}
         }
-        const meta = safeParse<JsrPackageMeta>(fetchText(`${JSR}/@${scope}/${name}/meta.json`));
+        const body = this.fetchBytesSync(`${JSR}/@${scope}/${name}/meta.json`);
+        const meta = safeParse<JsrPackageMeta>(engine.decodeString(body as any));
         if (!meta.latest) throw err(ErrorKind.VersionNotFound, `@${scope}/${name}: registry returned no latest`);
         ensureDir(dir);
         writeText(file, JSON.stringify({ ...meta, _at: Date.now() }, null, 2));
@@ -140,7 +157,8 @@ export class JsrHandler implements ProtocolHandler {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
             } catch {}
         }
-        const meta = safeParse<JsrVersionMeta>(fetchText(`${JSR}/@${scope}/${name}/${ver}_meta.json`));
+        const body = this.fetchBytesSync(`${JSR}/@${scope}/${name}/${ver}_meta.json`);
+        const meta = safeParse<JsrVersionMeta>(engine.decodeString(body as any));
         ensureDir(dir);
         writeText(file, JSON.stringify({ ...meta, _at: Date.now() }, null, 2));
         return meta;
@@ -152,7 +170,8 @@ export class JsrHandler implements ProtocolHandler {
             if (!this.cfg.silent && !isatty) log.info(`📦 jsr:@${scope}/${name}@${ver}/${file}`);
             const url = `${JSR}/@${scope}/${name}/${ver}/${file}`;
             ensureDir(dirname(local));
-            fs.writeFile(local, fetchBytes(url));
+            const body = this.fetchBytesSync(url);
+            fs.writeFile(local, body);
         }
         return local;
     }
@@ -199,7 +218,7 @@ export class JsrHandler implements ProtocolHandler {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
             } catch {}
         }
-        const { body } = await fetchAsync(`${JSR}/@${scope}/${name}/meta.json`);
+        const { body } = await fetchAsync(`${JSR}/@${scope}/${name}/meta.json`, undefined, this.fetchOptions());
         const meta = safeParse<JsrPackageMeta>(engine.decodeString(new Uint8Array(body)));
         if (!meta.latest) throw err(ErrorKind.VersionNotFound, `@${scope}/${name}: registry returned no latest`);
         ensureDir(dir);
@@ -216,7 +235,7 @@ export class JsrHandler implements ProtocolHandler {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
             } catch {}
         }
-        const { body } = await fetchAsync(`${JSR}/@${scope}/${name}/${ver}_meta.json`);
+        const { body } = await fetchAsync(`${JSR}/@${scope}/${name}/${ver}_meta.json`, undefined, this.fetchOptions());
         const meta = safeParse<JsrVersionMeta>(engine.decodeString(new Uint8Array(body)));
         ensureDir(dir);
         writeText(file, JSON.stringify({ ...meta, _at: Date.now() }, null, 2));
@@ -247,7 +266,7 @@ export class JsrHandler implements ProtocolHandler {
             if (!this.cfg.silent && !isatty) log.info(`📦 jsr:@${scope}/${name}@${ver}/${file}`);
             const url = `${JSR}/@${scope}/${name}/${ver}/${file}`;
             ensureDir(dirname(local));
-            const { body } = await fetchAsync(url, onProgress);
+            const { body } = await fetchAsync(url, onProgress, this.fetchOptions());
             fs.writeFile(local, body);
         }
         return local;

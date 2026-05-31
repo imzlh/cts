@@ -21,6 +21,7 @@ export interface ConfigOptions {
     enableNode?:    boolean;
     silent?:        boolean;
     jsrCacheTTL?:   number;
+    requestTimeout?: number;
     memoryLimit?:   number;
     maxStackSize?:  number;
     pathAliases?:   Record<string, string[]>;
