@@ -187,7 +187,7 @@ Pre-registered cleanups run in LIFO order before user code starts:
 | `src/task.ts` | `TaskRunner`: deno.json task execution, `deno run` rewriting, dep graph. |
 | `src/resources.ts` | LIFO cleanup registry. Pre-registers curl/connection/cache teardowns. |
 | `src/transformer.ts` | Sucrase wrapper: TS/JSX → JS, source map registration. |
-| `src/utils/log.ts` | Lazy-eval debug logger gated by `CTS_DEBUG` env var. Zero cost when disabled. |
+| `src/utils/log.ts` | Lazy-eval debug logger gated by `DEBUG` env var. Zero cost when disabled. |
 | `src/utils/lru.ts` | Map-backed O(1) LRU cache used by all bounded caches. |
 | `src/utils/net.ts` | Sync HTTP via circu.js TCP stack. Used by protocol handlers during module load. |
 | `src/utils/curl.ts` | Async HTTP via libcurl. Only used by `DepScanner`. 8 total / 4 per host. |

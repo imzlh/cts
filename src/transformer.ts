@@ -2,7 +2,7 @@
 
 import { transform, type Transform, type Options } from '../deps/sucrase/src/index';
 import { errMsg } from './utils/misc';
-import { err, ErrorKind } from './errors';
+import { err, ErrorKind, TransformError } from './errors';
 import { log } from './utils/log';
 import { __use_fn } from './utils';
 
@@ -37,7 +37,20 @@ export class Transformer {
             }
             return r.code;
         } catch (e) {
-            throw err(ErrorKind.TransformError, `Transform failed (${filename}): ${errMsg(e)}`);
+            throw this.toTransformError(e, filename);
         }
+    }
+
+    private toTransformError(error: unknown, filename: string): Error {
+        const message = errMsg(error);
+        const match = message.match(/\((\d+):(\d+)\)\s*$/);
+        const clean = message
+            .replace(/^Error transforming .+?:\s*/, '')
+            .replace(/\s*\(\d+:\d+\)\s*$/, '')
+            .trim();
+        if (!match) {
+            return err(ErrorKind.TransformError, `Transform failed (${filename}): ${clean}`);
+        }
+        return new TransformError(clean, filename, Number(match[1]), Number(match[2]));
     }
 }

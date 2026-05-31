@@ -49,6 +49,7 @@ export class JscCache {
             return engine.deserialize(new Uint8Array(bytes)) as CModuleEngine.Module;
         } catch {
             log.debug('jsc', () => `disk deserialize failed: ${jscPath}`);
+            try { fs.unlink(jscPath); } catch { /* ignore */ }
             return null;
         }
     }

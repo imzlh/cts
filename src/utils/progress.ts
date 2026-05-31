@@ -6,7 +6,7 @@
 // TTY:  live multi-line render with spinner, colors, speed
 // pipe: per-download 📦 lines (from handlers via !isatty)
 
-import { engine, timers, os, fs, pty } from './index';
+import { engine, timers, os, fs } from './index';
 const { setInterval, clearInterval } = timers;
 
 // ---------------------------------------------------------------------------
@@ -29,14 +29,6 @@ const C = {
 
 export let isatty = false;
 let termWidth = 80;
-
-function initTty(): void {
-    isatty = os.guessHandle(os.STDOUT_FILENO) === 'tty';
-    if (isatty) {
-        try { termWidth = pty.getwinsize(os.STDOUT_FILENO).cols || 80; }
-        catch { termWidth = 80; }
-    }
-}
 
 function write(s: string): void {
     fs.write(os.STDOUT_FILENO, engine.encodeString(s));
@@ -90,7 +82,8 @@ export class PrecacheProgress {
 
     constructor(maxLines = 5) {
         this.maxLines = maxLines;
-        initTty();
+        // FIXME: really initialize tty via C func
+        // initTty();
     }
 
     // ---- Scan phase ----

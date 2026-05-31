@@ -61,7 +61,7 @@ function envConfig(): Partial<ConfigOptions> {
 
 function defaultCacheDir(): string {
     let home: string | null = null;
-    try { home = os.homedir; } catch {}
+    try { home = os.homeDir; } catch {}
     if (!home) home = env(uname.sysname.includes('Windows') ? 'USERPROFILE' : 'HOME') ?? '/root';
     return joinPaths(home, '.cts');
 }
@@ -105,7 +105,7 @@ function verifyCacheDir(dir: string): void {
     try { stored = readText(vf); } catch {}
     if (stored !== engine.versions.quickjs) {
         log.debug('config', 'cache version mismatch, clearing .jsc');
-        clearJsc(dir);
+        clearJscSync(dir);
         writeText(vf, engine.versions.quickjs);
     }
 }

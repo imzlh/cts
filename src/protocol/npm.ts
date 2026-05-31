@@ -47,7 +47,7 @@ function loadNpmConfig(): NpmConfig {
         }
     };
     try { const p = joinPaths(os.cwd, '.npmrc'); if (fs.exists(p)) parse(readText(p), true); } catch {}
-    try { const p = joinPaths(os.homedir ?? '/root', '.npmrc'); if (fs.exists(p)) parse(readText(p), false); } catch {}
+    try { const p = joinPaths(os.homeDir ?? '/root', '.npmrc'); if (fs.exists(p)) parse(readText(p), false); } catch {}
     try { const r = os.getenv?.('NPM_CONFIG_REGISTRY'); if (r) cfg.registry = r.replace(/\/$/, ''); } catch {}
     try { const t = os.getenv?.('NPM_TOKEN') ?? os.getenv?.('NODE_AUTH_TOKEN'); if (t) cfg.authToken = t; } catch {}
     return cfg;

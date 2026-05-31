@@ -32,6 +32,21 @@ export enum ErrorKind {
     Generic         = 'generic',
 }
 
+export class TransformError extends Error {
+    kind = ErrorKind.TransformError as const;
+    fileName: string;
+    line: number;
+    column: number;
+
+    constructor(message: string, fileName: string, line: number, column: number) {
+        super(message);
+        this.name = 'TransformError';
+        this.fileName = fileName;
+        this.line = line;
+        this.column = column;
+    }
+}
+
 // Extend Error so every error can optionally carry a kind
 declare global {
     interface Error {
@@ -170,7 +185,7 @@ function sourceContext(file: string, line: number, col: number): string {
 // ---------------------------------------------------------------------------
 
 const debugEnv = (() => { try {
-    const str = os.getenv('CTS_DEBUG') ?? '';
+    const str = os.getenv('DEBUG') ?? '';
     if (str == '*') return true;
     if (str.includes('stack')) return true;
 } catch { return false; } })();
@@ -208,7 +223,7 @@ export function formatError(e: unknown, context?: string): string {
         }
     }
 
-    // Debug stack (only if CTS_DEBUG includes 'stack')
+    // Debug stack (only if DEBUG includes 'stack')
     if (debugEnv && error.stack) {
         lines.push('', C.dim(' Stack:'));
         for (const l of error.stack.split('\n').slice(1, 6))

@@ -6,9 +6,9 @@
 //   log.warn('npm', 'metadata cache expired for', name);
 //
 // Enable via environment variable:
-//   CTS_DEBUG=*              # all categories
-//   CTS_DEBUG=resolver,npm   # specific categories
-//   CTS_DEBUG=resolver,!lock # resolver but not lock
+//   DEBUG=*              # all categories
+//   DEBUG=resolver,npm   # specific categories
+//   DEBUG=resolver,!lock # resolver but not lock
 //
 // Key design: the message lambda is ONLY called when the category is active.
 // This avoids string interpolation cost on every hot-path call.
@@ -27,7 +27,7 @@ function init(): void {
     if (initialised) return;
     initialised = true;
     let raw = '';
-    try { raw = os.getenv('CTS_DEBUG') ?? ''; } catch {}
+    try { raw = os.getenv('DEBUG') ?? ''; } catch {}
     if (!raw) return;
     for (const tok of raw.split(',').map(s => s.trim()).filter(Boolean)) {
         if (tok.startsWith('!')) disabled.add(tok.slice(1));
@@ -64,7 +64,7 @@ export const log = {
         console.log(`\x1b[2m[${category}]\x1b[0m ${resolve(msg)}`, ...rest);
     },
 
-    /** Always shown regardless of CTS_DEBUG. */
+    /** Always shown regardless of DEBUG. */
     info(msg: string, ...rest: any[]): void {
         console.log(msg, ...rest);
     },

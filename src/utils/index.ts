@@ -25,7 +25,6 @@ export const ssl = useFn('ssl');
 export const dns = useFn('dns');
 export const http = useFn('@cnojs/http');
 export const zlib = useFn('zlib');
-export const pty = useFn('pty');
 export const __use_fn = useFn;
 
 export const uname = os.uname();
