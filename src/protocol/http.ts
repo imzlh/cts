@@ -1,4 +1,4 @@
-// protocol/http.ts — http/https handler
+﻿// protocol/http.ts 鈥?http/https handler
 
 import type { RuntimeConfig, ModuleInfo } from '../types';
 import type { ProtocolHandler } from './base';
@@ -6,8 +6,8 @@ import { guessFileKind } from './base';
 import { joinPaths, dirname } from '../utils/path';
 import { ensureDir } from '../utils/io';
 import { cacheFilename } from '../utils/misc';
-import { fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
-// URL polyfill — CNO runtime provides global URL
+import { fetchAsync, fetchBytes, type ProgressCallback } from '@cnojs/http/client';
+// URL polyfill 鈥?CNO runtime provides global URL
 declare const URL: any;
 import { fs, engine } from '../utils/index';
 import { log } from '../utils/log';
@@ -16,7 +16,7 @@ import { isatty } from '../utils/progress';
 export class HttpHandler implements ProtocolHandler {
     readonly protocols = ['http', 'https'];
 
-    // Maps canonical specPath (URL) → local cache path
+    // Maps canonical specPath (URL) 鈫?local cache path
     private readonly resolved = new Map<string, string>();
 
     constructor(private readonly cfg: RuntimeConfig) {}
@@ -26,15 +26,7 @@ export class HttpHandler implements ProtocolHandler {
     }
 
     private fetchBytesSync(url: string): Uint8Array {
-        const result = engine.waitPromise(
-            fetchAsync(url, undefined, this.fetchOptions())
-                .then(({ body }) => body)
-                .catch((error) => ({ __fetchError: error }))
-        ) as Uint8Array | { __fetchError: unknown };
-        if (result && typeof result === 'object' && '__fetchError' in result) {
-            throw result.__fetchError;
-        }
-        return result as Uint8Array;
+        return fetchBytes(url, undefined, this.fetchOptions());
     }
 
     resolve(spec: string, parent: string, _attr?: Record<string, any>): ModuleInfo {
@@ -42,7 +34,7 @@ export class HttpHandler implements ProtocolHandler {
         if (!this.resolved.has(url)) {
             const cachePath = this.cachePath(url);
             if (!fs.exists(cachePath)) {
-                if (!this.cfg.silent && !isatty) log.info(`📦 ${url}`);
+                if (!this.cfg.silent && !isatty) log.info(`馃摝 ${url}`);
                 const body = this.fetchBytesSync(url);
                 ensureDir(dirname(cachePath));
                 fs.writeFile(cachePath, body);
@@ -62,7 +54,7 @@ export class HttpHandler implements ProtocolHandler {
         if (!this.resolved.has(url)) {
             const cachePath = this.cachePath(url);
             if (!fs.exists(cachePath)) {
-                if (!this.cfg.silent && !isatty) log.info(`📦 ${url}`);
+                if (!this.cfg.silent && !isatty) log.info(`馃摝 ${url}`);
                 const { body } = await fetchAsync(url, onProgress, this.fetchOptions());
                 ensureDir(dirname(cachePath));
                 fs.writeFile(cachePath, body);
@@ -85,3 +77,4 @@ export class HttpHandler implements ProtocolHandler {
         return joinPaths(this.cfg.cacheDir, 'http', hostname, name.slice(0, 2), name);
     }
 }
+

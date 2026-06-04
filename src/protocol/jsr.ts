@@ -1,4 +1,4 @@
-// protocol/jsr.ts — JSR registry handler
+﻿// protocol/jsr.ts 鈥?JSR registry handler
 //
 // Fix vs original:
 //   - Version ranges (^1.0.0) are actually resolved against the full version list
@@ -10,8 +10,8 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
-// URL polyfill — CNO runtime provides global URL
+import { fetchAsync, fetchBytes, type ProgressCallback } from '@cnojs/http/client';
+// URL polyfill 鈥?CNO runtime provides global URL
 declare const URL: any;
 import { isCacheExpired, matchLatestVersion, safeParse, errMsg } from '../utils/misc';
 import { fs, engine } from '../utils/index';
@@ -24,7 +24,7 @@ const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
 
 export class JsrHandler implements ProtocolHandler {
     readonly protocols = ['jsr'];
-    private readonly resolved = new Map<string, string>(); // specPath → localPath
+    private readonly resolved = new Map<string, string>(); // specPath 鈫?localPath
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
@@ -33,15 +33,7 @@ export class JsrHandler implements ProtocolHandler {
     }
 
     private fetchBytesSync(url: string): Uint8Array {
-        const result = engine.waitPromise(
-            fetchAsync(url, undefined, this.fetchOptions())
-                .then(({ body }) => body)
-                .catch((error) => ({ __fetchError: error }))
-        ) as Uint8Array | { __fetchError: unknown };
-        if (result && typeof result === 'object' && '__fetchError' in result) {
-            throw result.__fetchError;
-        }
-        return result as Uint8Array;
+        return fetchBytes(url, undefined, this.fetchOptions());
     }
 
     resolve(spec: string, parent: string): ModuleInfo {
@@ -167,7 +159,7 @@ export class JsrHandler implements ProtocolHandler {
     private download(scope: string, name: string, ver: string, file: string): string {
         const local = joinPaths(this.cfg.cacheDir, 'jsr', scope, name, ver, file);
         if (!fs.exists(local)) {
-            if (!this.cfg.silent && !isatty) log.info(`📦 jsr:@${scope}/${name}@${ver}/${file}`);
+            if (!this.cfg.silent && !isatty) log.info(`馃摝 jsr:@${scope}/${name}@${ver}/${file}`);
             const url = `${JSR}/@${scope}/${name}/${ver}/${file}`;
             ensureDir(dirname(local));
             const body = this.fetchBytesSync(url);
@@ -263,7 +255,7 @@ export class JsrHandler implements ProtocolHandler {
     private async downloadAsync(scope: string, name: string, ver: string, file: string, onProgress?: ProgressCallback): Promise<string> {
         const local = joinPaths(this.cfg.cacheDir, 'jsr', scope, name, ver, file);
         if (!fs.exists(local)) {
-            if (!this.cfg.silent && !isatty) log.info(`📦 jsr:@${scope}/${name}@${ver}/${file}`);
+            if (!this.cfg.silent && !isatty) log.info(`馃摝 jsr:@${scope}/${name}@${ver}/${file}`);
             const url = `${JSR}/@${scope}/${name}/${ver}/${file}`;
             ensureDir(dirname(local));
             const { body } = await fetchAsync(url, onProgress, this.fetchOptions());
@@ -272,3 +264,4 @@ export class JsrHandler implements ProtocolHandler {
         return local;
     }
 }
+

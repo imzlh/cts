@@ -1,12 +1,12 @@
-// protocol/npm.ts — npm registry handler
+﻿// protocol/npm.ts 鈥?npm registry handler
 
 import type { RuntimeConfig, ModuleInfo, PackageJson } from '../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchAsync, type ProgressCallback } from '@cnojs/http/fetch';
-// URL polyfill — CNO runtime provides global URL
+import { fetchAsync, fetchBytes, type ProgressCallback } from '@cnojs/http/client';
+// URL polyfill 鈥?CNO runtime provides global URL
 declare const URL: any;
 import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
 import { detectFormat, readPkgFresh, createCtx, resolveSubpath, resolveImports } from '../pkg';
@@ -114,7 +114,7 @@ export class NpmHandler implements ProtocolHandler {
     readonly protocols = ['npm'];
     private readonly cacheDir: string;
     private npmCfg: NpmConfig | null = null;
-    // version cache: name@range → resolved exact version
+    // version cache: name@range 鈫?resolved exact version
     private readonly verCache = new Map<string, string>();
 
     constructor(private readonly cfg: RuntimeConfig) {
@@ -129,15 +129,7 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private fetchBytesSync(url: string, headers?: Record<string, string>): Uint8Array {
-        const result = engine.waitPromise(
-            fetchAsync(url, undefined, this.fetchOptions(headers))
-                .then(({ body }) => body)
-                .catch((error) => ({ __fetchError: error }))
-        ) as Uint8Array | { __fetchError: unknown };
-        if (result && typeof result === 'object' && '__fetchError' in result) {
-            throw result.__fetchError;
-        }
-        return result as Uint8Array;
+        return fetchBytes(url, undefined, this.fetchOptions(headers));
     }
 
     resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
@@ -150,7 +142,7 @@ export class NpmHandler implements ProtocolHandler {
         if (spec === '.' && parent.startsWith('npm:')) {
             return this.resolveRelative('.', parent, forceCjs);
         }
-        // Subpath imports (e.g. "#minpath") — resolve within the parent package
+        // Subpath imports (e.g. "#minpath") 鈥?resolve within the parent package
         if (spec.startsWith('#') && parent.startsWith('npm:')) {
             return this.resolveSubpathImport(spec, parent, forceCjs);
         }
@@ -161,7 +153,7 @@ export class NpmHandler implements ProtocolHandler {
 
     localPath(specPath: string): string {
         const { name, version, subpath } = parseNpmSpec(specPath);
-        // Resolve the actual installed version — the spec may contain a range
+        // Resolve the actual installed version 鈥?the spec may contain a range
         // like "latest" that doesn't match the on-disk directory name.
         const exactVer = this.resolveVersion(name, version);
         const dir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
@@ -221,7 +213,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
         const localPath = resolveImports(ctx, spec);
         if (!localPath) throw err(ErrorKind.ModuleNotFound,
-            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} — not found in package.json "imports"`);
+            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} 鈥?not found in package.json "imports"`);
         return {
             specPath: NpmHandler.specPath(name, pkg.resolvedVer, localPath.slice(pkg.dir.length + 1)),
             localPath,
@@ -271,7 +263,7 @@ export class NpmHandler implements ProtocolHandler {
                 ? `(exports: ${JSON.stringify(pkg.exports)})`
                 : pkg.main ? `(main: "${pkg.main}")` : '(no main field)';
             throw err(ErrorKind.ModuleNotFound,
-                `Cannot resolve "${subpath || '.'}" in ${name}@${ver} — ${hint}\n` +
+                `Cannot resolve "${subpath || '.'}" in ${name}@${ver} 鈥?${hint}\n` +
                 `  The package may not expose a default entry point. ` +
                 `Try importing a specific subpath like npm:${name}@${ver}/<file>`);
         }
@@ -295,7 +287,7 @@ export class NpmHandler implements ProtocolHandler {
         const exactVer = this.resolveVersion(name, version);
         const pkgDir   = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         if (!fs.exists(pkgDir)) {
-            if (!this.cfg.silent && !isatty) log.info(`📦 ${name}@${exactVer}`);
+            if (!this.cfg.silent && !isatty) log.info(`馃摝 ${name}@${exactVer}`);
             this.install(name, exactVer, pkgDir);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
@@ -399,7 +391,7 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     // -------------------------------------------------------------------------
-    // async resolve — parallel precache path (uses fetchAsync, no engine.waitPromise)
+    // async resolve 鈥?parallel precache path (uses fetchAsync, no engine.waitPromise)
     // -------------------------------------------------------------------------
 
     async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
@@ -449,7 +441,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
         const localPath = resolveImports(ctx, spec);
         if (!localPath) throw err(ErrorKind.ModuleNotFound,
-            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} — not found in package.json "imports"`);
+            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} 鈥?not found in package.json "imports"`);
         return {
             specPath: NpmHandler.specPath(name, pkg.resolvedVer, localPath.slice(pkg.dir.length + 1)),
             localPath,
@@ -467,7 +459,7 @@ export class NpmHandler implements ProtocolHandler {
         const exactVer = await this.resolveVersionAsync(name, version);
         const pkgDir   = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         if (!fs.exists(pkgDir)) {
-            if (!this.cfg.silent && !isatty) log.info(`📦 ${name}@${exactVer}`);
+            if (!this.cfg.silent && !isatty) log.info(`馃摝 ${name}@${exactVer}`);
             await this.installAsync(name, exactVer, pkgDir, onProgress);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
@@ -534,3 +526,4 @@ export class NpmHandler implements ProtocolHandler {
         }
     }
 }
+

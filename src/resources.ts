@@ -1,4 +1,4 @@
-// resources.ts — central resource lifecycle
+﻿// resources.ts 鈥?central resource lifecycle
 //
 // Tracks every resource opened during pre-cache and provides a single
 // cleanup() call that must be invoked before user code runs.
@@ -17,6 +17,7 @@
 import { clearResolveCache }  from './utils/io';
 import { clearPkgCache }      from './pkg';
 import { connectionManager } from '@cnojs/http/connection';
+import { closeCurlPool }      from '@cnojs/http/client';
 import { clearDnsCache }      from '@cnojs/http/dns-cache';
 
 import { log } from './utils/log';
@@ -45,7 +46,7 @@ class ResourceManager {
     }
 }
 
-// Module-level singleton — one per process
+// Module-level singleton 鈥?one per process
 const mgr = new ResourceManager();
 
 export const resources = {
@@ -74,6 +75,11 @@ resources.register(() => {
 });
 
 resources.register(() => {
+    // Close libcurl's shared client pool opened by @cnojs/http/client.
+    closeCurlPool();
+});
+
+resources.register(() => {
     // Clear DNS cache so stale entries don't survive across pre-cache phases
     clearDnsCache();
 });
@@ -89,3 +95,4 @@ resources.register(() => {
     // Clear file resolution cache: same reason as above.
     clearResolveCache();
 });
+
