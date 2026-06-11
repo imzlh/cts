@@ -10,8 +10,22 @@ const smap    = __use_fn('sourcemap');
 
 const BASE: Partial<Options> = { disableESTransforms: true, production: false };
 
+export interface TransformerOptions {
+    sourceMaps?: boolean;
+    jsxPragma?: string;
+    jsxFragmentPragma?: string;
+}
+
 export class Transformer {
-    constructor(private readonly sourceMaps = true) {}
+    private readonly sourceMaps: boolean;
+    private readonly jsxPragma: string;
+    private readonly jsxFragmentPragma: string;
+
+    constructor(options: TransformerOptions = {}) {
+        this.sourceMaps = options.sourceMaps ?? true;
+        this.jsxPragma = options.jsxPragma ?? 'React.createElement';
+        this.jsxFragmentPragma = options.jsxFragmentPragma ?? 'React.Fragment';
+    }
 
     transform(code: string, filename: string): string {
         if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
@@ -29,8 +43,8 @@ export class Transformer {
 
     private run(code: string, filename: string, transforms: Transform[]): string {
         try {
-            const r = transform(code, { transforms, jsxPragma: 'React.createElement',
-                jsxFragmentPragma: 'React.Fragment', filePath: filename, ...BASE });
+            const r = transform(code, { transforms, jsxPragma: this.jsxPragma,
+                jsxFragmentPragma: this.jsxFragmentPragma, filePath: filename, ...BASE });
             if (this.sourceMaps && r.sourceMap) {
                 try { smap.load(filename, r.sourceMap); }
                 catch (e) { log.warn('transformer', () => `smap: ${filename}`, e); }

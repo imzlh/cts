@@ -1,43 +1,35 @@
-﻿// protocol/http.ts 鈥?http/https handler
+// protocol/http.ts - http/https handler
 
 import type { RuntimeConfig, ModuleInfo } from '../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
+import { StepType, type Flow } from '../flow';
 import { joinPaths, dirname } from '../utils/path';
-import { ensureDir } from '../utils/io';
 import { cacheFilename } from '../utils/misc';
-import { fetchAsync, fetchBytes, type ProgressCallback } from '@cnojs/http/client';
-// URL polyfill 鈥?CNO runtime provides global URL
 declare const URL: any;
-import { fs, engine } from '../utils/index';
 import { log } from '../utils/log';
 import { isatty } from '../utils/progress';
 
 export class HttpHandler implements ProtocolHandler {
     readonly protocols = ['http', 'https'];
-
-    // Maps canonical specPath (URL) 鈫?local cache path
     private readonly resolved = new Map<string, string>();
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
-    private fetchOptions() {
-        return { timeout: this.cfg.requestTimeout };
-    }
-
-    private fetchBytesSync(url: string): Uint8Array {
-        return fetchBytes(url, undefined, this.fetchOptions());
-    }
-
-    resolve(spec: string, parent: string, _attr?: Record<string, any>): ModuleInfo {
+    *resolve(spec: string, parent: string): Flow<ModuleInfo> {
         const url = this.normalizeUrl(spec, parent);
+        const cachePath = this.cachePath(url);
         if (!this.resolved.has(url)) {
-            const cachePath = this.cachePath(url);
-            if (!fs.exists(cachePath)) {
-                if (!this.cfg.silent && !isatty) log.info(`馃摝 ${url}`);
-                const body = this.fetchBytesSync(url);
-                ensureDir(dirname(cachePath));
-                fs.writeFile(cachePath, body);
+            const cached = yield { type: StepType.FS_EXISTS, path: cachePath };
+            if (!cached) {
+                if (!this.cfg.silent && !isatty) log.download(url);
+                const { body } = yield {
+                    type: StepType.NET_FETCH,
+                    url,
+                    timeout: this.cfg.requestTimeout,
+                };
+                yield { type: StepType.FS_ENSURE_DIR, path: dirname(cachePath) };
+                yield { type: StepType.FS_WRITE_BYTES, path: cachePath, data: body };
             }
             this.resolved.set(url, cachePath);
         }
@@ -49,25 +41,13 @@ export class HttpHandler implements ProtocolHandler {
         return this.resolved.get(specPath) ?? this.cachePath(specPath);
     }
 
-    async resolveAsync(spec: string, parent: string, _attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
-        const url = this.normalizeUrl(spec, parent);
-        if (!this.resolved.has(url)) {
-            const cachePath = this.cachePath(url);
-            if (!fs.exists(cachePath)) {
-                if (!this.cfg.silent && !isatty) log.info(`馃摝 ${url}`);
-                const { body } = await fetchAsync(url, onProgress, this.fetchOptions());
-                ensureDir(dirname(cachePath));
-                fs.writeFile(cachePath, body);
-            }
-            this.resolved.set(url, cachePath);
-        }
-        const localPath = this.resolved.get(url)!;
-        return { specPath: url, localPath, format: 'esm', fileKind: guessFileKind(localPath) };
+    /** Clear resolved cache */
+    clearCache(): void {
+        this.resolved.clear();
     }
 
     private normalizeUrl(spec: string, parent: string): string {
         if (spec.startsWith('http://') || spec.startsWith('https://')) return spec;
-        // relative or absolute-path import within an HTTP module
         return new URL(spec, parent).toString();
     }
 
@@ -77,4 +57,3 @@ export class HttpHandler implements ProtocolHandler {
         return joinPaths(this.cfg.cacheDir, 'http', hostname, name.slice(0, 2), name);
     }
 }
-

@@ -39,6 +39,9 @@ export class TypeScriptRuntime {
         this.loader = new ModuleLoader(this.resolver, cfg);
         this.hookEngine();
         this.hookEvents();
+
+        // Register handler cache cleanup to run during resource release
+        resources.register(() => this.resolver.clearHandlerCaches());
     }
 
     // -------------------------------------------------------------------------
@@ -151,8 +154,10 @@ export class TypeScriptRuntime {
         let result;
         try {
             result = await scanner.scan(entrySpecPath, entryLocalPath);
-        } finally {
+        } catch (e) {
+            // Release resources on error, but re-throw
             resources.release();
+            throw e;
         }
         for (const { spec, parent, error } of result.errors)
             log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
@@ -185,6 +190,8 @@ export class TypeScriptRuntime {
         }
 
         prog?.stop();
+        // Release resources after precache completes successfully
+        resources.release();
         return result;
     }
 
@@ -241,6 +248,15 @@ export class TypeScriptRuntime {
 
     flushLock(): void   { this.resolver.flushLock(); }
     get rtConfig(): RuntimeConfig { return this.config; }
+
+    /** Clean up runtime caches and loaded modules */
+    cleanup(): void {
+        this.loader.clearLoadedModules();
+        this.loader.jsc.clearMemory();
+        this.loadedModules.clear();
+        this.metaCache.clear();
+        this.resolver.clearHandlerCaches();
+    }
 
     private reportSyntax(e: SyntaxError): never {
         const { source, code, path } = e.cause as { source: SyntaxError; code: string; path: string };

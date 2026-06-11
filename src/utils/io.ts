@@ -44,6 +44,9 @@ export function resolveFile(base: string, exts = EXTS): string {
 /** Mark a path as definitively non-existent (stat failed). */
 function markMissing(p: string): void { negCache.add(p); }
 
+/** Clear negative cache to allow re-checking paths */
+export function clearNegativeCache(): void { negCache.clear(); }
+
 function tryFile(p: string): string | null {
     if (negCache.has(p)) return null;
     try {

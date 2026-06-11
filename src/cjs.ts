@@ -79,6 +79,11 @@ function buildPaths(dir: string): string[] {
     return out;
 }
 
+/** Clear the directory paths cache */
+export function clearDirPathsCache(): void {
+    _dirPaths.clear();
+}
+
 // ---------------------------------------------------------------------------
 // CjsLoader
 // ---------------------------------------------------------------------------

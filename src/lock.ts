@@ -35,6 +35,8 @@ export class LockStore {
     private dirtyMods = new Map<string, ModuleInfo>();
     private dirtySrcs = new Map<string, string>();
     private readonly path: string;
+    private flushing = false;
+    private flushQueue: Array<() => void> = [];
 
     constructor(lockDir: string, private readonly readOnly: boolean) {
         this.path = joinPaths(lockDir, 'cts.lock');
@@ -97,24 +99,44 @@ export class LockStore {
     }
 
     // -------------------------------------------------------------------------
-    // Flush — append via fd, no read-back
+    // Flush — append via fd, no read-back (with queue to prevent concurrent writes)
     // -------------------------------------------------------------------------
 
     flush(): void {
         if (this.readOnly || (this.dirtyMods.size === 0 && this.dirtySrcs.size === 0)) return;
+
+        // Queue flush if another flush is in progress
+        if (this.flushing) {
+            this.flushQueue.push(() => this.flush());
+            return;
+        }
+
+        this.flushing = true;
+        const dirtyMods = new Map(this.dirtyMods);
+        const dirtySrcs = new Map(this.dirtySrcs);
+        this.dirtyMods.clear();
+        this.dirtySrcs.clear();
+
         try {
             ensureDir(dirname(this.path));
             let chunk = fs.exists(this.path) ? '' : HEADER;
-            for (const info of this.dirtyMods.values()) chunk += serMod(info);
-            for (const [q, v] of this.dirtySrcs) chunk += serSrc(q, v);
+            for (const info of dirtyMods.values()) chunk += serMod(info);
+            for (const [q, v] of dirtySrcs) chunk += serSrc(q, v);
 
             const fd = fs.open(this.path, 'a');
             try { fs.write(fd, engine.encodeString(chunk)); }
             finally { fs.close(fd); }
 
-            log.debug('lock', () => `flushed ${this.dirtyMods.size}M ${this.dirtySrcs.size}S`);
-            this.dirtyMods.clear(); this.dirtySrcs.clear();
+            log.debug('lock', () => `flushed ${dirtyMods.size}M ${dirtySrcs.size}S`);
         } catch (e) { log.warn('lock', 'flush failed', e); }
+
+        this.flushing = false;
+
+        // Process queued flushes
+        while (this.flushQueue.length > 0) {
+            const next = this.flushQueue.shift();
+            next?.();
+        }
     }
 
     // -------------------------------------------------------------------------

@@ -58,6 +58,8 @@ function envConfig(): Partial<ConfigOptions> {
     const ms = v('MAX_STACK_SIZE'); if (ms) c.maxStackSize = parseSize(ms);
     const ttl = v('JSR_CACHE_TTL'); if (ttl) c.jsrCacheTTL = +ttl * 24 * 60 * 60 * 1000;
     const rt = v('REQUEST_TIMEOUT'); if (rt) c.requestTimeout = +rt;
+    const jsxP = v('JSX_PRAGMA'); if (jsxP) c.jsxPragma = jsxP;
+    const jsxF = v('JSX_FRAGMENT_PRAGMA'); if (jsxF) c.jsxFragmentPragma = jsxF;
     return c;
 }
 
@@ -136,6 +138,8 @@ const CLI_TPL = {
     'h':              'boolean',
     'version':        'boolean',
     'v':              'boolean',
+    'jsx-pragma':     'string',
+    'jsx-fragment-pragma': 'string',
 } satisfies Record<string, 'string'|'boolean'|'number'>;
 
 function getEnv(name: string): string | null {
@@ -167,6 +171,8 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
         cfg.maxStackSize = parseSize(cli['max-stack-size'] || getEnv('CTS_MAX_STACK_SIZE') || '0');
     if (cli['jsr-cache-ttl'] !== undefined)
         cfg.jsrCacheTTL = (cli['jsr-cache-ttl'] as number) * 24 * 60 * 60 * 1000;
+    if (cli['jsx-pragma']) cfg.jsxPragma = cli['jsx-pragma'];
+    if (cli['jsx-fragment-pragma']) cfg.jsxFragmentPragma = cli['jsx-fragment-pragma'];
 
     cfg._ = cli._; cfg._args = cli._args; cfg._offset = cli._offset;
 

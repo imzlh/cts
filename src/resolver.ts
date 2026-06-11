@@ -10,7 +10,7 @@
 
 import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver, FileKind } from './types';
 import type { ProtocolHandler } from './protocol/base';
-import type { ProgressCallback } from '@cnojs/http';
+import type { ProgressCallback } from './flow';
 import { err, ErrorKind } from './errors';
 import { FileHandler } from './protocol/file';
 import { HttpHandler }  from './protocol/http';
@@ -19,6 +19,7 @@ import { NpmHandler }   from './protocol/npm';
 import { NodeHandler }  from './protocol/node';
 import { DataHandler }  from './protocol/data';
 import { LockStore }    from './lock';
+import { runAsync, runSync } from './flow';
 import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath } from './utils/path';
 import { resolveFile } from './utils/io';
 import { detectFormat } from './pkg';
@@ -188,10 +189,9 @@ export class ModuleResolver {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
             const h = this.handlers.get(proto);
             if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
-            if (h.resolveAsync) return h.resolveAsync(spec, parent, attr, onProgress);
-            return h.resolve(spec, parent, attr);
+            return runAsync(h.resolve(spec, parent, attr));
         }
-        if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelative(spec, parent, attr);
+        if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelativeAsync(spec, parent, attr);
         if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
         return this.resolveBareAsync(spec, parent, attr, onProgress);
     }
@@ -210,8 +210,7 @@ export class ModuleResolver {
         }
         const npm = this.handlers.get('npm');
         if (npm) {
-            if (npm.resolveAsync) return npm.resolveAsync(spec, parent, attr, onProgress);
-            return npm.resolve(spec, parent, attr);
+            return runAsync(npm.resolve(spec, parent, attr));
         }
         throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
@@ -291,6 +290,15 @@ export class ModuleResolver {
     get lockSize(): number { return this.lock.size; }
     get lockDirty(): number { return this.lock.dirtyCount; }
 
+    /** Clear handler caches (for memory cleanup) */
+    clearHandlerCaches(): void {
+        for (const h of this.handlers.values()) {
+            if ('clearCache' in h && typeof h.clearCache === 'function') {
+                h.clearCache();
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Dispatch
     // -------------------------------------------------------------------------
@@ -301,7 +309,7 @@ export class ModuleResolver {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
             const h = this.handlers.get(proto);
             if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
-            return h.resolve(spec, parent, attr);
+            return runSync(h.resolve(spec, parent, attr));
         }
         if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelative(spec, parent, attr);
         if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
@@ -311,7 +319,7 @@ export class ModuleResolver {
     private resolveRelative(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         const pp = protoOf(parent);
         // Delegate to protocol handler for non-file protocols (npm:, jsr:, http:, etc.)
-        if (pp && pp !== 'file') { const h = this.handlers.get(pp); if (h) return h.resolve(spec, parent, attr); }
+        if (pp && pp !== 'file') { const h = this.handlers.get(pp); if (h) return runSync(h.resolve(spec, parent, attr)); }
         let base = parent.startsWith('file://') ? parent.slice(7) : parent;
         // Ensure base is an absolute path for correct relative resolution
         if (!isAbsolute(base)) base = resolvePath(base);
@@ -320,6 +328,15 @@ export class ModuleResolver {
         const localPath = resolveFile(normalizePath(joined));
         const specPath = localPath;
         return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
+    }
+
+    private async resolveRelativeAsync(spec: string, parent: string, attr?: Record<string, any>): Promise<ModuleInfo> {
+        const pp = protoOf(parent);
+        if (pp && pp !== 'file') {
+            const h = this.handlers.get(pp);
+            if (h) return runAsync(h.resolve(spec, parent, attr));
+        }
+        return this.resolveRelative(spec, parent, attr);
     }
 
     private resolveAbsolute(spec: string, attr?: Record<string, any>): ModuleInfo {
@@ -342,7 +359,7 @@ export class ModuleResolver {
             }
         }
         const npm = this.handlers.get('npm');
-        if (npm) return npm.resolve(spec, parent, attr);
+        if (npm) return runSync(npm.resolve(spec, parent, attr));
         throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
 

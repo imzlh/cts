@@ -76,4 +76,8 @@ export const log = {
     error(category: string, msg: Msg, ...rest: any[]): void {
         console.error(`[${category}] ${resolve(msg)}`, ...rest);
     },
+
+    download(url: string): void {
+        console.log(`✨ ${url}...`);
+    }
 };

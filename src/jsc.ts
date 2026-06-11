@@ -54,6 +54,13 @@ export class JscCache {
         }
     }
 
+    /**
+     * Clear all in-memory bytecode (for memory cleanup)
+     */
+    clearMemory(): void {
+        this.memory.clear();
+    }
+
     // -------------------------------------------------------------------------
     // Store bytecode in memory (called by precompile driver)
     // -------------------------------------------------------------------------

@@ -155,6 +155,10 @@ Pre-registered cleanups run in LIFO order before user code starts:
 
 ## Caches and their bounds
 
+Note: the current code path prefers `closeHttpResources()` as the unified HTTP
+cleanup entry. It closes both the curl-backed fetch pool and the raw transport
+pool used by long-lived protocol clients such as SSE/WebSocket.
+
 | Cache | Location | Bound | Eviction |
 |-------|----------|-------|----------|
 | `pkgCache` | `pkg.ts` | LRU(512) | LRU + 5min TTL |
@@ -197,6 +201,10 @@ Pre-registered cleanups run in LIFO order before user code starts:
 | `deps/sucrase/` | Bundled Sucrase source. Used by transformer and dep scanner. Do not modify. |
 
 ## Conventions
+
+Note: `src/http/connection.ts` should now be read as a raw transport
+implementation for long-lived protocol flows. Standard fetch requests use the
+curl-backed client path instead.
 
 - `import.meta.use('module')` always at top-level, assigned to `const`
 - `log.debug('category', () => \`lazy string\`)` — lambda prevents string alloc when disabled

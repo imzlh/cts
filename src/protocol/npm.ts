@@ -1,24 +1,19 @@
-﻿// protocol/npm.ts 鈥?npm registry handler
+// protocol/npm.ts - npm registry handler
 
-import type { RuntimeConfig, ModuleInfo, PackageJson } from '../types';
+import type { RuntimeConfig, ModuleInfo } from '../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
+import { StepType, type Flow, type TarFile } from '../flow';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
-import { ensureDir, readText, writeText, resolveFile } from '../utils/io';
-import { fetchAsync, fetchBytes, type ProgressCallback } from '@cnojs/http/client';
-// URL polyfill 鈥?CNO runtime provides global URL
+import { readText, resolveFile } from '../utils/io';
 declare const URL: any;
-import { unTarGz, matchLatestVersion, compareVersions, safeParse, errMsg } from '../utils/misc';
+import { matchLatestVersion, compareVersions, safeParse } from '../utils/misc';
 import { detectFormat, readPkgFresh, createCtx, resolveSubpath, resolveImports } from '../pkg';
 import { err, ErrorKind } from '../errors';
 import { log } from '../utils/log';
 import { isatty } from '../utils/progress';
 import { fs, os, uname, engine } from '../utils/index';
 import { version } from '../../package.json';
-
-// ---------------------------------------------------------------------------
-// npm config (registry, auth)
-// ---------------------------------------------------------------------------
 
 interface NpmConfig {
     registry: string;
@@ -53,15 +48,10 @@ function loadNpmConfig(): NpmConfig {
     return cfg;
 }
 
-// ---------------------------------------------------------------------------
-// specifier parsing
-// ---------------------------------------------------------------------------
-
 interface ParsedNpmSpec { name: string; version: string; subpath: string }
 
 function parseNpmSpec(raw: string): ParsedNpmSpec {
     let rest = raw.startsWith('npm:') ? raw.slice(4).replace(/^\//, '') : raw;
-    // Strip leading slashes to handle npm://@scope/pkg etc.
     while (rest.startsWith('/')) rest = rest.slice(1);
     let name = '', ver = '', sub = '';
 
@@ -97,106 +87,75 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
     return { name, version: ver || 'latest', subpath: sub };
 }
 
-// ---------------------------------------------------------------------------
-// npm metadata types
-// ---------------------------------------------------------------------------
-
 interface NpmMeta {
     versions: Record<string, { version: string; dist: { tarball: string } }>;
     'dist-tags': Record<string, string>;
 }
 
-// ---------------------------------------------------------------------------
-// NpmHandler
-// ---------------------------------------------------------------------------
-
 export class NpmHandler implements ProtocolHandler {
     readonly protocols = ['npm'];
     private readonly cacheDir: string;
     private npmCfg: NpmConfig | null = null;
-    // version cache: name@range 鈫?resolved exact version
     private readonly verCache = new Map<string, string>();
 
     constructor(private readonly cfg: RuntimeConfig) {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
     }
 
-    private fetchOptions(headers?: Record<string, string>) {
-        return {
-            timeout: this.cfg.requestTimeout,
-            ...(headers ? { headers } : {}),
-        };
+    /** Clear version resolution cache */
+    clearCache(): void {
+        this.verCache.clear();
+        this.npmCfg = null;
     }
 
-    private fetchBytesSync(url: string, headers?: Record<string, string>): Uint8Array {
-        return fetchBytes(url, undefined, this.fetchOptions(headers));
-    }
-
-    resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
+    *resolve(spec: string, parent: string, attr?: Record<string, any>): Flow<ModuleInfo> {
         const forceCjs = attr?.cjs === true || (attr?.type !== 'module' && !parent.startsWith('npm:'));
-        // Relative import within an npm module
         if ((spec.startsWith('./') || spec.startsWith('../')) && parent.startsWith('npm:')) {
-            return this.resolveRelative(spec, parent, forceCjs);
+            return yield* this.resolveRelative(spec, parent, forceCjs);
         }
-        // require('.') means "the main entry of the current package"
         if (spec === '.' && parent.startsWith('npm:')) {
-            return this.resolveRelative('.', parent, forceCjs);
+            return yield* this.resolveRelative('.', parent, forceCjs);
         }
-        // Subpath imports (e.g. "#minpath") 鈥?resolve within the parent package
         if (spec.startsWith('#') && parent.startsWith('npm:')) {
-            return this.resolveSubpathImport(spec, parent, forceCjs);
+            return yield* this.resolveSubpathImport(spec, parent, forceCjs);
         }
-        const { name, version, subpath } = parseNpmSpec(spec);
-        const pkg = this.ensureInstalled(name, version, parent);
+        const { name, version: range, subpath } = parseNpmSpec(spec);
+        const pkg = yield* this.ensureInstalled(name, range, parent);
         return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
     }
 
     localPath(specPath: string): string {
-        const { name, version, subpath } = parseNpmSpec(specPath);
-        // Resolve the actual installed version 鈥?the spec may contain a range
-        // like "latest" that doesn't match the on-disk directory name.
-        const exactVer = this.resolveVersion(name, version);
-        const dir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
-        const ctx = createCtx(dir);
-        if (!ctx) throw err(ErrorKind.ModuleNotFound, `Package not installed: ${specPath}`);
-        return resolveSubpath(ctx, subpath) ?? (() => { throw err(ErrorKind.ModuleNotFound, `Cannot resolve ${subpath} in ${name}`); })();
+        const match = specPath.match(/^npm:([^@]+)@([^/]+)(\/.*)?$/);
+        if (!match) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specPath: ${specPath}`);
+        const [, name, version, subpath] = match;
+        const pkgDir = joinPaths(this.cacheDir, `${name}@${version}`);
+        if (!fs.exists(pkgDir)) throw err(ErrorKind.ModuleNotFound, `Package not in cache: ${specPath}`);
+        const ctx = createCtx(pkgDir);
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkgDir}`);
+        const localPath = resolveSubpath(ctx, subpath || '.');
+        if (!localPath) throw err(ErrorKind.ModuleNotFound, `Cannot resolve path for ${specPath}`);
+        return localPath;
     }
 
-    // ---------------------------------------------------------------------------
-
-    /** Build a canonical npm specPath: npm:name@version/subpath */
     private static specPath(name: string, version: string, subpath: string): string {
         return `npm:${name}@${version}` + (subpath ? `/${subpath}` : '');
     }
 
-    private resolveRelative(spec: string, parent: string, forceCjs: boolean): ModuleInfo {
+    private *resolveRelative(spec: string, parent: string, forceCjs: boolean): Flow<ModuleInfo> {
         const { name, version, subpath } = parseNpmSpec(parent);
-        // Use ensureInstalled to resolve the actual installed directory.
-        // The version from the parent specifier may be a range (e.g. "latest",
-        // "^1.0.0") that doesn't match the actual directory name on disk.
-        const pkg = this.ensureInstalled(name, version, parent);
-        const dir = pkg.dir;
-        const ctx = createCtx(dir, { forceCjs });
-        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
-
-        // Resolve the parent's actual localPath on disk.
+        const pkg = yield* this.ensureInstalled(name, version, parent);
+        const ctx = createCtx(pkg.dir, { forceCjs });
+        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
         let parentLocal = resolveSubpath(ctx, subpath || '.');
         if (!parentLocal) {
-            // Fallback: subpath may be a Deno-rewritten path (e.g. "b/index.js"
-            // mapping to "lib/index.js"). Search the package directory for a file
-            // with the same basename and compatible extension.
             const targetName = subpath.split('/').pop()!;
-            parentLocal = this.findFileByBasename(dir, targetName, subpath);
+            parentLocal = this.findFileByBasename(pkg.dir, targetName, subpath);
         }
         if (!parentLocal) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath || '.'}" in ${name}@${pkg.resolvedVer}`);
-
         const targetLocal = normalizePath(joinPaths(dirname(parentLocal), spec));
-        // Verify the target file exists
         const resolvedLocal = resolveFile(targetLocal);
         if (!resolvedLocal) throw err(ErrorKind.FileNotFound, `Cannot resolve "${spec}" from "${parent}": file not found at ${targetLocal}`);
-
-        // Compute the subpath relative to pkgDir for the canonical specPath
-        const relToDir = normalizePath(resolvedLocal.slice(dir.length + 1));
+        const relToDir = normalizePath(resolvedLocal.slice(pkg.dir.length + 1));
         return {
             specPath: NpmHandler.specPath(name, pkg.resolvedVer, relToDir),
             localPath: resolvedLocal,
@@ -205,52 +164,19 @@ export class NpmHandler implements ProtocolHandler {
         };
     }
 
-    /** Resolve a subpath import ("#xxx") within the parent npm package. */
-    private resolveSubpathImport(spec: string, parent: string, forceCjs: boolean): ModuleInfo {
+    private *resolveSubpathImport(spec: string, parent: string, forceCjs: boolean): Flow<ModuleInfo> {
         const { name, version } = parseNpmSpec(parent);
-        const pkg = this.ensureInstalled(name, version, parent);
+        const pkg = yield* this.ensureInstalled(name, version, parent);
         const ctx = createCtx(pkg.dir, { forceCjs });
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
         const localPath = resolveImports(ctx, spec);
-        if (!localPath) throw err(ErrorKind.ModuleNotFound,
-            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} 鈥?not found in package.json "imports"`);
+        if (!localPath) throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} - not found in package.json "imports"`);
         return {
             specPath: NpmHandler.specPath(name, pkg.resolvedVer, localPath.slice(pkg.dir.length + 1)),
             localPath,
             format: detectFormat(localPath),
             fileKind: guessFileKind(localPath),
         };
-    }
-
-    /** Find a file in dir matching basename, preferring paths that end with subpath's suffix. */
-    private findFileByBasename(dir: string, basename: string, subpath: string): string | null {
-        const subSuffix = subpath.includes('/') ? subpath.slice(0, subpath.lastIndexOf('/')) : '';
-        const results: string[] = [];
-        const walk = (d: string) => {
-            let entries: string[];
-            try { entries = fs.readdir(d); } catch { return; }
-            for (const e of entries) {
-                const p = joinPaths(d, e);
-                try {
-                    if (fs.stat(p).isDirectory) {
-                        // Skip node_modules to avoid deep recursion
-                        if (e !== 'node_modules') walk(p);
-                    } else if (e === basename) {
-                        results.push(p);
-                    }
-                } catch {}
-            }
-        };
-        walk(dir);
-        if (!results.length) return null;
-        // Prefer result whose relative path ends with the subpath directory prefix
-        if (subSuffix) {
-            for (const r of results) {
-                const rel = normalizePath(r.slice(dir.length + 1));
-                if (rel.endsWith(subSuffix + '/' + basename)) return r;
-            }
-        }
-        return results[0]!;
     }
 
     private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
@@ -263,9 +189,8 @@ export class NpmHandler implements ProtocolHandler {
                 ? `(exports: ${JSON.stringify(pkg.exports)})`
                 : pkg.main ? `(main: "${pkg.main}")` : '(no main field)';
             throw err(ErrorKind.ModuleNotFound,
-                `Cannot resolve "${subpath || '.'}" in ${name}@${ver} 鈥?${hint}\n` +
-                `  The package may not expose a default entry point. ` +
-                `Try importing a specific subpath like npm:${name}@${ver}/<file>`);
+                `Cannot resolve "${subpath || '.'}" in ${name}@${ver} - ${hint}\n` +
+                `  The package may not expose a default entry point. Try importing a specific subpath like npm:${name}@${ver}/<file>`);
         }
         return {
             specPath: NpmHandler.specPath(name, ver, subpath),
@@ -275,107 +200,48 @@ export class NpmHandler implements ProtocolHandler {
         };
     }
 
-    private ensureInstalled(name: string, version: string, parent?: string): { dir: string; resolvedVer: string } {
-        // Check local node_modules first
-        const local = this.findLocal(name, parent);
-        if (local) {
-            const pkg = readPkgFresh(local);
-            return { dir: local, resolvedVer: pkg?.version ?? version };
-        }
-
-        // Check global cache
-        const exactVer = this.resolveVersion(name, version);
-        const pkgDir   = joinPaths(this.cacheDir, `${name}@${exactVer}`);
-        if (!fs.exists(pkgDir)) {
-            if (!this.cfg.silent && !isatty) log.info(`馃摝 ${name}@${exactVer}`);
-            this.install(name, exactVer, pkgDir);
-        }
-        return { dir: pkgDir, resolvedVer: exactVer };
-    }
-
-    private resolveVersion(name: string, range: string): string {
-        const key = `${name}@${range}`;
-        if (this.verCache.has(key)) return this.verCache.get(key)!;
-
-        const meta = this.fetchMeta(name);
-        const tags  = meta['dist-tags'] ?? {};
-        let resolved: string;
-
-        if (!range || range === 'latest') {
-            resolved = tags.latest ?? this.highestVersion(meta);
-        } else if (tags[range]) {
-            resolved = tags[range]!;
-        } else if (/^\d+\.\d+\.\d+/.test(range) && meta.versions[range]) {
-            resolved = range;
-        } else {
-            resolved = matchLatestVersion(Object.keys(meta.versions), range)
-                ?? tags.latest ?? this.highestVersion(meta);
-        }
-
-        this.verCache.set(key, resolved);
-        return resolved;
-    }
-
     private highestVersion(meta: NpmMeta): string {
-        return Object.keys(meta.versions)
-            .sort(compareVersions).at(-1)!;
+        return Object.keys(meta.versions).sort(compareVersions).at(-1)!;
     }
 
-    private fetchMeta(name: string): NpmMeta {
-        const cfg      = this.getNpmCfg();
-        const registry = (name.startsWith('@') && cfg.scopeRegistries[name.split('/')[0]!])
-            ? cfg.scopeRegistries[name.split('/')[0]!]!
-            : cfg.registry;
-        const cacheFile = joinPaths(this.cacheDir, name, 'meta.json');
-        const cacheTs   = cacheFile + '.ts';
-        if (fs.exists(cacheFile)) {
-            try {
-                const age = Date.now() - +(readText(cacheTs) || '0');
-                if (age < 24 * 60 * 60 * 1000) return safeParse<NpmMeta>(readText(cacheFile));
-            } catch {}
+    private findFileByBasename(dir: string, basename: string, subpath: string): string | null {
+        const subSuffix = subpath.includes('/') ? subpath.slice(0, subpath.lastIndexOf('/')) : '';
+        const results: string[] = [];
+        const walk = (d: string) => {
+            let entries: string[];
+            try { entries = fs.readdir(d); } catch { return; }
+            for (const e of entries) {
+                const p = joinPaths(d, e);
+                try {
+                    if (fs.stat(p).isDirectory) {
+                        if (e !== 'node_modules') walk(p);
+                    } else if (e === basename) {
+                        results.push(p);
+                    }
+                } catch {}
+            }
+        };
+        walk(dir);
+        if (!results.length) return null;
+        if (subSuffix) {
+            for (const r of results) {
+                const rel = normalizePath(r.slice(dir.length + 1));
+                if (rel.endsWith(subSuffix + '/' + basename)) return r;
+            }
         }
-        const body = this.fetchBytesSync(`${registry}/${name}`);
-        const meta = safeParse<NpmMeta>(engine.decodeString(body as any));
-        ensureDir(dirname(cacheFile));
-        writeText(cacheFile, JSON.stringify(meta, null, 2));
-        writeText(cacheTs, String(Date.now()));
-        return meta;
-    }
-
-    private install(name: string, ver: string, dir: string): void {
-        const meta    = this.fetchMeta(name);
-        const tarball = meta.versions[ver]?.dist.tarball;
-        if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
-        const body = this.fetchBytesSync(tarball);
-        const files = unTarGz(body as any);
-        ensureDir(dir);
-        const seen = new Set<string>();
-        for (const f of files) {
-            let p = f.path;
-            if (p.startsWith('package/')) p = p.slice(8);
-            const target = joinPaths(dir, p);
-            if (f.type === 'dir') { if (!seen.has(target)) { ensureDir(target); seen.add(target); } }
-            else { const d = dirname(target); if (!seen.has(d)) { ensureDir(d); seen.add(d); } fs.writeFile(target, f.content as any); }
-        }
+        return results[0]!;
     }
 
     private findLocal(name: string, parent?: string): string | null {
         const search: string[] = [];
         if (parent) {
-            let startDir: string;
-            if (parent.startsWith('npm:')) {
-                // Parent is in the global cache (e.g. npm:lodash@4.17.21).
-                // Look for sibling node_modules under the cache directory,
-                // since npm hoists nested deps to the cache root.
-                startDir = this.cacheDir;
-            } else {
-                startDir = dirname(parent);
-            }
-            let d = startDir;
-            const root = uname.sysname.includes('Windows') ? d.split(':')[0] + ':/' : '/';
-            while (d && d !== root) {
-                search.push(joinPaths(d, 'node_modules'));
-                const up = dirname(d); if (up === d) break; d = up;
+            let startDir = parent.startsWith('npm:') ? this.cacheDir : dirname(parent);
+            const root = uname.sysname.includes('Windows') ? startDir.split(':')[0] + ':/' : '/';
+            while (startDir && startDir !== root) {
+                search.push(joinPaths(startDir, 'node_modules'));
+                const up = dirname(startDir);
+                if (up === startDir) break;
+                startDir = up;
             }
         }
         search.push(joinPaths(os.cwd, 'node_modules'));
@@ -390,140 +256,96 @@ export class NpmHandler implements ProtocolHandler {
         return (this.npmCfg ??= loadNpmConfig());
     }
 
-    // -------------------------------------------------------------------------
-    // async resolve 鈥?parallel precache path (uses fetchAsync, no engine.waitPromise)
-    // -------------------------------------------------------------------------
-
-    async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
-        const forceCjs = attr?.cjs === true || (attr?.type !== 'module' && !parent.startsWith('npm:'));
-        if ((spec.startsWith('./') || spec.startsWith('../')) && parent.startsWith('npm:')) {
-            return this.resolveRelativeAsync(spec, parent, forceCjs);
-        }
-        if (spec === '.' && parent.startsWith('npm:')) {
-            return this.resolveRelativeAsync('.', parent, forceCjs);
-        }
-        if (spec.startsWith('#') && parent.startsWith('npm:')) {
-            return this.resolveSubpathImportAsync(spec, parent, forceCjs);
-        }
-        const { name, version, subpath } = parseNpmSpec(spec);
-        const pkg = await this.ensureInstalledAsync(name, version, parent, onProgress);
-        return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
-    }
-
-    private async resolveRelativeAsync(spec: string, parent: string, forceCjs: boolean): Promise<ModuleInfo> {
-        const { name, version, subpath } = parseNpmSpec(parent);
-        const pkg = await this.ensureInstalledAsync(name, version, parent);
-        const dir = pkg.dir;
-        const ctx = createCtx(dir, { forceCjs });
-        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
-        let parentLocal = resolveSubpath(ctx, subpath || '.');
-        if (!parentLocal) {
-            const targetName = subpath.split('/').pop()!;
-            parentLocal = this.findFileByBasename(dir, targetName, subpath);
-        }
-        if (!parentLocal) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath || '.'}" in ${name}@${pkg.resolvedVer}`);
-        const targetLocal = normalizePath(joinPaths(dirname(parentLocal), spec));
-        const resolvedLocal = resolveFile(targetLocal);
-        if (!resolvedLocal) throw err(ErrorKind.FileNotFound, `Cannot resolve "${spec}" from "${parent}": file not found at ${targetLocal}`);
-        const relToDir = normalizePath(resolvedLocal.slice(dir.length + 1));
-        return {
-            specPath: NpmHandler.specPath(name, pkg.resolvedVer, relToDir),
-            localPath: resolvedLocal,
-            format: detectFormat(resolvedLocal),
-            fileKind: guessFileKind(resolvedLocal),
-        };
-    }
-
-    private async resolveSubpathImportAsync(spec: string, parent: string, forceCjs: boolean): Promise<ModuleInfo> {
-        const { name, version } = parseNpmSpec(parent);
-        const pkg = await this.ensureInstalledAsync(name, version, parent);
-        const ctx = createCtx(pkg.dir, { forceCjs });
-        if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
-        const localPath = resolveImports(ctx, spec);
-        if (!localPath) throw err(ErrorKind.ModuleNotFound,
-            `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} 鈥?not found in package.json "imports"`);
-        return {
-            specPath: NpmHandler.specPath(name, pkg.resolvedVer, localPath.slice(pkg.dir.length + 1)),
-            localPath,
-            format: detectFormat(localPath),
-            fileKind: guessFileKind(localPath),
-        };
-    }
-
-    private async ensureInstalledAsync(name: string, version: string, parent?: string, onProgress?: ProgressCallback): Promise<{ dir: string; resolvedVer: string }> {
+    private *ensureInstalled(name: string, version: string, parent?: string): Flow<{ dir: string; resolvedVer: string }> {
         const local = this.findLocal(name, parent);
         if (local) {
             const pkg = readPkgFresh(local);
             return { dir: local, resolvedVer: pkg?.version ?? version };
         }
-        const exactVer = await this.resolveVersionAsync(name, version);
-        const pkgDir   = joinPaths(this.cacheDir, `${name}@${exactVer}`);
-        if (!fs.exists(pkgDir)) {
-            if (!this.cfg.silent && !isatty) log.info(`馃摝 ${name}@${exactVer}`);
-            await this.installAsync(name, exactVer, pkgDir, onProgress);
+        const exactVer = yield* this.resolveVersion(name, version);
+        const pkgDir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
+        const exists = yield { type: StepType.FS_EXISTS, path: pkgDir };
+        if (!exists) {
+            if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
+            yield* this.install(name, exactVer, pkgDir);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
     }
 
-    private async resolveVersionAsync(name: string, range: string): Promise<string> {
+    private *resolveVersion(name: string, range: string): Flow<string> {
         const key = `${name}@${range}`;
         if (this.verCache.has(key)) return this.verCache.get(key)!;
-        const meta = await this.fetchMetaAsync(name);
-        const tags  = meta['dist-tags'] ?? {};
+        const meta = yield* this.fetchMeta(name);
+        const tags = meta['dist-tags'] ?? {};
         let resolved: string;
-        if (!range || range === 'latest') {
-            resolved = tags.latest ?? this.highestVersion(meta);
-        } else if (tags[range]) {
-            resolved = tags[range]!;
-        } else if (/^\d+\.\d+\.\d+/.test(range) && meta.versions[range]) {
-            resolved = range;
-        } else {
-            resolved = matchLatestVersion(Object.keys(meta.versions), range)
-                ?? tags.latest ?? this.highestVersion(meta);
-        }
+        if (!range || range === 'latest') resolved = tags.latest ?? this.highestVersion(meta);
+        else if (tags[range]) resolved = tags[range]!;
+        else if (/^\d+\.\d+\.\d+/.test(range) && meta.versions[range]) resolved = range;
+        else resolved = matchLatestVersion(Object.keys(meta.versions), range) ?? tags.latest ?? this.highestVersion(meta);
         this.verCache.set(key, resolved);
         return resolved;
     }
 
-    private async fetchMetaAsync(name: string): Promise<NpmMeta> {
-        const cfg      = this.getNpmCfg();
+    private *fetchMeta(name: string): Flow<NpmMeta> {
+        const cfg = this.getNpmCfg();
         const registry = (name.startsWith('@') && cfg.scopeRegistries[name.split('/')[0]!])
             ? cfg.scopeRegistries[name.split('/')[0]!]!
             : cfg.registry;
         const cacheFile = joinPaths(this.cacheDir, name, 'meta.json');
-        const cacheTs   = cacheFile + '.ts';
-        if (fs.exists(cacheFile)) {
+        const cacheTs = cacheFile + '.ts';
+        const hasMeta = yield { type: StepType.FS_EXISTS, path: cacheFile };
+        const hasTs = yield { type: StepType.FS_EXISTS, path: cacheTs };
+        if (hasMeta && hasTs) {
             try {
-                const age = Date.now() - +(readText(cacheTs) || '0');
-                if (age < 24 * 60 * 60 * 1000) return safeParse<NpmMeta>(readText(cacheFile));
+                const tsText = (yield { type: StepType.FS_READ_TEXT, path: cacheTs }) as string;
+                const age = Date.now() - +(tsText || '0');
+                if (age < 24 * 60 * 60 * 1000) {
+                    return safeParse<NpmMeta>((yield { type: StepType.FS_READ_TEXT, path: cacheFile }) as string);
+                }
             } catch {}
         }
-        const { body } = await fetchAsync(`${registry}/${name}`, undefined, {
-            method: 'GET',
-            ...this.fetchOptions({ 'User-Agent': 'cts/' + version, Accept: 'application/json' }),
-        });
-        const meta = safeParse<NpmMeta>(engine.decodeString(new Uint8Array(body)));
-        ensureDir(dirname(cacheFile));
-        writeText(cacheFile, JSON.stringify(meta, null, 2));
-        writeText(cacheTs, String(Date.now()));
+        const { body } = yield {
+            type: StepType.NET_FETCH,
+            url: `${registry}/${name}`,
+            headers: { 'User-Agent': 'cts/' + version, Accept: 'application/json' },
+            timeout: this.cfg.requestTimeout,
+        };
+        const meta = safeParse<NpmMeta>(engine.decodeString(body));
+        yield { type: StepType.FS_ENSURE_DIR, path: dirname(cacheFile) };
+        yield { type: StepType.FS_WRITE_TEXT, path: cacheFile, text: JSON.stringify(meta, null, 2) };
+        yield { type: StepType.FS_WRITE_TEXT, path: cacheTs, text: String(Date.now()) };
         return meta;
     }
 
-    private async installAsync(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Promise<void> {
-        const meta    = await this.fetchMetaAsync(name);
+    private *install(name: string, ver: string, dir: string): Flow<void> {
+        const meta = yield* this.fetchMeta(name);
         const tarball = meta.versions[ver]?.dist.tarball;
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
-        const { body } = await fetchAsync(tarball, onProgress, this.fetchOptions());
-        const files = unTarGz(new Uint8Array(body).buffer);
-        ensureDir(dir);
+        const { body } = yield { type: StepType.NET_FETCH, url: tarball, timeout: this.cfg.requestTimeout };
+        const files = (yield { type: StepType.ARCHIVE_UNTAR_GZ, data: body }) as TarFile[];
+        yield { type: StepType.FS_ENSURE_DIR, path: dir };
+        yield* this.writeArchive(dir, files);
+    }
+
+    private *writeArchive(dir: string, files: TarFile[]): Flow<void> {
         const seen = new Set<string>();
         for (const f of files) {
             let p = f.path;
             if (p.startsWith('package/')) p = p.slice(8);
             const target = joinPaths(dir, p);
-            if (f.type === 'dir') { if (!seen.has(target)) { ensureDir(target); seen.add(target); } }
-            else { const d = dirname(target); if (!seen.has(d)) { ensureDir(d); seen.add(d); } fs.writeFile(target, f.content); }
+            if (f.type === 'dir') {
+                if (!seen.has(target)) {
+                    yield { type: StepType.FS_ENSURE_DIR, path: target };
+                    seen.add(target);
+                }
+                continue;
+            }
+            const d = dirname(target);
+            if (!seen.has(d)) {
+                yield { type: StepType.FS_ENSURE_DIR, path: d };
+                seen.add(d);
+            }
+            yield { type: StepType.FS_WRITE_BYTES, path: target, data: f.content };
         }
     }
 }
-

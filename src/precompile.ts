@@ -38,7 +38,7 @@ export function isCompilerWorker(): boolean {
 
 export async function runCompilerWorker(): Promise<void> {
     const pipe = worker.pipe!;
-    const transformer = new Transformer(false);
+    const transformer = new Transformer({ sourceMaps: false });
 
     pipe.onmessage = (raw: any) => {
         const task = raw as TransformTask;
@@ -133,6 +133,12 @@ export class PrecompileDriver {
         let transformDone = 0;
         let transformFail = 0;
 
+        // Use a single Promise that resolves when all transforms complete
+        let resolveTransforms: () => void;
+        const allTransformsDone = new Promise<void>(resolve => {
+            resolveTransforms = resolve;
+        });
+
         const ensureWorkers = (n: number) => {
             while (this.workers.length < n) {
                 const w = new TxWorker(this.workers.length, (r) => {
@@ -141,6 +147,10 @@ export class PrecompileDriver {
                     else { transformFail++; log.debug('precompile', () => `transform fail: ${r.localPath}: ${r.error}`); }
                     onProgress?.(transformDone + transformFail, taskTotal);
                     this.drain();
+                    // Check if all transforms are done
+                    if (transformDone + transformFail >= taskTotal) {
+                        resolveTransforms();
+                    }
                 });
                 this.workers.push(w);
                 log.debug('precompile', () => `spawned worker ${w.idx}`);
@@ -152,17 +162,8 @@ export class PrecompileDriver {
         this.pending = tasks;
         this.drain();
 
-        // Wait for all transforms
-        await new Promise<void>((resolve) => {
-            const check = () => {
-                if (transformDone + transformFail >= taskTotal) {
-                    resolve();
-                } else {
-                    timers.setTimeout(check, 10);
-                }
-            };
-            check();
-        });
+        // Wait for all transforms using Promise instead of polling
+        await allTransformsDone;
 
         log.debug('precompile', () => `transforms: ${transformDone} ok, ${transformFail} fail`);
 

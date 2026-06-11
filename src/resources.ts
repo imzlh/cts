@@ -14,11 +14,10 @@
 //   - Caches reflect post-install state
 //   - No background timers consume CPU
 
-import { clearResolveCache }  from './utils/io';
+import { clearResolveCache, clearNegativeCache }  from './utils/io';
 import { clearPkgCache }      from './pkg';
-import { connectionManager } from '@cnojs/http/connection';
-import { closeCurlPool }      from '@cnojs/http/client';
 import { clearDnsCache }      from '@cnojs/http/dns-cache';
+import { closeConnectionPools } from './flow';
 
 import { log } from './utils/log';
 
@@ -67,16 +66,9 @@ export const resources = {
 // Pre-register the standard pre-cache resources
 // These are no-ops if the resources were never opened.
 // ---------------------------------------------------------------------------
-
 resources.register(() => {
-    // Close all keep-alive TCP connections opened by sync/async fetch
-    // (protocol handlers call this during pre-cache too)
-    connectionManager.closeAll();
-});
-
-resources.register(() => {
-    // Close libcurl's shared client pool opened by @cnojs/http/client.
-    closeCurlPool();
+    // Close connection pools in flow.ts
+    closeConnectionPools();
 });
 
 resources.register(() => {
@@ -92,7 +84,8 @@ resources.register(() => {
 });
 
 resources.register(() => {
-    // Clear file resolution cache: same reason as above.
+    // Clear file resolution cache and negative cache
     clearResolveCache();
+    clearNegativeCache();
 });
 

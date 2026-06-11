@@ -1,15 +1,12 @@
-// protocol/data.ts — data: URL handler
-//
-// Fix vs original: urlMap tracks resolved paths so getLocalPath() is O(1)
-// and the data URL is only parsed once per unique URL.
+// protocol/data.ts - data: URL handler
 
 import type { RuntimeConfig, ModuleInfo, FileKind } from '../types';
 import type { ProtocolHandler } from './base';
+import { StepType, type Flow } from '../flow';
 import { joinPaths, dirname } from '../utils/path';
-import { ensureDir } from '../utils/io';
 import { hashString, errMsg } from '../utils/misc';
 import { err, ErrorKind } from '../errors';
-import { fs, engine, crypto } from '../utils/index';
+import { engine, crypto } from '../utils/index';
 
 interface DataParsed { mime: string; isBase64: boolean; data: string }
 
@@ -46,11 +43,16 @@ function mimeToKind(mime: string): FileKind {
 
 export class DataHandler implements ProtocolHandler {
     readonly protocols = ['data'];
-    private readonly resolved = new Map<string, string>(); // specPath → localPath
+    private readonly resolved = new Map<string, string>();
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
-    resolve(spec: string, _parent: string): ModuleInfo {
+    /** Clear resolved cache */
+    clearCache(): void {
+        this.resolved.clear();
+    }
+
+    *resolve(spec: string, _parent: string): Flow<ModuleInfo> {
         if (this.resolved.has(spec)) {
             const localPath = this.resolved.get(spec)!;
             const { mime } = parseDataUrl(spec);
@@ -59,14 +61,17 @@ export class DataHandler implements ProtocolHandler {
 
         const parsed = parseDataUrl(spec);
         const localPath = joinPaths(this.cfg.cacheDir, 'data', hashString(spec) + mimeToExt(parsed.mime));
-
-        if (!fs.exists(localPath)) {
-            ensureDir(dirname(localPath));
+        const exists = yield { type: StepType.FS_EXISTS, path: localPath };
+        if (!exists) {
+            yield { type: StepType.FS_ENSURE_DIR, path: dirname(localPath) };
             if (parsed.isBase64) {
-                try { fs.writeFile(localPath, crypto.base64Decode(parsed.data)); }
-                catch (e) { throw err(ErrorKind.Generic, `data: base64 decode failed: ${errMsg(e)}`); }
+                try {
+                    yield { type: StepType.FS_WRITE_BYTES, path: localPath, data: crypto.base64Decode(parsed.data) };
+                } catch (e) {
+                    throw err(ErrorKind.Generic, `data: base64 decode failed: ${errMsg(e)}`);
+                }
             } else {
-                fs.writeFile(localPath, engine.encodeString(decodeURIComponent(parsed.data)));
+                yield { type: StepType.FS_WRITE_BYTES, path: localPath, data: engine.encodeString(decodeURIComponent(parsed.data)) };
             }
         }
 
@@ -76,7 +81,6 @@ export class DataHandler implements ProtocolHandler {
 
     localPath(specPath: string): string {
         if (this.resolved.has(specPath)) return this.resolved.get(specPath)!;
-        // Recompute deterministically (no I/O)
         const { mime } = parseDataUrl(specPath);
         return joinPaths(this.cfg.cacheDir, 'data', hashString(specPath) + mimeToExt(mime));
     }

@@ -21,12 +21,10 @@ import { log } from './utils/log';
 import { fs, engine } from './utils/index';
 import { JscCache, isRemote } from './jsc';
 
-const store: CModuleEngine.Module[] = [];
-
 import { buildWasmModule, type WasmImportSource } from './wasm';
 
 export class ModuleLoader {
-    private readonly transformer = new Transformer();
+    private readonly transformer: Transformer;
     private readonly cjs:        CjsLoader;
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
     /** Modules currently being compiled (circular dep detection). */
@@ -34,10 +32,18 @@ export class ModuleLoader {
     private readonly wasmCache   = new Map<string, CModuleEngine.Module>();
     readonly jsc                 = new JscCache();
 
+    /** Track all loaded modules for proper cleanup */
+    private readonly loadedModules = new Set<CModuleEngine.Module>();
+
     constructor(
         private readonly resolver: ModuleResolver,
         private readonly cfg:      RuntimeConfig,
     ) {
+        this.transformer = new Transformer({
+            sourceMaps: true,
+            jsxPragma: cfg.jsxPragma,
+            jsxFragmentPragma: cfg.jsxFragmentPragma,
+        });
         this.cjs = new CjsLoader(this.buildCjsDeps());
 
         let requireFn: Function | undefined;
@@ -64,6 +70,13 @@ export class ModuleLoader {
             enumerable: false,
             configurable: false,
         })
+    }
+
+    /** Clean up loaded modules when no longer needed */
+    clearLoadedModules(): void {
+        this.loadedModules.clear();
+        this.esmCache.clear();
+        this.wasmCache.clear();
     }
 
     // -------------------------------------------------------------------------
@@ -118,7 +131,7 @@ export class ModuleLoader {
             const placeholder = engine.Module.create(info.specPath);
             // Register immediately so subsequent circular refs get this object
             this.esmCache.set(info.localPath, placeholder);
-            store.push(placeholder);
+            this.loadedModules.add(placeholder);
             return placeholder;
         }
 
@@ -131,7 +144,7 @@ export class ModuleLoader {
             if (cached) {
                 Object.assign(cached.meta, meta);
                 this.esmCache.set(info.localPath, cached);
-                store.push(cached);
+                this.loadedModules.add(cached);
                 return cached;
             }
         }
@@ -162,7 +175,7 @@ export class ModuleLoader {
 
         Object.assign(mod.meta, meta);
         this.esmCache.set(info.localPath, mod);
-        store.push(mod);
+        this.loadedModules.add(mod);
         return mod;
     }
 
@@ -187,7 +200,7 @@ export class ModuleLoader {
         }
         Object.assign(mod.meta, meta);
         this.esmCache.set(info.localPath, mod);
-        store.push(mod);
+        this.loadedModules.add(mod);
         return mod;
     }
 
@@ -200,7 +213,7 @@ export class ModuleLoader {
     private loadTextSource(code: string, info: ModuleInfo): CModuleEngine.Module {
         const mod = engine.Module.create(info.specPath);
         mod.export('default', code);
-        store.push(mod);
+        this.loadedModules.add(mod);
         return mod;
     }
 
@@ -235,7 +248,7 @@ export class ModuleLoader {
             mod.export('default', exports);
         }
 
-        store.push(mod);
+        this.loadedModules.add(mod);
         return mod;
     }
 
@@ -304,21 +317,21 @@ export class ModuleLoader {
         }
 
         this.wasmCache.set(info.localPath, result.mod);
-        store.push(result.mod);
+        this.loadedModules.add(result.mod);
         return result.mod;
     }
 
     private loadBytes(info: ModuleInfo): CModuleEngine.Module {
         const mod = engine.Module.create(info.specPath);
         mod.export('default', new Uint8Array(fs.readFile(info.localPath)));
-        store.push(mod);
+        this.loadedModules.add(mod);
         return mod;
     }
 
     private loadText(info: ModuleInfo): CModuleEngine.Module {
         const mod = engine.Module.create(info.specPath);
         mod.export('default', readText(info.localPath));
-        store.push(mod);
+        this.loadedModules.add(mod);
         return mod;
     }
 

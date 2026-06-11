@@ -34,13 +34,16 @@ export interface ConfigOptions {
     lockDir?:       string;   // dir containing cts.lock (default: entry file dir)
     frozen?:        boolean;  // refuse to resolve anything not already in lock
     noLock?:        boolean;  // disable lock entirely
+    // JSX options
+    jsxPragma?:     string;   // JSX element factory (default: React.createElement)
+    jsxFragmentPragma?: string; // JSX fragment factory (default: React.Fragment)
 }
 
 // Fields that are always required after createConfig()
 // Optional fields remain optional (no value → feature disabled)
 export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     'pathAliases'|'baseUrl'|'importMap'|'memoryLimit'|'maxStackSize'|
-    'lockDir'|'frozen'|'noLock'|'eval'>> {
+    'lockDir'|'frozen'|'noLock'|'eval'|'jsxPragma'|'jsxFragmentPragma'>> {
     pathAliases?:  Record<string, string[]>;
     baseUrl?:      string;
     importMap?:    Record<string, string>;
@@ -50,6 +53,8 @@ export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     frozen?:       boolean;
     noLock?:       boolean;
     eval?:         string;
+    jsxPragma?:    string;
+    jsxFragmentPragma?: string;
     // CLI parse output
     _?:            string;
     _args?:        string[];
