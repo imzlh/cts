@@ -54,5 +54,5 @@
         "out": "../api/",
         "disableSources": true
     },
-    "exclude": ["deps/sucrase/**/*"]
+    "exclude": ["deps/sucrase/**/*", "tests/**/*"]
 }

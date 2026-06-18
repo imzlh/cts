@@ -1,8 +1,11 @@
 import { readText, ensureDir, writeText } from './utils/io';
-import { fs, __use_fn } from './utils/index';
 import { unTarGz, type TarFile } from './utils/misc';
+import { isEnabled, log } from './utils/log';
 
-const curlMod = __use_fn('curl') as typeof CModuleCURL;
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
+const curlMod = import.meta.use('curl');
+const asyncfs = import.meta.use('asyncfs');
 
 export type ProgressCallback = (now: number, total: number) => void;
 export interface FetchOptions {
@@ -123,9 +126,19 @@ function configureCurl(curl: CModuleCURL.CURL, step: NetFetchStep): void {
         curl.setTimeout(step.timeout);
         curl.setConnectTimeout(step.timeout);
     }
-    if (step.onProgress) {
+    if (step.onProgress || isEnabled('fetch')) {
+        let lastLog = 0;
+        let lastDone = -1;
         curl.onProgress((dltotal, dlnow) => {
-            step.onProgress!(Number(dlnow), Number(dltotal));
+            const done = Number(dlnow);
+            const total = Number(dltotal);
+            step.onProgress?.(done, total);
+            const now = Date.now();
+            if (isEnabled('fetch') && done !== lastDone && now - lastLog >= 1000) {
+                lastLog = now;
+                lastDone = done;
+                log.debug('fetch', () => `progress ${shortUrl(step.url)} ${fmtProgress(done, total)}`);
+            }
             return true;
         });
     }
@@ -145,9 +158,9 @@ let syncPool: CModuleCURL.ConnPool | null = null;
 function getAsyncPool(): CModuleCURL.ConnPool {
     if (!asyncPool) {
         asyncPool = new curlMod.ConnPool({
-            maxConnections: 16,
-            maxConnectionsPerHost: 4,
-            pipelining: true,
+            maxConnections: 32,
+            maxConnectionsPerHost: 8,
+            pipelining: false,
         });
     }
     return asyncPool;
@@ -168,7 +181,10 @@ async function fetchAsync(step: NetFetchStep): Promise<NetFetchResult> {
     const pool = getAsyncPool();
     const curl = new curlMod.CURL(pool);
     configureCurl(curl, step);
+    log.debug('fetch', () => `start ${step.url}`);
+    const started = Date.now();
     const res = await curl.perform()
+    log.debug('fetch', () => `done ${step.url} ${res.status} ${fmtBytes(res.body ? res.body.byteLength : 0)} ${Date.now() - started}ms`);
     return toResult(res);
 }
 
@@ -176,7 +192,11 @@ function fetchSync(step: NetFetchStep): NetFetchResult {
     const pool = getSyncPool();
     const curl = new curlMod.CURL(pool);
     configureCurl(curl, step);
-    return toResult(curl.performSync());
+    log.debug('fetch', () => `start ${step.url}`);
+    const started = Date.now();
+    const res = curl.performSync();
+    log.debug('fetch', () => `done ${step.url} ${res.status} ${fmtBytes(res.body ? res.body.byteLength : 0)} ${Date.now() - started}ms`);
+    return toResult(res);
 }
 
 /** Close all connection pools */
@@ -211,7 +231,11 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => unknown): unknow
         case StepType.NET_FETCH:
             return fetch(step);
         case StepType.ARCHIVE_UNTAR_GZ:
-            return unTarGz(step.data);
+            log.debug('archive', () => `untar.gz start ${fmtBytes(byteLengthOf(step.data))}`);
+            const started = Date.now();
+            const files = unTarGz(step.data);
+            log.debug('archive', () => `untar.gz done ${files.length} entries ${Date.now() - started}ms`);
+            return files;
     }
 }
 
@@ -219,8 +243,66 @@ function executeSync(step: Step): unknown {
     return executeStep(step, fetchSync);
 }
 
+async function existsAsync(path: string): Promise<boolean> {
+    try {
+        await asyncfs.stat(path);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function ensureDirAsync(dir: string): Promise<void> {
+    if (await existsAsync(dir)) return;
+    const slash = dir.replace(/\\/g, '/').lastIndexOf('/');
+    const parent = slash > 0 ? dir.slice(0, slash) : '';
+    if (parent && parent !== dir && parent !== '.') await ensureDirAsync(parent);
+    try {
+        await asyncfs.mkdir(dir, 0o755);
+    } catch {
+        if (!await existsAsync(dir)) throw new Error(`Failed to create directory: ${dir}`);
+    }
+}
+
+async function writeFileAsync(path: string, data: Uint8Array | ArrayBuffer): Promise<void> {
+    const bytes = (data instanceof Uint8Array ? data : new Uint8Array(data)) as Uint8Array<ArrayBuffer>;
+    const file = await asyncfs.open(path, 'w');
+    try {
+        let off = 0;
+        while (off < bytes.byteLength) {
+            off += await file.write(bytes.subarray(off));
+        }
+    } finally {
+        await file.close();
+    }
+}
+
 async function executeAsync(step: Step): Promise<unknown> {
-    return executeStep(step, fetchAsync);
+    switch (step.type) {
+        case StepType.FS_EXISTS:
+            return existsAsync(step.path);
+        case StepType.FS_READ_TEXT:
+            return engine.decodeString(await asyncfs.readFile(step.path));
+        case StepType.FS_READ_BYTES:
+            return asyncfs.readFile(step.path);
+        case StepType.FS_WRITE_TEXT:
+            await writeFileAsync(step.path, engine.encodeString(step.text));
+            return undefined;
+        case StepType.FS_WRITE_BYTES:
+            await writeFileAsync(step.path, step.data);
+            return undefined;
+        case StepType.FS_ENSURE_DIR:
+            await ensureDirAsync(step.path);
+            return undefined;
+        case StepType.NET_FETCH:
+            return fetchAsync(step);
+        case StepType.ARCHIVE_UNTAR_GZ:
+            log.debug('archive', () => `untar.gz start ${fmtBytes(byteLengthOf(step.data))}`);
+            const started = Date.now();
+            const files = unTarGz(step.data);
+            log.debug('archive', () => `untar.gz done ${files.length} entries ${Date.now() - started}ms`);
+            return files;
+    }
 }
 
 export function runSync<T>(flow: Flow<T>): T {
@@ -248,3 +330,22 @@ export async function runAsync<T>(flow: Flow<T>): Promise<T> {
 }
 
 export type { TarFile };
+
+function byteLengthOf(data: Uint8Array | ArrayBuffer): number {
+    return data instanceof Uint8Array ? data.byteLength : data.byteLength;
+}
+
+function fmtProgress(done: number, total: number): string {
+    if (total > 0) return `${fmtBytes(done)}/${fmtBytes(total)} ${Math.floor(done / total * 100)}%`;
+    return `${fmtBytes(done)}`;
+}
+
+function fmtBytes(n: number): string {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+    return `${(n / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function shortUrl(url: string): string {
+    return url.length <= 100 ? url : '...' + url.slice(-97);
+}

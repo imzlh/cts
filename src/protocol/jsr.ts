@@ -3,13 +3,14 @@
 import type { RuntimeConfig, ModuleInfo, ParsedJsrSpec, JsrPackageMeta, JsrVersionMeta } from '../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow } from '../flow';
+import { StepType, type Flow, type ProgressCallback } from '../flow';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { safeParse, isCacheExpired, matchLatestVersion } from '../utils/misc';
 import { log } from '../utils/log';
 import { isatty } from '../utils/progress';
 import { err, ErrorKind } from '../errors';
-import { engine } from '../utils/index';
+
+const engine = import.meta.use('engine');
 
 const JSR = 'https://jsr.io';
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
@@ -25,7 +26,7 @@ export class JsrHandler implements ProtocolHandler {
         this.resolved.clear();
     }
 
-    *resolve(spec: string, parent: string): Flow<ModuleInfo> {
+    *resolve(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
         let parsed: ParsedJsrSpec;
         if ((spec.startsWith('./') || spec.startsWith('../')) && parent.startsWith('jsr:')) {
             const pp = this.parseSpec(parent);
@@ -43,7 +44,7 @@ export class JsrHandler implements ProtocolHandler {
         else if (!/^\d+\.\d+\.\d+/.test(parsed.version)) parsed.version = yield* this.resolveVersion(parsed.scope, parsed.name, parsed.version);
 
         const filePath = yield* this.resolveFilePath(parsed);
-        const localPath = yield* this.download(parsed.scope, parsed.name, parsed.version!, filePath);
+        const localPath = yield* this.download(parsed.scope, parsed.name, parsed.version!, filePath, onProgress);
         const specPath = `jsr:@${parsed.scope}/${parsed.name}@${parsed.version}/${filePath}`;
         this.resolved.set(specPath, localPath);
         return { specPath, localPath, format: 'esm', fileKind: guessFileKind(localPath) };
@@ -110,7 +111,9 @@ export class JsrHandler implements ProtocolHandler {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
             } catch {}
         }
-        const { body } = yield { type: StepType.NET_FETCH, url: `${JSR}/@${scope}/${name}/meta.json`, timeout: this.cfg.requestTimeout };
+        const url = `${JSR}/@${scope}/${name}/meta.json`;
+        log.debug('jsr', () => `fetch meta @${scope}/${name} <- ${url}`);
+        const { body } = yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout };
         const meta = safeParse<JsrPackageMeta>(engine.decodeString(body));
         if (!meta.latest) throw err(ErrorKind.VersionNotFound, `@${scope}/${name}: registry returned no latest`);
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
@@ -128,21 +131,24 @@ export class JsrHandler implements ProtocolHandler {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
             } catch {}
         }
-        const { body } = yield { type: StepType.NET_FETCH, url: `${JSR}/@${scope}/${name}/${ver}_meta.json`, timeout: this.cfg.requestTimeout };
+        const url = `${JSR}/@${scope}/${name}/${ver}_meta.json`;
+        log.debug('jsr', () => `fetch version meta @${scope}/${name}@${ver} <- ${url}`);
+        const { body } = yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout };
         const meta = safeParse<JsrVersionMeta>(engine.decodeString(body));
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
         yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: Date.now() }, null, 2) };
         return meta;
     }
 
-    private *download(scope: string, name: string, ver: string, file: string): Flow<string> {
+    private *download(scope: string, name: string, ver: string, file: string, onProgress?: ProgressCallback): Flow<string> {
         const local = joinPaths(this.cfg.cacheDir, 'jsr', scope, name, ver, file);
         const exists = yield { type: StepType.FS_EXISTS, path: local };
         if (!exists) {
             if (!this.cfg.silent && !isatty) log.download(`jsr:@${scope}/${name}@${ver}/${file}`);
             const url = `${JSR}/@${scope}/${name}/${ver}/${file}`;
+            log.debug('jsr', () => `fetch file @${scope}/${name}@${ver}/${file} <- ${url}`);
             yield { type: StepType.FS_ENSURE_DIR, path: dirname(local) };
-            const { body } = yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout };
+            const { body } = yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout, onProgress };
             yield { type: StepType.FS_WRITE_BYTES, path: local, data: body };
         }
         return local;

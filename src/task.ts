@@ -6,15 +6,21 @@
 //
 // `deno run [flags] <file>` in task commands is translated to a direct cts
 // re-invocation so the same cache/lock settings apply.  All other commands
-// are executed through the OS shell.
+// are resolved via BinResolver (lock bin index + node_modules/.bin) and
+// executed directly. If a command cannot be resolved as a bin, it fails.
 
 import { dirname, joinPaths } from './utils/path';
 import { readText } from './utils/io';
 import { stripJsonc, safeParse, errMsg } from './utils/misc';
-import { fs, process, console, os, uname } from './utils/index';
 import { log } from './utils/log';
+import { uname } from './utils/index';
+import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
+import { LockStore } from './lock';
 
-
+const os = import.meta.use('os');
+const console = import.meta.use('console');
+const fs = import.meta.use('fs');
+const process = import.meta.use('process');
 
 // ---------------------------------------------------------------------------
 // deno.json task schema
@@ -28,6 +34,130 @@ type TaskDef = string | {
 
 interface DenoConfig {
     tasks?: Record<string, TaskDef>;
+}
+
+// ---------------------------------------------------------------------------
+// Bin resolver — resolves command names to executable paths
+// ---------------------------------------------------------------------------
+
+export interface ResolvedBin {
+    /** Absolute path to the JS entry file (runnable by cts directly) */
+    entry: string;
+    /** Original bin path (.cmd, shell wrapper, etc.) before resolution */
+    binPath: string;
+    /** True if we had to fall back to cmd.exe / sh because the wrapper couldn't be parsed */
+    fallback: boolean;
+    /** Short explanation useful for debugging resolver decisions */
+    reason?: string;
+}
+
+const WIN_BIN_EXTS = ['.cmd', '.CMD', '.bat', '.BAT'];
+
+export class BinResolver {
+    private readonly isWin: boolean;
+
+    constructor(private lockStore: LockStore) {
+        this.isWin = uname.sysname.includes('Windows');
+    }
+
+    /**
+     * Resolve a binary name to a runnable JS entry path.
+     * Priority: local node_modules/.bin > lock bin index.
+     * Returns null if name looks like a path or flag, or if the binary cannot be found.
+     *
+     * When possible, parses .cmd/.bat/shell wrappers to extract the real JS
+     * entry so it can be run directly by the cts runtime.
+     */
+    resolve(name: string, cwd: string): ResolvedBin | null {
+        if (name.startsWith('/') || name.startsWith('.') || name.includes('/')) return null;
+        if (name.startsWith('-')) return null;
+
+        // 1. Local node_modules/.bin
+        const local = this.findLocalBin(name, cwd);
+        if (local) return this.resolveEntry(local);
+
+        // 2. Lock bin index
+        const lockBin = this.lockStore.getBin(name);
+        if (lockBin) return this.resolveEntry(lockBin.path);
+
+        return null;
+    }
+
+    private findLocalBin(name: string, cwd: string): string | null {
+        let dir = cwd.replace(/\\/g, '/');
+        const root = this.isWin ? dir.split(':')[0] + ':/' : '/';
+        while (true) {
+            const base = joinPaths(dir, 'node_modules', '.bin', name);
+            if (this.isWin) {
+                // On Windows package managers often create both an extensionless
+                // POSIX shell shim and a .CMD/.BAT wrapper.  Prefer the Windows
+                // wrapper; running/parsing the POSIX shim on Windows can silently
+                // go down the wrong path.
+                for (const ext of WIN_BIN_EXTS) {
+                    const c = base + ext;
+                    if (fs.exists(c)) return c;
+                }
+            }
+            // Unix: extensionless symlink/wrapper.  Also a last resort on Windows
+            // if no .cmd/.bat exists.
+            if (fs.exists(base)) return base;
+            if (dir === root) break;
+            const up = dirname(dir);
+            if (up === dir) break;
+            dir = up;
+        }
+        return null;
+    }
+
+    /**
+     * Given a bin path (from node_modules/.bin or lock), try to extract the
+     * real JS entry file from wrapper scripts.  Falls back to running the
+     * bin through cmd.exe / sh if the wrapper can't be parsed.
+     */
+    private resolveEntry(binPath: string): ResolvedBin {
+        const normPath = binPath.replace(/\\/g, '/');
+        const isNodeModulesBin = normPath.includes('/node_modules/.bin/');
+
+        if (isNodeModulesBin) {
+            if (this.isWin) {
+                // Find the .cmd/.bat file
+                let cmdPath: string | null = null;
+                if (normPath.toLowerCase().endsWith('.cmd') || normPath.toLowerCase().endsWith('.bat')) {
+                    cmdPath = binPath;
+                } else {
+                    for (const ext of WIN_BIN_EXTS) {
+                        const c = binPath + ext;
+                        if (fs.exists(c)) { cmdPath = c; break; }
+                    }
+                }
+                if (cmdPath) {
+                    const entry = resolveWinBinEntry(cmdPath);
+                    if (entry) return { entry, binPath: cmdPath, fallback: false, reason: 'win-cmd-entry' };
+                    // Can't parse the .cmd — fall back to cmd.exe
+                    return { entry: cmdPath, binPath: cmdPath, fallback: true, reason: 'unparsed-win-cmd' };
+                }
+                // No .cmd/.bat found for this node_modules/.bin entry —
+                // the extensionless file might be a raw JS script with a shebang
+                const entry = resolveUnixBinEntry(binPath);
+                if (entry) return { entry, binPath, fallback: false, reason: 'win-posix-shim-entry' };
+            } else {
+                // Unix: parse shebang / wrapper for real JS entry
+                const entry = resolveUnixBinEntry(binPath);
+                if (entry) return { entry, binPath, fallback: false, reason: 'unix-shim-entry' };
+                // Wrapper couldn't be parsed — mark as fallback
+                return { entry: binPath, binPath, fallback: true, reason: 'unparsed-unix-shim' };
+            }
+        }
+
+        // Lock bin path (not in node_modules/.bin) — try to resolve JS entry
+        // from the path itself (it might be a direct JS file)
+        if (normPath.toLowerCase().endsWith('.js') || normPath.toLowerCase().endsWith('.mjs') || normPath.toLowerCase().endsWith('.cjs')) {
+            return { entry: binPath, binPath, fallback: false, reason: 'direct-js' };
+        }
+
+        // Unknown — run as-is, likely will fallback to cmd.exe or chmod
+        return { entry: binPath, binPath, fallback: true, reason: 'unknown-non-js' };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,95 +222,172 @@ function stripDenoRunFlags(tokens: string[]): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Environment variable expansion
+// ---------------------------------------------------------------------------
+
+/**
+ * Expand $VAR and ${VAR} in a string using the given env.
+ * $$ is escaped as a literal $ (shell convention).
+ * $ followed by non-identifier characters (e.g. $/foo) is left as-is.
+ */
+function expandVars(s: string, env: Record<string, string>): string {
+    return s.replace(/\$(\$|\{(\w+)\}|(\w+))/g, (_, esc, braced, bare) => {
+        if (esc === '$') return '$';
+        const name = braced || bare;
+        if (!name) return _;
+        return env[name] ?? '';
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Command parsing and execution
 // ---------------------------------------------------------------------------
 
 /**
- * Split a command string into tokens, respecting single and double quotes.
- * Does NOT handle subshells, escapes, or other advanced shell features.
- */
-function tokenize(cmd: string): string[] {
-    const tokens: string[] = [];
-    let current = '';
-    let quote: '' | '"' | "'" = '';
-    for (let i = 0; i < cmd.length; i++) {
-        const c = cmd[i]!;
-        if (quote) {
-            if (c === quote) quote = '';
-            else current += c;
-        } else if (c === '"' || c === "'") {
-            quote = c;
-        } else if (c === ' ' || c === '\t') {
-            if (current) { tokens.push(current); current = ''; }
-        } else {
-            current += c;
-        }
-    }
-    if (current) tokens.push(current);
-    return tokens;
-}
-
-/**
- * Execute a single command string.
- * If it starts with `deno run`, rewrites to a cts invocation.
- * Otherwise, runs through the OS shell.
+ * Execute a command string.
+ * - `deno run [flags] <file> [args]` → re-invoke cts
+ * - `deno task <name>` → re-invoke cts task
+ * - Anything else → resolve each segment via BinResolver, fail if not found
  */
 async function execCommand(
     cmd: string,
     env: Record<string, string>,
     cwd: string,
     extraArgs: string[],
+    resolver: BinResolver,
 ): Promise<number> {
-    const tokens = tokenize(cmd.trim());
-    if (!tokens.length) return 0;
+    // Expand environment variables in the command string before parsing
+    const mergedEnv = { ...os.environ(), ...env };
+    const expanded = expandVars(cmd, mergedEnv);
 
-    let argv: string[];
-    let prog: string;
+    const segments = parseShellCommand(expanded);
+    if (!segments.length) return 0;
 
-    // Detect `deno run [flags] <file> [args]`
-    if (tokens[0] === 'deno' && tokens[1] === 'run') {
-        const stripped = stripDenoRunFlags(tokens.slice(2));
-        if (!stripped.length) {
-            console.error('[task] `deno run` with no entry file');
-            return 1;
+    // Single-command shortcuts
+    if (segments.length === 1) {
+        const seg = segments[0]!;
+        if (!seg.bin) return 0;  // empty command after parsing
+        const allArgs = [...seg.args, ...extraArgs];
+
+        // deno run [flags] <file> [args]
+        if (seg.bin === 'deno' && seg.args[0] === 'run') {
+            const stripped = stripDenoRunFlags(seg.args.slice(1));
+            if (!stripped.length) {
+                console.error('[task] `deno run` with no entry file');
+                return 1;
+            }
+            return execRun([...stripped, ...extraArgs], env, cwd);
         }
-        // Re-invoke ourselves: cts <stripped...> <extraArgs...>
-        prog = os.exePath;
-        argv = [...stripped, ...extraArgs];
-        log.debug('task', () => `deno run → cts ${argv.join(' ')}`);
-    } else if (tokens[0] === 'deno' && tokens[1] === 'task') {
-        // Nested `deno task <name>` — just re-exec ourselves
-        prog = os.exePath;
-        argv = ['task', ...(tokens.slice(2)), ...extraArgs];
-    } else {
-        // Generic shell command
-        const shell = uname.sysname.includes('Windows') ? 'cmd' : '/bin/sh';
-        const shellArg = uname.sysname.includes('Windows') ? '/c' : '-c';
-        // Append extra args to the command string
-        const fullCmd = extraArgs.length
-            ? `${cmd} ${extraArgs.map(a => JSON.stringify(a)).join(' ')}`
-            : cmd;
-        prog = shell;
-        argv = [shellArg, fullCmd];
+
+        // deno task <name>
+        if (seg.bin === 'deno' && seg.args[0] === 'task') {
+            return execTask([...seg.args.slice(1), ...extraArgs], env, cwd);
+        }
+
+        // Try resolve as bin
+        const resolved = resolver.resolve(seg.bin, cwd);
+        if (resolved) {
+            return execBinary(resolved, allArgs, env, cwd);
+        }
+
+        console.error(`[task] Command '${seg.bin}' not found in bin index or node_modules/.bin`);
+        return 1;
     }
 
-    // Merge env
-    const mergedEnv: Record<string, string> = {
-        ...os.environ(),
-        ...env
+    // Multi-segment pipeline: op is on the segment BEFORE the operator.
+    // seg.op === '&&': run next only if this succeeds; bail on failure
+    // seg.op === '||': run next only if this fails; skip next on success
+    // seg.op === ';':  always run next regardless of exit code
+    // seg.op === undefined (last seg / after '|'/'&'): bail on failure
+    let prevCode = 0;
+    for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i]!;
+        const isLast = i === segments.length - 1;
+        const segArgs = isLast ? [...seg.args, ...extraArgs] : seg.args;
+
+        // Handle deno run/task in multi-segment too
+        if (seg.bin === 'deno' && seg.args[0] === 'run') {
+            const stripped = stripDenoRunFlags(seg.args.slice(1));
+            if (!stripped.length) {
+                console.error('[task] `deno run` with no entry file');
+                prevCode = 1;
+            } else {
+                prevCode = await execRun(isLast ? [...stripped, ...extraArgs] : stripped, env, cwd);
+            }
+        } else if (seg.bin === 'deno' && seg.args[0] === 'task') {
+            prevCode = await execTask(isLast ? [...seg.args.slice(1), ...extraArgs] : seg.args.slice(1), env, cwd);
+        } else {
+            const resolved = resolver.resolve(seg.bin, cwd);
+            if (!resolved) {
+                console.error(`[task] Command '${seg.bin}' not found in bin index or node_modules/.bin`);
+                return 1;
+            }
+            prevCode = await execBinary(resolved, segArgs, env, cwd);
+        }
+
+        if (prevCode !== 0) {
+            if (seg.op === ';') continue;   // ; — always run next
+            if (seg.op === '||') continue;  // || — run next as fallback
+            return prevCode;                // && or no op — bail
+        } else {
+            if (seg.op === '||') i++;       // || succeeded — skip the fallback segment
+        }
     }
-    // We can't enumerate the current env in QuickJS easily, so we rely on
-    // spawn inheriting it and only passing the extras.
-    const child = process.spawn([prog, ...argv], {
-        stdin:  'inherit',
-        stdout: 'inherit',
-        stderr: 'inherit',
-        env: mergedEnv,
-        cwd
+    return prevCode;
+}
+
+async function execRun(args: string[], env: Record<string, string>, cwd: string): Promise<number> {
+    const mergedEnv = { ...os.environ(), ...env };
+    const child = process.spawn([os.exePath, 'run', ...args], {
+        stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
+        env: mergedEnv, cwd,
     });
-
     const info = await child.wait();
     return info.exit_status ?? 0;
+}
+
+async function execTask(args: string[], env: Record<string, string>, cwd: string): Promise<number> {
+    const mergedEnv = { ...os.environ(), ...env };
+    const child = process.spawn([os.exePath, 'task', ...args], {
+        stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
+        env: mergedEnv, cwd,
+    });
+    const info = await child.wait();
+    return info.exit_status ?? 0;
+}
+
+async function execBinary(resolved: ResolvedBin, args: string[], env: Record<string, string>, cwd: string): Promise<number> {
+    const mergedEnv = { ...os.environ(), ...env };
+    const isWin = uname.sysname.includes('Windows');
+
+    log.debug('task', () => `exec bin: entry=${resolved.entry} binPath=${resolved.binPath} fallback=${resolved.fallback} reason=${resolved.reason ?? ''}`);
+
+    if (resolved.fallback) {
+        // Couldn't parse the wrapper script — fall back to cmd.exe / sh
+        if (isWin || resolved.binPath.toLowerCase().endsWith('.cmd') || resolved.binPath.toLowerCase().endsWith('.bat')) {
+            return rawExec(['cmd', '/c', resolved.binPath, ...args], mergedEnv, cwd);
+        }
+        // Unix fallback: make executable
+        try { fs.chmod(resolved.binPath, 0o755); } catch {}
+    }
+
+    // Run the JS entry through the same CLI path as user files.
+    return rawExec([os.exePath, 'run', resolved.entry, ...args], mergedEnv, cwd);
+}
+
+async function rawExec(argv: string[], env: Record<string, string>, cwd: string): Promise<number> {
+    try {
+        const mergedEnv = { ...os.environ(), ...env };
+        const child = process.spawn(argv, {
+            stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
+            env: mergedEnv, cwd,
+        });
+        const info = await child.wait();
+        return info.exit_status ?? 0;
+    } catch (e) {
+        console.error(`[task] Failed to spawn: ${argv.join(' ')}\n  ${e instanceof Error ? e.message : String(e)}`);
+        return 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,17 +397,20 @@ async function execCommand(
 export class TaskRunner {
     private readonly tasks: Record<string, TaskDef>;
     private readonly cwd: string;
+    private readonly resolver: BinResolver;
     private readonly done = new Set<string>();
+    private readonly running = new Set<string>();  // cycle detection
 
-    constructor(tasks: Record<string, TaskDef>, cwd: string) {
+    constructor(tasks: Record<string, TaskDef>, cwd: string, lockStore: LockStore) {
         this.tasks = tasks;
         this.cwd   = cwd;
+        this.resolver = new BinResolver(lockStore);
     }
 
     list(): void {
         const names = Object.keys(this.tasks);
         if (!names.length) {
-            console.log('  \x1b[2mNo tasks defined in this config.\x1b[0m');
+            log.debug('task', () => '  \x1b[2mNo tasks defined in this config.\x1b[0m');
             return;
         }
         const maxLen = names.reduce((m, n) => Math.max(m, n.length), 0);
@@ -210,8 +420,12 @@ export class TaskRunner {
             const deps = typeof def === 'string' ? [] : (def.dependencies ?? []);
             const pad  = ' '.repeat(maxLen - name.length + 2);
             const depStr = deps.length ? `  \x1b[2m← needs: ${deps.join(', ')}\x1b[0m` : '';
-            console.log(`  \x1b[36m${name}\x1b[0m${pad}\x1b[2m${cmd}\x1b[0m${depStr}`);
+            log.debug('task', () => `  \x1b[36m${name}\x1b[0m${pad}\x1b[2m${cmd}\x1b[0m${depStr}`);
         }
+    }
+
+    has(name: string): boolean {
+        return this.tasks[name] !== undefined;
     }
 
     async run(name: string, extraArgs: string[] = []): Promise<number> {
@@ -227,26 +441,43 @@ export class TaskRunner {
             return 1;
         }
 
+        // Cycle detection
+        if (this.running.has(name)) {
+            console.error(`\x1b[31m✖ Circular dependency detected:\x1b[0m ${name}`);
+            return 1;
+        }
+
         const command = typeof def === 'string' ? def : def.command;
         const deps    = typeof def === 'string' ? [] : (def.dependencies ?? []);
         const env     = typeof def === 'string' ? {} : (def.env ?? {});
 
+        // Validate: empty command string
+        if (!command || !command.trim()) {
+            console.error(`\x1b[31m✖ Task \x1b[36m${name}\x1b[0m\x1b[31m has an empty command\x1b[0m`);
+            return 1;
+        }
+
         // Run dependencies first (DFS, skip already-done)
-        for (const dep of deps) {
-            if (this.done.has(dep)) continue;
-            const code = await this.run(dep);
-            if (code !== 0) {
-                console.error(`\x1b[31m✖ Dependency task \x1b[36m${dep}\x1b[0m\x1b[31m failed (exit ${code})\x1b[0m`);
-                return code;
+        this.running.add(name);
+        try {
+            for (const dep of deps) {
+                if (this.done.has(dep)) continue;
+                const code = await this.run(dep);
+                if (code !== 0) {
+                    console.error(`\x1b[31m✖ Dependency task \x1b[36m${dep}\x1b[0m\x1b[31m failed (exit ${code})\x1b[0m`);
+                    return code;
+                }
             }
+        } finally {
+            this.running.delete(name);
         }
 
         if (this.done.has(name)) return 0;
         this.done.add(name);
 
-        console.log(`\n\x1b[32m$ ${command}\x1b[0m`);
+        log.debug('task', () => `\n\x1b[32m$ ${command}\x1b[0m`);
         // Only pass extra args to the leaf task, not to dependencies
-        const code = await execCommand(command, env, this.cwd, extraArgs);
+        const code = await execCommand(command, env, this.cwd, extraArgs, this.resolver);
         if (code !== 0) console.error(`\x1b[31m✖ Task \x1b[36m${name}\x1b[0m\x1b[31m exited with code ${code}\x1b[0m`);
         return code;
     }
@@ -256,23 +487,58 @@ export class TaskRunner {
 // Public API
 // ---------------------------------------------------------------------------
 
-/** Find and load the nearest deno.json/deno.jsonc containing a `tasks` field. */
-export function loadTasks(startDir: string): { runner: TaskRunner; configPath: string } | null {
-    let dir = startDir;
-    while (dir !== '/' && dir !== '.') {
+/** Find and load the nearest deno.json/deno.jsonc or package.json containing tasks. */
+export function loadTasks(startDir: string, lockStore: LockStore): { runner: TaskRunner; configPath: string } | null {
+    let dir = startDir.replace(/\\/g, '/');
+    const isWin = uname.sysname.includes('Windows');
+    while (true) {
+        // Collect tasks from both deno.json and package.json (deno.json takes priority)
+        const merged: Record<string, TaskDef> = {};
+        let found = false;
+        let configPath = '';
+
+        // package.json "scripts" — loaded first so deno.json can override
+        const pkgP = joinPaths(dir, 'package.json');
+        if (fs.exists(pkgP)) {
+            try {
+                const pkg = safeParse<{ scripts?: Record<string, string> }>(readText(pkgP));
+                if (pkg?.scripts && typeof pkg.scripts === 'object') {
+                    for (const [k, v] of Object.entries(pkg.scripts)) {
+                        merged[k] = String(v);
+                    }
+                    found = true;
+                    configPath = pkgP;
+                }
+            } catch (e) {
+                log.warn('task', () => `Failed to parse ${pkgP}: ${errMsg(e)}`);
+            }
+        }
+
+        // deno.json / deno.jsonc — overrides package.json on conflict
         for (const name of ['deno.json', 'deno.jsonc']) {
             const p = joinPaths(dir, name);
             if (!fs.exists(p)) continue;
             try {
                 const cfg = safeParse<DenoConfig>(stripJsonc(readText(p)));
                 if (cfg.tasks && typeof cfg.tasks === 'object') {
-                    return { runner: new TaskRunner(cfg.tasks, dir), configPath: p };
+                    for (const [k, v] of Object.entries(cfg.tasks)) {
+                        merged[k] = v;
+                    }
+                    found = true;
+                    configPath = p;  // deno.json is the primary config
                 }
             } catch (e) {
                 log.warn('task', () => `Failed to parse ${p}: ${errMsg(e)}`);
             }
         }
-        const up = dirname(dir); if (up === dir) break; dir = up;
+
+        if (found) return { runner: new TaskRunner(merged, dir, lockStore), configPath };
+
+        const up = dirname(dir);
+        if (up === dir) break;
+        // Windows: stop at drive root (e.g. "C:/")
+        if (isWin && /^[A-Za-z]:\/?$/.test(dir) && up.length < dir.length) break;
+        dir = up;
     }
     return null;
 }

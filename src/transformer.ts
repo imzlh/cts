@@ -1,12 +1,12 @@
-// transformer.ts — TS/JSX → JS via Sucrase (no debug artifacts)
+// transformer.ts — TS/JSX → JS via oxc (native, fast) or Sucrase (fallback)
 
 import { transform, type Transform, type Options } from '../deps/sucrase/src/index';
 import { errMsg } from './utils/misc';
 import { err, ErrorKind, TransformError } from './errors';
 import { log } from './utils/log';
-import { __use_fn } from './utils';
+import type { OxcTranspiler } from './oxc';
 
-const smap    = __use_fn('sourcemap');
+const smap = import.meta.use('sourcemap');
 
 const BASE: Partial<Options> = { disableESTransforms: true, production: false };
 
@@ -20,6 +20,7 @@ export class Transformer {
     private readonly sourceMaps: boolean;
     private readonly jsxPragma: string;
     private readonly jsxFragmentPragma: string;
+    private oxc: OxcTranspiler | null = null;
 
     constructor(options: TransformerOptions = {}) {
         this.sourceMaps = options.sourceMaps ?? true;
@@ -27,13 +28,31 @@ export class Transformer {
         this.jsxFragmentPragma = options.jsxFragmentPragma ?? 'React.Fragment';
     }
 
+    /** Install the native oxc transpiler. When set, it takes priority over Sucrase. */
+    setOxc(oxc: OxcTranspiler): void {
+        this.oxc = oxc;
+    }
+
     transform(code: string, filename: string): string {
         if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
         const ext = filename.slice(filename.lastIndexOf('.'));
         switch (ext) {
-            case '.ts':   return this.run(code, filename, ['typescript']);
-            case '.tsx':  return this.run(code, filename, ['typescript', 'jsx']);
-            case '.jsx':  return this.run(code, filename, ['jsx']);
+            case '.ts':
+            case '.tsx':
+            case '.jsx': {
+                if (this.oxc) {
+                    const result = this.oxc.transpile(code, filename);
+                    if (result !== null) {
+                        log.debug('transformer', () => `oxc: ${filename}`);
+                        return result;
+                    }
+                    log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
+                }
+                const transforms: Transform[] = ext === '.jsx' ? ['jsx']
+                    : ext === '.tsx' ? ['typescript', 'jsx']
+                    : ['typescript'];
+                return this.run(code, filename, transforms);
+            }
             case '.json': return `export default ${code};`;
             default:
                 log.debug('transformer', () => `passthrough: ${filename}`);

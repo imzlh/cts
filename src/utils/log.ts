@@ -13,7 +13,8 @@
 // Key design: the message lambda is ONLY called when the category is active.
 // This avoids string interpolation cost on every hot-path call.
 
-import { os, console } from './index';
+const os = import.meta.use('os');
+const console = import.meta.use('console');
 
 // ---------------------------------------------------------------------------
 // Category index
@@ -52,6 +53,29 @@ function resolve(msg: Msg): string {
     return typeof msg === 'function' ? msg() : msg;
 }
 
+// ---------------------------------------------------------------------------
+// Native console access — bypass the JS hook installed by DebugSession.
+// DebugSession.installConsoleHook saves the C-module originals on the console
+// object as console.__originals__ BEFORE wrapping. We use those to avoid
+// forwarding internal debug logs to DevTools.
+// ---------------------------------------------------------------------------
+
+function nativeLog(...args: any[]): void {
+    const origs = (console as any).__originals__;
+    const fn = origs?.log ?? console.log;
+    fn.apply(console, args);
+}
+function nativeWarn(...args: any[]): void {
+    const origs = (console as any).__originals__;
+    const fn = origs?.warn ?? console.warn;
+    fn.apply(console, args);
+}
+function nativeError(...args: any[]): void {
+    const origs = (console as any).__originals__;
+    const fn = origs?.error ?? console.error;
+    fn.apply(console, args);
+}
+
 export const log = {
     /**
      * Debug log — message is lazily evaluated, zero cost when disabled.
@@ -61,23 +85,23 @@ export const log = {
      */
     debug(category: string, msg: Msg, ...rest: any[]): void {
         if (!isEnabled(category)) return;
-        console.log(`\x1b[2m[${category}]\x1b[0m ${resolve(msg)}`, ...rest);
+        nativeLog(`\x1b[2m[${category}]\x1b[0m ${resolve(msg)}`, ...rest);
     },
 
     /** Always shown regardless of DEBUG. */
     info(msg: string, ...rest: any[]): void {
-        console.log(msg, ...rest);
+        nativeLog(msg, ...rest);
     },
 
     warn(category: string, msg: Msg, ...rest: any[]): void {
-        console.warn(`[${category}] ${resolve(msg)}`, ...rest);
+        nativeWarn(`[${category}] ${resolve(msg)}`, ...rest);
     },
 
     error(category: string, msg: Msg, ...rest: any[]): void {
-        console.error(`[${category}] ${resolve(msg)}`, ...rest);
+        nativeError(`[${category}] ${resolve(msg)}`, ...rest);
     },
 
     download(url: string): void {
-        console.log(`✨ ${url}...`);
+        nativeLog(`✨ ${url}...`);
     }
 };

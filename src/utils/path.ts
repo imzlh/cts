@@ -1,6 +1,8 @@
 // utils/path.ts — pure path utilities
 
-import { os, uname } from './index';
+import { uname } from './index';
+
+const os = import.meta.use('os');
 
 export function basename(p: string, ext?: string): string {
     const s = p.replace(/\\/g, '/').replace(/\/$/, '');
@@ -13,7 +15,11 @@ export function dirname(p: string): string {
     const s = p.replace(/\\/g, '/');
     const i = s.lastIndexOf('/');
     if (i <= 0) return i === 0 ? '/' : '.';
-    return s.slice(0, i);
+    const dir = s.slice(0, i);
+    // On Windows, "C:" (without trailing slash) means "current dir on C:",
+    // not the root.  Ensure we always return "C:/" for drive-root children.
+    if (/^[a-zA-Z]:$/.test(dir)) return dir + '/';
+    return dir;
 }
 
 export function extname(p: string): string {
@@ -24,8 +30,9 @@ export function extname(p: string): string {
 
 export function joinPaths(...parts: string[]): string {
     let out = '';
-    for (const p of parts) {
+    for (let p of parts) {
         if (!p) continue;
+        p = p.replace(/\\/g, '/');
         if (!out) { out = p; continue;
         }
         const outSlash = out.endsWith('/');
@@ -43,19 +50,26 @@ export function joinPaths(...parts: string[]): string {
 
 export function normalizePath(p: string): string {
     if (!p.includes('/.') && !p.includes('./')) return p;
-    const abs = p.startsWith('/');
+    // Detect drive-letter prefix (e.g. "C:/") as the absolute root
+    const driveMatch = p.match(/^([a-zA-Z]:\/)/);
+    const prefix = driveMatch ? driveMatch[1]! : (p.startsWith('/') ? '/' : '');
+    const abs = prefix.length > 0;
+    const rest = p.slice(prefix.length);
     const out: string[] = [];
-    for (const s of p.split('/')) {
+    for (const s of rest.split('/')) {
         if (!s || s === '.') continue;
-        if (s === '..') { if (out.length && out.at(-1) !== '..') out.pop(); else if (!abs) out.push('..'); }
-        else out.push(s);
+        if (s === '..') {
+            if (out.length && out.at(-1) !== '..') out.pop();
+            else if (!abs) out.push('..');
+            // When abs (Unix root or Windows drive root), silently ignore
+        } else out.push(s);
     }
-    return (abs ? '/' : '') + out.join('/') || '.';
+    return prefix + out.join('/') || '.';
 }
 
 export function resolvePath(...parts: string[]): string {
     let r = joinPaths(...parts);
-    if (!r.startsWith('/')) r = joinPaths(os.cwd, r);
+    if (!isAbsolute(r)) r = joinPaths(String(os.cwd).replace(/\\/g, '/'), r);
     return normalizePath(r);
 }
 

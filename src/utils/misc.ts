@@ -2,8 +2,11 @@
 
 // URL polyfill — CNO runtime provides global URL
 declare const URL: any;
-import { basename, crypto, dirname, extname, zlib } from './index';
+import { basename, dirname, extname } from './index';
 import { err, ErrorKind } from '../errors';
+
+const crypto = import.meta.use('crypto');
+const zlib = import.meta.use('zlib');
 
 // ---------------------------------------------------------------------------
 // Misc
@@ -190,9 +193,15 @@ export function parseArgs<T extends ArgTemplate>(argv: string[], tpl: T): ArgRes
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i]!;
         if (arg.startsWith('--')) {
-            const key = arg.slice(2), type = tpl[key], next = argv[i + 1];
-            if (!type) { out[key] = true; continue; }
-            if (type === 'boolean') { out[key] = true; }
+            const eqIdx = arg.indexOf('=');
+            const key = eqIdx >= 0 ? arg.slice(2, eqIdx) : arg.slice(2);
+            const inlineVal = eqIdx >= 0 ? arg.slice(eqIdx + 1) : undefined;
+            const type = tpl[key], next = argv[i + 1];
+            if (!type) { out[key] = inlineVal ?? true; continue; }
+            if (type === 'boolean') { out[key] = inlineVal !== 'false'; }
+            else if (inlineVal !== undefined) {
+                out[key] = type === 'number' ? +inlineVal : inlineVal;
+            }
             else if (next && !next.startsWith('--')) {
                 out[key] = type === 'number' ? +next : next; i++;
             }

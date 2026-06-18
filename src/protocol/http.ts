@@ -3,12 +3,13 @@
 import type { RuntimeConfig, ModuleInfo } from '../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow } from '../flow';
+import { StepType, type Flow, type ProgressCallback } from '../flow';
 import { joinPaths, dirname } from '../utils/path';
 import { cacheFilename } from '../utils/misc';
 declare const URL: any;
 import { log } from '../utils/log';
 import { isatty } from '../utils/progress';
+import { err, ErrorKind } from '../errors';
 
 export class HttpHandler implements ProtocolHandler {
     readonly protocols = ['http', 'https'];
@@ -16,20 +17,25 @@ export class HttpHandler implements ProtocolHandler {
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
-    *resolve(spec: string, parent: string): Flow<ModuleInfo> {
+    *resolve(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
         const url = this.normalizeUrl(spec, parent);
         const cachePath = this.cachePath(url);
         if (!this.resolved.has(url)) {
             const cached = yield { type: StepType.FS_EXISTS, path: cachePath };
             if (!cached) {
                 if (!this.cfg.silent && !isatty) log.download(url);
-                const { body } = yield {
+                const result = yield {
                     type: StepType.NET_FETCH,
                     url,
                     timeout: this.cfg.requestTimeout,
+                    onProgress,
                 };
+                if (result.status < 200 || result.status >= 300) {
+                    throw err(ErrorKind.ModuleNotFound,
+                        `HTTP ${result.status} fetching ${url}`);
+                }
                 yield { type: StepType.FS_ENSURE_DIR, path: dirname(cachePath) };
-                yield { type: StepType.FS_WRITE_BYTES, path: cachePath, data: body };
+                yield { type: StepType.FS_WRITE_BYTES, path: cachePath, data: result.body };
             }
             this.resolved.set(url, cachePath);
         }

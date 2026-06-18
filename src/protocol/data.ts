@@ -6,7 +6,9 @@ import { StepType, type Flow } from '../flow';
 import { joinPaths, dirname } from '../utils/path';
 import { hashString, errMsg } from '../utils/misc';
 import { err, ErrorKind } from '../errors';
-import { engine, crypto } from '../utils/index';
+
+const engine = import.meta.use('engine');
+const crypto = import.meta.use('crypto');
 
 interface DataParsed { mime: string; isBase64: boolean; data: string }
 
@@ -71,7 +73,11 @@ export class DataHandler implements ProtocolHandler {
                     throw err(ErrorKind.Generic, `data: base64 decode failed: ${errMsg(e)}`);
                 }
             } else {
-                yield { type: StepType.FS_WRITE_BYTES, path: localPath, data: engine.encodeString(decodeURIComponent(parsed.data)) };
+                try {
+                    yield { type: StepType.FS_WRITE_BYTES, path: localPath, data: engine.encodeString(decodeURIComponent(parsed.data)) };
+                } catch (e) {
+                    throw err(ErrorKind.Generic, `data: URL decode failed: ${errMsg(e)}`);
+                }
             }
         }
 

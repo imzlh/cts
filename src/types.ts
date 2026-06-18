@@ -29,11 +29,14 @@ export interface ConfigOptions {
     importMap?:     Record<string, string>;
     polyfill?:      string;
     disableCache?:  boolean;
+    enableOxc?:     boolean;
     eval?:          string;   // inline code to evaluate (-e / --eval)
     // Lock options
     lockDir?:       string;   // dir containing cts.lock (default: entry file dir)
     frozen?:        boolean;  // refuse to resolve anything not already in lock
     noLock?:        boolean;  // disable lock entirely
+    // Lifecycle scripts
+    ignoreScripts?: boolean;  // skip postinstall scripts during cno cache
     // JSX options
     jsxPragma?:     string;   // JSX element factory (default: React.createElement)
     jsxFragmentPragma?: string; // JSX fragment factory (default: React.Fragment)
@@ -43,7 +46,7 @@ export interface ConfigOptions {
 // Optional fields remain optional (no value → feature disabled)
 export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     'pathAliases'|'baseUrl'|'importMap'|'memoryLimit'|'maxStackSize'|
-    'lockDir'|'frozen'|'noLock'|'eval'|'jsxPragma'|'jsxFragmentPragma'>> {
+    'lockDir'|'frozen'|'noLock'|'eval'|'jsxPragma'|'jsxFragmentPragma'|'enableSwc'>> {
     pathAliases?:  Record<string, string[]>;
     baseUrl?:      string;
     importMap?:    Record<string, string>;
@@ -55,6 +58,7 @@ export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     eval?:         string;
     jsxPragma?:    string;
     jsxFragmentPragma?: string;
+    lockStore?:    import('./lock').LockStore;
     // CLI parse output
     _?:            string;
     _args?:        string[];
@@ -73,7 +77,10 @@ export interface PackageJson {
     exports?:      string | Record<string, unknown>;
     type?:         'module' | 'commonjs';
     imports?:      Record<string, string>;
+    bin?:          string | Record<string, string>;
     dependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+    scripts?:      Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------

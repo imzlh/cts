@@ -18,10 +18,13 @@ import { isTypeDecl } from './protocol/base';
 import { readText } from './utils/io';
 import { err, ErrorKind } from './errors';
 import { log } from './utils/log';
-import { fs, engine } from './utils/index';
 import { JscCache, isRemote } from './jsc';
-
 import { buildWasmModule, type WasmImportSource } from './wasm';
+import type { OxcTranspiler } from './oxc';
+
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
+const os = import.meta.use('os');
 
 export class ModuleLoader {
     private readonly transformer: Transformer;
@@ -34,6 +37,10 @@ export class ModuleLoader {
 
     /** Track all loaded modules for proper cleanup */
     private readonly loadedModules = new Set<CModuleEngine.Module>();
+
+    setOxc(oxc: OxcTranspiler): void {
+        this.transformer.setOxc(oxc);
+    }
 
     constructor(
         private readonly resolver: ModuleResolver,
@@ -49,10 +56,7 @@ export class ModuleLoader {
         let requireFn: Function | undefined;
         Object.defineProperty(globalThis, 'require', {
             get: () => {
-                if (!requireFn) requireFn = this.cjs.mkRequire(
-                    // @ts-ignore - entry donot has parent module
-                    resolver.entry, undefined
-                );
+                if (!requireFn) requireFn = this.cjs.mkRequire(resolver.entry);
                 return requireFn;
             },
             enumerable: true,
@@ -74,9 +78,13 @@ export class ModuleLoader {
 
     /** Clean up loaded modules when no longer needed */
     clearLoadedModules(): void {
-        this.loadedModules.clear();
         this.esmCache.clear();
         this.wasmCache.clear();
+    }
+
+    /** True if any module is currently being loaded (esmLoading or wasmLoading). */
+    hasPendingLoads(): boolean {
+        return this.esmLoading.size > 0 || this.wasmLoading.size > 0;
     }
 
     // -------------------------------------------------------------------------
@@ -109,6 +117,10 @@ export class ModuleLoader {
 
     preRegister(localPath: string, parentPath: string): void {
         this.cjs.preRegister(localPath, parentPath);
+    }
+
+    requireInternal(id: string, parentPath = `${os.cwd}/<internal>`): any {
+        return this.cjs.mkRequire(parentPath)(id);
     }
 
     // -------------------------------------------------------------------------
@@ -168,6 +180,20 @@ export class ModuleLoader {
             throw e;
         }
         this.esmLoading.delete(info.localPath);
+
+        // If a placeholder was created during circular resolution, populate it
+        // with the real exports now that the module is compiled. Modules that
+        // received the placeholder during the cycle hold a reference to it and
+        // will see the populated exports (live-binding semantics).
+        const cached = this.esmCache.get(info.localPath);
+        if (cached && cached !== mod) {
+            const ns = mod.namespace;
+            for (const key of Object.keys(ns)) {
+                try { cached.export(key, ns[key]); } catch { /* ok */ }
+            }
+            log.debug('loader', () => `populated ESM placeholder: ${info.specPath} (${Object.keys(ns).length} exports)`);
+            return cached;
+        }
 
         if (cacheable) {
             this.jsc.persist(info.localPath, mod);
@@ -275,6 +301,7 @@ export class ModuleLoader {
             placeholder.export('default', shared);
             this.wasmCache.set(info.localPath, placeholder);
             this.pendingWasm.set(info.localPath, shared);
+            this.loadedModules.add(placeholder);
             return placeholder;
         }
 

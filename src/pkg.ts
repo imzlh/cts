@@ -5,8 +5,10 @@ import { dirname, extname, joinPaths } from './utils/path';
 import { resolveFile } from './utils/io';
 import { safeParse } from './utils/misc';
 import { LRU } from './utils/lru';
-import { fs, engine } from './utils/index';
 import { log } from './utils/log';
+
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 // ---------------------------------------------------------------------------
 // Cache capacities — tuned to typical project sizes without excess
@@ -49,6 +51,18 @@ export function readPkgFresh(dir: string): PackageJson | null {
 
 export function clearPkgCache(): void {
     pkgCache.clear(); formatCache.clear(); formatDirCache.clear(); exportsCache.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Bin field normalization
+// ---------------------------------------------------------------------------
+
+export function normalizeBinField(pkgName: string, bin: string | Record<string, string>): Record<string, string> {
+    return typeof bin === 'string' ? { [pkgName]: bin } : bin;
+}
+
+export function getBinMap(pkg: PackageJson): Record<string, string> {
+    return pkg.bin ? normalizeBinField(pkg.name || '', pkg.bin) : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +167,7 @@ function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string): string | null
     }
     if (t && typeof t === 'object') {
         for (const c of conds(ctx)) {
-            if (!(c in (t as any))) continue;
+            if (!(c in t)) continue;
             const r = resolveTarget(ctx, (t as any)[c], rep); if (r) return r;
         }
     }

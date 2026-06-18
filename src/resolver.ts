@@ -19,6 +19,7 @@ import { NpmHandler }   from './protocol/npm';
 import { NodeHandler }  from './protocol/node';
 import { DataHandler }  from './protocol/data';
 import { LockStore }    from './lock';
+import { BUILTINS }     from './cjs';
 import { runAsync, runSync } from './flow';
 import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath } from './utils/path';
 import { resolveFile } from './utils/io';
@@ -26,12 +27,17 @@ import { detectFormat } from './pkg';
 import { guessFileKind, applyAttrType } from './protocol/base';
 import { assert } from './utils/misc';
 import { log } from './utils/log';
-import { os } from './utils/index';
+
+const os = import.meta.use('os');
 
 // ---------------------------------------------------------------------------
 // protoOf — extract protocol prefix without regex
 // Returns '' for relative/absolute paths, 'http' for 'http://...', etc.
 // ---------------------------------------------------------------------------
+
+function isRelative(s: string): boolean {
+    return s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');
+}
 
 function protoOf(s: string): string {
     const ci = s.indexOf(':');
@@ -100,6 +106,7 @@ export class ModuleResolver {
         lockReadOnly = false,
     ) {
         this.lock        = new LockStore(lockDir ?? os.cwd, lockReadOnly);
+        cfg.lockStore = this.lock;
         this.importIndex = cfg.importMap    ? buildImportMapIndex(cfg.importMap) : null;
         this.aliasIndex  = cfg.pathAliases  ? buildAliasIndex(cfg.pathAliases)  : [];
         this.lock.load();
@@ -189,15 +196,16 @@ export class ModuleResolver {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
             const h = this.handlers.get(proto);
             if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
-            return runAsync(h.resolve(spec, parent, attr));
+            return runAsync(h.resolve(spec, parent, attr, onProgress));
         }
-        if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelativeAsync(spec, parent, attr);
+        if (isRelative(spec)) return this.resolveRelativeAsync(spec, parent, attr, onProgress);
         if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
         return this.resolveBareAsync(spec, parent, attr, onProgress);
     }
 
     private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
+        if (BUILTINS.has(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {
@@ -210,7 +218,7 @@ export class ModuleResolver {
         }
         const npm = this.handlers.get('npm');
         if (npm) {
-            return runAsync(npm.resolve(spec, parent, attr));
+            return runAsync(npm.resolve(spec, parent, attr, onProgress));
         }
         throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
@@ -299,6 +307,15 @@ export class ModuleResolver {
         }
     }
 
+    /** Drain pending postinstall scripts from the npm handler. */
+    drainPostinstall(): Array<{ name: string; version: string; dir: string; script: string }> {
+        const npm = this.handlers.get('npm');
+        if (npm && 'drainPostinstall' in npm && typeof (npm as any).drainPostinstall === 'function') {
+            return (npm as NpmHandler).drainPostinstall();
+        }
+        return [];
+    }
+
     // -------------------------------------------------------------------------
     // Dispatch
     // -------------------------------------------------------------------------
@@ -311,7 +328,7 @@ export class ModuleResolver {
             if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
             return runSync(h.resolve(spec, parent, attr));
         }
-        if (spec.startsWith('./') || spec.startsWith('../')) return this.resolveRelative(spec, parent, attr);
+        if (isRelative(spec)) return this.resolveRelative(spec, parent, attr);
         if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
         return this.resolveBare(spec, parent, attr);
     }
@@ -321,6 +338,8 @@ export class ModuleResolver {
         // Delegate to protocol handler for non-file protocols (npm:, jsr:, http:, etc.)
         if (pp && pp !== 'file') { const h = this.handlers.get(pp); if (h) return runSync(h.resolve(spec, parent, attr)); }
         let base = parent.startsWith('file://') ? parent.slice(7) : parent;
+        // file:///C:/... → /C:/... → strip leading / before drive letter
+        if (/^\/[a-zA-Z]:/.test(base)) base = base.slice(1);
         // Ensure base is an absolute path for correct relative resolution
         if (!isAbsolute(base)) base = resolvePath(base);
         base = dirname(base);
@@ -330,11 +349,11 @@ export class ModuleResolver {
         return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
     }
 
-    private async resolveRelativeAsync(spec: string, parent: string, attr?: Record<string, any>): Promise<ModuleInfo> {
+    private async resolveRelativeAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         const pp = protoOf(parent);
         if (pp && pp !== 'file') {
             const h = this.handlers.get(pp);
-            if (h) return runAsync(h.resolve(spec, parent, attr));
+            if (h) return runAsync(h.resolve(spec, parent, attr, onProgress));
         }
         return this.resolveRelative(spec, parent, attr);
     }
@@ -348,6 +367,7 @@ export class ModuleResolver {
 
     private resolveBare(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         if (spec.startsWith('@std/')) return this.dispatch(`jsr:${spec}`, parent, attr);
+        if (BUILTINS.has(spec)) return this.dispatch(`node:${spec}`, parent, attr);
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {

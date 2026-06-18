@@ -12,11 +12,18 @@ import { resources }      from './resources';
 import { dirname, normalizePath, isAbsolute, joinPaths } from './utils/path';
 import { writeText, ensureDir, resolveFile } from './utils/io';
 import { errMsg } from './utils/misc';
-import { err, ErrorKind } from './errors';
+import { err, ErrorKind, formatError } from './errors';
 import { guessFileKind } from './protocol/base';
-import { console, engine, os, crypto, __use_fn } from './utils';
+import { uname } from './utils';
 import { log } from './utils/log';
 import { isRemote } from './jsc';
+import { tryLoadOxc, type OxcTranspiler } from './oxc';
+
+const os = import.meta.use('os');
+const console = import.meta.use('console');
+const engine = import.meta.use('engine');
+const crypto = import.meta.use('crypto');
+const process = import.meta.use('process');
 
 const SUPPORTED_ATTRS = new Set(['type', 'raw', 'text', 'bytes']);
 
@@ -25,9 +32,16 @@ export class TypeScriptRuntime {
     readonly loader:   ModuleLoader;
     readonly config:   RuntimeConfig;
     private readonly metaCache = new Map<string, Record<string, any>>();
+    private readonly oxc: OxcTranspiler | null;
     /** Load dedup: specPath → Module. Ensures the engine never loads the same
      *  module twice (QuickJS does not cache dynamic import() results). */
     private readonly loadedModules = new Map<string, CModuleEngine.Module>();
+    private readonly initHooks: Array<(specPath: string) => void> = [];
+
+    /** Register an additional callback to fire after each module's init hook. */
+    addInitHook(fn: (specPath: string) => void): void {
+        this.initHooks.push(fn);
+    }
 
     constructor(cfg: RuntimeConfig, entryDir?: string) {
         this.config   = cfg;
@@ -37,6 +51,8 @@ export class TypeScriptRuntime {
             cfg.noLock ?? false,
         );
         this.loader = new ModuleLoader(this.resolver, cfg);
+        this.oxc = tryLoadOxc();
+        if (this.oxc) this.loader.setOxc(this.oxc);
         this.hookEngine();
         this.hookEvents();
 
@@ -96,6 +112,10 @@ export class TypeScriptRuntime {
                 } else {
                     this.fillMeta(importMeta, this.resolver.getInfo(specPath));
                 }
+                // Fire additional init hooks (e.g. CDP scriptParsed)
+                for (const fn of this.initHooks) {
+                    try { fn(specPath); } catch {}
+                }
             },
 
             attrchk: (attr: Record<string, any>): void => {
@@ -106,37 +126,41 @@ export class TypeScriptRuntime {
     }
 
     private hookEvents(): void {
-        // engine.onEvent((name: number, data: any) => {
-        //     const ET = engine.EventType;
-        //     if (name === ET.UNHANDLED_REJECTION) {
-        //         const r = Array.isArray(data) ? data[1] : data;
-        //         console.error(formatError(r, 'unhandled promise rejection'));
-        //         return false;
-        //     }
-        //     if (name === ET.JOB_EXCEPTION) {
-        //         console.error(formatError(data, 'unhandled job exception'));
-        //         return true;
-        //     }
-        //     return false;
-        // });
+        const trace = new Set();
+        engine.onEvent((name: number, data) => {
+            const ET = engine.EventType;
+            if (name === ET.UNHANDLED_REJECTION) {
+                // @ts-ignore
+                const r = data[1] as Error;
+                if (trace.size > 20) trace.clear();
+                else if (trace.has(r)) return false;
+                trace.add(r);
+                // log.error('runtime', formatError(r, 'unhandled promise rejection'));
+                return false;
+            }
+            if (name === ET.JOB_EXCEPTION) {
+                log.error('runtime', formatError(data, 'unhandled job exception'));
+                return true;
+            }
+            return false;
+        });
     }
 
     // -------------------------------------------------------------------------
     // import.meta
     // -------------------------------------------------------------------------
 
-    // Reuse a single bound resolve function across all import.meta objects
-    private readonly metaResolve = (s: string, p: string, a?: Record<string, any>) =>
-        this.resolver.resolve(s, p, a).specPath;
-
     private fillMeta(meta: Record<string, any>, info: ModuleInfo): void {
         const remote  = isRemote(info.specPath);
-        meta.url      = remote ? info.specPath : info.localPath;
+        meta.url      = remote ? info.specPath : `file:///${info.localPath.replace(/^\//, '')}`;
         meta.filename = info.localPath;
         meta.dirname  = dirname(info.localPath);
         meta.main     = info.specPath === this.resolver.entry;
-        meta.use      = __use_fn;
-        meta.resolve  = this.metaResolve;
+        meta.use      = import.meta.use;
+        // import.meta.resolve(spec[, parent]) — parent defaults to this module's specPath
+        const self = info.specPath;
+        meta.resolve  = (s: string, p?: string, a?: Record<string, any>) =>
+            this.resolver.resolve(s, p ?? self, a).specPath;
     }
 
     private parentLocal(parent: string): string {
@@ -149,19 +173,55 @@ export class TypeScriptRuntime {
     // -------------------------------------------------------------------------
 
     async precache(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
+        const result = await this.runPrecache((scanner) =>
+            scanner.scan(entrySpecPath, entryLocalPath)
+        );
+        return result;
+    }
+
+    /**
+     * Pre-cache from an explicit set of specifiers (no entry file).
+     */
+    async precacheFromSpecifiers(specifiers: string[], dir: string): Promise<ScanResult> {
+        const result = await this.runPrecache((scanner) =>
+            scanner.scanFromSpecifiers(specifiers, dir)
+        );
+        return result;
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared precache implementation
+    // -------------------------------------------------------------------------
+
+    private async runPrecache(
+        scanFn: (scanner: DepScanner) => Promise<ScanResult>,
+    ): Promise<ScanResult> {
         const prog = this.config.silent ? null : new PrecacheProgress(6);
-        const scanner = new DepScanner(this.resolver, this.config, prog);
+        // Driver created early so its worker pool serves import scanning during BFS
+        const driver = new PrecompileDriver();
+        const scanner = new DepScanner(this.resolver, this.config, prog, this.oxc, driver.scanFile.bind(driver));
         let result;
         try {
-            result = await scanner.scan(entrySpecPath, entryLocalPath);
+            log.debug('deps', () => 'scan begin');
+            const scanStarted = Date.now();
+            result = await scanFn(scanner);
+            log.debug('deps', () => `scan done in ${Date.now() - scanStarted}ms`);
         } catch (e) {
-            // Release resources on error, but re-throw
+            // Even on catastrophic failure, flush whatever we resolved so far
+            try { this.resolver.rewriteLock(); } catch {}
+            prog?.stop();
             resources.release();
+            await driver.terminate();
             throw e;
         }
         for (const { spec, parent, error } of result.errors)
             log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
         this.resolver.rewriteLock();
+
+        // Run postinstall lifecycle scripts (only during cno cache)
+        if (!this.config.ignoreScripts) {
+            await this.runPostinstallScripts();
+        }
 
         const scannable = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
         const toCompile = result.modules.filter(m => {
@@ -171,7 +231,6 @@ export class TypeScriptRuntime {
 
         if (toCompile.length > 0) {
             try {
-                const driver = new PrecompileDriver();
                 prog?.setCompileProgress(0, toCompile.length);
                 const bytecodes = await driver.precompile(toCompile, (done, total) => {
                     prog?.setCompileProgress(done, total);
@@ -182,17 +241,45 @@ export class TypeScriptRuntime {
                     if (isRemote(m.specPath))
                         this.loader.jsc.persistMemory(m.localPath);
                 }
-                await driver.terminate();
                 log.debug('precompile', () => `${bytecodes.size}/${toCompile.length} modules precompiled`);
             } catch (e) {
-                log.debug('precompile', () => `failed: ${errMsg(e)}`);
+                log.warn('precompile', () => `failed: ${errMsg(e)}`);
             }
         }
 
+        await driver.terminate();
         prog?.stop();
-        // Release resources after precache completes successfully
         resources.release();
         return result;
+    }
+
+    private async runPostinstallScripts(): Promise<void> {
+        const scripts = this.resolver.drainPostinstall();
+        if (!scripts.length) return;
+        const isWin = uname.sysname.includes('Windows');
+        const shell = isWin ? 'cmd.exe' : 'sh';
+        const shellArg = isWin ? '/c' : '-c';
+        for (const { name, version, dir, script } of scripts) {
+            log.debug('postinstall', () => `${name}@${version}: ${script}`);
+            if (!this.config.silent) {
+                console.log(`  postinstall: ${name}@${version}`);
+            }
+            try {
+                const child = process.spawn([shell, shellArg, script], {
+                    cwd: dir,
+                    stdin: 'inherit',
+                    stdout: 'inherit',
+                    stderr: 'inherit',
+                    env: os.environ(),
+                });
+                const info = await child.wait();
+                if (info.exit_status !== 0) {
+                    log.warn('postinstall', () => `${name}@${version} exited with code ${info.exit_status}`);
+                }
+            } catch (e) {
+                log.warn('postinstall', () => `${name}@${version} failed: ${errMsg(e)}`);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -231,9 +318,10 @@ export class TypeScriptRuntime {
     }
 
     async loadEntry(path: string, extra: Record<string, any> = {}): Promise<CModuleEngine.Module> {
-        // Release any leftover pre-cache resources before user code starts.
-        // This is a no-op if precache() was never called or already cleaned up.
-        resources.release();
+        // Do NOT call resources.release() here — user code may trigger dynamic
+        // imports whose protocol handlers still rely on resolver/handler state
+        // (e.g. HttpHandler.resolved, NpmHandler.verCache).  Release happens
+        // after the entry module has fully settled in the caller (run.ts).
 
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
         const meta: Record<string, any> = { ...extra };
@@ -251,6 +339,10 @@ export class TypeScriptRuntime {
 
     /** Clean up runtime caches and loaded modules */
     cleanup(): void {
+        if (this.loader.hasPendingLoads()) {
+            log.warn('runtime', () => 'cleanup() called while async loads are in-flight — skipping cache clear to avoid use-after-free');
+            return;
+        }
         this.loader.clearLoadedModules();
         this.loader.jsc.clearMemory();
         this.loadedModules.clear();

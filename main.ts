@@ -4,16 +4,15 @@ import { isCompilerWorker, runCompilerWorker } from './src/precompile';
 import { createConfig, loadConfigFile, CLI_TPL } from './src/config';
 import { createRuntime } from './src/runtime';
 import { loadTasks } from './src/task';
+import { LockStore } from './src/lock';
 import { fatal, formatError } from './src/errors';
 import { dirname, normalizePath, isAbsolute, joinPaths } from './src/utils/path';
 import type { ConfigOptions, RuntimeConfig, ModuleInfo } from './src/types';
-import { os, console, worker, process, engine } from './src/utils';
+import { os, console, worker, engine, fs } from './src/utils';
 import { log } from './src/utils/log';
+import { stripJsonc } from './src/utils/misc';
 import { version } from './package.json';
-
-// debug
-(globalThis as any).console = console;
-(globalThis as any).process = process;
+const console = import.meta.use('console');
 
 interface WorkerData { __cts_entry: string; name?: string }
 
@@ -44,7 +43,8 @@ ${C.bold('cts2')} v${version} — TypeScript runner for circu.js
 
 ${C.bold('USAGE')}
   ${C.cyan('cts')} [options] ${C.cyan('<file.ts>')} [args…]
-  ${C.cyan('cts cache')} ${C.cyan('<file.ts>')}       Pre-download all deps + write lock
+  ${C.cyan('cts cache')}                    Cache deps from deno.json + package.json
+  ${C.cyan('cts cache')} ${C.cyan('<file.ts>')}       BFS from entry file + write lock
   ${C.cyan('cts task')}                  List deno.json tasks
   ${C.cyan('cts task')} ${C.cyan('<name>')} [args…]   Run a deno.json task
   ${C.cyan('cts --eval')} ${C.cyan('<code>')}         Evaluate inline TypeScript code
@@ -116,36 +116,107 @@ function warnUnknownFlags(parsed: Record<string, any>): void {
 async function runCacheCmd(args: string[], baseCfg: Partial<ConfigOptions>): Promise<void> {
     const raw = args[0];
     if (!raw) {
-        console.error(`Usage: ${C.cyan('cts cache')} ${C.cyan('<file.ts>')}`);
-        os.exit(1); return;
+        await runCacheNoArgs(baseCfg);
+        return;
     }
     const { entry, dir } = entryAndDir(raw);
     const cfg            = { ...loadConfigFile(dir), ...baseCfg, silent: false, noLock: false };
     const runtime        = createRuntime(cfg, dir);
-    const info           = runtime.resolver.resolve(entry, `${os.cwd}/<cache-cmd>`);
+    let info;
+    try {
+        info = runtime.resolver.resolve(entry, `${os.cwd}/<cache-cmd>`);
+    } catch (e) {
+        console.error(`${C.warn('⚠')} Cannot resolve entry: ${entry}`);
+        console.error(`  ${(e instanceof Error ? e.message : String(e))}`);
+        os.exit(1);
+        return;
+    }
     await runtime.precache(info.specPath, info.localPath);
     const lockDir = cfg.lockDir ?? dir;
     console.log(`${C.green('✔')} ${runtime.resolver.lockSize} modules cached`);
     console.log(C.dim(`  Lock: ${lockDir}/cts.lock`));
 }
 
+async function runCacheNoArgs(baseCfg: Partial<ConfigOptions>): Promise<void> {
+    const dir = os.cwd;
+    const cfg = { ...loadConfigFile(dir), ...baseCfg, silent: false, noLock: false };
+    const runtime = createRuntime(cfg, dir);
+    const specs = collectSpecifiers(dir);
+
+    if (specs.size === 0) {
+        console.error(`${C.warn('⚠')} No imports in deno.json or dependencies in package.json`);
+        os.exit(1); return;
+    }
+
+    await runtime.precacheFromSpecifiers([...specs], dir);
+
+    const lockDir = cfg.lockDir ?? dir;
+    console.log(`${C.green('✔')} ${runtime.resolver.lockSize} modules cached`);
+    console.log(C.dim(`  Lock: ${lockDir}/cts.lock`));
+}
+
+function collectSpecifiers(dir: string): Set<string> {
+    const specs = new Set<string>();
+
+    // deno.json / deno.jsonc imports
+    for (const name of ['deno.json', 'deno.jsonc']) {
+        const p = joinPaths(dir, name);
+        if (!fs.exists(p)) continue;
+        let dc: Record<string, any> | null = null;
+        try { dc = JSON.parse(stripJsonc(engine.decodeString(fs.readFile(p)))); } catch {}
+        if (dc?.imports && typeof dc.imports === 'object') {
+            for (const [, value] of Object.entries(dc.imports)) {
+                if (typeof value === 'string' && value.trim()) {
+                    specs.add(value);
+                }
+            }
+        }
+        // Don't break — also check package.json
+    }
+
+    // package.json dependencies / devDependencies
+    const pkgP = joinPaths(dir, 'package.json');
+    if (fs.exists(pkgP)) {
+        let pkg: Record<string, any> | null = null;
+        try { pkg = JSON.parse(engine.decodeString(fs.readFile(pkgP))); } catch {}
+        if (pkg) {
+            for (const field of ['dependencies', 'devDependencies'] as const) {
+                const deps = pkg[field];
+                if (!deps || typeof deps !== 'object') continue;
+                for (const [name, version] of Object.entries(deps)) {
+                    if (typeof version === 'string') {
+                        specs.add(`npm:${name}@${version}`);
+                    }
+                }
+            }
+        }
+    }
+
+    return specs;
+}
+
 async function runTaskCmd(args: string[]): Promise<void> {
-    const result = loadTasks(os.cwd);
-    if (!result) {
-        fatal(new Error(
-            'No deno.json with tasks found in current directory or any parent.\n' +
-            'Create a deno.json with a "tasks" field.'
-        ), 'cts task');
+    const lockStore = new LockStore(os.cwd, true);
+    try {
+        const result = loadTasks(os.cwd, lockStore);
+        if (!result) {
+            fatal(new Error(
+                'No deno.json with tasks found in current directory or any parent.\n' +
+                'Create a deno.json with a "tasks" field.'
+            ), 'cts task');
+        }
+        const { runner, configPath } = result;
+        if (!args.length || args[0] === '--list') {
+            console.log(C.dim(`Tasks from ${configPath}`));
+            runner.list();
+            return;
+        }
+        const [name, ...rest] = args;
+        const code = await runner.run(name!, rest);
+        if (code !== 0) os.exit(code);
+    } finally {
+        lockStore.close();
     }
-    const { runner, configPath } = result;
-    if (!args.length || args[0] === '--list') {
-        console.log(C.dim(`Tasks from ${configPath}`));
-        runner.list();
-        return;
-    }
-    const [name, ...rest] = args;
-    const code = await runner.run(name!, rest);
-    if (code !== 0) os.exit(code);
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +257,7 @@ async function run(
 }
 
 async function runEval(code: string, baseCfg: Partial<ConfigOptions>): Promise<void> {
-    const evalPath = joinPaths(os.cwd, '<eval>.ts');
+    const evalPath = joinPaths(String(os.cwd).replace(/\\/g, '/'), '<eval>.ts');
     const fileCfg  = loadConfigFile(os.cwd);
     const cfg      = { ...fileCfg, ...baseCfg };
     const runtime  = createRuntime(cfg, os.cwd);

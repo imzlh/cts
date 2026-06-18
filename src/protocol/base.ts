@@ -9,14 +9,14 @@
 // requests.  Protocol handlers don't need to worry about the runtime cache.
 
 import type { ModuleInfo, FileKind } from '../types';
-import type { Flow } from '../flow';
+import type { Flow, ProgressCallback } from '../flow';
 import { extname } from '../utils';
 
 export type { ModuleInfo };
 
 export interface ProtocolHandler {
     readonly protocols: string[];
-    resolve(spec: string, parent: string, attr?: Record<string, any>): Flow<ModuleInfo>;
+    resolve(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Flow<ModuleInfo>;
     localPath(specPath: string): string;
 }
 

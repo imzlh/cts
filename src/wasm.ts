@@ -11,7 +11,11 @@
 import type { ModuleInfo } from './types';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';
-import { fs, engine, wasm, assert } from './utils/index';
+import { assert } from './utils/index';
+
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
+const wasm = import.meta.use('wasm');
 
 const RE_INT_LITERAL = /^-?\d+n?$/;
 
@@ -79,6 +83,8 @@ export interface WasmImportSource {
     /** Resolve a JS module by specifier + parentPath. Return its exports object. */
     require(spec: string, parentPath: string): Record<string, any> | null;
 }
+
+const loadedWasmModule: CModuleEngine.Module[] = [];
 
 /**
  * Look up a named export, falling back to `exports.default[name]`.
@@ -167,8 +173,8 @@ function resolveMemoryImport(
         const exports = importSource.require(modName, parentPath);
         if (exports) {
             const mem = getExport(exports, fieldName);
-            if (mem && typeof mem === 'object' && (mem as any).buffer instanceof ArrayBuffer) {
-                const initial = Math.ceil(((mem as any).buffer as ArrayBuffer).byteLength / 65536);
+            if (mem && typeof mem === 'object' && mem.buffer instanceof ArrayBuffer) {
+                const initial = Math.ceil((mem.buffer as ArrayBuffer).byteLength / 65536);
                 return { module: modName, name: fieldName, initial };
             }
         }
@@ -190,7 +196,7 @@ function resolveGlobalImport(
         if (exports) {
             const g = getExport(exports, fieldName);
             if (g && typeof g === 'object') {
-                const raw = (g as any).value ?? (typeof (g as any).valueOf === 'function' ? (g as any).valueOf() : 0);
+                const raw = g.value ?? (typeof g.valueOf === 'function' ? g.valueOf() : 0);
                 const vtype = typeof raw;
                 const type = vtype === 'bigint' ? 'i64' as const
                     : vtype === 'number' ? (Number.isInteger(raw) ? 'i32' as const : 'f64' as const)
@@ -372,6 +378,7 @@ export function buildWasmModule(
 
     mod.export('default', ns);
     mod.export('instance', wrappedInst);
+    loadedWasmModule.push(mod);
 
     log.debug('wasm', () => `loaded: ${exp.length} exports`);
     return { mod, instance: inst };

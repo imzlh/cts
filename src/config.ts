@@ -6,8 +6,12 @@ import { readText, writeText, ensureDir } from './utils/io';
 import { stripJsonc, safeParse, parseArgs } from './utils/misc';
 import { log } from './utils/log';
 import { err, ErrorKind } from './errors';
-import { os, fs, engine, uname, timers } from './utils/index';
+import { uname } from './utils/index';
 
+const os = import.meta.use('os');
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
+const timers = import.meta.use('timers');
 
 // ---------------------------------------------------------------------------
 // Defaults (only truly required fields)
@@ -21,6 +25,8 @@ const DEFAULTS = {
     jsrCacheTTL: 7 * 24 * 60 * 60 * 1000,
     requestTimeout: 30000,
     disableCache: false,
+    enableOxc: true,
+    ignoreScripts: false,
     polyfill:    '',
     cacheDir:    '',
 } as const;
@@ -33,7 +39,7 @@ export function parseSize(s: string | undefined): number | undefined {
     if (!s) return undefined;
     const m = s.match(/^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$/i);
     if (!m) throw err(ErrorKind.InvalidSpecifier, `Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
-    const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024**2, GB: 1024**3 };
+    const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024**2, GB: 1024**3, TB: 1024**4 };
     return Math.floor(parseFloat(m[1]!) * (units[(m[2] ?? 'B').toUpperCase()] ?? 1));
 }
 
@@ -50,6 +56,12 @@ function envConfig(): Partial<ConfigOptions> {
     const v = (k: string) => env(E + k);
     const cacheDir = v('CACHE_DIR'); if (cacheDir) c.cacheDir = cacheDir;
     const dc  = bool(v('DISABLE_CACHE')); if (dc  !== undefined) c.disableCache = dc;
+    // New OXC env vars (preferred)
+    const no  = bool(v('NO_OXC'));         if (no === true) c.enableOxc = false;
+    const oxc = bool(v('ENABLE_OXC'));     if (oxc !== undefined) c.enableOxc = oxc;
+    // Legacy SWC env vars — map to enableOxc for backward compat
+    const ns  = bool(v('NO_SWC'));         if (ns === true) c.enableOxc = false;
+    const swc = bool(v('ENABLE_SWC'));     if (swc !== undefined) c.enableOxc = swc;
     const http = bool(v('ENABLE_HTTP')); if (http !== undefined) c.enableHttp = http;
     const jsr  = bool(v('ENABLE_JSR'));  if (jsr  !== undefined) c.enableJsr  = jsr;
     const node = bool(v('ENABLE_NODE')); if (node !== undefined) c.enableNode = node;
@@ -67,7 +79,7 @@ function defaultCacheDir(): string {
     let home: string | null = null;
     try { home = os.homeDir; } catch {}
     if (!home) home = env(uname.sysname.includes('Windows') ? 'USERPROFILE' : 'HOME') ?? '/root';
-    return joinPaths(home, '.cts');
+    return joinPaths(String(home).replace(/\\/g, '/'), '.cts');
 }
 
 // ---------------------------------------------------------------------------
@@ -131,9 +143,12 @@ const CLI_TPL = {
     'no-jsr':         'boolean',
     'no-node':        'boolean',
     'disable-cache':  'boolean',
+    'no-oxc':         'boolean',
+    'no-swc':         'boolean',
     'precache':       'boolean',
     'no-lock':        'boolean',
     'frozen':         'boolean',
+    'ignore-scripts': 'boolean',
     'help':           'boolean',
     'h':              'boolean',
     'version':        'boolean',
@@ -159,12 +174,14 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     if (cli['eval'])          cfg.eval           = cli['eval'];
     if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || getEnv('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.disableCache  = true;
+    if (cli['no-oxc'] || cli['no-swc']) cfg.enableOxc = false;
     if (cli['silent'])        cfg.silent        = true;
     if (cli['no-http'])       cfg.enableHttp    = false;
     if (cli['no-jsr'])        cfg.enableJsr     = false;
     if (cli['no-node'])       cfg.enableNode    = false;
     if (cli['no-lock'])       cfg.noLock        = true;
     if (cli['frozen'])        cfg.frozen        = true;
+    if (cli['ignore-scripts']) cfg.ignoreScripts = true;
     if (cli['memory-limit'] !== undefined)
         cfg.memoryLimit = parseSize(cli['memory-limit'] || getEnv('CTS_MEMORY_LIMIT') || '1g');
     if (cli['max-stack-size'] !== undefined)

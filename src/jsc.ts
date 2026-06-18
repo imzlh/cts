@@ -12,7 +12,9 @@
 import { dirname } from './utils/path';
 import { ensureDir } from './utils/io';
 import { log } from './utils/log';
-import { fs, engine } from './utils/index';
+
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 export function isRemote(specPath: string): boolean {
     return specPath.startsWith('http://') || specPath.startsWith('https://')

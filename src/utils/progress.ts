@@ -6,8 +6,10 @@
 // TTY:  live multi-line render with spinner, colors, speed
 // pipe: per-download 📦 lines (from handlers via !isatty)
 
-import { engine, timers, os, fs } from './index';
-const { setInterval, clearInterval } = timers;
+const os = import.meta.use('os');
+const engine = import.meta.use('engine');
+const fs = import.meta.use('fs');
+const { setInterval, clearInterval } = import.meta.use('timers');
 
 // ---------------------------------------------------------------------------
 // Colors
@@ -27,8 +29,18 @@ const C = {
 // TTY
 // ---------------------------------------------------------------------------
 
-export let isatty = false;
-let termWidth = 80;
+export const isatty = (() => {
+    try { return os.guessHandle(os.STDOUT_FILENO) === 'tty'; }
+    catch { return false; }
+})();
+let termWidth = (() => {
+    try {
+        const cols = Number(os.getenv('COLUMNS') ?? '');
+        return Number.isFinite(cols) && cols > 20 ? cols : 80;
+    } catch {
+        return 80;
+    }
+})();
 
 function write(s: string): void {
     fs.write(os.STDOUT_FILENO, engine.encodeString(s));
@@ -51,6 +63,7 @@ interface DownloadItem {
     total: number;
     done: number;
     finished: boolean;
+    downloaded: boolean;
     error?: string;
 }
 
@@ -82,8 +95,6 @@ export class PrecacheProgress {
 
     constructor(maxLines = 5) {
         this.maxLines = maxLines;
-        // FIXME: really initialize tty via C func
-        // initTty();
     }
 
     // ---- Scan phase ----
@@ -94,19 +105,22 @@ export class PrecacheProgress {
         this.kick();
     }
 
-    /** Build onProgress callback for a specifier. Only big packages get detail lines. */
+    /** Show that a specifier is actively being resolved, even before network starts. */
+    startResolve(spec: string): void {
+        this.addItem(spec, `resolve ${short(spec)}`, 0, false);
+    }
+
+    /** Build onProgress callback for a specifier. */
     onDownloadProgress(spec: string): (now: number, total: number) => void {
-        let tracked = false;
         return (now: number, total: number) => {
-            if (tracked) {
-                this.updateItem(spec, now, total);
-                return;
+            const item = this.items.get(spec);
+            if (!item) {
+                this.addItem(spec, `fetch ${short(spec)}`, total, true);
+            } else {
+                item.label = `fetch ${short(spec)}`;
+                item.downloaded = true;
             }
-            if (total >= BIG_THRESHOLD) {
-                this.addItem(spec, short(spec), total);
-                tracked = true;
-                this.updateItem(spec, now, total);
-            }
+            this.updateItem(spec, now, total);
         };
     }
 
@@ -117,7 +131,8 @@ export class PrecacheProgress {
         item.finished = true;
         item.error = error;
         this.itemDone++;
-        this.downloaded++;
+        if (item.downloaded) this.downloaded++;
+        this.kick();
     }
 
     // ---- Precompile phase ----
@@ -145,11 +160,12 @@ export class PrecacheProgress {
         }
     }
 
-    private addItem(key: string, label: string, totalBytes: number): void {
+    private addItem(key: string, label: string, totalBytes: number, downloaded: boolean): void {
         if (this.items.has(key)) return;
-        this.items.set(key, { label, total: totalBytes, done: 0, finished: false });
+        this.items.set(key, { label, total: totalBytes, done: 0, finished: false, downloaded });
         this.order.push(key);
         this.itemTotal++;
+        this.kick();
     }
 
     private updateItem(key: string, done: number, total: number): void {

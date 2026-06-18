@@ -13,8 +13,10 @@ import { resolveFile } from './utils/io';
 import { safeParse } from './utils/misc';
 import { detectFormat, resolveMain, createCtx } from './pkg';
 import { log } from './utils/log';
-import { fs, engine } from './utils/index';
 import { err, ErrorKind } from './errors';
+
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 // ---------------------------------------------------------------------------
 // Types
@@ -203,13 +205,15 @@ export class CjsLoader {
         this.loading.add(mod.filename);
 
         try {
+            const started = Date.now();
+            log.debug('cjs', () => `eval begin: ${mod.filename} (${src.length} chars)`);
             const wrapper =
                 `const global=globalThis,{exports,require,module,__filename,__dirname}` +
                 `=globalThis[${JSON.stringify(key)}];\n${src}`;
             engine.eval(wrapper, mod.filename,
                 engine.EVAL_NEW_BACKTRACE | engine.EVAL_MODULE);
             mod.loaded = true;
-            log.debug('cjs', () => `loaded: ${mod.filename}`);
+            log.debug('cjs', () => `eval done: ${mod.filename} in ${Date.now() - started}ms`);
         } catch (e) {
             this.cache.delete(mod.filename);
             throw err(ErrorKind.Generic, `Error loading '${mod.filename}': ${e}`);
@@ -223,7 +227,7 @@ export class CjsLoader {
     // require() factory
     // -------------------------------------------------------------------------
 
-    public mkRequire(parentPath: string, parentMod: CjsModule): CjsRequireFn {
+    public mkRequire(parentPath: string, parentMod: CjsModule | null = null): CjsRequireFn {
         const self = this;
 
         function require(id: string): any {
@@ -269,7 +273,7 @@ export class CjsLoader {
         require.extensions = {
             '.js':   (m: CjsModule) => self.execJs(m),
             '.json': (m: CjsModule) => self.execJson(m),
-        } as any;
+        };
         return require as CjsRequireFn;
     }
 
@@ -345,7 +349,7 @@ export class CjsLoader {
         }
 
         // Relative path
-        if (id.startsWith('./') || id.startsWith('../')) {
+        if (id.startsWith('./') || id.startsWith('../') || id.startsWith('.\\') || id.startsWith('..\\')) {
             const base = joinPaths(dirname(parentPath), id);
             try {
                 const path = resolveFile(base);

@@ -2,8 +2,10 @@
 
 import { dirname, joinPaths } from './path';
 import { LRU } from './lru';
-import { fs, engine } from './index';
 import { err, ErrorKind } from '../errors';
+
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 export const readText  = (p: string) => engine.decodeString(fs.readFile(p));
 export const writeText = (p: string, s: string) => fs.writeFile(p, engine.encodeString(s));

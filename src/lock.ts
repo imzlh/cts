@@ -1,163 +1,309 @@
-// lock.ts — persistent resolution lock (optimized I/O)
+// lock.ts — persistent resolution lock (SQLite3)
 //
-// Format: NDJSON v2, one JSON object per line.
-//   Module entry: {"s":"specPath","l":"localPath","f":"esm","k":"source"}
-//   Source entry: {"q":"spec\0parent","v":"specPath"}
+// Tables:
+//   modules: spec TEXT PK, local TEXT, format TEXT, kind TEXT
+//   sources: key TEXT PK ("spec\0parent"), spec TEXT
+//   bins:    name TEXT PK, path TEXT, pkg TEXT
 //
-// Lock is the single source of truth for module resolution.
-// It does NOT store dependency edges or compilation artifacts —
-// those belong to the JSC cache (jsc.ts) and the BFS scanner (deps.ts).
-//
-// Load: wraps all data lines in [] → single JSON.parse() instead of N calls.
-// Flush: opens file with 'a' flag → pure append, never reads existing content.
+// Performance:
+//   - Every statement is prepared → used → finalized per call (safe reuse pattern).
+//   - Writes accumulate inside a lazy deferred transaction committed on
+//     flush() / rewrite() / close().  For `cno cache` with 500+ modules this
+//     turns hundreds of individual INSERTs into a single batch commit.
 
 import type { ModuleInfo, ModuleFormat, FileKind } from './types';
 import { joinPaths, dirname } from './utils/path';
 import { ensureDir } from './utils/io';
 import { log } from './utils/log';
-import { fs, engine } from './utils/index';
+import { errMsg } from './utils';
 
-interface ModuleEntry { s: string; l: string; f: ModuleFormat; k: FileKind }
-interface SourceEntry  { q: string; v: string }
+const sqlite3 = import.meta.use('sqlite3');
+const fs = import.meta.use('fs');
 
-const HEADER = '// cts.lock v2\n';
+const DB_FILENAME = 'cts.lock';
 
-function serMod(i: ModuleInfo): string {
-    return `{"s":${JSON.stringify(i.specPath)},"l":${JSON.stringify(i.localPath)},"f":"${i.format}","k":"${i.fileKind}"}\n`;
-}
-function serSrc(q: string, v: string): string {
-    return `{"q":${JSON.stringify(q)},"v":${JSON.stringify(v)}}\n`;
-}
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS modules (
+    spec  TEXT PRIMARY KEY,
+    local TEXT NOT NULL,
+    fmt   TEXT NOT NULL,
+    kind  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sources (
+    key  TEXT PRIMARY KEY,
+    spec TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bins (
+    name TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    pkg  TEXT NOT NULL
+);
+`;
 
 export class LockStore {
-    readonly modules = new Map<string, ModuleInfo>();
-    readonly sources = new Map<string, string>();
-    private dirtyMods = new Map<string, ModuleInfo>();
-    private dirtySrcs = new Map<string, string>();
-    private readonly path: string;
-    private flushing = false;
-    private flushQueue: Array<() => void> = [];
+    private static readonly openStores = new Set<LockStore>();
 
-    constructor(lockDir: string, private readonly readOnly: boolean) {
-        this.path = joinPaths(lockDir, 'cts.lock');
+    private db:   CModuleSQLite3.Sqlite3Handle | null = null;
+    private inTx = false;
+    private loadFailed = false;
+    private recoveredInvalidLock = false;
+    private readonly dbPath:   string;
+    private readonly readOnly: boolean;
+
+    constructor(lockDir: string, readOnly: boolean) {
+        this.readOnly = readOnly;
+        const dir = lockDir.replace(/\\/g, '/');
+        this.dbPath = joinPaths(dir, DB_FILENAME);
     }
 
     // -------------------------------------------------------------------------
-    // Load — single JSON.parse for all lines, zero I/O beyond the read
+    // Open / schema init
     // -------------------------------------------------------------------------
+
+    static closeAll(): void {
+        for (const store of [...LockStore.openStores]) {
+            try { store.close(); }
+            catch (e) { log.warn('lock', `close failed: ${errMsg(e)}`); }
+        }
+    }
+
+    static closeAllFast(): void {
+        for (const store of [...LockStore.openStores]) {
+            try { store.closeFast(); }
+            catch (e) { log.debug('lock', () => `fast close failed: ${errMsg(e)}`); }
+        }
+    }
+
+    private markOpen(): void {
+        LockStore.openStores.add(this);
+    }
 
     load(): void {
-        if (!fs.exists(this.path)) return;
-        let raw: string;
-        try { raw = engine.decodeString(fs.readFile(this.path)); }
-        catch { log.warn('lock', 'read failed'); return; }
+        if (this.db) return;
+        if (this.loadFailed) return;
 
-        const lines: string[] = [];
-        for (const line of raw.split('\n')) {
-            const l = line.trim();
-            if (l && !l.startsWith('//')) lines.push(l);
+        if (!this.readOnly) {
+            try { ensureDir(dirname(this.dbPath)); } catch {}
         }
-        if (!lines.length) return;
 
-        let rows: Array<ModuleEntry & SourceEntry>;
         try {
-            rows = JSON.parse('[' + lines.join(',') + ']');
-        } catch {
-            rows = [];
-            let badLines = 0;
-            for (const l of lines) { try { rows.push(JSON.parse(l)); } catch { badLines++; } }
-            if (badLines > 0) log.warn('lock', `truncated lock file: ${badLines} corrupt line(s) skipped`);
+            if (this.readOnly) {
+                if (fs.exists(this.dbPath)) {
+                    this.db = sqlite3.open(this.dbPath, sqlite3.O_READONLY);
+                    this.markOpen();
+                    log.debug('lock', () => `opened ${this.dbPath}`);
+                    return;  // existing DB already has schema
+                } else {
+                    // no lock yet — use throw-away in-memory DB (read-only mode, no writes)
+                    this.db = sqlite3.open('', sqlite3.O_CREATE | sqlite3.O_READWRITE | sqlite3.O_MEMORY);
+                }
+            } else {
+                this.db = sqlite3.open(this.dbPath, sqlite3.O_CREATE | sqlite3.O_READWRITE);
+            }
+        } catch (e) {
+            log.warn('lock', `open failed: ${errMsg(e)}`);
+            this.loadFailed = true;
+            return;
         }
 
-        let mods = 0, srcs = 0;
-        for (const o of rows) {
-            if (o.q !== undefined) {
-                this.sources.set(o.q, o.v); srcs++;
-            } else if (o.s && o.l && o.f && o.k) {
-                this.modules.set(o.s, { specPath: o.s, localPath: o.l, format: o.f, fileKind: o.k });
-                mods++;
+        try {
+            this.db!.exec('PRAGMA journal_mode = WAL');
+            this.db!.exec('PRAGMA synchronous = NORMAL');
+            this.db!.exec('PRAGMA cache_size = -8000');
+            this.db!.exec('PRAGMA temp_store = MEMORY');
+            this.db!.exec(SCHEMA);
+        } catch (e) {
+            log.warn('lock', `schema init failed: ${errMsg(e)}`);
+            try { this.db!.close(); } catch {}
+            this.db = null;
+            if (!this.readOnly && !this.recoveredInvalidLock) {
+                this.recoveredInvalidLock = true;
+                this.backupInvalidLock();
+                this.loadFailed = false;
+                this.load();
+                return;
             }
+            this.loadFailed = true;
+            return;
         }
-        log.debug('lock', () => `loaded ${mods}M ${srcs}S`);
+
+        this.markOpen();
+        log.debug('lock', () => `opened ${this.dbPath}`);
     }
 
-    getModule(sp: string): ModuleInfo | undefined { return this.modules.get(sp); }
-    getSource(spec: string, parent: string): string | undefined { return this.sources.get(`${spec}\0${parent}`); }
+    private backupInvalidLock(): void {
+        const bak = `${this.dbPath}.bak`;
+        try { if (fs.exists(bak)) fs.unlink(bak); } catch {}
+        try {
+            if (fs.exists(this.dbPath)) fs.rename(this.dbPath, bak);
+        } catch {
+            try { if (fs.exists(this.dbPath)) fs.unlink(this.dbPath); } catch {}
+        }
+        for (const suffix of ['-wal', '-shm']) {
+            try {
+                const p = this.dbPath + suffix;
+                if (fs.exists(p)) fs.unlink(p);
+            } catch {}
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers — prepare → use → finalize per call (avoids statement-reuse bugs)
+    // -------------------------------------------------------------------------
+
+    private getDb(): CModuleSQLite3.Sqlite3Handle | null {
+        if (!this.db) this.load();
+        return this.db;
+    }
+
+    private query(sql: string, params: any[] = []): any[] {
+        const db = this.getDb(); if (!db) return [];
+        try {
+            const stmt = db.prepare(sql);
+            const rows = stmt.all(params);
+            stmt.finalize();
+            return rows;
+        } catch (e) {
+            log.debug('lock', () => `query failed: ${e}`);
+            return [];
+        }
+    }
+
+    private exec(sql: string, params: any[]): void {
+        const db = this.getDb(); if (!db) return;
+        const stmt = db.prepare(sql);
+        stmt.run(params);
+        stmt.finalize();
+    }
+
+    // -------------------------------------------------------------------------
+    // Lazy write transaction — BEGIN on first write, COMMIT on flush/rewrite/close
+    // -------------------------------------------------------------------------
+
+    private beginTx(): void {
+        if (this.inTx || !this.db) return;
+        try { this.db.exec('BEGIN DEFERRED'); this.inTx = true; } catch {}
+    }
+
+    private commitTx(): void {
+        if (!this.inTx || !this.db) return;
+        try { this.db.exec('COMMIT'); } catch (e) {
+            try { this.db.exec('ROLLBACK'); } catch {}
+            log.warn('lock', `commit failed: ${e}`);
+        }
+        this.inTx = false;
+    }
+
+    private rollbackTx(): void {
+        if (!this.inTx || !this.db) return;
+        try { this.db.exec('ROLLBACK'); } catch {}
+        this.inTx = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Read
+    // -------------------------------------------------------------------------
+
+    getModule(sp: string): ModuleInfo | undefined {
+        const rows = this.query('SELECT local, fmt, kind FROM modules WHERE spec = ?', [sp]);
+        if (!rows.length) return undefined;
+        const r = rows[0];
+        return { specPath: sp, localPath: r.local, format: r.fmt as ModuleFormat, fileKind: r.kind as FileKind };
+    }
+
+    getSource(spec: string, parent: string): string | undefined {
+        const rows = this.query('SELECT spec FROM sources WHERE key = ?', [`${spec}\0${parent}`]);
+        return rows.length ? rows[0].spec : undefined;
+    }
+
+    getBin(name: string): { path: string; pkg: string } | undefined {
+        const rows = this.query('SELECT path, pkg FROM bins WHERE name = ?', [name]);
+        return rows.length ? { path: rows[0].path, pkg: rows[0].pkg } : undefined;
+    }
+
+    // -------------------------------------------------------------------------
+    // Write  (all writes accumulate inside a lazy deferred transaction)
+    // -------------------------------------------------------------------------
 
     setModule(info: ModuleInfo): void {
-        if (this.readOnly || this.modules.has(info.specPath)) return;
-        this.modules.set(info.specPath, info);
-        this.dirtyMods.set(info.specPath, info);
+        if (this.readOnly) return;
+        this.beginTx();
+        this.exec('INSERT OR REPLACE INTO modules (spec, local, fmt, kind) VALUES (?, ?, ?, ?)',
+            [info.specPath, info.localPath, info.format, info.fileKind]);
     }
 
     setSource(spec: string, parent: string, sp: string): void {
         if (this.readOnly) return;
-        const k = `${spec}\0${parent}`;
-        if (this.sources.has(k)) return;
-        this.sources.set(k, sp);
-        this.dirtySrcs.set(k, sp);
+        this.beginTx();
+        this.exec('INSERT OR REPLACE INTO sources (key, spec) VALUES (?, ?)',
+            [`${spec}\0${parent}`, sp]);
+    }
+
+    addBin(name: string, path: string, pkg: string): void {
+        if (this.readOnly) return;
+        this.beginTx();
+        this.exec('INSERT OR REPLACE INTO bins (name, path, pkg) VALUES (?, ?, ?)',
+            [name, path, pkg]);
+    }
+
+    removeBinsForPackage(pkg: string): void {
+        if (this.readOnly) return;
+        this.beginTx();
+        this.exec('DELETE FROM bins WHERE pkg = ?', [pkg]);
     }
 
     // -------------------------------------------------------------------------
-    // Flush — append via fd, no read-back (with queue to prevent concurrent writes)
+    // Flush / rewrite / close
     // -------------------------------------------------------------------------
 
     flush(): void {
-        if (this.readOnly || (this.dirtyMods.size === 0 && this.dirtySrcs.size === 0)) return;
-
-        // Queue flush if another flush is in progress
-        if (this.flushing) {
-            this.flushQueue.push(() => this.flush());
-            return;
+        if (!this.db) return;
+        this.commitTx();
+        if (!this.readOnly) {
+            try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch {}
         }
+    }
 
-        this.flushing = true;
-        const dirtyMods = new Map(this.dirtyMods);
-        const dirtySrcs = new Map(this.dirtySrcs);
-        this.dirtyMods.clear();
-        this.dirtySrcs.clear();
+    // Called at end of `cno cache` — commit everything accumulated so far.
+    rewrite(): void { this.commitTx(); }
 
+    close(): void {
+        const db = this.db;
+        if (!db) return;
+        this.commitTx();
         try {
-            ensureDir(dirname(this.path));
-            let chunk = fs.exists(this.path) ? '' : HEADER;
-            for (const info of dirtyMods.values()) chunk += serMod(info);
-            for (const [q, v] of dirtySrcs) chunk += serSrc(q, v);
+            if (!this.readOnly) {
+                db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+            }
+        } catch {}
+        try { db.close(); }
+        finally {
+            this.db = null;
+            this.inTx = false;
+            LockStore.openStores.delete(this);
+        }
+    }
 
-            const fd = fs.open(this.path, 'a');
-            try { fs.write(fd, engine.encodeString(chunk)); }
-            finally { fs.close(fd); }
-
-            log.debug('lock', () => `flushed ${dirtyMods.size}M ${dirtySrcs.size}S`);
-        } catch (e) { log.warn('lock', 'flush failed', e); }
-
-        this.flushing = false;
-
-        // Process queued flushes
-        while (this.flushQueue.length > 0) {
-            const next = this.flushQueue.shift();
-            next?.();
+    closeFast(): void {
+        const db = this.db;
+        if (!db) return;
+        this.rollbackTx();
+        try { db.close(); }
+        finally {
+            this.db = null;
+            this.inTx = false;
+            LockStore.openStores.delete(this);
         }
     }
 
     // -------------------------------------------------------------------------
-    // Rewrite — sorted, deduplicated (called by `cts cache`)
+    // Metrics
     // -------------------------------------------------------------------------
 
-    rewrite(): void {
-        if (this.readOnly) return;
-        try {
-            ensureDir(dirname(this.path));
-            let out = HEADER;
-            for (const i of [...this.modules.values()].sort((a, b) => a.specPath < b.specPath ? -1 : 1))
-                out += serMod(i);
-            for (const [q, v] of [...this.sources.entries()].sort(([a], [b]) => a < b ? -1 : 1))
-                out += serSrc(q, v);
-            fs.writeFile(this.path, engine.encodeString(out));
-            this.dirtyMods.clear(); this.dirtySrcs.clear();
-            log.debug('lock', () => `rewrote ${this.modules.size}M ${this.sources.size}S`);
-        } catch (e) { log.warn('lock', 'rewrite failed', e); }
+    get size(): number {
+        const rows = this.query('SELECT COUNT(*) AS n FROM modules');
+        return rows[0]?.n ?? 0;
     }
 
-    get size(): number { return this.modules.size; }
-    get dirtyCount(): number { return this.dirtyMods.size + this.dirtySrcs.size; }
+    get dirtyCount(): number { return 0; }
 }

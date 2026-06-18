@@ -1,88 +1,37 @@
-import { parse } from '../deps/sucrase/src/parser';
-import { TokenType as tt } from '../deps/sucrase/src/parser/tokenizer/types';
-import { ContextualKeyword } from '../deps/sucrase/src/parser/tokenizer/keywords';
-
 import type { RuntimeConfig } from './types';
 import { ModuleResolver } from './resolver';
 import { extname } from './utils/path';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';
 import { PrecacheProgress } from './utils/progress';
-import { fs, engine, asyncfs, wasm } from './utils/index';
+import type { OxcTranspiler } from './oxc';
+import { extractImports, SCANNABLE, WASM_EXT } from './scan';
 
-// ---------------------------------------------------------------------------
-// Import specifier extraction — sucrase token-based, no regex
-// ---------------------------------------------------------------------------
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
+const asyncfs = import.meta.use('asyncfs');
+const wasm = import.meta.use('wasm');
+const os = import.meta.use('os');
 
-const SCANNABLE = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
-const WASM_EXT  = '.wasm';
 // WASI module names — provided by the runtime, no JS resolution needed.
 const WASI_MODS = new Set(['wasi_unstable', 'wasi_snapshot_preview1']);
 
-export function extractImports(source: string, isTs = true): string[] {
-    // Fast path: skip parse if source has no import/export/require keywords.
-    // These substrings appear in every valid import/export/require statement.
+async function extractImportsFast(
+    source: string,
+    filename: string,
+    isTs: boolean,
+    acc: OxcTranspiler | null,
+): Promise<string[]> {
     if (!source.includes('import') && !source.includes('export') && !source.includes('require')) return [];
-    let tokens;
-    try {
-        const file = parse(source, true, isTs, false);
-        tokens = file.tokens;
-    } catch { return []; }
-
-    // stringValue(i): equivalent to TokenProcessor.stringValueAtIndex —
-    // strips the surrounding quote characters from a string token.
-    const sv = (i: number) => source.slice(tokens[i]!.start + 1, tokens[i]!.end - 1);
-    const specs = new Set<string>();
-
-    for (let i = 0; i < tokens.length; i++) {
-        const tok = tokens[i]!;
-        if (tok.type === tt._import) {
-            const next = tokens[i + 1];
-            if (!next) continue;
-            if (next.type === tt.parenL) {                    // import('...')
-                if (tokens[i + 2]?.type === tt.string) specs.add(sv(i + 2));
-                continue;
-            }
-            if (next.type === tt.string) {                    // import '...'
-                specs.add(sv(i + 1)); continue;
-            }
-            const si = findFromString(tokens, i + 1);         // import ... from '...'
-            if (si !== -1) specs.add(sv(si));
-            continue;
+    if (acc) {
+        try {
+            const deps = acc.scanImports(source, filename);
+            if (deps !== null) return deps;
+        } catch (e) {
+            log.debug('oxc', () => `scanImports failed for ${filename}: ${errMsg(e)}`);
         }
-        if (tok.type === tt._export) {                        // export ... from '...'
-            const si = findFromString(tokens, i + 1);
-            if (si !== -1) specs.add(sv(si));
-            continue;
-        }
-        if (tok.type === tt.name &&                           // require('...')
-            source.slice(tok.start, tok.end) === 'require' &&
-            tokens[i + 1]?.type === tt.parenL &&
-            tokens[i + 2]?.type === tt.string)
-            specs.add(sv(i + 2));
     }
-    return [...specs];
-}
-
-function findFromString(
-    tokens: ReturnType<typeof parse>['tokens'],
-    start:  number,
-): number {
-    const limit = Math.min(start + 80, tokens.length);
-    let braceDepth = 0;
-    for (let i = start; i < limit; i++) {
-        const t = tokens[i]!;
-        // Track brace depth to skip over { Foo, Bar } in export type { ... } from '...'
-        if (t.type === tt.braceL) { braceDepth++; continue; }
-        if (t.type === tt.braceR) { braceDepth--; continue; }
-        // Only look for 'from' when not inside braces
-        if (braceDepth > 0) continue;
-        if (t.type === tt.semi) break;
-        if (t.type === tt.name &&
-            t.contextualKeyword === ContextualKeyword._from &&
-            tokens[i + 1]?.type === tt.string) return i + 1;
-    }
-    return -1;
+    return extractImports(source, isTs);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,79 +39,210 @@ function findFromString(
 // ---------------------------------------------------------------------------
 
 export interface ScanResult {
-    visited:    number;
+    visited: number;
     downloaded: number;
     errors: Array<{ spec: string; parent: string; error: string }>;
-    modules:    Array<{ specPath: string; localPath: string }>;
+    modules: Array<{ specPath: string; localPath: string }>;
 }
 
 export class DepScanner {
-    private readonly seen  = new Set<string>();
+    private readonly seen = new Set<string>();
     private readonly errs: ScanResult['errors'] = [];
     private readonly found: ScanResult['modules'] = [];
     private downloaded = 0;
 
     constructor(
         private readonly resolver: ModuleResolver,
-        private readonly cfg:      RuntimeConfig,
-        private readonly prog:     PrecacheProgress | null = null,
-    ) {}
+        private readonly cfg: RuntimeConfig,
+        private readonly prog: PrecacheProgress | null = null,
+        private readonly oxc: OxcTranspiler | null = null,
+        private readonly scanWorker: ((source: string, localPath: string) => Promise<string[]>) | null = null,
+    ) { }
 
     async scan(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
+        this.init();
+        // Seed with the entry file — resolveAsync will handle local file resolution
+        return this.queueLoopInternal([{ spec: entrySpecPath, parent: `${os.cwd}/<entry>` }]);
+    }
+
+    /**
+     * BFS from an explicit set of specifiers (no entry file needed).
+     */
+    async scanFromSpecifiers(specifiers: string[], parentDir: string): Promise<ScanResult> {
+        this.init();
+        if (!specifiers.length) {
+            return { visited: 0, downloaded: 0, errors: [], modules: [] };
+        }
+        const parent = `${parentDir}/<cache>`;
+        const seeds: Array<{ spec: string; parent: string }> = [];
+        for (const spec of specifiers) {
+            seeds.push({ spec, parent });
+        }
+        return this.queueLoopInternal(seeds);
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared internals
+    // -------------------------------------------------------------------------
+
+    private init(): void {
         this.seen.clear();
         this.errs.length = 0;
         this.found.length = 0;
-        this.downloaded  = 0;
+        this.downloaded = 0;
+    }
 
-        let batch: Array<{ specPath: string; localPath: string }> =
-            [{ specPath: entrySpecPath, localPath: entryLocalPath }];
+    /**
+     * Concurrent queue: keep the full curl connection pool busy.
+     * Each worker pulls one specifier, resolves it, enqueues its children.
+     * No waiting for a whole batch to finish.
+     */
+    private async queueLoopInternal(
+        seeds: Array<{ spec: string; parent: string }>,
+    ): Promise<ScanResult> {
+        // Queue holds specifiers to resolve (spec, parentSpecPath)
+        const queue: Array<{ spec: string; parent: string }> = [];
+        // pending counts items not yet fully processed (queued + active).
+        let pending = 0;
+        const wakeWaiters: Array<() => void> = [];
 
-        try {
-            while (batch.length > 0) {
-                const specifiers = await this.parseLevel(batch);
-                const next: typeof batch = [];
+        const wake = () => {
+            while (wakeWaiters.length) wakeWaiters.shift()!();
+        };
 
-                const promises = specifiers.map(({ spec, parent }) => {
+        const enqueue = (spec: string, parent: string) => {
+            queue.push({ spec, parent });
+            pending++;
+            wake();
+        };
+
+        // Seed the queue
+        for (const seed of seeds) {
+            enqueue(seed.spec, seed.parent);
+        }
+
+        // Guard: empty seed list — nothing to do
+        if (pending === 0) {
+            return { visited: 0, downloaded: 0, errors: [], modules: [] };
+        }
+
+        const CONCURRENCY = 16;
+        const nextItem = async (): Promise<{ spec: string; parent: string } | null> => {
+            while (queue.length === 0) {
+                if (pending === 0) return null;
+                await new Promise<void>(resolve => { wakeWaiters.push(resolve); });
+            }
+            return queue.shift()!;
+        };
+        let active = 0;
+        let settled = false;   // prevents double-resolve
+        let doneResolve: (() => void) | null = null;
+        const tryDone = () => {
+            if (pending === 0 && doneResolve && !settled) {
+                settled = true;
+                // Defer the Promise settlement to the next microtask.
+                // Calling doneResolve() synchronously here resolves the outer
+                // queueLoopInternal Promise while worker frames are still running,
+                // which causes QuickJS to decrement the async-closure refcount
+                // prematurely and free the shared closure env (queue, this, etc.)
+                // before the worker's finally block finishes.
+                const resolve = doneResolve;
+                doneResolve = null;
+                Promise.resolve().then(resolve);
+            }
+        };
+
+        const worker = async () => {
+            if (active >= CONCURRENCY) return;
+            active++;
+            try {
+                while (queue.length > 0) {
+                    const item = queue.shift()!;
                     let didDownload = false;
-                    const baseProgress = this.prog?.onDownloadProgress(spec);
+                    const baseProgress = this.prog?.onDownloadProgress(item.spec);
                     const onProgress = baseProgress
                         ? (now: number, total: number) => { didDownload = true; baseProgress(now, total); }
                         : undefined;
 
-                    return this.resolver.resolveAsync(spec, parent, undefined, onProgress).then(
-                        info => {
-                            if (didDownload) this.downloaded++;
-                            this.prog?.bumpResolved();
-                            this.prog?.finishDownload(spec);
-                            return { ok: true, info, spec, parent } as const;
-                        },
-                        e => {
-                            this.prog?.bumpResolved();
-                            this.prog?.finishDownload(spec, errMsg(e));
-                            return { ok: false, error: e, spec, parent } as const;
-                        },
-                    );
-                });
+                    try {
+                        this.prog?.startResolve(item.spec);
+                        const info = await this.resolver.resolveAsync(item.spec, item.parent, undefined, onProgress);
+                        if (didDownload) this.downloaded++;
+                        this.prog?.bumpResolved();
+                        this.prog?.finishDownload(item.spec);
 
-                const results = await Promise.all(promises);
+                        if (this.seen.has(info.specPath)) { pending--; tryDone(); continue; }
+                        this.seen.add(info.specPath);
+                        this.found.push({ specPath: info.specPath, localPath: info.localPath });
 
-                for (const r of results) {
-                    if (!r.ok) {
-                        this.errs.push({ spec: (r as any).spec, parent: (r as any).parent, error: errMsg((r as any).error) });
-                        continue;
+                        // Enqueue child imports for next-level processing
+                        if (fs.exists(info.localPath) && (SCANNABLE.has(extname(info.localPath)) || extname(info.localPath) === WASM_EXT)) {
+                            const children = await this.parseOne(info.specPath, info.localPath);
+                            for (const child of children) {
+                                enqueue(child.spec, info.specPath);
+                            }
+                        }
+                    } catch (e) {
+                        this.prog?.bumpResolved();
+                        this.prog?.finishDownload(item.spec, errMsg(e));
+                        this.errs.push({ spec: item.spec, parent: item.parent, error: errMsg(e) });
+                        // Continue scanning — don't let one module failure stop the whole BFS
                     }
-                    const info = r.info;
-                    if (this.seen.has(info.specPath)) continue;
-                    this.seen.add(info.specPath);
-                    this.found.push({ specPath: info.specPath, localPath: info.localPath });
-
-                    if (fs.exists(info.localPath) && (SCANNABLE.has(extname(info.localPath)) || extname(info.localPath) === WASM_EXT))
-                        next.push({ specPath: info.specPath, localPath: info.localPath });
+                    pending--;
+                    tryDone();
                 }
-
-                batch = next;
+            } finally {
+                active--;
+                // If queue still has items and we have capacity, start another worker.
+                // This is critical: if active workers dropped to 0 while new items
+                // were enqueued (e.g. by a different worker between our shift and now),
+                // the scan would stall without this kick.
+                if (queue.length > 0 && active < CONCURRENCY) worker();
             }
-        } finally {}
+        };
+
+        const rootedWorker = async () => {
+            while (true) {
+                const item = await nextItem();
+                if (!item) return;
+
+                let didDownload = false;
+                const baseProgress = this.prog?.onDownloadProgress(item.spec);
+                const onProgress = baseProgress
+                    ? (now: number, total: number) => { didDownload = true; baseProgress(now, total); }
+                    : undefined;
+
+                try {
+                    this.prog?.startResolve(item.spec);
+                    const info = await this.resolver.resolveAsync(item.spec, item.parent, undefined, onProgress);
+                    if (didDownload) this.downloaded++;
+                    this.prog?.bumpResolved();
+                    this.prog?.finishDownload(item.spec);
+
+                    if (!this.seen.has(info.specPath)) {
+                        this.seen.add(info.specPath);
+                        this.found.push({ specPath: info.specPath, localPath: info.localPath });
+
+                        if (fs.exists(info.localPath) && (SCANNABLE.has(extname(info.localPath)) || extname(info.localPath) === WASM_EXT)) {
+                            const children = await this.parseOne(info.specPath, info.localPath);
+                            for (const child of children) enqueue(child.spec, info.specPath);
+                        }
+                    }
+                } catch (e) {
+                    this.prog?.bumpResolved();
+                    this.prog?.finishDownload(item.spec, errMsg(e));
+                    this.errs.push({ spec: item.spec, parent: item.parent, error: errMsg(e) });
+                } finally {
+                    pending--;
+                    wake();
+                }
+            }
+        };
+
+        // Start the full worker pool. The initial queue is often just the
+        // entry module; workers that find an empty queue will wait for imports
+        // discovered by the active worker instead of making the scan serial.
+        await Promise.all(Array.from({ length: CONCURRENCY }, () => rootedWorker()));
 
         if (!this.cfg.silent) {
             const e = this.errs.length ? `, ${this.errs.length} error(s)` : '';
@@ -172,44 +252,44 @@ export class DepScanner {
     }
 
     // -------------------------------------------------------------------------
-    // Read + parse a batch of files with asyncfs concurrently
+    // Read + parse a single file, return its import specifiers
     // -------------------------------------------------------------------------
 
-    private async parseLevel(
-        batch: Array<{ specPath: string; localPath: string }>,
+    private async parseOne(
+        specPath: string,
+        localPath: string,
     ): Promise<Array<{ spec: string; parent: string }>> {
-        const results = await Promise.all(batch.map(async ({ specPath, localPath }) => {
-            const ext = extname(localPath);
-            if (ext === WASM_EXT) {
-                // wasm imports are baked into the binary, not the surrounding
-                // JS — extract them so JSR/HTTP-hosted glue modules (./wbg.js,
-                // ./env.js …) get precached. Without this they're only
-                // discovered at sync wasm-link time, which can't refresh.
-                if (!wasm) return [];
-                try {
-                    const bytes = await asyncfs.readFile(localPath);
-                    const wmod  = wasm.parseModule(new Uint8Array(bytes));
-                    const seen  = new Set<string>();
-                    for (const imp of wasm.moduleImports(wmod)) {
-                        if (WASI_MODS.has(imp.module)) continue;
-                        if (imp.module === 'env') continue;          // built-in fallback
-                        if (seen.has(imp.module)) continue;
-                        seen.add(imp.module);
-                    }
-                    return [...seen].map(spec => ({ spec, parent: specPath }));
-                } catch (e) {
-                    log.debug('deps', () => `wasm scan failed for ${localPath}: ${errMsg(e)}`);
-                    return [];
-                }
-            }
-            if (!SCANNABLE.has(ext)) return [];
+        const ext = extname(localPath);
+        if (ext === WASM_EXT) {
+            if (!wasm) return [];
             try {
                 const bytes = await asyncfs.readFile(localPath);
-                const src   = engine.decodeString(bytes);
-                const isTs  = /\.[mc]?tsx?$/.test(localPath);
-                return extractImports(src, isTs).map(spec => ({ spec, parent: specPath }));
-            } catch { return []; }
-        }));
-        return results.flat();
+                const wmod = wasm.parseModule(new Uint8Array(bytes));
+                const seen = new Set<string>();
+                for (const imp of wasm.moduleImports(wmod)) {
+                    if (WASI_MODS.has(imp.module)) continue;
+                    if (imp.module === 'env') continue;
+                    if (seen.has(imp.module)) continue;
+                    seen.add(imp.module);
+                }
+                return [...seen].map(spec => ({ spec, parent: specPath }));
+            } catch (e) {
+                log.debug('deps', () => `wasm scan failed for ${localPath}: ${errMsg(e)}`);
+                return [];
+            }
+        }
+        if (!SCANNABLE.has(ext)) return [];
+        try {
+            const bytes = await asyncfs.readFile(localPath);
+            const src = engine.decodeString(bytes);
+            let imports: string[];
+            if (this.scanWorker) {
+                imports = await this.scanWorker(src, localPath);
+            } else {
+                const isTs = /\.[mc]?tsx?$/.test(localPath);
+                imports = await extractImportsFast(src, localPath, isTs, this.cfg.enableOxc !== false ? this.oxc : null);
+            }
+            return imports.map(spec => ({ spec, parent: specPath }));
+        } catch { return []; }
     }
 }

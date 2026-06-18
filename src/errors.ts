@@ -11,7 +11,10 @@
 //   External errors (from user code, engines, or dependencies) have no `.kind`
 //   and fall back to message-based heuristics — but those are best-effort only.
 
-import { os, engine, streams, console, fs } from './utils/index';
+const os = import.meta.use('os');
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
+const console = import.meta.use('console');
 
 // ---------------------------------------------------------------------------
 // ErrorKind — the single source of truth for error categories
@@ -73,10 +76,7 @@ export function err(kind: ErrorKind, msg: string): Error {
 // Terminal colour helpers (graceful degradation)
 // ---------------------------------------------------------------------------
 
-const _isTTY: boolean = (() => {
-    try { new (streams as any).TTY(2, false); return true; }
-    catch { return false; }
-})();
+const _isTTY: boolean = os.guessHandle(os.STDERR_FILENO) == 'tty';
 function isTTY(): boolean { return _isTTY; }
 
 const C = {
@@ -162,7 +162,7 @@ function sourceContext(file: string, line: number, col: number): string {
     try { src = engine.decodeString(fs.readFile(file)); }
     catch { return ''; }
 
-    const lines = src.split('\n');
+    const lines = src.split(/\r?\n/);
     const lo = Math.max(0, line - 2), hi = Math.min(lines.length, line + 1);
     const numW = String(hi + 1).length;
     const out: string[] = [''];
@@ -202,7 +202,7 @@ export function formatError(e: unknown, context?: string): string {
     const lines: string[] = [];
 
     // Header
-    lines.push(C.bold(C.red(`✖ ${label(kind)}` + (context ? `  in ${context} ` : ''))));
+    lines.push(C.bold(C.red(`✖ Uncaught${(context ? ` (in ${context})` : '')} ${label(kind)}`)));
 
     // Clean up the message — remove redundant prefixes from nested wrapping
     let cleanMsg = msg
