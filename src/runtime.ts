@@ -36,10 +36,10 @@ export class TypeScriptRuntime {
     /** Load dedup: specPath → Module. Ensures the engine never loads the same
      *  module twice (QuickJS does not cache dynamic import() results). */
     private readonly loadedModules = new Map<string, CModuleEngine.Module>();
-    private readonly initHooks: Array<(specPath: string) => void> = [];
+    private readonly initHooks: Array<(specPath: string, info: ModuleInfo) => void> = [];
 
     /** Register an additional callback to fire after each module's init hook. */
-    addInitHook(fn: (specPath: string) => void): void {
+    addInitHook(fn: (specPath: string, info: ModuleInfo) => void): void {
         this.initHooks.push(fn);
     }
 
@@ -107,14 +107,15 @@ export class TypeScriptRuntime {
             init: (specPath: string, importMeta: Record<string, any>): void => {
                 log.debug('runtime', () => `init hook called for ${specPath}`);
                 const cached = this.metaCache.get(specPath);
+                const info = this.resolver.getInfo(specPath);
                 if (cached) {
                     Object.assign(importMeta, cached);
                 } else {
-                    this.fillMeta(importMeta, this.resolver.getInfo(specPath));
+                    this.fillMeta(importMeta, info);
                 }
                 // Fire additional init hooks (e.g. CDP scriptParsed)
                 for (const fn of this.initHooks) {
-                    try { fn(specPath); } catch {}
+                    try { fn(specPath, info); } catch {}
                 }
             },
 
@@ -135,7 +136,7 @@ export class TypeScriptRuntime {
                 if (trace.size > 20) trace.clear();
                 else if (trace.has(r)) return false;
                 trace.add(r);
-                // log.error('runtime', formatError(r, 'unhandled promise rejection'));
+                log.warn('runtime', formatError(r, 'unhandled promise rejection'));
                 return false;
             }
             if (name === ET.JOB_EXCEPTION) {
