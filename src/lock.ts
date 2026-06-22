@@ -1,4 +1,4 @@
-// lock.ts — persistent resolution lock (SQLite3)
+// lock.ts - persistent resolution lock (SQLite3)
 //
 // Tables:
 //   modules: spec TEXT PK, local TEXT, format TEXT, kind TEXT
@@ -6,10 +6,9 @@
 //   bins:    name TEXT PK, path TEXT, pkg TEXT
 //
 // Performance:
-//   - Every statement is prepared → used → finalized per call (safe reuse pattern).
-//   - Writes accumulate inside a lazy deferred transaction committed on
-//     flush() / rewrite() / close().  For `cno cache` with 500+ modules this
-//     turns hundreds of individual INSERTs into a single batch commit.
+//   - Every statement is prepared -> used -> finalized per call.
+//   - Writes are staged in memory, then flushed inside a short SQLite
+//     transaction on flush() / rewrite() / close().
 
 import type { ModuleInfo, ModuleFormat, FileKind } from './types';
 import { joinPaths, dirname } from './utils/path';
@@ -43,22 +42,22 @@ CREATE TABLE IF NOT EXISTS bins (
 export class LockStore {
     private static readonly openStores = new Set<LockStore>();
 
-    private db:   CModuleSQLite3.Sqlite3Handle | null = null;
-    private inTx = false;
+    private db: CModuleSQLite3.Sqlite3Handle | null = null;
     private loadFailed = false;
     private recoveredInvalidLock = false;
-    private readonly dbPath:   string;
+    private readonly dbPath: string;
     private readonly readOnly: boolean;
+
+    private readonly pendingModules = new Map<string, ModuleInfo>();
+    private readonly pendingSources = new Map<string, string>();
+    private readonly pendingBins = new Map<string, { path: string; pkg: string }>();
+    private readonly pendingRemovedBinPkgs = new Set<string>();
 
     constructor(lockDir: string, readOnly: boolean) {
         this.readOnly = readOnly;
         const dir = lockDir.replace(/\\/g, '/');
         this.dbPath = joinPaths(dir, DB_FILENAME);
     }
-
-    // -------------------------------------------------------------------------
-    // Open / schema init
-    // -------------------------------------------------------------------------
 
     static closeAll(): void {
         for (const store of [...LockStore.openStores]) {
@@ -78,12 +77,21 @@ export class LockStore {
         LockStore.openStores.add(this);
     }
 
+    private cleanupSidecars(): void {
+        for (const suffix of ['-wal', '-shm']) {
+            try {
+                const p = this.dbPath + suffix;
+                if (fs.exists(p)) fs.unlink(p);
+            } catch {}
+        }
+    }
+
     load(): void {
-        if (this.db) return;
-        if (this.loadFailed) return;
+        if (this.db || this.loadFailed) return;
 
         if (!this.readOnly) {
             try { ensureDir(dirname(this.dbPath)); } catch {}
+            this.cleanupSidecars();
         }
 
         try {
@@ -92,11 +100,9 @@ export class LockStore {
                     this.db = sqlite3.open(this.dbPath, sqlite3.O_READONLY);
                     this.markOpen();
                     log.debug('lock', () => `opened ${this.dbPath}`);
-                    return;  // existing DB already has schema
-                } else {
-                    // no lock yet — use throw-away in-memory DB (read-only mode, no writes)
-                    this.db = sqlite3.open('', sqlite3.O_CREATE | sqlite3.O_READWRITE | sqlite3.O_MEMORY);
+                    return;
                 }
+                this.db = sqlite3.open('', sqlite3.O_CREATE | sqlite3.O_READWRITE | sqlite3.O_MEMORY);
             } else {
                 this.db = sqlite3.open(this.dbPath, sqlite3.O_CREATE | sqlite3.O_READWRITE);
             }
@@ -107,10 +113,11 @@ export class LockStore {
         }
 
         try {
-            this.db!.exec('PRAGMA journal_mode = WAL');
+            this.db!.exec('PRAGMA journal_mode = DELETE');
             this.db!.exec('PRAGMA synchronous = NORMAL');
             this.db!.exec('PRAGMA cache_size = -8000');
             this.db!.exec('PRAGMA temp_store = MEMORY');
+            this.db!.exec('PRAGMA busy_timeout = 3000');
             this.db!.exec(SCHEMA);
         } catch (e) {
             log.warn('lock', `schema init failed: ${errMsg(e)}`);
@@ -139,17 +146,8 @@ export class LockStore {
         } catch {
             try { if (fs.exists(this.dbPath)) fs.unlink(this.dbPath); } catch {}
         }
-        for (const suffix of ['-wal', '-shm']) {
-            try {
-                const p = this.dbPath + suffix;
-                if (fs.exists(p)) fs.unlink(p);
-            } catch {}
-        }
+        this.cleanupSidecars();
     }
-
-    // -------------------------------------------------------------------------
-    // Helpers — prepare → use → finalize per call (avoids statement-reuse bugs)
-    // -------------------------------------------------------------------------
 
     private getDb(): CModuleSQLite3.Sqlite3Handle | null {
         if (!this.db) this.load();
@@ -176,35 +174,46 @@ export class LockStore {
         stmt.finalize();
     }
 
-    // -------------------------------------------------------------------------
-    // Lazy write transaction — BEGIN on first write, COMMIT on flush/rewrite/close
-    // -------------------------------------------------------------------------
-
-    private beginTx(): void {
-        if (this.inTx || !this.db) return;
-        try { this.db.exec('BEGIN DEFERRED'); this.inTx = true; } catch {}
+    private hasPendingWrites(): boolean {
+        return this.pendingModules.size > 0
+            || this.pendingSources.size > 0
+            || this.pendingBins.size > 0
+            || this.pendingRemovedBinPkgs.size > 0;
     }
 
-    private commitTx(): void {
-        if (!this.inTx || !this.db) return;
-        try { this.db.exec('COMMIT'); } catch (e) {
-            try { this.db.exec('ROLLBACK'); } catch {}
-            log.warn('lock', `commit failed: ${e}`);
+    private clearPendingWrites(): void {
+        this.pendingModules.clear();
+        this.pendingSources.clear();
+        this.pendingBins.clear();
+        this.pendingRemovedBinPkgs.clear();
+    }
+
+    private applyPendingWrites(): void {
+        if (this.readOnly || !this.hasPendingWrites()) return;
+        const db = this.getDb(); if (!db) return;
+        try {
+            db.exec('BEGIN IMMEDIATE');
+            for (const pkg of this.pendingRemovedBinPkgs)
+                this.exec('DELETE FROM bins WHERE pkg = ?', [pkg]);
+            for (const info of this.pendingModules.values())
+                this.exec('INSERT OR REPLACE INTO modules (spec, local, fmt, kind) VALUES (?, ?, ?, ?)',
+                    [info.specPath, info.localPath, info.format, info.fileKind]);
+            for (const [key, spec] of this.pendingSources)
+                this.exec('INSERT OR REPLACE INTO sources (key, spec) VALUES (?, ?)', [key, spec]);
+            for (const [name, bin] of this.pendingBins)
+                this.exec('INSERT OR REPLACE INTO bins (name, path, pkg) VALUES (?, ?, ?)',
+                    [name, bin.path, bin.pkg]);
+            db.exec('COMMIT');
+            this.clearPendingWrites();
+        } catch (e) {
+            try { db.exec('ROLLBACK'); } catch {}
+            log.warn('lock', `flush failed: ${errMsg(e)}`);
         }
-        this.inTx = false;
     }
-
-    private rollbackTx(): void {
-        if (!this.inTx || !this.db) return;
-        try { this.db.exec('ROLLBACK'); } catch {}
-        this.inTx = false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Read
-    // -------------------------------------------------------------------------
 
     getModule(sp: string): ModuleInfo | undefined {
+        const pending = this.pendingModules.get(sp);
+        if (pending) return pending;
         const rows = this.query('SELECT local, fmt, kind FROM modules WHERE spec = ?', [sp]);
         if (!rows.length) return undefined;
         const r = rows[0];
@@ -212,74 +221,64 @@ export class LockStore {
     }
 
     getSource(spec: string, parent: string): string | undefined {
-        const rows = this.query('SELECT spec FROM sources WHERE key = ?', [`${spec}\0${parent}`]);
+        const key = `${spec}\0${parent}`;
+        const pending = this.pendingSources.get(key);
+        if (pending !== undefined) return pending;
+        const rows = this.query('SELECT spec FROM sources WHERE key = ?', [key]);
         return rows.length ? rows[0].spec : undefined;
     }
 
     getBin(name: string): { path: string; pkg: string } | undefined {
+        const pending = this.pendingBins.get(name);
+        if (pending) return pending;
         const rows = this.query('SELECT path, pkg FROM bins WHERE name = ?', [name]);
-        return rows.length ? { path: rows[0].path, pkg: rows[0].pkg } : undefined;
+        if (!rows.length) return undefined;
+        const bin = { path: rows[0].path, pkg: rows[0].pkg };
+        if (this.pendingRemovedBinPkgs.has(bin.pkg)) return undefined;
+        return bin;
     }
-
-    // -------------------------------------------------------------------------
-    // Write  (all writes accumulate inside a lazy deferred transaction)
-    // -------------------------------------------------------------------------
 
     setModule(info: ModuleInfo): void {
         if (this.readOnly) return;
-        this.beginTx();
-        this.exec('INSERT OR REPLACE INTO modules (spec, local, fmt, kind) VALUES (?, ?, ?, ?)',
-            [info.specPath, info.localPath, info.format, info.fileKind]);
+        this.pendingModules.set(info.specPath, info);
     }
 
     setSource(spec: string, parent: string, sp: string): void {
         if (this.readOnly) return;
-        this.beginTx();
-        this.exec('INSERT OR REPLACE INTO sources (key, spec) VALUES (?, ?)',
-            [`${spec}\0${parent}`, sp]);
+        this.pendingSources.set(`${spec}\0${parent}`, sp);
     }
 
     addBin(name: string, path: string, pkg: string): void {
         if (this.readOnly) return;
-        this.beginTx();
-        this.exec('INSERT OR REPLACE INTO bins (name, path, pkg) VALUES (?, ?, ?)',
-            [name, path, pkg]);
+        this.pendingBins.set(name, { path, pkg });
     }
 
     removeBinsForPackage(pkg: string): void {
         if (this.readOnly) return;
-        this.beginTx();
-        this.exec('DELETE FROM bins WHERE pkg = ?', [pkg]);
-    }
-
-    // -------------------------------------------------------------------------
-    // Flush / rewrite / close
-    // -------------------------------------------------------------------------
-
-    flush(): void {
-        if (!this.db) return;
-        this.commitTx();
-        if (!this.readOnly) {
-            try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch {}
+        this.pendingRemovedBinPkgs.add(pkg);
+        for (const [name, bin] of this.pendingBins) {
+            if (bin.pkg === pkg) this.pendingBins.delete(name);
         }
     }
 
-    // Called at end of `cno cache` — commit everything accumulated so far.
-    rewrite(): void { this.commitTx(); }
+    flush(): void {
+        if (!this.db) return;
+        this.applyPendingWrites();
+    }
+
+    rewrite(): void {
+        this.applyPendingWrites();
+    }
 
     close(): void {
         const db = this.db;
         if (!db) return;
-        this.commitTx();
-        try {
-            if (!this.readOnly) {
-                db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-            }
-        } catch {}
+        this.applyPendingWrites();
         try { db.close(); }
         finally {
             this.db = null;
-            this.inTx = false;
+            this.clearPendingWrites();
+            if (!this.readOnly) this.cleanupSidecars();
             LockStore.openStores.delete(this);
         }
     }
@@ -287,23 +286,28 @@ export class LockStore {
     closeFast(): void {
         const db = this.db;
         if (!db) return;
-        this.rollbackTx();
         try { db.close(); }
         finally {
             this.db = null;
-            this.inTx = false;
+            this.clearPendingWrites();
+            if (!this.readOnly) this.cleanupSidecars();
             LockStore.openStores.delete(this);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Metrics
-    // -------------------------------------------------------------------------
-
     get size(): number {
         const rows = this.query('SELECT COUNT(*) AS n FROM modules');
-        return rows[0]?.n ?? 0;
+        let total = rows[0]?.n ?? 0;
+        for (const key of this.pendingModules.keys()) {
+            if (!this.query('SELECT 1 AS n FROM modules WHERE spec = ?', [key]).length) total++;
+        }
+        return total;
     }
 
-    get dirtyCount(): number { return 0; }
+    get dirtyCount(): number {
+        return this.pendingModules.size
+            + this.pendingSources.size
+            + this.pendingBins.size
+            + this.pendingRemovedBinPkgs.size;
+    }
 }

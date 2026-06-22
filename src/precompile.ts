@@ -151,11 +151,11 @@ export class PrecompileDriver {
     private transformDone = 0;
     private transformFail = 0;
     private taskTotal = 0;
-    private resolveTransforms!: () => void;
+    private resolveTransforms?: () => void;
     private onProgressCb?: (done: number, total: number) => void;
 
     private static readonly TASK_TIMEOUT_MS = 60_000;
-    private static readonly GLOBAL_TIMEOUT_MS = 600_000;
+    private static readonly GLOBAL_TIMEOUT_MS = 1200_000;
     private globalTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor() {
@@ -327,7 +327,7 @@ export class PrecompileDriver {
         }
 
         this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
-        if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
+        if (this.taskTotal > 0 && this.transformDone + this.transformFail >= this.taskTotal) this.finish();
     }
 
     private finish(): void {
@@ -336,7 +336,7 @@ export class PrecompileDriver {
         for (const t of this.taskTimers.values()) clearTimeout(t);
         this.taskTimers.clear();
         if (this.globalTimer) { clearTimeout(this.globalTimer); this.globalTimer = null; }
-        this.resolveTransforms();
+        this.resolveTransforms?.();
     }
 
     private drain(): void {

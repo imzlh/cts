@@ -410,7 +410,7 @@ export class TaskRunner {
     list(): void {
         const names = Object.keys(this.tasks);
         if (!names.length) {
-            log.debug('task', () => '  \x1b[2mNo tasks defined in this config.\x1b[0m');
+            console.log('  \x1b[2mNo tasks defined in this config.\x1b[0m');
             return;
         }
         const maxLen = names.reduce((m, n) => Math.max(m, n.length), 0);
@@ -420,7 +420,7 @@ export class TaskRunner {
             const deps = typeof def === 'string' ? [] : (def.dependencies ?? []);
             const pad  = ' '.repeat(maxLen - name.length + 2);
             const depStr = deps.length ? `  \x1b[2m← needs: ${deps.join(', ')}\x1b[0m` : '';
-            log.debug('task', () => `  \x1b[36m${name}\x1b[0m${pad}\x1b[2m${cmd}\x1b[0m${depStr}`);
+            console.log(`  \x1b[36m${name}\x1b[0m${pad}\x1b[2m${cmd}\x1b[0m${depStr}`);
         }
     }
 
@@ -473,11 +473,11 @@ export class TaskRunner {
         }
 
         if (this.done.has(name)) return 0;
-        this.done.add(name);
 
         log.debug('task', () => `\n\x1b[32m$ ${command}\x1b[0m`);
         // Only pass extra args to the leaf task, not to dependencies
         const code = await execCommand(command, env, this.cwd, extraArgs, this.resolver);
+        if (code === 0) this.done.add(name);
         if (code !== 0) console.error(`\x1b[31m✖ Task \x1b[36m${name}\x1b[0m\x1b[31m exited with code ${code}\x1b[0m`);
         return code;
     }

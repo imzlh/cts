@@ -25,6 +25,8 @@ import type { OxcTranspiler } from './oxc';
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
+const CTS_INTERNAL = Symbol.for('cts.internal');
+const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
 
 export class ModuleLoader {
     private readonly transformer: Transformer;
@@ -53,27 +55,8 @@ export class ModuleLoader {
         });
         this.cjs = new CjsLoader(this.buildCjsDeps());
 
-        let requireFn: Function | undefined;
-        Object.defineProperty(globalThis, 'require', {
-            get: () => {
-                if (!requireFn) requireFn = this.cjs.mkRequire(resolver.entry);
-                return requireFn;
-            },
-            enumerable: true,
-            configurable: true,
-        })
-
-        const CTS_INTERNAL = Symbol.for('cts.internal');
-        Object.defineProperty(globalThis, CTS_INTERNAL, {
-            value: {
-                mkRequire: this.cjs.mkRequire.bind(this.cjs),
-                builtinModules: [...BUILTINS],
-                cache: this.cjs.cache,
-            },
-            writable: false,
-            enumerable: false,
-            configurable: false,
-        })
+        this.installGlobalRequire();
+        this.installInternalBridge();
     }
 
     /** Clean up loaded modules when no longer needed */
@@ -388,12 +371,69 @@ export class ModuleLoader {
                 return ns;
             },
 
-            resolveExternal(req: string, parent: string): { path: string; isCjs: boolean } | null {
+            resolveExternal(req: string, parent: string): { path: string; specPath: string; isCjs: boolean } | null {
                 try {
                     const info = self.resolver.resolve(req, parent, { cjs: true });
-                    return { path: info.localPath, isCjs: info.format === 'cjs' };
+                    return {
+                        path: info.localPath,
+                        specPath: info.specPath,
+                        isCjs: info.format === 'cjs' || info.fileKind === 'json',
+                    };
                 } catch { return null; }
             },
         };
+    }
+
+    private installGlobalRequire(): void {
+        let requireFn: Function | undefined;
+        const getter = () => {
+            if (!requireFn) requireFn = this.cjs.mkRequire(this.resolver.entry);
+            return requireFn;
+        };
+
+        const desc = Object.getOwnPropertyDescriptor(globalThis, 'require');
+        if (!desc) {
+            Object.defineProperty(globalThis, 'require', {
+                get: getter,
+                enumerable: true,
+                configurable: true,
+            });
+            Reflect.set(globalThis, CTS_REQUIRE_GETTER, getter);
+            return;
+        }
+
+        if (desc.configurable) {
+            Object.defineProperty(globalThis, 'require', {
+                get: getter,
+                enumerable: desc.enumerable ?? true,
+                configurable: true,
+            });
+            Reflect.set(globalThis, CTS_REQUIRE_GETTER, getter);
+        }
+    }
+
+    private installInternalBridge(): void {
+        const value = {
+            mkRequire: this.cjs.mkRequire.bind(this.cjs),
+            builtinModules: [...BUILTINS],
+            cache: this.cjs.cache,
+        };
+        const desc = Object.getOwnPropertyDescriptor(globalThis, CTS_INTERNAL);
+        if (!desc) {
+            Object.defineProperty(globalThis, CTS_INTERNAL, {
+                value,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            });
+            return;
+        }
+        if ('value' in desc && desc.value && typeof desc.value === 'object') {
+            try {
+                (desc.value as any).mkRequire = value.mkRequire;
+                (desc.value as any).builtinModules = value.builtinModules;
+                (desc.value as any).cache = value.cache;
+            } catch {}
+        }
     }
 }

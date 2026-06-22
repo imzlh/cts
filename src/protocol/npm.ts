@@ -92,8 +92,82 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
 }
 
 interface NpmMeta {
-    versions: Record<string, { version: string; dist: { tarball: string } }>;
+    versions: Record<string, {
+        version: string;
+        dist: { tarball: string };
+        os?: string[];
+        cpu?: string[];
+    }>;
     'dist-tags': Record<string, string>;
+}
+
+function currentOs(): string {
+    if (uname.sysname.includes('Windows')) return 'win32';
+    if (uname.sysname === 'Darwin') return 'darwin';
+    if (uname.sysname === 'Linux') return 'linux';
+    if (uname.sysname === 'FreeBSD') return 'freebsd';
+    if (uname.sysname === 'OpenBSD') return 'openbsd';
+    return uname.sysname.toLowerCase();
+}
+
+function currentCpu(): string {
+    const machine = String(uname.machine || '').toLowerCase();
+    if (machine === 'x86_64' || machine === 'amd64') return 'x64';
+    if (machine === 'aarch64' || machine === 'arm64') return 'arm64';
+    if (machine === 'i386' || machine === 'i686' || machine === 'x86') return 'ia32';
+    if (machine.startsWith('armv7')) return 'arm';
+    if (machine.startsWith('arm')) return 'arm';
+    return machine;
+}
+
+function currentAbi(): 'msvc' | 'gnu' | 'musl' | '' {
+    const sys = String(uname.sysname || '').toLowerCase();
+    const machine = String(uname.machine || '').toLowerCase();
+    let msystem = '';
+    let ostype = '';
+    try { msystem = String(os.getenv?.('MSYSTEM') ?? '').toLowerCase(); } catch {}
+    try { ostype = String(os.getenv?.('OSTYPE') ?? '').toLowerCase(); } catch {}
+
+    if (sys.includes('windows')) {
+        if (sys.includes('mingw') || sys.includes('msys') || sys.includes('cygwin')
+            || msystem.includes('mingw') || msystem.includes('msys')
+            || ostype.includes('msys') || ostype.includes('mingw')) {
+            return 'gnu';
+        }
+        return 'msvc';
+    }
+
+    if (sys === 'linux') {
+        if (machine.includes('musl') || ostype.includes('musl')) return 'musl';
+        return 'gnu';
+    }
+
+    return '';
+}
+
+function matchesConstraint(list: string[] | undefined, current: string): boolean {
+    if (!list || !list.length) return true;
+    let allowed = false;
+    let hasPositive = false;
+    for (const raw of list) {
+        const item = String(raw || '').trim();
+        if (!item) continue;
+        if (item.startsWith('!')) {
+            if (item.slice(1) === current) return false;
+            continue;
+        }
+        hasPositive = true;
+        if (item === current) allowed = true;
+    }
+    return hasPositive ? allowed : true;
+}
+
+function matchesAbiVariant(pkgName: string, abi: string): boolean {
+    if (!abi) return true;
+    if (pkgName.endsWith('-msvc')) return abi === 'msvc';
+    if (pkgName.endsWith('-gnu')) return abi === 'gnu';
+    if (pkgName.endsWith('-musl')) return abi === 'musl';
+    return true;
 }
 
 export class NpmHandler implements ProtocolHandler {
@@ -130,9 +204,28 @@ export class NpmHandler implements ProtocolHandler {
         if (spec.startsWith('#') && parent.startsWith('npm:')) {
             return yield* this.resolveSubpathImport(spec, parent, forceCjs, onProgress);
         }
-        const { name, version: range, subpath } = parseNpmSpec(spec);
+        const { name, version: parsedRange, subpath } = parseNpmSpec(spec);
+        const range = parsedRange === 'latest'
+            ? (yield* this.resolveParentRange(name, parent, onProgress)) ?? parsedRange
+            : parsedRange;
         const pkg = yield* this.ensureInstalled(name, range, parent, onProgress);
         return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
+    }
+
+    tryResolveLocal(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo | null {
+        if (!spec || spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) return null;
+        const forceCjs = attr?.cjs === true || (attr?.type !== 'module' && !parent.startsWith('npm:'));
+        let parsed: ParsedNpmSpec;
+        try {
+            parsed = parseNpmSpec(spec);
+        } catch {
+            return null;
+        }
+        const local = this.findLocal(parsed.name, parent);
+        if (!local) return null;
+        const pkg = readPkgFresh(local);
+        const resolvedVer = pkg?.version ?? parsed.version;
+        return this.resolvePkg(local, resolvedVer, parsed.name, parsed.subpath, forceCjs);
     }
 
     /**
@@ -186,6 +279,11 @@ export class NpmHandler implements ProtocolHandler {
 
     private static specPath(name: string, version: string, subpath: string): string {
         return `npm:${name}@${version}` + (subpath ? `/${subpath}` : '');
+    }
+
+    private static canonicalSubpath(pkgDir: string, localPath: string): string {
+        const rel = normalizePath(localPath.slice(pkgDir.length + 1));
+        return rel === 'package.json' ? '' : rel;
     }
 
     private *resolveRelative(spec: string, parent: string, forceCjs: boolean, onProgress?: ProgressCallback): Flow<ModuleInfo> {
@@ -265,8 +363,9 @@ export class NpmHandler implements ProtocolHandler {
                 `Cannot resolve "${subpath}" in ${name}@${ver} - ${hint}\n` +
                 `  The package may not expose a default entry point. Try importing a specific subpath like npm:${name}@${ver}/<file>`);
         }
+        const canonicalSubpath = NpmHandler.canonicalSubpath(dir, localPath);
         return {
-            specPath: NpmHandler.specPath(name, ver, subpath),
+            specPath: NpmHandler.specPath(name, ver, canonicalSubpath),
             localPath,
             format: detectFormat(localPath),
             fileKind: guessFileKind(localPath),
@@ -328,6 +427,45 @@ export class NpmHandler implements ProtocolHandler {
             } catch {}
         }
         return null;
+    }
+
+    private findOwningPackageDir(parent: string): string | null {
+        if (!parent) return null;
+        if (parent.startsWith('npm:')) {
+            const { name, version } = parseNpmSpec(parent);
+            if (/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+                const pkgDir = joinPaths(this.cacheDir, `${name}@${version}`);
+                if (fs.exists(joinPaths(pkgDir, 'package.json'))) return pkgDir;
+            }
+            return null;
+        }
+        let dir = dirname(parent);
+        const root = uname.sysname.includes('Windows') ? dir.split(':')[0] + ':/' : '/';
+        while (dir && dir !== root) {
+            const pkgPath = joinPaths(dir, 'package.json');
+            if (fs.exists(pkgPath)) return dir;
+            const up = dirname(dir);
+            if (up === dir) break;
+            dir = up;
+        }
+        const pkgPath = joinPaths(dir, 'package.json');
+        return fs.exists(pkgPath) ? dir : null;
+    }
+
+    private *resolveParentRange(name: string, parent: string, onProgress?: ProgressCallback): Flow<string | null> {
+        let pkgDir = this.findOwningPackageDir(parent);
+        if (!pkgDir && parent.startsWith('npm:')) {
+            const parsed = parseNpmSpec(parent);
+            const installed = yield* this.ensureInstalled(parsed.name, parsed.version, parent, onProgress);
+            pkgDir = installed.dir;
+        }
+        if (!pkgDir) return null;
+        const pkg = readPkgFresh(pkgDir);
+        if (!pkg) return null;
+        return pkg.dependencies?.[name]
+            ?? pkg.optionalDependencies?.[name]
+            ?? pkg.peerDependencies?.[name]
+            ?? null;
     }
 
     private indexLocalBins(pkgDir: string, name: string): void {
@@ -453,9 +591,23 @@ export class NpmHandler implements ProtocolHandler {
         const opts = Object.entries(pkg.optionalDependencies);
         if (!opts.length) return;
         log.debug('npm', () => `optional deps for ${pkg.name}: ${opts.map(([n]) => n).join(', ')}`);
+        const osName = currentOs();
+        const cpuName = currentCpu();
+        const abiName = currentAbi();
         for (const [depName, depRange] of opts) {
             try {
+                const depMeta = yield* this.fetchMeta(depName, onProgress);
                 const exactVer = yield* this.resolveVersion(depName, depRange, onProgress);
+                const versionMeta = depMeta.versions[exactVer];
+                if (!versionMeta) continue;
+                if (!matchesConstraint(versionMeta.os, osName) || !matchesConstraint(versionMeta.cpu, cpuName)) {
+                    log.debug('npm', () => `optional dep skipped: ${depName}@${exactVer} (platform mismatch: ${osName}/${cpuName})`);
+                    continue;
+                }
+                if (!matchesAbiVariant(depName, abiName)) {
+                    log.debug('npm', () => `optional dep skipped: ${depName}@${exactVer} (abi mismatch: ${abiName || 'unknown'})`);
+                    continue;
+                }
                 const depDir = joinPaths(this.cacheDir, `${depName}@${exactVer}`);
                 const exists = yield { type: StepType.FS_EXISTS, path: depDir };
                 if (!exists) {

@@ -29,6 +29,7 @@ import { assert } from './utils/misc';
 import { log } from './utils/log';
 
 const os = import.meta.use('os');
+const fs = import.meta.use('fs');
 
 // ---------------------------------------------------------------------------
 // protoOf — extract protocol prefix without regex
@@ -37,6 +38,13 @@ const os = import.meta.use('os');
 
 function isRelative(s: string): boolean {
     return s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');
+}
+
+function isNodeBuiltinSpecifier(spec: string): boolean {
+    const bare = spec.startsWith('node:') ? spec.slice(5) : spec;
+    const slash = bare.indexOf('/');
+    const head = slash === -1 ? bare : bare.slice(0, slash);
+    return BUILTINS.has(head);
 }
 
 function protoOf(s: string): string {
@@ -99,6 +107,7 @@ export class ModuleResolver {
     private readonly aliasIndex:   PathAliasEntry[];
     private mainEntry = '';
     private readonly fileKindCache = new Map<string, FileKind>();
+    private readonly liveModules = new Map<string, ModuleInfo>();
 
     constructor(
         private readonly cfg: RuntimeConfig,
@@ -149,13 +158,19 @@ export class ModuleResolver {
 
         const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
 
+        const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
+        if (localPreferred) {
+            return this.rememberResolved(mapped, parent, localPreferred);
+        }
+
         // L1
         const srcKey = this.lock.getSource(mapped, parent);
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
-            if (cached) {
+            if (cached && this.isUsableInfo(cached)) {
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
+                this.liveModules.set(final.specPath, final);
                 this.fileKindCache.set(final.specPath, final.fileKind);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
@@ -166,9 +181,10 @@ export class ModuleResolver {
         const proto = protoOf(mapped);
         if (proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
-            if (lockHit) {
+            if (lockHit && this.isUsableInfo(lockHit)) {
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
+                this.liveModules.set(final.specPath, final);
                 this.fileKindCache.set(final.specPath, final.fileKind);
                 this.lock.setSource(mapped, parent, final.specPath);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
@@ -182,12 +198,7 @@ export class ModuleResolver {
 
         // L3 — dispatch async if handler supports it, else sync
         const info = await this.dispatchAsync(mapped, parent, attr, onProgress);
-        this.fileKindCache.set(info.specPath, info.fileKind);
-
-        this.lock.setModule(info);
-        this.lock.setSource(mapped, parent, info.specPath);
-        if (!this.mainEntry) { this.mainEntry = info.specPath; log.debug('resolver', () => `main: "${info.specPath}"`); }
-        return info;
+        return this.rememberResolved(mapped, parent, info);
     }
 
     private async dispatchAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
@@ -205,7 +216,7 @@ export class ModuleResolver {
 
     private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
-        if (BUILTINS.has(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
+        if (isNodeBuiltinSpecifier(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {
@@ -234,14 +245,20 @@ export class ModuleResolver {
         const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
 
+        const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
+        if (localPreferred) {
+            return this.rememberResolved(mapped, parent, localPreferred);
+        }
+
         // L1 — source index: (mapped, parent) → specPath we've seen before
         const srcKey = this.lock.getSource(mapped, parent);
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
-            if (cached) {
+            if (cached && this.isUsableInfo(cached)) {
                 log.debug('resolver', () => `L1 hit: "${mapped}" → "${srcKey}"`);
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
+                this.liveModules.set(final.specPath, final);
                 this.fileKindCache.set(final.specPath, final.fileKind);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
@@ -252,10 +269,11 @@ export class ModuleResolver {
         const proto = protoOf(mapped);
         if (proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
-            if (lockHit) {
+            if (lockHit && this.isUsableInfo(lockHit)) {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
+                this.liveModules.set(final.specPath, final);
                 this.fileKindCache.set(final.specPath, final.fileKind);
                 this.lock.setSource(mapped, parent, final.specPath);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
@@ -272,24 +290,29 @@ export class ModuleResolver {
             );
         }
         const info = this.dispatch(mapped, parent, attr);
-        this.fileKindCache.set(info.specPath, info.fileKind);
-
-        this.lock.setModule(info);
-        this.lock.setSource(mapped, parent, info.specPath);
-        if (!this.mainEntry) { this.mainEntry = info.specPath; log.debug('resolver', () => `main: "${info.specPath}"`); }
-        return info;
+        return this.rememberResolved(mapped, parent, info);
     }
 
     getInfo(specPath: string): ModuleInfo {
+        const live = this.liveModules.get(specPath);
+        if (live) return live;
         const cachedKind = this.fileKindCache.get(specPath);
         const hit = this.lock.getModule(specPath);
-        if (hit) {
+        if (hit && this.isUsableInfo(hit)) {
+            this.liveModules.set(hit.specPath, hit);
             if (cachedKind && cachedKind !== hit.fileKind) return { ...hit, fileKind: cachedKind };
             return hit;
         }
-        if (cachedKind) return { specPath, localPath: specPath, format: 'esm', fileKind: cachedKind };
         const h = this.handlers.get(protoOf(specPath));
-        if (h) return { specPath, localPath: h.localPath(specPath), format: 'esm', fileKind: 'source' };
+        if (h) {
+            return {
+                specPath,
+                localPath: h.localPath(specPath),
+                format: 'esm',
+                fileKind: cachedKind ?? 'source',
+            };
+        }
+        if (cachedKind) return { specPath, localPath: specPath, format: 'esm', fileKind: cachedKind };
         return { specPath, localPath: specPath, format: 'esm', fileKind: 'source' };
     }
 
@@ -367,7 +390,7 @@ export class ModuleResolver {
 
     private resolveBare(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         if (spec.startsWith('@std/')) return this.dispatch(`jsr:${spec}`, parent, attr);
-        if (BUILTINS.has(spec)) return this.dispatch(`node:${spec}`, parent, attr);
+        if (isNodeBuiltinSpecifier(spec)) return this.dispatch(`node:${spec}`, parent, attr);
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {
@@ -415,5 +438,38 @@ export class ModuleResolver {
             }
         }
         return spec;
+    }
+
+    private tryResolveLocalNpm(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo | null {
+        if (!spec || spec[0] === '.' || spec[0] === '/' || spec.startsWith('#')) return null;
+        const proto = protoOf(spec);
+        if (proto && proto !== 'npm') return null;
+        if (spec.startsWith('@std/') || isNodeBuiltinSpecifier(spec)) return null;
+        const npm = this.handlers.get('npm');
+        if (!(npm instanceof NpmHandler)) return null;
+        try {
+            return npm.tryResolveLocal(spec, parent, attr);
+        } catch {
+            return null;
+        }
+    }
+
+    private rememberResolved(mapped: string, parent: string, info: ModuleInfo): ModuleInfo {
+        this.liveModules.set(info.specPath, info);
+        this.fileKindCache.set(info.specPath, info.fileKind);
+        this.lock.setModule(info);
+        this.lock.setSource(mapped, parent, info.specPath);
+        if (!this.mainEntry) {
+            this.mainEntry = info.specPath;
+            log.debug('resolver', () => `main: "${info.specPath}"`);
+        }
+        return info;
+    }
+
+    private isUsableInfo(info: ModuleInfo): boolean {
+        const proto = protoOf(info.specPath);
+        if (proto === 'http' || proto === 'https' || proto === 'jsr' || proto === 'data') return true;
+        try { return fs.exists(info.localPath); }
+        catch { return false; }
     }
 }

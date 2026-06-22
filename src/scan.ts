@@ -30,11 +30,21 @@ export function extractImports(source: string, isTs = true): string[] {
                 continue;
             }
             if (next.type === tt.string) { specs.add(sv(i + 1)); continue; }
+            // `import type { X }` / `import type * as X` / `import type X` — type-only, skip.
+            // Exception: `import type from '...'` where "from" follows directly — that's a
+            // value default import with the binding named "type".
+            if (next.type === tt.name && next.contextualKeyword === ContextualKeyword._type) {
+                const afterType = tokens[i + 2];
+                if (!afterType || afterType.contextualKeyword !== ContextualKeyword._from) continue;
+            }
             const si = findFromString(tokens, i + 1);
             if (si !== -1) specs.add(sv(si));
             continue;
         }
         if (tok.type === tt._export) {
+            // `export type { X } from '...'` / `export type * from '...'` — type-only, skip.
+            const next = tokens[i + 1];
+            if (next && next.type === tt.name && next.contextualKeyword === ContextualKeyword._type) continue;
             const si = findFromString(tokens, i + 1);
             if (si !== -1) specs.add(sv(si));
             continue;

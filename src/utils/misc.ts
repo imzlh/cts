@@ -206,8 +206,25 @@ export function parseArgs<T extends ArgTemplate>(argv: string[], tpl: T): ArgRes
                 out[key] = type === 'number' ? +next : next; i++;
             }
         } else if (arg[0] == '-') {
-            for (let j = 1; j < arg.length; j++)
-                out[arg[j]!] = true;
+            for (let j = 1; j < arg.length; j++) {
+                const key = arg[j]!;
+                const type = tpl[key];
+                if (!type || type === 'boolean') {
+                    out[key] = true;
+                    continue;
+                }
+                const inlineVal = arg.slice(j + 1);
+                if (inlineVal) {
+                    out[key] = type === 'number' ? +inlineVal : inlineVal;
+                } else {
+                    const next = argv[i + 1];
+                    if (next && !next.startsWith('-')) {
+                        out[key] = type === 'number' ? +next : next;
+                        i++;
+                    }
+                }
+                break;
+            }
         } else {
             out._ = arg;
             out._args = argv.slice(i + 1);

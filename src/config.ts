@@ -138,6 +138,7 @@ const CLI_TPL = {
     'max-stack-size': 'string',
     'jsr-cache-ttl':  'number',
     'eval':           'string',
+    'e':              'string',
     'silent':         'boolean',
     'no-http':        'boolean',
     'no-jsr':         'boolean',
@@ -171,7 +172,7 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
 
     if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || getEnv('CTS_CACHE_DIR') || '';
     if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'];
-    if (cli['eval'])          cfg.eval           = cli['eval'];
+    if (cli['eval'] || cli['e']) cfg.eval        = (cli['eval'] || cli['e']) as string;
     if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || getEnv('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.disableCache  = true;
     if (cli['no-oxc'] || cli['no-swc']) cfg.enableOxc = false;

@@ -8,11 +8,15 @@ import { LockStore } from './src/lock';
 import { fatal, formatError } from './src/errors';
 import { dirname, normalizePath, isAbsolute, joinPaths } from './src/utils/path';
 import type { ConfigOptions, RuntimeConfig, ModuleInfo } from './src/types';
-import { os, console, worker, engine, fs } from './src/utils';
 import { log } from './src/utils/log';
 import { stripJsonc } from './src/utils/misc';
 import { version } from './package.json';
+
+const os = import.meta.use('os');
 const console = import.meta.use('console');
+const engine = import.meta.use('engine');
+const worker = import.meta.use('worker');
+const fs = import.meta.use('fs');
 
 interface WorkerData { __cts_entry: string; name?: string }
 

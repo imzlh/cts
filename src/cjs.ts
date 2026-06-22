@@ -42,8 +42,8 @@ export interface CjsDeps {
      * Must call engine.promiseResult internally; returns the namespace.
      */
     loadEsmSync(localPath: string, specPath: string): Record<string, any>;
-    /** Resolve any external specifier → { path, isCjs }. */
-    resolveExternal(req: string, parent: string): { path: string; isCjs: boolean } | null;
+    /** Resolve any external specifier → canonical/local path pair + format. */
+    resolveExternal(req: string, parent: string): { path: string; specPath: string; isCjs: boolean } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +58,13 @@ export const BUILTINS = new Set([
     'timers','tls','trace_events','tty','url','util','v8','vm',
     'worker_threads','zlib',
 ]);
+
+function isBuiltinSpecifier(id: string): boolean {
+    const bare = id.startsWith('node:') ? id.slice(5) : id;
+    const slash = bare.indexOf('/');
+    const head = slash === -1 ? bare : bare.slice(0, slash);
+    return BUILTINS.has(head);
+}
 
 // ---------------------------------------------------------------------------
 // Performance: counter-based CJS context keys (no regex), dir-level path cache
@@ -233,17 +240,17 @@ export class CjsLoader {
         function require(id: string): any {
             // 1. Node built-ins
             const bare = id.startsWith('node:') ? id.slice(5) : id;
-            if (BUILTINS.has(bare)) return self.loadBuiltin(bare, parentPath).exports;
+            if (isBuiltinSpecifier(id)) return self.loadBuiltin(bare, parentPath).exports;
 
             // 2. Resolve
             const resolved = self.resolveId(id, parentPath);
             if (!resolved) throw err(ErrorKind.ModuleNotFound, `Cannot find module '${id}' from '${parentPath}'`);
 
-            const { path, isCjs } = resolved;
+            const { path, specPath, isCjs } = resolved;
 
             // 3. CJS → ESM interop: if resolved is ESM, load it via ESM pipeline
             if (!isCjs) {
-                return self.requireEsm(path, id, parentPath);
+                return self.requireEsm(path, specPath, id, parentPath);
             }
 
             // 4. Cache hit (includes in-progress = circular dep → return partial exports)
@@ -287,12 +294,10 @@ export class CjsLoader {
      *
      * The result is cached so repeated require() calls return the same object.
      */
-    private requireEsm(localPath: string, specifier: string, parentPath: string): any {
+    private requireEsm(localPath: string, specPath: string, specifier: string, parentPath: string): any {
         const cacheKey = `__esm__${localPath}`;
         const hit = this.builtinCache.get(cacheKey);
         if (hit) return hit.exports;
-
-        const specPath = localPath;
 
         const ns = this.deps.loadEsmSync(localPath, specPath);
 
@@ -333,7 +338,7 @@ export class CjsLoader {
     // Module resolution
     // -------------------------------------------------------------------------
 
-    private resolveId(id: string, parentPath: string): { path: string; isCjs: boolean } | null {
+    private resolveId(id: string, parentPath: string): { path: string; specPath: string; isCjs: boolean } | null {
         // External resolver first (covers npm, jsr, http, aliases, import map)
         try {
             const ext = this.deps.resolveExternal(id, parentPath);
@@ -344,7 +349,7 @@ export class CjsLoader {
         if (isAbsolute(id)) {
             try {
                 const path = resolveFile(id);
-                return { path, isCjs: detectFormat(path) === 'cjs' };
+                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
             } catch { return null; }
         }
 
@@ -353,7 +358,7 @@ export class CjsLoader {
             const base = joinPaths(dirname(parentPath), id);
             try {
                 const path = resolveFile(base);
-                return { path, isCjs: detectFormat(path) === 'cjs' };
+                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
             } catch { return null; }
         }
 
@@ -365,7 +370,7 @@ export class CjsLoader {
                 const ctx = createCtx(dir);
                 const mainPath = ctx ? resolveMain(ctx) : null;
                 const path = mainPath ?? resolveFile(dir);
-                return { path, isCjs: detectFormat(path) === 'cjs' };
+                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
             } catch { return null; }
         }
 
@@ -373,7 +378,7 @@ export class CjsLoader {
         for (const dir of buildPaths(dirname(parentPath))) {
             try {
                 const path = resolveFile(joinPaths(dir, id));
-                return { path, isCjs: detectFormat(path) === 'cjs' };
+                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
             } catch {}
         }
         return null;

@@ -140,7 +140,7 @@ export class TypeScriptRuntime {
                 return false;
             }
             if (name === ET.JOB_EXCEPTION) {
-                log.error('runtime', formatError(data, 'unhandled job exception'));
+                log.warn('runtime', formatError(data, 'unhandled job exception'));
                 return true;
             }
             return false;
@@ -217,11 +217,14 @@ export class TypeScriptRuntime {
         }
         for (const { spec, parent, error } of result.errors)
             log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
+        log.info(`[precache] scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
         this.resolver.rewriteLock();
 
         // Run postinstall lifecycle scripts (only during cno cache)
         if (!this.config.ignoreScripts) {
+            log.info('[precache] postinstall begin');
             await this.runPostinstallScripts();
+            log.info('[precache] postinstall end');
         }
 
         const scannable = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
@@ -232,6 +235,7 @@ export class TypeScriptRuntime {
 
         if (toCompile.length > 0) {
             try {
+                log.info(`[precache] precompile begin: ${toCompile.length} modules`);
                 prog?.setCompileProgress(0, toCompile.length);
                 const bytecodes = await driver.precompile(toCompile, (done, total) => {
                     prog?.setCompileProgress(done, total);
@@ -243,12 +247,15 @@ export class TypeScriptRuntime {
                         this.loader.jsc.persistMemory(m.localPath);
                 }
                 log.debug('precompile', () => `${bytecodes.size}/${toCompile.length} modules precompiled`);
+                log.info(`[precache] precompile end: ${bytecodes.size}/${toCompile.length} bytecodes`);
             } catch (e) {
                 log.warn('precompile', () => `failed: ${errMsg(e)}`);
             }
         }
 
+        log.info('[precache] worker terminate begin');
         await driver.terminate();
+        log.info('[precache] worker terminate end');
         prog?.stop();
         resources.release();
         return result;
