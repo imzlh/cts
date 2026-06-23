@@ -7,6 +7,7 @@ import { stripJsonc, safeParse, parseArgs } from './utils/misc';
 import { log } from './utils/log';
 import { err, ErrorKind } from './errors';
 import { uname } from './utils/index';
+import { getMemoryTier } from './utils/tier';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -30,6 +31,22 @@ const DEFAULTS = {
     polyfill:    '',
     cacheDir:    '',
 } as const;
+
+// ---------------------------------------------------------------------------
+// Tier-based runtime defaults (applied when no explicit CLI/env override)
+// ---------------------------------------------------------------------------
+
+const TIER_MEM_LIMIT: Record<string, number> = {
+    low:    32 * 1024 * 1024,  // 32 MB
+    normal: 256 * 1024 * 1024, // 256 MB
+    high:   0,                 // unlimited
+};
+
+const TIER_STACK_SIZE: Record<string, number> = {
+    low:     2 * 1024 * 1024,  // 2 MB
+    normal:  4 * 1024 * 1024,  // 4 MB
+    high:    6 * 1024 * 1024,  // 6 MB
+};
 
 // ---------------------------------------------------------------------------
 // Memory size parser  "256MB" → bytes
@@ -110,6 +127,20 @@ function clearJscSync(dir: string): void {
     } catch {}
 }
 
+/** Remove a directory and all contents (used for {cacheDir}/local/ cleanup). */
+function rmrf(dir: string): void {
+    try {
+        for (const e of fs.readdir(dir)) {
+            const p = joinPaths(dir, e);
+            try {
+                if (fs.stat(p).isDirectory) rmrf(p);
+                else fs.unlink(p);
+            } catch {}
+        }
+        try { fs.rmdir(dir); } catch {}
+    } catch {}
+}
+
 function verifyCacheDir(dir: string): void {
     if (!fs.exists(dir)) {
         ensureDir(dir);
@@ -120,8 +151,9 @@ function verifyCacheDir(dir: string): void {
     let stored = '';
     try { stored = readText(vf); } catch {}
     if (stored !== engine.versions.quickjs) {
-        log.debug('config', 'cache version mismatch, clearing .jsc');
+        log.debug('config', 'cache version mismatch, clearing .jsc + local/');
         clearJscSync(dir);
+        rmrf(joinPaths(dir, 'local'));
         writeText(vf, engine.versions.quickjs);
     }
 }
@@ -196,8 +228,13 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
 
     if (!cfg.cacheDir) cfg.cacheDir = defaultCacheDir();
     verifyCacheDir(cfg.cacheDir);
-    if (cfg.memoryLimit  !== undefined) engine.setMemoryLimit(cfg.memoryLimit);
-    if (cfg.maxStackSize !== undefined) engine.setMaxStackSize(cfg.maxStackSize);
+
+    // Apply tier defaults unless explicitly overridden by CLI or env.
+    const tier = getMemoryTier();
+    if (cfg.memoryLimit === undefined) cfg.memoryLimit = TIER_MEM_LIMIT[tier] ?? TIER_MEM_LIMIT['normal']!;
+    if (cfg.maxStackSize === undefined) cfg.maxStackSize = TIER_STACK_SIZE[tier] ?? TIER_STACK_SIZE['normal']!;
+    engine.setMemoryLimit(cfg.memoryLimit);
+    engine.setMaxStackSize(cfg.maxStackSize);
     (cfg as any)._cli = cli;  // keep raw CLI args for unknown flag warning
     return cfg;
 }

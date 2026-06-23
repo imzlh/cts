@@ -6,6 +6,7 @@ import { log } from './utils/log';
 import { PrecacheProgress } from './utils/progress';
 import type { OxcTranspiler } from './oxc';
 import { extractImports, SCANNABLE, WASM_EXT } from './scan';
+import { getMemoryTier } from './utils/tier';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -126,7 +127,7 @@ export class DepScanner {
             return { visited: 0, downloaded: 0, errors: [], modules: [] };
         }
 
-        const CONCURRENCY = 16;
+        const CONCURRENCY = { low: 4, normal: 8, high: 16 }[getMemoryTier()] ?? 8;
         const nextItem = async (): Promise<{ spec: string; parent: string } | null> => {
             while (queue.length === 0) {
                 if (pending === 0) return null;

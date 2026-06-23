@@ -106,8 +106,10 @@ export class ModuleResolver {
     private readonly importIndex:  ImportMapIndex | null;
     private readonly aliasIndex:   PathAliasEntry[];
     private mainEntry = '';
-    private readonly fileKindCache = new Map<string, FileKind>();
-    private readonly liveModules = new Map<string, ModuleInfo>();
+    /** specPath → { info, fileKind } — merged liveModules + fileKindCache. */
+    private readonly resolvedModules = new Map<string, { info: ModuleInfo; fileKind: FileKind }>();
+    /** In-memory (spec, parent) → ModuleInfo cache — skips SQLite on repeat resolves. */
+    private readonly resolveCache = new Map<string, ModuleInfo>();
 
     constructor(
         private readonly cfg: RuntimeConfig,
@@ -170,8 +172,7 @@ export class ModuleResolver {
             if (cached && this.isUsableInfo(cached)) {
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
-                this.liveModules.set(final.specPath, final);
-                this.fileKindCache.set(final.specPath, final.fileKind);
+                this.resolvedModules.set(final.specPath, { info: final, fileKind: cached.fileKind });
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
             }
@@ -184,8 +185,7 @@ export class ModuleResolver {
             if (lockHit && this.isUsableInfo(lockHit)) {
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
-                this.liveModules.set(final.specPath, final);
-                this.fileKindCache.set(final.specPath, final.fileKind);
+                this.resolvedModules.set(final.specPath, { info: final, fileKind: lockHit.fileKind });
                 this.lock.setSource(mapped, parent, final.specPath);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
@@ -241,6 +241,13 @@ export class ModuleResolver {
     resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
+        // Fast path: exact (spec, parent) seen before — skip import map + L1/L2/dispatch
+        if (!attr) {
+            const cacheKey = `${spec}\0${parent}`;
+            const hit = this.resolveCache.get(cacheKey);
+            if (hit) return hit;
+        }
+
         // Import map applied first; skip for obvious relative/absolute paths
         const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
@@ -258,9 +265,9 @@ export class ModuleResolver {
                 log.debug('resolver', () => `L1 hit: "${mapped}" → "${srcKey}"`);
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
-                this.liveModules.set(final.specPath, final);
-                this.fileKindCache.set(final.specPath, final.fileKind);
+                this.resolvedModules.set(final.specPath, { info: final, fileKind: cached.fileKind });
                 if (!this.mainEntry) this.mainEntry = final.specPath;
+                if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
                 return final;
             }
         }
@@ -273,10 +280,10 @@ export class ModuleResolver {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
-                this.liveModules.set(final.specPath, final);
-                this.fileKindCache.set(final.specPath, final.fileKind);
+                this.resolvedModules.set(final.specPath, { info: final, fileKind: lockHit.fileKind });
                 this.lock.setSource(mapped, parent, final.specPath);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
+                if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
                 return final;
             }
         }
@@ -294,13 +301,11 @@ export class ModuleResolver {
     }
 
     getInfo(specPath: string): ModuleInfo {
-        const live = this.liveModules.get(specPath);
-        if (live) return live;
-        const cachedKind = this.fileKindCache.get(specPath);
+        const cached = this.resolvedModules.get(specPath);
+        if (cached) return cached.info;
         const hit = this.lock.getModule(specPath);
         if (hit && this.isUsableInfo(hit)) {
-            this.liveModules.set(hit.specPath, hit);
-            if (cachedKind && cachedKind !== hit.fileKind) return { ...hit, fileKind: cachedKind };
+            this.resolvedModules.set(hit.specPath, { info: hit, fileKind: hit.fileKind });
             return hit;
         }
         const h = this.handlers.get(protoOf(specPath));
@@ -309,10 +314,9 @@ export class ModuleResolver {
                 specPath,
                 localPath: h.localPath(specPath),
                 format: 'esm',
-                fileKind: cachedKind ?? 'source',
+                fileKind: 'source',
             };
         }
-        if (cachedKind) return { specPath, localPath: specPath, format: 'esm', fileKind: cachedKind };
         return { specPath, localPath: specPath, format: 'esm', fileKind: 'source' };
     }
 
@@ -455,10 +459,10 @@ export class ModuleResolver {
     }
 
     private rememberResolved(mapped: string, parent: string, info: ModuleInfo): ModuleInfo {
-        this.liveModules.set(info.specPath, info);
-        this.fileKindCache.set(info.specPath, info.fileKind);
+        this.resolvedModules.set(info.specPath, { info, fileKind: info.fileKind });
         this.lock.setModule(info);
         this.lock.setSource(mapped, parent, info.specPath);
+        this.resolveCache.set(`${mapped}\0${parent}`, info);
         if (!this.mainEntry) {
             this.mainEntry = info.specPath;
             log.debug('resolver', () => `main: "${info.specPath}"`);
@@ -468,7 +472,9 @@ export class ModuleResolver {
 
     private isUsableInfo(info: ModuleInfo): boolean {
         const proto = protoOf(info.specPath);
-        if (proto === 'http' || proto === 'https' || proto === 'jsr' || proto === 'data') return true;
+        // npm/node/jsr/http/data packages live in cacheDir or are runtime-provided — always usable
+        if (proto && proto !== 'file') return true;
+        // Local files: must verify they still exist on disk
         try { return fs.exists(info.localPath); }
         catch { return false; }
     }

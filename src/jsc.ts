@@ -4,17 +4,20 @@
 //   L1  in-memory bytecode (from precompile workers, same-process only)
 //   L2  on-disk .jsc files   (persisted, survives process restart)
 //
-// Cacheable modules: remote (npm:, jsr:, http:, https:) + node: polyfills.
-// Local user files are never cached — users change them frequently,
-// and mtime checking adds overhead for no benefit.
-// Node polyfills are runtime-provided and never modified by users.
+// Remote modules (npm:, jsr:, http:, https:, node:) are cached unconditionally
+// next to their local file (localPath + '.jsc').
+//
+// Local user files (.ts, .tsx, .jsx) are cached in {cacheDir}/local/
+// using a path-hash filename.  A .jsc.mt sidecar stores the source mtime;
+// on load, the cached bytecode is used only when the source hasn't changed.
 
-import { dirname } from './utils/path';
+import { dirname, joinPaths } from './utils/path';
 import { ensureDir } from './utils/io';
 import { log } from './utils/log';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+const crypto = import.meta.use('crypto');
 
 export function isRemote(specPath: string): boolean {
     return specPath.startsWith('http://') || specPath.startsWith('https://')
@@ -24,12 +27,30 @@ export function isRemote(specPath: string): boolean {
 
 export class JscCache {
     private readonly memory = new Map<string, ArrayBuffer>();
+    private readonly localDir: string | null;
+
+    constructor(cacheDir?: string) {
+        this.localDir = cacheDir ? joinPaths(cacheDir, 'local') : null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Local cache path: {cacheDir}/local/{hash[0:2]}/{hash}.jsc
+    // -------------------------------------------------------------------------
+
+    private localCachePath(localPath: string): { jsc: string; mt: string } | null {
+        if (!this.localDir) return null;
+        const hash = crypto.hexEncode(crypto.md5(engine.encodeString(localPath)));
+        const dir = joinPaths(this.localDir, hash.slice(0, 2));
+        const base = joinPaths(dir, hash);
+        return { jsc: base + '.jsc', mt: base + '.jsc.mt' };
+    }
 
     // -------------------------------------------------------------------------
     // Load: L1 (memory) → L2 (disk .jsc) → null
     // -------------------------------------------------------------------------
 
     load(localPath: string, remote: boolean): CModuleEngine.Module | null {
+        // L1: in-memory bytecode
         const bc = this.memory.get(localPath);
         if (bc) {
             try {
@@ -42,16 +63,42 @@ export class JscCache {
             }
         }
 
-        if (!remote) return null;
+        // L2: on-disk
+        if (remote) {
+            // Remote: .jsc sits next to the local file, no mtime check
+            const jscPath = localPath + '.jsc';
+            if (!fs.exists(jscPath)) return null;
+            try {
+                return engine.deserialize(new Uint8Array(fs.readFile(jscPath))) as CModuleEngine.Module;
+            } catch {
+                log.debug('jsc', () => `disk deserialize failed: ${jscPath}`);
+                try { fs.unlink(jscPath); } catch {}
+                return null;
+            }
+        }
 
-        const jscPath = localPath + '.jsc';
-        if (!fs.exists(jscPath)) return null;
+        // Local: .jsc in cacheDir, mtime-validated
+        const paths = this.localCachePath(localPath);
+        if (!paths) return null;
+        if (!fs.exists(paths.jsc)) return null;
+
         try {
-            const bytes = fs.readFile(jscPath);
-            return engine.deserialize(new Uint8Array(bytes)) as CModuleEngine.Module;
+            const cachedMt = engine.decodeString(fs.readFile(paths.mt));
+            const currentMt = String(fs.stat(localPath).mtim);
+            if (cachedMt !== currentMt) {
+                try { fs.unlink(paths.jsc); fs.unlink(paths.mt); } catch {}
+                return null;
+            }
         } catch {
-            log.debug('jsc', () => `disk deserialize failed: ${jscPath}`);
-            try { fs.unlink(jscPath); } catch { /* ignore */ }
+            try { fs.unlink(paths.jsc); fs.unlink(paths.mt); } catch {}
+            return null;
+        }
+
+        try {
+            return engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))) as CModuleEngine.Module;
+        } catch {
+            log.debug('jsc', () => `disk deserialize failed: ${paths.jsc}`);
+            try { fs.unlink(paths.jsc); fs.unlink(paths.mt); } catch {}
             return null;
         }
     }
@@ -88,7 +135,7 @@ export class JscCache {
     }
 
     // -------------------------------------------------------------------------
-    // Persist a compiled module to .jsc (called from loadEsm fallback)
+    // Persist remote module bytecode (next to local file)
     // -------------------------------------------------------------------------
 
     persist(localPath: string, mod: CModuleEngine.Module): void {
@@ -98,6 +145,48 @@ export class JscCache {
             fs.writeFile(jscPath, mod.dump());
         } catch (e) {
             log.warn('jsc', `persist failed: ${jscPath}`, e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Persist local file bytecode to cacheDir with mtime sidecar
+    // -------------------------------------------------------------------------
+
+    persistLocal(localPath: string, mod: CModuleEngine.Module): void {
+        const paths = this.localCachePath(localPath);
+        if (!paths) return;
+        try {
+            ensureDir(dirname(paths.jsc));
+            fs.writeFile(paths.jsc, mod.dump());
+            const mt = fs.stat(localPath).mtim;
+            fs.writeFile(paths.mt, engine.encodeString(String(mt)));
+            log.debug('jsc', () => `cached local: ${localPath}`);
+        } catch (e) {
+            log.warn('jsc', `persistLocal failed: ${paths.jsc}`, e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Clear local bytecode cache (full wipe of {cacheDir}/local/)
+    // -------------------------------------------------------------------------
+
+    clearLocal(): void {
+        if (!this.localDir || !fs.exists(this.localDir)) return;
+        try {
+            for (const entry of fs.readdir(this.localDir)) {
+                const p = joinPaths(this.localDir, entry);
+                try {
+                    if (fs.stat(p).isDirectory) {
+                        for (const f of fs.readdir(p)) {
+                            try { fs.unlink(joinPaths(p, f)); } catch {}
+                        }
+                        try { fs.rmdir(p); } catch {}
+                    }
+                } catch {}
+            }
+            log.debug('jsc', () => `cleared local cache: ${this.localDir}`);
+        } catch (e) {
+            log.debug('jsc', () => `clearLocal failed: ${e}`);
         }
     }
 }

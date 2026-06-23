@@ -18,7 +18,8 @@ const engine = import.meta.use('engine');
 //  formatDirCache:one per directory → 512 fine
 //  exportsCache:  one per (pkgDir × subpath × cjs) triple → 1024
 
-const pkgCache      = new LRU<string, { pkg: PackageJson; at: number }>(512);
+const _NO_PKG = Symbol('no.pkg');
+const pkgCache      = new LRU<string, { pkg: PackageJson | typeof _NO_PKG; at: number }>(512);
 const formatCache   = new LRU<string, ModuleFormat>(2048);
 const formatDirCache = new LRU<string, ModuleFormat>(512);
 const exportsCache  = new LRU<string, string | null>(1024);
@@ -27,17 +28,17 @@ const PKG_TTL = 5 * 60 * 1000;
 
 export function readPkg(dir: string): PackageJson | null {
     const hit = pkgCache.get(dir);
-    if (hit && Date.now() - hit.at < PKG_TTL) return hit.pkg;
+    if (hit && Date.now() - hit.at < PKG_TTL)
+        return hit.pkg === _NO_PKG ? null : hit.pkg;
     const pkgPath = joinPaths(dir, 'package.json');
-    if (!fs.exists(pkgPath)) return null;
+    if (!fs.exists(pkgPath)) { pkgCache.set(dir, { pkg: _NO_PKG, at: Date.now() }); return null; }
     try {
         const pkg = safeParse<PackageJson>(engine.decodeString(fs.readFile(pkgPath)));
         pkgCache.set(dir, { pkg, at: Date.now() });
         return pkg;
     } catch (e) {
         log.debug('pkg', () => `failed ${pkgPath}: ${e}`);
-        // Don't cache failures — allow retry on next access
-        pkgCache.delete(dir);
+        pkgCache.set(dir, { pkg: _NO_PKG, at: Date.now() });
         return null;
     }
 }

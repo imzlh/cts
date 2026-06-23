@@ -8,7 +8,7 @@ import { joinPaths, dirname, normalizePath } from '../utils/path';
 import { readText, resolveFile } from '../utils/io';
 declare const URL: any;
 import { matchLatestVersion, compareVersions, safeParse } from '../utils/misc';
-import { detectFormat, readPkgFresh, createCtx, resolveSubpath, resolveImports, getBinMap } from '../pkg';
+import { detectFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap } from '../pkg';
 import { err, ErrorKind } from '../errors';
 import { log } from '../utils/log';
 import { isatty } from '../utils/progress';
@@ -175,6 +175,8 @@ export class NpmHandler implements ProtocolHandler {
     private readonly cacheDir: string;
     private npmCfg: NpmConfig | null = null;
     private readonly verCache = new Map<string, string>();
+    /** Cache findLocal results — packages don't move during runtime. */
+    private readonly localCache = new Map<string, string | null>();
     private readonly pendingPostinstall: Array<{ name: string; version: string; dir: string; script: string }> = [];
 
     constructor(private readonly cfg: RuntimeConfig) {
@@ -184,6 +186,7 @@ export class NpmHandler implements ProtocolHandler {
     /** Clear version resolution cache */
     clearCache(): void {
         this.verCache.clear();
+        this.localCache.clear();
         this.npmCfg = null;
     }
 
@@ -223,7 +226,7 @@ export class NpmHandler implements ProtocolHandler {
         }
         const local = this.findLocal(parsed.name, parent);
         if (!local) return null;
-        const pkg = readPkgFresh(local);
+        const pkg = readPkg(local);
         const resolvedVer = pkg?.version ?? parsed.version;
         return this.resolvePkg(local, resolvedVer, parsed.name, parsed.subpath, forceCjs);
     }
@@ -405,6 +408,9 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private findLocal(name: string, parent?: string): string | null {
+        const cached = this.localCache.get(name);
+        if (cached !== undefined) return cached;
+
         const search: string[] = [];
         if (parent) {
             let startDir = parent.startsWith('npm:') ? this.cacheDir : dirname(parent);
@@ -422,10 +428,12 @@ export class NpmHandler implements ProtocolHandler {
             try {
                 if (fs.stat(p).isDirectory && fs.exists(joinPaths(p, 'package.json'))) {
                     this.indexLocalBins(p, name);
+                    this.localCache.set(name, p);
                     return p;
                 }
             } catch {}
         }
+        this.localCache.set(name, null);
         return null;
     }
 
@@ -460,7 +468,7 @@ export class NpmHandler implements ProtocolHandler {
             pkgDir = installed.dir;
         }
         if (!pkgDir) return null;
-        const pkg = readPkgFresh(pkgDir);
+        const pkg = readPkg(pkgDir);
         if (!pkg) return null;
         return pkg.dependencies?.[name]
             ?? pkg.optionalDependencies?.[name]
@@ -469,7 +477,7 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private indexLocalBins(pkgDir: string, name: string): void {
-        const pkg = readPkgFresh(pkgDir);
+        const pkg = readPkg(pkgDir);
         if (!pkg) return;
         const binMap = getBinMap(pkg);
         for (const [binName, relPath] of Object.entries(binMap)) {
@@ -487,7 +495,7 @@ export class NpmHandler implements ProtocolHandler {
     private *ensureInstalled(name: string, version: string, parent?: string, onProgress?: ProgressCallback): Flow<{ dir: string; resolvedVer: string }> {
         const local = this.findLocal(name, parent);
         if (local) {
-            const pkg = readPkgFresh(local);
+            const pkg = readPkg(local);
             return { dir: local, resolvedVer: pkg?.version ?? version };
         }
         if (/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
@@ -576,7 +584,7 @@ export class NpmHandler implements ProtocolHandler {
         yield* this.indexInstalledBins(name, ver, dir);
         yield* this.installOptionalDeps(dir, onProgress);
         // Record postinstall script for deferred execution (cno cache only)
-        const pkg = readPkgFresh(dir);
+        const pkg = readPkg(dir);
         const postinstall = pkg?.scripts?.postinstall;
         if (postinstall && typeof postinstall === 'string' && postinstall.trim()) {
             this.pendingPostinstall.push({ name, version: ver, dir, script: postinstall });
@@ -586,7 +594,7 @@ export class NpmHandler implements ProtocolHandler {
 
     /** Try to install each optionalDependency. Failures are non-fatal (platform mismatch, etc). */
     private *installOptionalDeps(dir: string, onProgress?: ProgressCallback): Flow<void> {
-        const pkg = readPkgFresh(dir);
+        const pkg = readPkg(dir);
         if (!pkg?.optionalDependencies) return;
         const opts = Object.entries(pkg.optionalDependencies);
         if (!opts.length) return;
@@ -622,7 +630,7 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private *indexInstalledBins(name: string, ver: string, dir: string): Flow<void> {
-        const pkg = readPkgFresh(dir);
+        const pkg = readPkg(dir);
         if (!pkg) return;
         const binMap = getBinMap(pkg);
         const spec = `${name}@${ver}`;

@@ -35,7 +35,7 @@ export class ModuleLoader {
     /** Modules currently being compiled (circular dep detection). */
     private readonly esmLoading  = new Set<string>();
     private readonly wasmCache   = new Map<string, CModuleEngine.Module>();
-    readonly jsc                 = new JscCache();
+    readonly jsc:                JscCache;
 
     /** Track all loaded modules for proper cleanup */
     private readonly loadedModules = new Set<CModuleEngine.Module>();
@@ -48,6 +48,7 @@ export class ModuleLoader {
         private readonly resolver: ModuleResolver,
         private readonly cfg:      RuntimeConfig,
     ) {
+        this.jsc = new JscCache(cfg.cacheDir);
         this.transformer = new Transformer({
             sourceMaps: true,
             jsxPragma: cfg.jsxPragma,
@@ -131,9 +132,11 @@ export class ModuleLoader {
         }
 
         const remote = isRemote(info.specPath);
-        const cacheable = !this.cfg.disableCache && remote;
+        const needsTransform = !remote && /\.(?:tsx?|jsx)$/.test(info.localPath);
+        const needsCompile  = !remote && !needsTransform && /\.(?:m?js)$/.test(info.localPath);
+        const cacheable = !this.cfg.disableCache && (remote || needsTransform || needsCompile);
 
-        // 1) JSC cache: in-memory (from precompile) → on-disk .jsc (remote only)
+        // 1) JSC cache: in-memory (from precompile) → on-disk .jsc
         if (cacheable) {
             const cached = this.jsc.load(info.localPath, remote);
             if (cached) {
@@ -179,7 +182,8 @@ export class ModuleLoader {
         }
 
         if (cacheable) {
-            this.jsc.persist(info.localPath, mod);
+            if (remote) this.jsc.persist(info.localPath, mod);
+            else        this.jsc.persistLocal(info.localPath, mod);
         }
 
         Object.assign(mod.meta, meta);

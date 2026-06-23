@@ -15,6 +15,7 @@ import { joinPaths, dirname } from './utils/path';
 import { ensureDir } from './utils/io';
 import { log } from './utils/log';
 import { errMsg } from './utils';
+import { getMemoryTier } from './utils/tier';
 
 const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
@@ -115,7 +116,7 @@ export class LockStore {
         try {
             this.db!.exec('PRAGMA journal_mode = DELETE');
             this.db!.exec('PRAGMA synchronous = NORMAL');
-            this.db!.exec('PRAGMA cache_size = -8000');
+            this.db!.exec(`PRAGMA cache_size = ${{ low: -256, normal: -2000, high: -8000 }[getMemoryTier()] ?? -2000}`);
             this.db!.exec('PRAGMA temp_store = MEMORY');
             this.db!.exec('PRAGMA busy_timeout = 3000');
             this.db!.exec(SCHEMA);
