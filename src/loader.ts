@@ -150,7 +150,7 @@ export class ModuleLoader {
         // 2) Fallback: read + transform + compile on main thread
         this.esmLoading.add(info.localPath);
         const text = readText(info.localPath);
-        const code = this.transformer.transform(text, info.localPath);
+        const code = this.transformer.transform(text, info.localPath, meta?.lang);
         let mod: CModuleEngine.Module;
         try {
             mod = new engine.Module(code, info.specPath);
@@ -198,7 +198,7 @@ export class ModuleLoader {
             if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
             return hit;
         }
-        const transformed = this.transformer.transform(code, info.localPath);
+        const transformed = this.transformer.transform(code, info.localPath, meta?.lang);
         let mod: CModuleEngine.Module;
         try {
             mod = new engine.Module(transformed, info.specPath);
@@ -218,7 +218,7 @@ export class ModuleLoader {
     }
 
     private loadCjsSource(code: string, info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
-        const transformed = this.transformer.transform(code, info.localPath);
+        const transformed = this.transformer.transform(code, info.localPath, meta?.lang);
         const cjsMod = this.cjs.loadSourceAndGet(transformed, info.localPath);
         return this.bridgeCjsToEsm(info, meta, cjsMod.exports);
     }

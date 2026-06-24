@@ -325,7 +325,7 @@ export class TypeScriptRuntime {
         return resolveFile(normalizePath(joinPaths(cwd, normalized)));
     }
 
-    async loadEntry(path: string, extra: Record<string, any> = {}): Promise<CModuleEngine.Module> {
+    async loadEntry(path: string, extra: Record<string, any> = {}, lang = 'ts'): Promise<CModuleEngine.Module> {
         // Do NOT call resources.release() here — user code may trigger dynamic
         // imports whose protocol handlers still rely on resolver/handler state
         // (e.g. HttpHandler.resolved, NpmHandler.verCache).  Release happens
@@ -336,7 +336,7 @@ export class TypeScriptRuntime {
         // regardless of extension (e.g. extensionless scripts).
         info.fileKind = 'source';
         info.format = 'esm';
-        const meta: Record<string, any> = { ...extra };
+        const meta: Record<string, any> = { lang, ...extra };
         this.fillMeta(meta, info);
         meta.main = true;
         return this.loader.load(info, meta);

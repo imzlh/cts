@@ -33,9 +33,9 @@ export class Transformer {
         this.oxc = oxc;
     }
 
-    transform(code: string, filename: string): string {
+    transform(code: string, filename: string, lang?: string): string {
         if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
-        const ext = filename.slice(filename.lastIndexOf('.'));
+        const ext = lang ? `.${lang}` : filename.slice(filename.lastIndexOf('.'));
         switch (ext) {
             case '.ts':
             case '.tsx':
