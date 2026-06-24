@@ -332,6 +332,10 @@ export class TypeScriptRuntime {
         // after the entry module has fully settled in the caller (run.ts).
 
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
+        // Entry file is always treated as executable ESM source,
+        // regardless of extension (e.g. extensionless scripts).
+        info.fileKind = 'source';
+        info.format = 'esm';
         const meta: Record<string, any> = { ...extra };
         this.fillMeta(meta, info);
         meta.main = true;
