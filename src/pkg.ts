@@ -147,8 +147,8 @@ function conds(ctx: ResolveCtx): string[] {
     // ESM: import > module > default > node > require
     // CJS: require > default > node
     // Also include 'browser' and 'types' for broader compatibility
-    if (ctx.forceCjs) return ['require', 'default', 'node', 'browser', 'types'];
-    return ['import', 'module', 'default', 'node', 'require', 'browser', 'types'];
+    if (ctx.forceCjs) return ['require', 'default', 'node', 'browser'];
+    return ['import', 'module', 'default', 'node', 'require', 'browser'];
 }
 
 function resolvePath(ctx: ResolveCtx, p: string): string | null {
