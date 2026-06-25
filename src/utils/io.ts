@@ -31,7 +31,7 @@ export function ensureDir(dir: string): void {
 
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.wasm'];
 const cache = new LRU<string, string>(2048);
-const negCache = new Set<string>();  // paths known not to exist
+const negCache = new LRU<string, boolean>(4096);  // bounded: paths known not to exist
 
 export function resolveFile(base: string, exts = EXTS): string {
     const hit = cache.get(base);
@@ -44,7 +44,7 @@ export function resolveFile(base: string, exts = EXTS): string {
 }
 
 /** Mark a path as definitively non-existent (stat failed). */
-function markMissing(p: string): void { negCache.add(p); }
+function markMissing(p: string): void { negCache.set(p, true); }
 
 /** Clear negative cache to allow re-checking paths */
 export function clearNegativeCache(): void { negCache.clear(); }

@@ -138,7 +138,7 @@ export class ModuleLoader {
 
         // 1) JSC cache: in-memory (from precompile) → on-disk .jsc
         if (cacheable) {
-            const cached = this.jsc.load(info.localPath, remote);
+            const cached = this.jsc.load(info.localPath, remote, this.resolver.getCachedMtime(info.localPath));
             if (cached) {
                 Object.assign(cached.meta, meta);
                 this.esmCache.set(info.localPath, cached);

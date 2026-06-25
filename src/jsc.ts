@@ -49,7 +49,7 @@ export class JscCache {
     // Load: L1 (memory) → L2 (disk .jsc) → null
     // -------------------------------------------------------------------------
 
-    load(localPath: string, remote: boolean): CModuleEngine.Module | null {
+    load(localPath: string, remote: boolean, cachedMtime?: number): CModuleEngine.Module | null {
         // L1: in-memory bytecode
         const bc = this.memory.get(localPath);
         if (bc) {
@@ -84,7 +84,7 @@ export class JscCache {
 
         try {
             const cachedMt = engine.decodeString(fs.readFile(paths.mt));
-            const currentMt = String(fs.stat(localPath).mtim);
+            const currentMt = String(cachedMtime ?? fs.stat(localPath).mtim);
             if (cachedMt !== currentMt) {
                 try { fs.unlink(paths.jsc); fs.unlink(paths.mt); } catch {}
                 return null;

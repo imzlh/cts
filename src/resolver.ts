@@ -26,6 +26,7 @@ import { resolveFile } from './utils/io';
 import { detectFormat } from './pkg';
 import { guessFileKind, applyAttrType } from './protocol/base';
 import { assert } from './utils/misc';
+import { LRU } from './utils/lru';
 import { log } from './utils/log';
 
 const os = import.meta.use('os');
@@ -106,10 +107,12 @@ export class ModuleResolver {
     private readonly importIndex:  ImportMapIndex | null;
     private readonly aliasIndex:   PathAliasEntry[];
     private mainEntry = '';
-    /** specPath → { info, fileKind } — merged liveModules + fileKindCache. */
-    private readonly resolvedModules = new Map<string, { info: ModuleInfo; fileKind: FileKind }>();
+    /** specPath → ModuleInfo — live resolution cache. */
+    private readonly resolvedModules = new Map<string, ModuleInfo>();
     /** In-memory (spec, parent) → ModuleInfo cache — skips SQLite on repeat resolves. */
-    private readonly resolveCache = new Map<string, ModuleInfo>();
+    private readonly resolveCache = new LRU<string, ModuleInfo>(4096);
+    /** Stat cache: localPath → { exists, mtime }. Avoids repeated sync fs.stat on hot path. */
+    private readonly statCache = new LRU<string, { exists: boolean; mtime: number }>(2048);
 
     constructor(
         private readonly cfg: RuntimeConfig,
@@ -172,7 +175,7 @@ export class ModuleResolver {
             if (cached && this.isUsableInfo(cached)) {
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
-                this.resolvedModules.set(final.specPath, { info: final, fileKind: cached.fileKind });
+                this.resolvedModules.set(final.specPath, final);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
             }
@@ -185,7 +188,7 @@ export class ModuleResolver {
             if (lockHit && this.isUsableInfo(lockHit)) {
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
-                this.resolvedModules.set(final.specPath, { info: final, fileKind: lockHit.fileKind });
+                this.resolvedModules.set(final.specPath, final);
                 this.lock.setSource(mapped, parent, final.specPath);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
@@ -265,7 +268,7 @@ export class ModuleResolver {
                 log.debug('resolver', () => `L1 hit: "${mapped}" → "${srcKey}"`);
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
-                this.resolvedModules.set(final.specPath, { info: final, fileKind: cached.fileKind });
+                this.resolvedModules.set(final.specPath, final);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
                 return final;
@@ -280,7 +283,7 @@ export class ModuleResolver {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
-                this.resolvedModules.set(final.specPath, { info: final, fileKind: lockHit.fileKind });
+                this.resolvedModules.set(final.specPath, final);
                 this.lock.setSource(mapped, parent, final.specPath);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
@@ -302,10 +305,10 @@ export class ModuleResolver {
 
     getInfo(specPath: string): ModuleInfo {
         const cached = this.resolvedModules.get(specPath);
-        if (cached) return cached.info;
+        if (cached) return cached;
         const hit = this.lock.getModule(specPath);
         if (hit && this.isUsableInfo(hit)) {
-            this.resolvedModules.set(hit.specPath, { info: hit, fileKind: hit.fileKind });
+            this.resolvedModules.set(hit.specPath, hit);
             return hit;
         }
         const h = this.handlers.get(protoOf(specPath));
@@ -459,7 +462,7 @@ export class ModuleResolver {
     }
 
     private rememberResolved(mapped: string, parent: string, info: ModuleInfo): ModuleInfo {
-        this.resolvedModules.set(info.specPath, { info, fileKind: info.fileKind });
+        this.resolvedModules.set(info.specPath, info);
         this.lock.setModule(info);
         this.lock.setSource(mapped, parent, info.specPath);
         this.resolveCache.set(`${mapped}\0${parent}`, info);
@@ -474,8 +477,26 @@ export class ModuleResolver {
         const proto = protoOf(info.specPath);
         // npm/node/jsr/http/data packages live in cacheDir or are runtime-provided — always usable
         if (proto && proto !== 'file') return true;
-        // Local files: must verify they still exist on disk
-        try { return fs.exists(info.localPath); }
-        catch { return false; }
+        // Local files: stat cache avoids repeated sync syscalls on hot path
+        const cached = this.statCache.get(info.localPath);
+        if (cached) return cached.exists;
+        try {
+            const st = fs.stat(info.localPath);
+            this.statCache.set(info.localPath, { exists: true, mtime: st.mtim.getTime() });
+            return true;
+        } catch {
+            this.statCache.set(info.localPath, { exists: false, mtime: 0 });
+            return false;
+        }
+    }
+
+    /** Evict a path from the stat cache (e.g. after a load failure). */
+    invalidatePath(localPath: string): void {
+        this.statCache.delete(localPath);
+    }
+
+    /** Get cached mtime for a local path (avoids redundant fs.stat in jsc.load). */
+    getCachedMtime(localPath: string): number | undefined {
+        return this.statCache.get(localPath)?.mtime;
     }
 }

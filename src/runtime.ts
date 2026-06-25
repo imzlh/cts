@@ -37,6 +37,10 @@ export class TypeScriptRuntime {
      *  module twice (QuickJS does not cache dynamic import() results). */
     private readonly loadedModules = new Map<string, CModuleEngine.Module>();
     private readonly initHooks: Array<(specPath: string, info: ModuleInfo) => void> = [];
+    /** Reusable meta object — avoids per-load allocation. */
+    private readonly _meta: Record<string, any> = {};
+    /** Cached resolve closures keyed by specPath — avoids per-load closure allocation. */
+    private readonly resolveFnCache = new Map<string, (s: string, p?: string, a?: Record<string, any>) => string>();
 
     /** Register an additional callback to fire after each module's init hook. */
     addInitHook(fn: (specPath: string, info: ModuleInfo) => void): void {
@@ -84,7 +88,8 @@ export class TypeScriptRuntime {
                 const dedup = this.loadedModules.get(specPath);
                 if (dedup) return dedup;
                 const info = this.resolver.getInfo(specPath);
-                const meta: Record<string, any> = {};
+                // Reuse meta object — loader.load copies properties out synchronously
+                const meta = this._meta;
                 this.fillMeta(meta, info);
                 // Cache meta for init hook to apply
                 this.metaCache.set(specPath, meta);
@@ -158,10 +163,15 @@ export class TypeScriptRuntime {
         meta.dirname  = dirname(info.localPath);
         meta.main     = info.specPath === this.resolver.entry;
         meta.use      = import.meta.use;
-        // import.meta.resolve(spec[, parent]) — parent defaults to this module's specPath
-        const self = info.specPath;
-        meta.resolve  = (s: string, p?: string, a?: Record<string, any>) =>
-            this.resolver.resolve(s, p ?? self, a).specPath;
+        // import.meta.resolve — reuse cached closure per specPath
+        let fn = this.resolveFnCache.get(info.specPath);
+        if (!fn) {
+            const self = info.specPath;
+            fn = (s: string, p?: string, a?: Record<string, any>) =>
+                this.resolver.resolve(s, p ?? self, a).specPath;
+            this.resolveFnCache.set(info.specPath, fn);
+        }
+        meta.resolve = fn;
     }
 
     private parentLocal(parent: string): string {
