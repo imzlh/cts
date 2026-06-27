@@ -11,6 +11,7 @@
 import { dirname, joinPaths, isAbsolute, extname, isRelative } from './utils/path';
 import { resolveFile } from './utils/io';
 import { safeParse } from './utils/misc';
+import { detectFormat, resolveMain, createCtx, type ResolvedPath } from './pkg';
 import { log } from './utils/log';
 import { err, ErrorKind } from './errors';
 
@@ -394,22 +395,43 @@ export class CjsLoader {
 
         // Local filesystem fallback for contexts that bypass the resolver, such as
         // internal createRequire() consumers operating directly on filenames.
-        if (isAbsolute(id)) return this.resolveLocalPath(id);
-        if (isRelative(id)) return this.resolveLocalPath(joinPaths(dirname(parentPath), id));
-        if (id === '.') return this.resolveLocalPath(dirname(parentPath));
+        if (isAbsolute(id)) return this.resolveLocalPath(id, true);
+        if (isRelative(id)) return this.resolveLocalPath(joinPaths(dirname(parentPath), id), true);
+        if (id === '.') return this.resolveLocalPath(dirname(parentPath), true);
         for (const dir of buildPaths(dirname(parentPath))) {
-            const resolved = this.resolveLocalPath(joinPaths(dir, id));
+            const resolved = this.resolveLocalPath(joinPaths(dir, id), true);
             if (resolved) return resolved;
         }
         return null;
     }
 
-    private resolveLocalPath(candidate: string): ResolvedCjsRequest | null {
+    private resolveLocalPath(candidate: string, preferPackageMain = false): ResolvedCjsRequest | null {
+        const packageEntry = this.resolvePackageEntry(candidate, preferPackageMain);
+        if (packageEntry) return this.toResolvedRequest(packageEntry);
         try {
             const path = resolveFile(candidate);
-            return { path, specPath: path, isCjs: true };
+            return this.toResolvedRequest({ path, format: detectFormat(path) });
         } catch {
             return null;
         }
+    }
+
+    private resolvePackageEntry(candidate: string, forcePackageMain: boolean): ResolvedPath | null {
+        if (!forcePackageMain) return null;
+        try {
+            if (!fs.stat(candidate).isDirectory) return null;
+        } catch {
+            return null;
+        }
+        const ctx = createCtx(candidate, { forceCjs: true });
+        return ctx ? resolveMain(ctx) : null;
+    }
+
+    private toResolvedRequest(resolved: ResolvedPath): ResolvedCjsRequest {
+        return {
+            path: resolved.path,
+            specPath: resolved.path,
+            isCjs: resolved.format === 'cjs',
+        };
     }
 }
