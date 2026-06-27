@@ -1,10 +1,10 @@
 // transformer.ts — TS/JSX → JS via oxc (native, fast) or Sucrase (fallback)
 
-import { transform, type Transform, type Options } from '../deps/sucrase/src/index';
-import { errMsg } from './utils/misc';
-import { err, ErrorKind, TransformError } from './errors';
-import { log } from './utils/log';
-import type { OxcTranspiler } from './oxc';
+import { transform, type Transform, type Options } from '../../deps/sucrase/src/index';
+import { errMsg } from '../utils/misc';
+import { err, ErrorKind, TransformError } from '../errors';
+import { log } from '../utils/log';
+import type { OxcTranspiler } from '../oxc';
 
 const smap = import.meta.use('sourcemap');
 

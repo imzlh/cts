@@ -306,8 +306,20 @@ export class LockStore {
     get size(): number {
         const rows = this.query('SELECT COUNT(*) AS n FROM modules');
         let total = rows[0]?.n ?? 0;
-        for (const key of this.pendingModules.keys()) {
-            if (!this.query('SELECT 1 AS n FROM modules WHERE spec = ?', [key]).length) total++;
+        if (this.pendingModules.size > 0) {
+            const existing = new Set<string>();
+            const specs = [...this.pendingModules.keys()];
+            for (let i = 0; i < specs.length; i += 100) {
+                const batch = specs.slice(i, i + 100);
+                const placeholders = batch.map(() => '?').join(',');
+                const hits = this.query(
+                    `SELECT spec FROM modules WHERE spec IN (${placeholders})`, batch
+                );
+                for (const h of hits) existing.add(h.spec);
+            }
+            for (const key of this.pendingModules.keys()) {
+                if (!existing.has(key)) total++;
+            }
         }
         return total;
     }

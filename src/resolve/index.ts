@@ -8,26 +8,26 @@
 // lock.modules IS the live in-process cache — no separate runCache needed.
 // lock.setModule() writes to both lock.modules and lock.dirtyModules.
 
-import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver, FileKind } from './types';
-import type { ProtocolHandler } from './protocol/base';
-import type { ProgressCallback } from './flow';
-import { err, ErrorKind } from './errors';
-import { FileHandler } from './protocol/file';
-import { HttpHandler }  from './protocol/http';
-import { JsrHandler }   from './protocol/jsr';
-import { NpmHandler }   from './protocol/npm';
-import { NodeHandler }  from './protocol/node';
-import { DataHandler }  from './protocol/data';
-import { LockStore }    from './lock';
-import { isBuiltinSpecifier } from './cjs';
-import { runAsync, runSync } from './flow';
-import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative } from './utils/path';
-import { resolveFile } from './utils/io';
+import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver, FileKind } from '../types';
+import type { ProtocolHandler } from './protocols/base';
+import type { ProgressCallback } from '../flow';
+import { err, ErrorKind } from '../errors';
+import { FileHandler } from './protocols/file';
+import { HttpHandler }  from './protocols/http';
+import { JsrHandler }   from './protocols/jsr';
+import { NpmHandler }   from './protocols/npm';
+import { NodeHandler }  from './protocols/node';
+import { DataHandler }  from './protocols/data';
+import { LockStore }    from '../lock';
+import { isBuiltinSpecifier } from './builtins';
+import { runAsync, runSync } from '../flow';
+import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative } from '../utils/path';
+import { resolveFile } from '../utils/io';
 import { detectFormat } from './pkg';
-import { guessFileKind, applyAttrType } from './protocol/base';
-import { assert } from './utils/misc';
-import { LRU } from './utils/lru';
-import { log } from './utils/log';
+import { guessFileKind, applyAttrType } from './protocols/base';
+import { assert } from '../utils/misc';
+import { LRU } from '../utils/lru';
+import { log } from '../utils/log';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -152,7 +152,9 @@ export class ModuleResolver {
     async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
 
-        const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
+        if (spec.includes('\\')) spec = spec.replace(/\\/g, '/');
+
+        const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const transient = this.isTransientResolve(attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
@@ -241,6 +243,10 @@ export class ModuleResolver {
     resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
+        // Normalize Windows backslashes to forward slashes for consistent handling.
+        // Must happen before import map lookup, protoOf check, and dispatch.
+        if (spec.includes('\\')) spec = spec.replace(/\\/g, '/');
+
         // Fast path: exact (spec, parent) seen before — skip import map + L1/L2/dispatch
         if (!attr) {
             const cacheKey = `${spec}\0${parent}`;
@@ -248,8 +254,9 @@ export class ModuleResolver {
             if (hit) return hit;
         }
 
-        // Import map applied first; skip for obvious relative/absolute paths
-        const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
+        // Import map: skip for relative and absolute paths (they don't need remapping).
+        // Uses isAbsolute/isRelative from utils/path to handle Windows drive letters.
+        const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const transient = this.isTransientResolve(attr);
@@ -299,7 +306,7 @@ export class ModuleResolver {
         if (this.cfg.frozen) {
             throw err(ErrorKind.LockFrozen,
                 `Module not in lock: "${mapped}"\n` +
-                `  Run [36mcts cache <entry>[0m to update the lock, then retry with --frozen.`
+                `  Run \x1b[36mcts cache <entry>\x1b[0m to update the lock, then retry with --frozen.`
             );
         }
         const info = this.dispatch(mapped, parent, attr);

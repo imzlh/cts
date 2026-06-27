@@ -28,13 +28,13 @@ export interface ConfigOptions {
     baseUrl?:       string;
     importMap?:     Record<string, string>;
     polyfill?:      string;
-    disableCache?:  boolean;
+    enableCache?:   boolean;
     enableOxc?:     boolean;
     eval?:          string;   // inline code to evaluate (-e / --eval)
     // Lock options
     lockDir?:       string;   // dir containing cts.lock (default: entry file dir)
     frozen?:        boolean;  // refuse to resolve anything not already in lock
-    noLock?:        boolean;  // disable lock entirely
+    disableLock?:   boolean;  // disable lock entirely
     // Lifecycle scripts
     ignoreScripts?: boolean;  // skip postinstall scripts during cno cache
     // JSX options
@@ -46,7 +46,7 @@ export interface ConfigOptions {
 // Optional fields remain optional (no value → feature disabled)
 export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     'pathAliases'|'baseUrl'|'importMap'|'memoryLimit'|'maxStackSize'|
-    'lockDir'|'frozen'|'noLock'|'eval'|'jsxPragma'|'jsxFragmentPragma'|'enableSwc'>> {
+    'lockDir'|'frozen'|'disableLock'|'enableCache'|'eval'|'jsxPragma'|'jsxFragmentPragma'>> {
     pathAliases?:  Record<string, string[]>;
     baseUrl?:      string;
     importMap?:    Record<string, string>;
@@ -54,7 +54,8 @@ export interface RuntimeConfig extends Required<Omit<ConfigOptions,
     maxStackSize?: number;
     lockDir?:      string;
     frozen?:       boolean;
-    noLock?:       boolean;
+    disableLock?:  boolean;
+    enableCache?:  boolean;
     eval?:         string;
     jsxPragma?:    string;
     jsxFragmentPragma?: string;

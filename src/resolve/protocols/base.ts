@@ -8,9 +8,9 @@
 // returned ModuleInfo by specPath, then calls localPath() on subsequent load
 // requests.  Protocol handlers don't need to worry about the runtime cache.
 
-import type { ModuleInfo, FileKind } from '../types';
-import type { Flow, ProgressCallback } from '../flow';
-import { extname } from '../utils';
+import type { ModuleInfo, FileKind } from '../../types';
+import type { Flow, ProgressCallback } from '../../flow';
+import { extname } from '../../utils';
 
 export type { ModuleInfo };
 

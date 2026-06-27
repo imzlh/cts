@@ -1,19 +1,20 @@
-// cjs.ts — CommonJS module system with correct ESM interop
+// compile/cjs.ts — CommonJS compilation engine
 //
-// ESM/CJS interop rules (matches Node.js behaviour):
-//   ESM imports CJS  → CJS module.exports becomes `default`; named keys also exported
-//   ESM imports CJS with __esModule=true → treat as transpiled ESM: use .default as default
-//   CJS requires ESM → synchronously extract ESM namespace via engine.promiseResult
-//   CJS requires CJS → normal require() chain
-//   Circular CJS     → return partial exports (same as Node.js)
-//   Circular ESM→CJS→ESM → return empty namespace with warning
+// Responsibilities:
+//   - CjsLoader: build, execute, cache CJS modules
+//   - mkRequire() factory
+//   - node_modules path traversal
+//
+// Does NOT contain:
+//   - BUILTINS (in resolve/builtins.ts)
+//   - CJS/ESM bridge (in compile/bridge.ts)
 
-import { dirname, joinPaths, isAbsolute, extname, isRelative } from './utils/path';
-import { resolveFile } from './utils/io';
-import { safeParse } from './utils/misc';
-import { detectFormat, resolveMain, createCtx, type ResolvedPath } from './pkg';
-import { log } from './utils/log';
-import { err, ErrorKind } from './errors';
+import { dirname, joinPaths, isAbsolute, extname, isRelative } from '../utils/path';
+import { resolveFile } from '../utils/io';
+import { safeParse } from '../utils/misc';
+import { log } from '../utils/log';
+import { err, ErrorKind } from '../errors';
+import { isBuiltinSpecifier } from '../resolve/builtins';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -28,7 +29,7 @@ export interface CjsModule {
     require: CjsRequireFn; children: CjsModule[]; parent: CjsModule | null; paths: string[];
 }
 
-interface CjsRequireFn {
+export interface CjsRequireFn {
     (id: string): any;
     resolve: (id: string, opts?: { paths?: string[] }) => string;
     cache: Map<string, CjsModule>; main: CjsModule | null;
@@ -56,33 +57,13 @@ interface ResolvedCjsRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in module names (no protocol prefix)
-// ---------------------------------------------------------------------------
-
-export const BUILTINS = new Set([
-    'assert','buffer','child_process','cluster','console','constants',
-    'crypto','dgram','dns','domain','events','fs','http','http2','https','inspector',
-    'module','net','os','path','perf_hooks','process','punycode',
-    'querystring','readline','repl','sqlite','stream','string_decoder',
-    'sqlite3','timers','tls','trace_events','tty','url','util','v8','vm',
-    'worker_threads','zlib',
-]);
-
-export function isBuiltinSpecifier(id: string): boolean {
-    const bare = id.startsWith('node:') ? id.slice(5) : id;
-    const slash = bare.indexOf('/');
-    const head = slash === -1 ? bare : bare.slice(0, slash);
-    return BUILTINS.has(head);
-}
-
-// ---------------------------------------------------------------------------
 // Performance: counter-based CJS context keys (no regex), dir-level path cache
 // ---------------------------------------------------------------------------
 
 let _ctxId = 0;
 const _dirPaths = new Map<string, string[]>(); // dir → node_modules search list
 
-function buildPaths(dir: string): string[] {
+export function buildPaths(dir: string): string[] {
     const hit = _dirPaths.get(dir);
     if (hit) return hit;
     const out: string[] = [];
@@ -308,15 +289,14 @@ export class CjsLoader {
         return require as CjsRequireFn;
     }
 
+    // -------------------------------------------------------------------------
+    // CJS → ESM interop
+    // -------------------------------------------------------------------------
+
     /**
-     * CJS → ESM interop: synchronously load an ESM module and return its
-     * `exports`-compatible object.
-     *
-     * Returns `ns.default ?? ns` so that `require('esm-package')` behaves like
-     * Node.js: packages that export a single default get it directly, while
-     * packages with only named exports return the namespace.
-     *
-     * The result is cached so repeated require() calls return the same object.
+     * CJS → ESM interop: synchronously load an ESM module.
+     * Uses deps.loadEsmSync which handles promiseResult semantics.
+     * Result cached so repeated require() calls return the same object.
      */
     private requireEsm(localPath: string, specPath: string, parentPath: string): any {
         const cacheKey = `__esm__${localPath}`;
@@ -329,41 +309,24 @@ export class CjsLoader {
             return mod.exports;
         }
 
-        const ns = this.deps.loadEsmSync(localPath, specPath);
-
-        // Synthesise a CJS-compatible exports object that mirrors the ESM namespace.
-        // Node.js compat: require('esm-pkg') returns ns.default when present,
-        // otherwise the full namespace (named exports accessible as ns.foo).
-        const synthetic = Object.assign(Object.create(null), ns);
-        const result = 'default' in ns ? ns.default : synthetic;
+        const result = this.deps.loadEsmSync(localPath, specPath);
         const mod = this.synth(localPath);
-        mod.exports = result;
+        mod.exports = 'default' in result ? result['default'] : Object(result);
         this.esmInteropCache.set(cacheKey, mod);
-        return result;
+        return mod.exports;
     }
 
-    private loadResolvedCjs(path: string, parent: CjsModule | null): CjsModule {
-        const mod = this.make(path, parent);
-        this.cache.set(path, mod);
-        try {
-            this.exec(mod);
-            return mod;
-        } catch (e) {
-            this.cache.delete(path);
-            throw e;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Built-in / polyfill loading
-    // -------------------------------------------------------------------------
-
+    /**
+     * Load a node builtin module (e.g. 'fs', 'path').
+     * Delegates to deps for resolution + ESM loading,
+     * then applies ns.default logic (same as requireEsm).
+     */
     private loadBuiltin(name: string, parent: string): CjsModule {
         const hit = this.builtinCache.get(name);
         if (hit) return hit;
 
         const localPath = this.deps.builtinToPath(name, parent);
-        const ns        = this.deps.loadEsmSync(localPath, `node:${name}`);
+        const ns = this.deps.loadEsmSync(localPath, `node:${name}`);
 
         const mod = this.synth(localPath);
         // Builtins: spread named exports, keep default as the default export
@@ -382,6 +345,18 @@ export class CjsLoader {
         return mod;
     }
 
+    private loadResolvedCjs(path: string, parent: CjsModule | null): CjsModule {
+        const mod = this.make(path, parent);
+        this.cache.set(path, mod);
+        try {
+            this.exec(mod);
+            return mod;
+        } catch (e) {
+            this.cache.delete(path);
+            throw e;
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Module resolution
     // -------------------------------------------------------------------------
@@ -395,43 +370,22 @@ export class CjsLoader {
 
         // Local filesystem fallback for contexts that bypass the resolver, such as
         // internal createRequire() consumers operating directly on filenames.
-        if (isAbsolute(id)) return this.resolveLocalPath(id, true);
-        if (isRelative(id)) return this.resolveLocalPath(joinPaths(dirname(parentPath), id), true);
-        if (id === '.') return this.resolveLocalPath(dirname(parentPath), true);
+        if (isAbsolute(id)) return this.resolveLocalPath(id);
+        if (isRelative(id)) return this.resolveLocalPath(joinPaths(dirname(parentPath), id));
+        if (id === '.') return this.resolveLocalPath(dirname(parentPath));
         for (const dir of buildPaths(dirname(parentPath))) {
-            const resolved = this.resolveLocalPath(joinPaths(dir, id), true);
+            const resolved = this.resolveLocalPath(joinPaths(dir, id));
             if (resolved) return resolved;
         }
         return null;
     }
 
-    private resolveLocalPath(candidate: string, preferPackageMain = false): ResolvedCjsRequest | null {
-        const packageEntry = this.resolvePackageEntry(candidate, preferPackageMain);
-        if (packageEntry) return this.toResolvedRequest(packageEntry);
+    private resolveLocalPath(candidate: string): ResolvedCjsRequest | null {
         try {
             const path = resolveFile(candidate);
-            return this.toResolvedRequest({ path, format: detectFormat(path) });
+            return { path, specPath: path, isCjs: true };
         } catch {
             return null;
         }
-    }
-
-    private resolvePackageEntry(candidate: string, forcePackageMain: boolean): ResolvedPath | null {
-        if (!forcePackageMain) return null;
-        try {
-            if (!fs.stat(candidate).isDirectory) return null;
-        } catch {
-            return null;
-        }
-        const ctx = createCtx(candidate, { forceCjs: true });
-        return ctx ? resolveMain(ctx) : null;
-    }
-
-    private toResolvedRequest(resolved: ResolvedPath): ResolvedCjsRequest {
-        return {
-            path: resolved.path,
-            specPath: resolved.path,
-            isCjs: resolved.format === 'cjs',
-        };
     }
 }

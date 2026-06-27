@@ -1,15 +1,15 @@
 // protocol/http.ts - http/https handler
 
-import type { RuntimeConfig, ModuleInfo } from '../types';
+import type { RuntimeConfig, ModuleInfo } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow, type ProgressCallback } from '../flow';
-import { joinPaths, dirname } from '../utils/path';
-import { cacheFilename } from '../utils/misc';
+import { StepType, type Flow, type ProgressCallback } from '../../flow';
+import { joinPaths, dirname } from '../../utils/path';
+import { cacheFilename } from '../../utils/misc';
 declare const URL: any;
-import { log } from '../utils/log';
-import { isatty } from '../utils/progress';
-import { err, ErrorKind } from '../errors';
+import { log } from '../../utils/log';
+import { isatty } from '../../utils/progress';
+import { err, ErrorKind } from '../../errors';
 
 export class HttpHandler implements ProtocolHandler {
     readonly protocols = ['http', 'https'];

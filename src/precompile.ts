@@ -6,7 +6,7 @@
 // Workers also handle import scanning (kind:'scan') during BFS — same pool,
 // scan tasks are dispatched first since they unblock the dependency graph.
 
-import { Transformer } from './transformer';
+import { Transformer } from './source/transform';
 import { OxcTranspiler, oxcExtPath, type OxcModule } from './oxc';
 import { extractImports } from './scan';
 import { readText } from './utils/io';

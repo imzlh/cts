@@ -1,20 +1,20 @@
 // protocol/npm.ts - npm registry handler
 
-import type { RuntimeConfig, ModuleInfo, ModuleFormat } from '../types';
+import type { RuntimeConfig, ModuleInfo, ModuleFormat } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow, type TarFile, type ProgressCallback } from '../flow';
-import { joinPaths, dirname, normalizePath, toPosixPath, pathRoot, cwd } from '../utils/path';
-import { readText, resolveFile } from '../utils/io';
+import { StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
+import { joinPaths, dirname, normalizePath, toPosixPath, pathRoot, cwd } from '../../utils/path';
+import { readText, resolveFile } from '../../utils/io';
 declare const URL: any;
-import { matchLatestVersion, compareVersions, safeParse, fmtBytes } from '../utils/misc';
+import { matchLatestVersion, compareVersions, safeParse, fmtBytes } from '../../utils/misc';
 import { detectFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, type ResolvedPath } from '../pkg';
-import { err, ErrorKind } from '../errors';
-import { log } from '../utils/log';
-import { isatty } from '../utils/progress';
-import { uname, isWindows } from '../utils/index';
-import { findLocalBin } from '../utils/bin';
-import { version } from '../../package.json';
+import { err, ErrorKind } from '../../errors';
+import { log } from '../../utils/log';
+import { isatty } from '../../utils/progress';
+import { uname, isWindows } from '../../utils/index';
+import { findLocalBin } from '../../utils/bin';
+import { version } from '../../../package.json';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');

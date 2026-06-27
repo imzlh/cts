@@ -1,11 +1,11 @@
 // protocol/data.ts - data: URL handler
 
-import type { RuntimeConfig, ModuleInfo, FileKind } from '../types';
+import type { RuntimeConfig, ModuleInfo, FileKind } from '../../types';
 import type { ProtocolHandler } from './base';
-import { StepType, type Flow } from '../flow';
-import { joinPaths, dirname } from '../utils/path';
-import { hashString, errMsg } from '../utils/misc';
-import { err, ErrorKind } from '../errors';
+import { StepType, type Flow } from '../../flow';
+import { joinPaths, dirname } from '../../utils/path';
+import { hashString, errMsg } from '../../utils/misc';
+import { err, ErrorKind } from '../../errors';
 
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');

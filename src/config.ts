@@ -25,7 +25,7 @@ const DEFAULTS = {
     silent:      false,
     jsrCacheTTL: 7 * 24 * 60 * 60 * 1000,
     requestTimeout: 30000,
-    disableCache: false,
+    enableCache: true,
     enableOxc: true,
     ignoreScripts: false,
     polyfill:    '',
@@ -81,7 +81,7 @@ function envConfig(): Partial<ConfigOptions> {
     const E = 'CTS_';
     const v = (k: string) => env(E + k);
     const cacheDir = v('CACHE_DIR'); if (cacheDir) c.cacheDir = cacheDir;
-    const dc  = bool(v('DISABLE_CACHE')); if (dc  !== undefined) c.disableCache = dc;
+    const dc  = bool(v('DISABLE_CACHE')); if (dc  !== undefined) c.enableCache = !dc;
     // New OXC env vars (preferred)
     const no  = bool(v('NO_OXC'));         if (no === true) c.enableOxc = false;
     const oxc = bool(v('ENABLE_OXC'));     if (oxc !== undefined) c.enableOxc = oxc;
@@ -198,13 +198,13 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'];
     if (cli['eval'] || cli['e']) cfg.eval        = (cli['eval'] || cli['e']) as string;
     if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || env('CTS_LOCK_DIR') || '';
-    if (cli['disable-cache']) cfg.disableCache  = true;
+    if (cli['disable-cache']) cfg.enableCache  = false;
     if (cli['no-oxc'] || cli['no-swc']) cfg.enableOxc = false;
     if (cli['silent'])        cfg.silent        = true;
     if (cli['no-http'])       cfg.enableHttp    = false;
     if (cli['no-jsr'])        cfg.enableJsr     = false;
     if (cli['no-node'])       cfg.enableNode    = false;
-    if (cli['no-lock'])       cfg.noLock        = true;
+    if (cli['no-lock'])       cfg.disableLock    = true;
     if (cli['frozen'])        cfg.frozen        = true;
     if (cli['ignore-scripts']) cfg.ignoreScripts = true;
     if (cli['memory-limit'] !== undefined)

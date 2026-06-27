@@ -307,7 +307,11 @@ export function runSync<T>(flow: Flow<T>): T {
         try {
             state = flow.next(executeSync(state.value as Step));
         } catch (e) {
-            state = flow.throw ? flow.throw(e) : (() => { throw e; })();
+            if (flow.throw) {
+                state = flow.throw(e);
+            } else {
+                throw e;
+            }
         }
     }
     return state.value;
@@ -319,7 +323,11 @@ export async function runAsync<T>(flow: Flow<T>): Promise<T> {
         try {
             state = flow.next(await executeAsync(state.value as Step));
         } catch (e) {
-            state = flow.throw ? flow.throw(e) : (() => { throw e; })();
+            if (flow.throw) {
+                state = flow.throw(e);
+            } else {
+                throw e;
+            }
         }
     }
     return state.value;

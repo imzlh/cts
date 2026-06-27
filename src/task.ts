@@ -17,7 +17,7 @@ import { isWindows } from './utils/index';
 import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
 import { findLocalBin, WIN_BIN_EXTS } from './utils/bin';
-import { getBinMap, readPkgFresh } from './pkg';
+import { getBinMap, readPkgFresh } from './resolve/pkg';
 
 const os = import.meta.use('os');
 const console = import.meta.use('console');

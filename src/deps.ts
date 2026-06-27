@@ -1,5 +1,5 @@
 import type { RuntimeConfig } from './types';
-import { ModuleResolver } from './resolver';
+import { ModuleResolver } from './resolve/index';
 import { extname } from './utils/path';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';

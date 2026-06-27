@@ -1,0 +1,70 @@
+// runtime/resources.ts — Central resource lifecycle manager
+//
+// Tracks resources opened during pre-cache and provides a single release()
+// call that must be invoked before user code runs.
+//
+// Design: instance-based (not singleton) so each TypeScriptRuntime
+// can have its own ResourceManager. Supports REPL creating multiple runtimes.
+
+import { clearResolveCache, clearNegativeCache } from '../utils/io';
+import { clearPkgCache } from '../resolve/pkg';
+import { clearDnsCache } from '@cnojs/http/dns-cache';
+import { closeConnectionPools } from '../flow';
+import { log } from '../utils/log';
+
+export interface Cleanup { (): void }
+
+export class ResourceManager {
+    private readonly cleanups: Cleanup[] = [];
+    private done = false;
+
+    register(fn: Cleanup): void {
+        this.cleanups.push(fn);
+    }
+
+    /** Release all resources in LIFO order. Idempotent. */
+    release(): void {
+        if (this.done) return;
+        this.done = true;
+
+        for (let i = this.cleanups.length - 1; i >= 0; i--) {
+            try { this.cleanups[i]!(); }
+            catch (e) { log.debug('resources', 'cleanup error', e); }
+        }
+        this.cleanups.length = 0;
+    }
+
+    get released(): boolean { return this.done; }
+}
+
+/**
+ * Create a ResourceManager with standard pre-cache cleanups registered.
+ */
+export function createResourceManager(): ResourceManager {
+    const mgr = new ResourceManager();
+
+    mgr.register(() => {
+        closeConnectionPools();
+    });
+
+    mgr.register(() => {
+        clearDnsCache();
+    });
+
+    mgr.register(() => {
+        clearPkgCache();
+    });
+
+    mgr.register(() => {
+        clearResolveCache();
+        clearNegativeCache();
+    });
+
+    return mgr;
+}
+
+// Module-level singleton for process-level cleanup (used by src/main.ts).
+// Each TypeScriptRuntime creates its own instance; this one is for
+// process exit cleanup when no runtime reference is available.
+export const resources = createResourceManager();
+

@@ -1,14 +1,14 @@
 // protocol/jsr.ts - JSR registry handler
 
-import type { RuntimeConfig, ModuleInfo, ParsedJsrSpec, JsrPackageMeta, JsrVersionMeta } from '../types';
+import type { RuntimeConfig, ModuleInfo, ParsedJsrSpec, JsrPackageMeta, JsrVersionMeta } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow, type ProgressCallback } from '../flow';
-import { joinPaths, dirname, normalizePath } from '../utils/path';
-import { safeParse, isCacheExpired, matchLatestVersion } from '../utils/misc';
-import { log } from '../utils/log';
-import { isatty } from '../utils/progress';
-import { err, ErrorKind } from '../errors';
+import { StepType, type Flow, type ProgressCallback } from '../../flow';
+import { joinPaths, dirname, normalizePath } from '../../utils/path';
+import { safeParse, isCacheExpired, matchLatestVersion } from '../../utils/misc';
+import { log } from '../../utils/log';
+import { isatty } from '../../utils/progress';
+import { err, ErrorKind } from '../../errors';
 
 const engine = import.meta.use('engine');
 

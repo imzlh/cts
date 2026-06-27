@@ -11,9 +11,9 @@
 // using a path-hash filename.  A .jsc.mt sidecar stores the source mtime;
 // on load, the cached bytecode is used only when the source hasn't changed.
 
-import { dirname, joinPaths } from './utils/path';
-import { ensureDir } from './utils/io';
-import { log } from './utils/log';
+import { dirname, joinPaths } from '../utils/path';
+import { ensureDir } from '../utils/io';
+import { log } from '../utils/log';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -67,12 +67,9 @@ export class JscCache {
         if (remote) {
             // Remote: .jsc sits next to the local file, no mtime check
             const jscPath = localPath + '.jsc';
-            if (!fs.exists(jscPath)) return null;
             try {
                 return engine.deserialize(new Uint8Array(fs.readFile(jscPath))) as CModuleEngine.Module;
             } catch {
-                log.debug('jsc', () => `disk deserialize failed: ${jscPath}`);
-                try { fs.unlink(jscPath); } catch {}
                 return null;
             }
         }
@@ -80,7 +77,6 @@ export class JscCache {
         // Local: .jsc in cacheDir, mtime-validated
         const paths = this.localCachePath(localPath);
         if (!paths) return null;
-        if (!fs.exists(paths.jsc)) return null;
 
         try {
             const cachedMt = engine.decodeString(fs.readFile(paths.mt));

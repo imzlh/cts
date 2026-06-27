@@ -1,13 +1,13 @@
 // protocol/file.ts - file:// handler
 
-import type { ModuleInfo, RuntimeConfig } from '../types';
+import type { ModuleInfo, RuntimeConfig } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow } from '../flow';
-import { normalizePath } from '../utils/path';
+import { StepType, type Flow } from '../../flow';
+import { normalizePath } from '../../utils/path';
 import { detectFormat } from '../pkg';
-import { isWindows } from '../utils/index';
-import { err, ErrorKind } from '../errors';
+import { isWindows } from '../../utils/index';
+import { err, ErrorKind } from '../../errors';
 
 export class FileHandler implements ProtocolHandler {
     readonly protocols = ['file'];

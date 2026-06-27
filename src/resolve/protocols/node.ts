@@ -1,12 +1,12 @@
 // protocol/node.ts - node: builtin module handler
 
-import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver } from '../types';
+import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver } from '../../types';
 import type { ProtocolHandler } from './base';
-import { StepType, type Flow } from '../flow';
-import { joinPaths, dirname, normalizePath } from '../utils/path';
+import { StepType, type Flow } from '../../flow';
+import { joinPaths, dirname, normalizePath } from '../../utils/path';
 
-import { err, ErrorKind } from '../errors';
-import { log } from '../utils/log';
+import { err, ErrorKind } from '../../errors';
+import { log } from '../../utils/log';
 
 export class NodeHandler implements ProtocolHandler {
     readonly protocols = ['node'];

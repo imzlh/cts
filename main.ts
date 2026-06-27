@@ -2,7 +2,7 @@
 
 import { isCompilerWorker, runCompilerWorker } from './src/precompile';
 import { createConfig, loadConfigFile, CLI_TPL } from './src/config';
-import { createRuntime } from './src/runtime';
+import { createRuntime } from './src/runtime/index';
 import { loadTasks } from './src/task';
 import { LockStore } from './src/lock';
 import { fatal, formatError } from './src/errors';
@@ -123,7 +123,7 @@ async function runCacheCmd(args: string[], baseCfg: Partial<ConfigOptions>): Pro
         return;
     }
     const { entry, dir } = entryAndDir(raw);
-    const cfg            = { ...loadConfigFile(dir), ...baseCfg, silent: false, noLock: false };
+    const cfg            = { ...loadConfigFile(dir), ...baseCfg, silent: false, disableLock: false };
     const runtime        = createRuntime(cfg, dir);
     let info;
     try {
@@ -142,7 +142,7 @@ async function runCacheCmd(args: string[], baseCfg: Partial<ConfigOptions>): Pro
 
 async function runCacheNoArgs(baseCfg: Partial<ConfigOptions>): Promise<void> {
     const dir = os.cwd;
-    const cfg = { ...loadConfigFile(dir), ...baseCfg, silent: false, noLock: false };
+    const cfg = { ...loadConfigFile(dir), ...baseCfg, silent: false, disableLock: false };
     const runtime = createRuntime(cfg, dir);
     const specs = collectSpecifiers(dir);
 
@@ -302,7 +302,7 @@ async function runMain(): Promise<void> {
             os.exit(1);
         }
         await runEval(code, {
-            noLock: cli['no-lock'], lockDir: cli['lock-dir'],
+            disableLock: cli['no-lock'], lockDir: cli['lock-dir'],
             cacheDir: cli.cacheDir, silent: cli.silent,
             polyfill: cli.polyfill,
         });
@@ -313,7 +313,7 @@ async function runMain(): Promise<void> {
     switch (cli._) {
         case 'cache':
             await runCacheCmd(cli._args ?? [], {
-                noLock: cli['no-lock'], lockDir: cli['lock-dir'],
+                disableLock: cli['no-lock'], lockDir: cli['lock-dir'],
                 cacheDir: cli.cacheDir, silent: cli.silent,
             });
             return;

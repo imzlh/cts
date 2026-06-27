@@ -1,11 +1,11 @@
 // pkg.ts — package.json utilities with bounded caches
 
-import type { PackageJson, ModuleFormat } from './types';
-import { dirname, extname, joinPaths, normalizePath } from './utils/path';
-import { resolveFile } from './utils/io';
-import { safeParse } from './utils/misc';
-import { LRU } from './utils/lru';
-import { log } from './utils/log';
+import type { PackageJson, ModuleFormat } from '../types';
+import { dirname, extname, joinPaths, normalizePath } from '../utils/path';
+import { resolveFile } from '../utils/io';
+import { safeParse } from '../utils/misc';
+import { LRU } from '../utils/lru';
+import { log } from '../utils/log';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
