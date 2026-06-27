@@ -1,7 +1,7 @@
 // resolver.ts — ModuleResolver
 //
 // Three-level resolution cache:
-//   L1  lock.sources["spec\0parent"] → specPath    (skip dispatch entirely)
+//   L1  lock.sources["mode\0spec\0parent"] → specPath    (skip dispatch entirely)
 //   L2  lock.modules[specPath]       → ModuleInfo  (skip protocol handler)
 //   L3  dispatch to protocol handler (download if needed)
 //
@@ -19,9 +19,9 @@ import { NpmHandler }   from './protocol/npm';
 import { NodeHandler }  from './protocol/node';
 import { DataHandler }  from './protocol/data';
 import { LockStore }    from './lock';
-import { BUILTINS }     from './cjs';
+import { isBuiltinSpecifier } from './cjs';
 import { runAsync, runSync } from './flow';
-import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath } from './utils/path';
+import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative } from './utils/path';
 import { resolveFile } from './utils/io';
 import { detectFormat } from './pkg';
 import { guessFileKind, applyAttrType } from './protocol/base';
@@ -36,17 +36,6 @@ const fs = import.meta.use('fs');
 // protoOf — extract protocol prefix without regex
 // Returns '' for relative/absolute paths, 'http' for 'http://...', etc.
 // ---------------------------------------------------------------------------
-
-function isRelative(s: string): boolean {
-    return s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');
-}
-
-function isNodeBuiltinSpecifier(spec: string): boolean {
-    const bare = spec.startsWith('node:') ? spec.slice(5) : spec;
-    const slash = bare.indexOf('/');
-    const head = slash === -1 ? bare : bare.slice(0, slash);
-    return BUILTINS.has(head);
-}
 
 function protoOf(s: string): string {
     const ci = s.indexOf(':');
@@ -111,6 +100,8 @@ export class ModuleResolver {
     private readonly resolvedModules = new Map<string, ModuleInfo>();
     /** In-memory (spec, parent) → ModuleInfo cache — skips SQLite on repeat resolves. */
     private readonly resolveCache = new LRU<string, ModuleInfo>(4096);
+    /** Mode-aware source cache for cjs-vs-esm lookups in the current runtime. */
+    private readonly sourceInfoCache = new LRU<string, ModuleInfo>(4096);
     /** Stat cache: localPath → { exists, mtime }. Avoids repeated sync fs.stat on hot path. */
     private readonly statCache = new LRU<string, { exists: boolean; mtime: number }>(2048);
 
@@ -162,20 +153,25 @@ export class ModuleResolver {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
 
         const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
+        const sourceKey = this.sourceCacheKey(mapped, parent, attr);
+        const transient = this.isTransientResolve(attr);
+        const sourceHit = this.sourceInfoCache.get(sourceKey);
+        if (sourceHit) return sourceHit;
 
         const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
         if (localPreferred) {
-            return this.rememberResolved(mapped, parent, localPreferred);
+            return this.rememberResolved(mapped, parent, localPreferred, attr);
         }
 
         // L1
-        const srcKey = this.lock.getSource(mapped, parent);
+        const srcKey = transient ? undefined : this.lock.getSourceByKey(sourceKey);
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
             if (cached && this.isUsableInfo(cached)) {
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
                 this.resolvedModules.set(final.specPath, final);
+                this.sourceInfoCache.set(sourceKey, final);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
             }
@@ -183,13 +179,14 @@ export class ModuleResolver {
 
         // L2
         const proto = protoOf(mapped);
-        if (proto && proto !== 'file') {
+        if (!transient && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
             if (lockHit && this.isUsableInfo(lockHit)) {
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
                 this.resolvedModules.set(final.specPath, final);
-                this.lock.setSource(mapped, parent, final.specPath);
+                this.lock.setSourceByKey(this.sourceCacheKey(mapped, parent, attr), final.specPath);
+                this.sourceInfoCache.set(sourceKey, final);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
             }
@@ -201,7 +198,7 @@ export class ModuleResolver {
 
         // L3 — dispatch async if handler supports it, else sync
         const info = await this.dispatchAsync(mapped, parent, attr, onProgress);
-        return this.rememberResolved(mapped, parent, info);
+        return this.rememberResolved(mapped, parent, info, attr);
     }
 
     private async dispatchAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
@@ -219,7 +216,7 @@ export class ModuleResolver {
 
     private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
-        if (isNodeBuiltinSpecifier(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
+        if (isBuiltinSpecifier(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {
@@ -254,14 +251,18 @@ export class ModuleResolver {
         // Import map applied first; skip for obvious relative/absolute paths
         const mapped = (spec[0] === '.' || spec[0] === '/') ? spec : this.applyImportMap(spec);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
+        const sourceKey = this.sourceCacheKey(mapped, parent, attr);
+        const transient = this.isTransientResolve(attr);
+        const sourceHit = this.sourceInfoCache.get(sourceKey);
+        if (sourceHit) return sourceHit;
 
         const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
         if (localPreferred) {
-            return this.rememberResolved(mapped, parent, localPreferred);
+            return this.rememberResolved(mapped, parent, localPreferred, attr);
         }
 
         // L1 — source index: (mapped, parent) → specPath we've seen before
-        const srcKey = this.lock.getSource(mapped, parent);
+        const srcKey = transient ? undefined : this.lock.getSourceByKey(sourceKey);
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
             if (cached && this.isUsableInfo(cached)) {
@@ -269,6 +270,7 @@ export class ModuleResolver {
                 const fileKind = applyAttrType(cached.fileKind, attr);
                 const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
                 this.resolvedModules.set(final.specPath, final);
+                this.sourceInfoCache.set(sourceKey, final);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
                 return final;
@@ -277,14 +279,15 @@ export class ModuleResolver {
 
         // L2 — module index: for canonical specifiers, check without dispatching
         const proto = protoOf(mapped);
-        if (proto && proto !== 'file') {
+        if (!transient && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
             if (lockHit && this.isUsableInfo(lockHit)) {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
                 const fileKind = applyAttrType(lockHit.fileKind, attr);
                 const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
                 this.resolvedModules.set(final.specPath, final);
-                this.lock.setSource(mapped, parent, final.specPath);
+                this.lock.setSourceByKey(this.sourceCacheKey(mapped, parent, attr), final.specPath);
+                this.sourceInfoCache.set(sourceKey, final);
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
                 return final;
@@ -300,7 +303,7 @@ export class ModuleResolver {
             );
         }
         const info = this.dispatch(mapped, parent, attr);
-        return this.rememberResolved(mapped, parent, info);
+        return this.rememberResolved(mapped, parent, info, attr);
     }
 
     getInfo(specPath: string): ModuleInfo {
@@ -311,13 +314,15 @@ export class ModuleResolver {
             this.resolvedModules.set(hit.specPath, hit);
             return hit;
         }
-        const h = this.handlers.get(protoOf(specPath));
+        const proto = protoOf(specPath);
+        const h = this.handlers.get(proto);
         if (h) {
+            const lp = h.localPath(specPath);
             return {
                 specPath,
-                localPath: h.localPath(specPath),
-                format: 'esm',
-                fileKind: 'source',
+                localPath: lp,
+                format: proto === 'node' ? 'esm' : detectFormat(lp),
+                fileKind: guessFileKind(lp),
             };
         }
         return { specPath, localPath: specPath, format: 'esm', fileKind: 'source' };
@@ -331,18 +336,14 @@ export class ModuleResolver {
     /** Clear handler caches (for memory cleanup) */
     clearHandlerCaches(): void {
         for (const h of this.handlers.values()) {
-            if ('clearCache' in h && typeof h.clearCache === 'function') {
-                h.clearCache();
-            }
+            h.clearCache?.();
         }
     }
 
     /** Drain pending postinstall scripts from the npm handler. */
     drainPostinstall(): Array<{ name: string; version: string; dir: string; script: string }> {
         const npm = this.handlers.get('npm');
-        if (npm && 'drainPostinstall' in npm && typeof (npm as any).drainPostinstall === 'function') {
-            return (npm as NpmHandler).drainPostinstall();
-        }
+        if (npm instanceof NpmHandler) return npm.drainPostinstall();
         return [];
     }
 
@@ -397,7 +398,7 @@ export class ModuleResolver {
 
     private resolveBare(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         if (spec.startsWith('@std/')) return this.dispatch(`jsr:${spec}`, parent, attr);
-        if (isNodeBuiltinSpecifier(spec)) return this.dispatch(`node:${spec}`, parent, attr);
+        if (isBuiltinSpecifier(spec)) return this.dispatch(`node:${spec}`, parent, attr);
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {
@@ -451,7 +452,7 @@ export class ModuleResolver {
         if (!spec || spec[0] === '.' || spec[0] === '/' || spec.startsWith('#')) return null;
         const proto = protoOf(spec);
         if (proto && proto !== 'npm') return null;
-        if (spec.startsWith('@std/') || isNodeBuiltinSpecifier(spec)) return null;
+        if (spec.startsWith('@std/') || isBuiltinSpecifier(spec)) return null;
         const npm = this.handlers.get('npm');
         if (!(npm instanceof NpmHandler)) return null;
         try {
@@ -461,11 +462,15 @@ export class ModuleResolver {
         }
     }
 
-    private rememberResolved(mapped: string, parent: string, info: ModuleInfo): ModuleInfo {
+    private rememberResolved(mapped: string, parent: string, info: ModuleInfo, attr?: Record<string, any>): ModuleInfo {
         this.resolvedModules.set(info.specPath, info);
-        this.lock.setModule(info);
-        this.lock.setSource(mapped, parent, info.specPath);
-        this.resolveCache.set(`${mapped}\0${parent}`, info);
+        const sourceKey = this.sourceCacheKey(mapped, parent, attr);
+        this.sourceInfoCache.set(sourceKey, info);
+        if (!this.isTransientResolve(attr)) {
+            this.lock.setModule(info);
+            this.lock.setSourceByKey(sourceKey, info.specPath);
+        }
+        if (!attr) this.resolveCache.set(`${mapped}\0${parent}`, info);
         if (!this.mainEntry) {
             this.mainEntry = info.specPath;
             log.debug('resolver', () => `main: "${info.specPath}"`);
@@ -499,4 +504,13 @@ export class ModuleResolver {
     getCachedMtime(localPath: string): number | undefined {
         return this.statCache.get(localPath)?.mtime;
     }
+
+    private sourceCacheKey(spec: string, parent: string, attr?: Record<string, any>): string {
+        return `${attr?.cjs === true ? 'cjs' : 'esm'}\0${spec}\0${parent}`;
+    }
+
+    private isTransientResolve(attr?: Record<string, any>): boolean {
+        return attr?.cjs === true;
+    }
+
 }

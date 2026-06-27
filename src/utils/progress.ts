@@ -6,6 +6,8 @@
 // TTY:  live multi-line render with spinner, colors, speed
 // pipe: per-download 📦 lines (from handlers via !isatty)
 
+import { fmtBytes } from './misc';
+
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
@@ -240,12 +242,6 @@ export class PrecacheProgress {
 function renderBar(done: number, total: number, width: number): string {
     const filled = Math.floor(Math.min(1, done / total) * width);
     return '[' + '█'.repeat(filled) + '░'.repeat(width - filled) + ']';
-}
-
-function fmtBytes(n: number): string {
-    if (n < 1024) return `${n}B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
-    return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
 function truncate(s: string, max: number): string {

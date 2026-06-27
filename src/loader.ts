@@ -28,6 +28,23 @@ const os = import.meta.use('os');
 const CTS_INTERNAL = Symbol.for('cts.internal');
 const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
 
+/** Normalize path traversal (../..) in npm spec paths. */
+function normalizeNpmSpec(spec: string): string {
+    if (!spec.startsWith('npm:')) return spec;
+    const body = spec.slice(4);
+    const slash = body.indexOf('/');
+    if (slash === -1) return spec;
+    const pkg = body.slice(0, slash);
+    const parts = body.slice(slash + 1).split('/');
+    const normalized: string[] = [];
+    for (const p of parts) {
+        if (p === '.' || p === '') continue;
+        if (p === '..') { normalized.pop(); continue; }
+        normalized.push(p);
+    }
+    return normalized.length > 0 ? `npm:${pkg}/${normalized.join('/')}` : `npm:${pkg}`;
+}
+
 export class ModuleLoader {
     private readonly transformer: Transformer;
     private readonly cjs:        CjsLoader;
@@ -94,9 +111,11 @@ export class ModuleLoader {
     }
 
     loadSource(code: string, info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
-        log.debug('loader', () => `loadSource ${info.specPath} kind=${info.fileKind}`);
+        log.debug('loader', () => `loadSource ${info.specPath} kind=${info.fileKind} format=${info.format}`);
         if (info.fileKind === 'text') return this.loadTextSource(code, info);
-        return this.loadEsmSource(code, info, meta);
+        return info.format === 'cjs'
+            ? this.loadCjsSource(code, info, meta)
+            : this.loadEsmSource(code, info, meta);
     }
 
     preRegister(localPath: string, parentPath: string): void {
@@ -110,6 +129,21 @@ export class ModuleLoader {
     // -------------------------------------------------------------------------
     // ESM loading
     // -------------------------------------------------------------------------
+
+    /** Compile ESM source code, wrapping SyntaxError with file context. */
+    private compileEsm(code: string, specPath: string, localPath: string): CModuleEngine.Module {
+        try {
+            return new engine.Module(code, specPath);
+        } catch (e) {
+            if (e instanceof SyntaxError) {
+                const ne = err(ErrorKind.SyntaxError,
+                    `Syntax error in ${localPath}: ${e.message}`);
+                (ne as any).cause = { source: e, code, path: localPath };
+                throw ne;
+            }
+            throw e;
+        }
+    }
 
     private loadEsm(info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
         const hit = this.esmCache.get(info.localPath);
@@ -153,16 +187,10 @@ export class ModuleLoader {
         const code = this.transformer.transform(text, info.localPath, meta?.lang);
         let mod: CModuleEngine.Module;
         try {
-            mod = new engine.Module(code, info.specPath);
+            mod = this.compileEsm(code, info.specPath, info.localPath);
         } catch (e) {
             this.esmLoading.delete(info.localPath);
             this.esmCache.delete(info.localPath);
-            if (e instanceof SyntaxError) {
-                const ne = err(ErrorKind.SyntaxError,
-                    `Syntax error in ${info.localPath}: ${e.message}`);
-                (ne as any).cause = { source: e, code, path: info.localPath };
-                throw ne;
-            }
             throw e;
         }
         this.esmLoading.delete(info.localPath);
@@ -199,18 +227,7 @@ export class ModuleLoader {
             return hit;
         }
         const transformed = this.transformer.transform(code, info.localPath, meta?.lang);
-        let mod: CModuleEngine.Module;
-        try {
-            mod = new engine.Module(transformed, info.specPath);
-        } catch (e) {
-            if (e instanceof SyntaxError) {
-                const ne = err(ErrorKind.SyntaxError,
-                    `Syntax error in ${info.localPath}: ${e.message}`);
-                (ne as any).cause = { source: e, code, path: info.localPath };
-                throw ne;
-            }
-            throw e;
-        }
+        const mod = this.compileEsm(transformed, info.specPath, info.localPath);
         Object.assign(mod.meta, meta);
         this.esmCache.set(info.localPath, mod);
         this.loadedModules.add(mod);
@@ -218,7 +235,7 @@ export class ModuleLoader {
     }
 
     private loadCjsSource(code: string, info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
-        const transformed = this.transformer.transform(code, info.localPath, meta?.lang);
+        const transformed = this.transformer.transformForCjs(code, info.localPath, meta?.lang);
         const cjsMod = this.cjs.loadSourceAndGet(transformed, info.localPath);
         return this.bridgeCjsToEsm(info, meta, cjsMod.exports);
     }
@@ -361,18 +378,25 @@ export class ModuleLoader {
             },
 
             loadEsmSync(localPath: string, specPath: string): Record<string, any> {
-                const info: ModuleInfo = { specPath, localPath, format: 'esm', fileKind: 'source' };
-                const mod = self.loadEsm(info, {});
+                // Use resolver info when available to get correct fileKind (e.g. 'binary' for .node files)
+                let info: ModuleInfo;
+                try {
+                    info = self.resolver.getInfo(specPath);
+                } catch {
+                    info = { specPath, localPath, format: 'esm', fileKind: 'source' };
+                }
+                const mod = self.load(info, {});
 
-                const p = mod.eval();
-                const ns = mod.namespace;
-
-                if (Object.keys(ns).length === 0 && engine.promiseResult(p) === null) {
-                    log.warn('loader',
-                        () => `${specPath} uses top-level await; CJS require() may get empty exports`);
+                // Binary/text modules don't need eval — their exports are set directly
+                if (info.fileKind === 'source' || info.fileKind === 'json') {
+                    const p = mod.eval();
+                    if (Object.keys(mod.namespace).length === 0 && engine.promiseResult(p) === null) {
+                        log.warn('loader',
+                            () => `${specPath} uses top-level await; CJS require() may get empty exports`);
+                    }
                 }
 
-                return ns;
+                return mod.namespace;
             },
 
             resolveExternal(req: string, parent: string): { path: string; specPath: string; isCjs: boolean } | null {
@@ -384,6 +408,10 @@ export class ModuleLoader {
                         isCjs: info.format === 'cjs' || info.fileKind === 'json',
                     };
                 } catch { return null; }
+            },
+
+            prepareSource(code: string, filePath: string): string | null {
+                return self.transformer.transformForCjs(code, filePath);
             },
         };
     }
@@ -417,10 +445,21 @@ export class ModuleLoader {
     }
 
     private installInternalBridge(): void {
+        const resolver = this.resolver;
         const value = {
             mkRequire: this.cjs.mkRequire.bind(this.cjs),
             builtinModules: [...BUILTINS],
             cache: this.cjs.cache,
+            /** Convert npm spec path to local filesystem path. */
+            specToLocalPath(specPath: string): string | null {
+                // Normalize path traversal (../..) in npm specs before resolving
+                // e.g. npm:vite@5.4.21/dist/node/../../package.json → npm:vite@5.4.21/package.json
+                const normalized = normalizeNpmSpec(specPath);
+                try {
+                    const info = resolver.getInfo(normalized);
+                    return info?.localPath ?? null;
+                } catch { return null; }
+            },
         };
         const desc = Object.getOwnPropertyDescriptor(globalThis, CTS_INTERNAL);
         if (!desc) {
@@ -437,6 +476,7 @@ export class ModuleLoader {
                 (desc.value as any).mkRequire = value.mkRequire;
                 (desc.value as any).builtinModules = value.builtinModules;
                 (desc.value as any).cache = value.cache;
+                (desc.value as any).specToLocalPath = value.specToLocalPath;
             } catch {}
         }
     }

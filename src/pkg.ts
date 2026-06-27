@@ -1,7 +1,7 @@
 // pkg.ts — package.json utilities with bounded caches
 
 import type { PackageJson, ModuleFormat } from './types';
-import { dirname, extname, joinPaths } from './utils/path';
+import { dirname, extname, joinPaths, normalizePath } from './utils/path';
 import { resolveFile } from './utils/io';
 import { safeParse } from './utils/misc';
 import { LRU } from './utils/lru';
@@ -22,7 +22,7 @@ const _NO_PKG = Symbol('no.pkg');
 const pkgCache      = new LRU<string, { pkg: PackageJson | typeof _NO_PKG; at: number }>(512);
 const formatCache   = new LRU<string, ModuleFormat>(2048);
 const formatDirCache = new LRU<string, ModuleFormat>(512);
-const exportsCache  = new LRU<string, string | null>(1024);
+const exportsCache = new LRU<string, ResolvedPath | null>(1024);
 
 const PKG_TTL = 5 * 60 * 1000;
 
@@ -80,8 +80,8 @@ export function detectFormat(localPath: string): ModuleFormat {
 
 function _detectFormat(localPath: string): ModuleFormat {
     const ext = extname(localPath);
-    if (ext === '.mjs' || ext === '.ts' || ext === '.tsx' || ext === '.jsx') return 'esm';
-    if (ext === '.cjs') return 'cjs';
+    if (ext === '.mjs' || ext === '.mts' || ext === '.ts' || ext === '.tsx' || ext === '.jsx') return 'esm';
+    if (ext === '.cjs' || ext === '.cts' || ext === '.node') return 'cjs';
     if (ext !== '.js') return 'esm';
 
     // Walk up directories, caching every intermediate dir to avoid re-traversal
@@ -120,6 +120,11 @@ function _detectFormat(localPath: string): ModuleFormat {
 
 export interface ResolveCtx { pkgDir: string; pkg: PackageJson; forceCjs?: boolean }
 
+export interface ResolvedPath {
+    path: string;
+    format: ModuleFormat;
+}
+
 export function createCtx(dir: string, opts: { forceCjs?: boolean } = {}): ResolveCtx | null {
     const pkg = readPkg(dir);
     return pkg ? { pkgDir: dir, pkg, ...opts } : null;
@@ -133,7 +138,7 @@ function exportsKey(ctx: ResolveCtx, sub: string): string {
     return `${ctx.pkgDir}\0${sub}\0${ctx.forceCjs ? '1' : '0'}`;
 }
 
-export function resolveExports(ctx: ResolveCtx, sub = '.'): string | null {
+export function resolveExports(ctx: ResolveCtx, sub = '.'): ResolvedPath | null {
     const key = exportsKey(ctx, sub);
     const cached = exportsCache.get(key);
     if (cached !== undefined) return cached;
@@ -158,28 +163,30 @@ function resolvePath(ctx: ResolveCtx, p: string): string | null {
     catch { return null; }
 }
 
-function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string): string | null {
+function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string, condition?: string): ResolvedPath | null {
     if (typeof t === 'string') {
-        return resolvePath(ctx, rep !== undefined ? t.replace('*', rep) : t);
+        const path = resolvePath(ctx, rep !== undefined ? t.replace('*', rep) : t);
+        return path ? { path, format: resolvedFormat(ctx, path, condition) } : null;
     }
     if (Array.isArray(t)) {
-        for (const e of t) { const r = resolveTarget(ctx, e, rep); if (r) return r; }
+        for (const e of t) { const r = resolveTarget(ctx, e, rep, condition); if (r) return r; }
         return null;
     }
     if (t && typeof t === 'object') {
         for (const c of conds(ctx)) {
             if (!(c in t)) continue;
-            const r = resolveTarget(ctx, (t as any)[c], rep); if (r) return r;
+            const r = resolveTarget(ctx, (t as any)[c], rep, c);
+            if (r) return r;
         }
     }
     return null;
 }
 
-function _resolveExports(ctx: ResolveCtx, sub: string): string | null {
+function _resolveExports(ctx: ResolveCtx, sub: string): ResolvedPath | null {
     const { exports } = ctx.pkg;
     if (!exports) return null;
     if (typeof exports === 'string')
-        return (sub === '.' || sub === './') ? resolvePath(ctx, exports) : null;
+        return (sub === '.' || sub === './') ? resolveTarget(ctx, exports) : null;
     if (typeof exports !== 'object') return null;
     const map = exports as Record<string, unknown>;
     const direct = resolveTarget(ctx, map[sub]); if (direct) return direct;
@@ -195,7 +202,7 @@ function _resolveExports(ctx: ResolveCtx, sub: string): string | null {
 }
 
 /** Resolve a subpath import (package.json "imports" field, e.g. "#foo": "./path"). */
-export function resolveImports(ctx: ResolveCtx, spec: string): string | null {
+export function resolveImports(ctx: ResolveCtx, spec: string): ResolvedPath | null {
     const { imports } = ctx.pkg;
     if (!imports || typeof imports !== 'object') return null;
     const map = imports as Record<string, unknown>;
@@ -215,28 +222,50 @@ export function resolveImports(ctx: ResolveCtx, spec: string): string | null {
     return null;
 }
 
-export function resolveMain(ctx: ResolveCtx): string | null {
+export function resolveMain(ctx: ResolveCtx): ResolvedPath | null {
     const e = resolveExports(ctx, '.'); if (e) return e;
     // Some packages (e.g. devlop@1.1.0) use a "default" export condition
     // without a "." key — try it as a fallback
     if (ctx.pkg.exports && typeof ctx.pkg.exports === 'object') {
         const def = (ctx.pkg.exports as Record<string, unknown>)['default'];
         if (typeof def === 'string') {
-            try { return resolveFile(joinPaths(ctx.pkgDir, def.startsWith('./') ? def.slice(2) : def)); } catch {}
+            const resolved = resolveTarget(ctx, def, undefined, 'default');
+            if (resolved) return resolved;
         }
     }
-    if (!ctx.forceCjs && ctx.pkg.module) { try { return resolveFile(joinPaths(ctx.pkgDir, ctx.pkg.module)); } catch {} }
-    if (ctx.pkg.main) { try { return resolveFile(joinPaths(ctx.pkgDir, ctx.pkg.main)); } catch {} }
+    if (!ctx.forceCjs && ctx.pkg.module) {
+        const resolved = resolveTarget(ctx, ctx.pkg.module, undefined, 'module');
+        if (resolved) return resolved;
+    }
+    if (ctx.pkg.main) {
+        const resolved = resolveTarget(ctx, ctx.pkg.main, undefined, 'require');
+        if (resolved) return resolved;
+    }
     for (const f of ['index.js','index.mjs','index.cjs','index.ts']) {
-        const p = joinPaths(ctx.pkgDir, f); if (fs.exists(p)) return p;
+        const p = joinPaths(ctx.pkgDir, f);
+        if (fs.exists(p)) return { path: p, format: detectFormat(p) };
     }
     return null;
 }
 
-export function resolveSubpath(ctx: ResolveCtx, sub: string): string | null {
+export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | null {
     if (!sub || sub === '.' || sub === './') return resolveMain(ctx);
     const norm = sub.startsWith('./') ? sub : `./${sub}`;
     return resolveExports(ctx, norm) ?? (() => {
-        try { return resolveFile(joinPaths(ctx.pkgDir, norm.slice(2))); } catch { return null; }
+        try {
+            const path = resolveFile(joinPaths(ctx.pkgDir, norm.slice(2)));
+            return { path, format: detectFormat(path) };
+        } catch { return null; }
     })();
+}
+
+function resolvedFormat(ctx: ResolveCtx, path: string, condition?: string): ModuleFormat {
+    const detected = detectFormat(path);
+    if (ctx.forceCjs || condition === 'require') return detected;
+    return isAmbiguousScriptPath(path) ? 'esm' : detected;
+}
+
+function isAmbiguousScriptPath(path: string): boolean {
+    const ext = extname(path);
+    return ext === '.js' || ext === '.ts' || ext === '.tsx' || ext === '.jsx';
 }

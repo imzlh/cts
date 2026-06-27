@@ -1,6 +1,6 @@
 // runtime.ts — TypeScriptRuntime
 
-import type { RuntimeConfig, NodeBuiltinResolver, ModuleInfo } from './types';
+import type { RuntimeConfig, NodeBuiltinResolver, ModuleInfo, ModuleFormat, FileKind } from './types';
 import type { ScanResult } from './deps';
 import { ModuleResolver } from './resolver';
 import { ModuleLoader }   from './loader';
@@ -9,12 +9,12 @@ import { createConfig }   from './config';
 import { PrecompileDriver, isCompilerWorker, runCompilerWorker } from './precompile';
 import { PrecacheProgress } from './utils/progress';
 import { resources }      from './resources';
-import { dirname, normalizePath, isAbsolute, joinPaths } from './utils/path';
+import { dirname, normalizePath, isAbsolute, joinPaths, toPosixPath, cwd as posixCwd } from './utils/path';
 import { writeText, ensureDir, resolveFile } from './utils/io';
 import { errMsg } from './utils/misc';
 import { err, ErrorKind, formatError } from './errors';
 import { guessFileKind } from './protocol/base';
-import { uname } from './utils';
+import { uname, isWindows } from './utils';
 import { log } from './utils/log';
 import { isRemote } from './jsc';
 import { tryLoadOxc, type OxcTranspiler } from './oxc';
@@ -274,7 +274,7 @@ export class TypeScriptRuntime {
     private async runPostinstallScripts(): Promise<void> {
         const scripts = this.resolver.drainPostinstall();
         if (!scripts.length) return;
-        const isWin = uname.sysname.includes('Windows');
+        const isWin = isWindows;
         const shell = isWin ? 'cmd.exe' : 'sh';
         const shellArg = isWin ? '/c' : '-c';
         for (const { name, version, dir, script } of scripts) {
@@ -326,13 +326,11 @@ export class TypeScriptRuntime {
 
     /** Resolve a polyfill path to an absolute local file path. */
     private resolvePolyfillPath(path: string): string {
-        // Normalize Windows backslashes to forward slashes first
-        const normalized = path.replace(/\\/g, '/');
+        const normalized = toPosixPath(path);
         // Already absolute
         if (isAbsolute(normalized)) return resolveFile(normalizePath(normalized));
-        // Relative to cwd — also normalize os.cwd on Windows
-        const cwd = String(os.cwd).replace(/\\/g, '/');
-        return resolveFile(normalizePath(joinPaths(cwd, normalized)));
+        // Relative to cwd
+        return resolveFile(normalizePath(joinPaths(posixCwd(), normalized)));
     }
 
     async loadEntry(path: string, extra: Record<string, any> = {}, lang = 'ts'): Promise<CModuleEngine.Module> {
@@ -350,6 +348,27 @@ export class TypeScriptRuntime {
         this.fillMeta(meta, info);
         meta.main = true;
         return this.loader.load(info, meta);
+    }
+
+    loadSourceEntry(
+        code: string,
+        path: string,
+        extra: Record<string, any> = {},
+        opts: { lang?: string; format?: ModuleFormat; fileKind?: FileKind } = {},
+    ): CModuleEngine.Module {
+        this.resolver.entry = path;
+        const info: ModuleInfo = {
+            specPath: path,
+            localPath: path,
+            format: opts.format ?? 'esm',
+            fileKind: opts.fileKind ?? 'source',
+        };
+        const meta: Record<string, any> = { lang: opts.lang ?? 'ts', ...extra };
+        this.fillMeta(meta, info);
+        meta.main = true;
+        const mod = this.loader.loadSource(code, info, meta);
+        this.loadedModules.set(info.specPath, mod);
+        return mod;
     }
 
     registerNodeResolver(r: NodeBuiltinResolver): void {

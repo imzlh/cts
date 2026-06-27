@@ -1,12 +1,12 @@
 // config.ts — configuration loading
 
 import type { RuntimeConfig, ConfigOptions } from './types';
-import { dirname, joinPaths } from './utils/path';
+import { dirname, joinPaths, toPosixPath } from './utils/path';
 import { readText, writeText, ensureDir } from './utils/io';
 import { stripJsonc, safeParse, parseArgs } from './utils/misc';
 import { log } from './utils/log';
 import { err, ErrorKind } from './errors';
-import { uname } from './utils/index';
+import { uname, isWindows } from './utils/index';
 import { getMemoryTier } from './utils/tier';
 
 const os = import.meta.use('os');
@@ -66,6 +66,15 @@ export function parseSize(s: string | undefined): number | undefined {
 
 function env(k: string): string | null { try { return os.getenv(k); } catch { return null; } }
 
+/** Filter import map entries: keep only string-valued, non-# entries. */
+function filterImports(raw: Record<string, unknown>): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw)) {
+        if (!k.startsWith('#') && typeof v === 'string') out[k] = v;
+    }
+    return out;
+}
+
 function envConfig(): Partial<ConfigOptions> {
     const c: Partial<ConfigOptions> = {};
     const bool = (v: string | null) => v !== null ? v === 'true' : undefined;
@@ -95,8 +104,8 @@ function envConfig(): Partial<ConfigOptions> {
 function defaultCacheDir(): string {
     let home: string | null = null;
     try { home = os.homeDir; } catch {}
-    if (!home) home = env(uname.sysname.includes('Windows') ? 'USERPROFILE' : 'HOME') ?? '/root';
-    return joinPaths(String(home).replace(/\\/g, '/'), '.cts');
+    if (!home) home = env(isWindows ? 'USERPROFILE' : 'HOME') ?? '/root';
+    return joinPaths(toPosixPath(home), '.cts');
 }
 
 // ---------------------------------------------------------------------------
@@ -105,16 +114,7 @@ function defaultCacheDir(): string {
 
 function clearJsc(dir: string): void {
     // Delete .jsc files in a background timer so we don't block startup.
-    // The old bytecode is stale anyway — it'll be overwritten on next cache write.
-    timers.setTimeout(() => {
-        try {
-            for (const e of fs.readdir(dir)) {
-                const p = joinPaths(dir, e);
-                try { if (fs.stat(p).isDirectory) clearJscSync(p); else if (p.endsWith('.jsc')) fs.unlink(p); }
-                catch {}
-            }
-        } catch {}
-    }, 0);
+    timers.setTimeout(() => { try { clearJscSync(dir); } catch {} }, 0);
 }
 
 function clearJscSync(dir: string): void {
@@ -190,22 +190,14 @@ const CLI_TPL = {
     'jsx-fragment-pragma': 'string',
 } satisfies Record<string, 'string'|'boolean'|'number'>;
 
-function getEnv(name: string): string | null {
-    try{
-        return os.getenv(name);
-    } catch {
-        return null;
-    }
-}
-
 export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeConfig {
     const cli = parseArgs(os.args.slice(1), CLI_TPL);
     const cfg = { ...DEFAULTS, ...envConfig(), ...userConfig } as RuntimeConfig;
 
-    if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || getEnv('CTS_CACHE_DIR') || '';
+    if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || env('CTS_CACHE_DIR') || '';
     if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'];
     if (cli['eval'] || cli['e']) cfg.eval        = (cli['eval'] || cli['e']) as string;
-    if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || getEnv('CTS_LOCK_DIR') || '';
+    if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || env('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.disableCache  = true;
     if (cli['no-oxc'] || cli['no-swc']) cfg.enableOxc = false;
     if (cli['silent'])        cfg.silent        = true;
@@ -216,9 +208,9 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     if (cli['frozen'])        cfg.frozen        = true;
     if (cli['ignore-scripts']) cfg.ignoreScripts = true;
     if (cli['memory-limit'] !== undefined)
-        cfg.memoryLimit = parseSize(cli['memory-limit'] || getEnv('CTS_MEMORY_LIMIT') || '1g');
+        cfg.memoryLimit = parseSize(cli['memory-limit'] || env('CTS_MEMORY_LIMIT') || '1g');
     if (cli['max-stack-size'] !== undefined)
-        cfg.maxStackSize = parseSize(cli['max-stack-size'] || getEnv('CTS_MAX_STACK_SIZE') || '0');
+        cfg.maxStackSize = parseSize(cli['max-stack-size'] || env('CTS_MAX_STACK_SIZE') || '0');
     if (cli['jsr-cache-ttl'] !== undefined)
         cfg.jsrCacheTTL = (cli['jsr-cache-ttl'] as number) * 24 * 60 * 60 * 1000;
     if (cli['jsx-pragma']) cfg.jsxPragma = cli['jsx-pragma'];
@@ -276,13 +268,17 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             const p = joinPaths(d, name);
             if (!fs.exists(p)) continue;
             const dc = readJson(p); if (!dc) { foundDeno = true; break; }
-            if (dc.imports)                cfg.importMap  = { ...cfg.importMap,   ...dc.imports };
+            if (dc.imports) {
+                cfg.importMap = { ...cfg.importMap, ...filterImports(dc.imports as Record<string, unknown>) };
+            }
             if (dc.compilerOptions?.paths) cfg.pathAliases = { ...cfg.pathAliases, ...dc.compilerOptions.paths };
             if (typeof dc.importMap === 'string') {
                 const mp = joinPaths(d, dc.importMap);
                 if (fs.exists(mp)) {
                     const mj = readJson(mp);
-                    if (mj?.imports) cfg.importMap = { ...cfg.importMap, ...mj.imports };
+                    if (mj?.imports) {
+                        cfg.importMap = { ...cfg.importMap, ...filterImports(mj.imports as Record<string, unknown>) };
+                    }
                 }
             }
             log.debug('config', () => `${name}: ${p}`);
@@ -293,8 +289,10 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
         if (!foundPkg && fs.exists(pkgP)) {
             const pkg = readJson(pkgP);
             if (pkg) {
-                if (pkg.imports && typeof pkg.imports === 'object')
-                    cfg.importMap = { ...pkg.imports, ...cfg.importMap };
+                if (pkg.imports && typeof pkg.imports === 'object') {
+                    // package.json imports use reversed merge priority (package > deno)
+                    cfg.importMap = { ...filterImports(pkg.imports as Record<string, unknown>), ...cfg.importMap };
+                }
                 foundPkg = true;
             }
         }

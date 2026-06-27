@@ -4,7 +4,6 @@ import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver } from '../types';
 import type { ProtocolHandler } from './base';
 import { StepType, type Flow } from '../flow';
 import { joinPaths, dirname, normalizePath } from '../utils/path';
-import { detectFormat } from '../pkg';
 
 import { err, ErrorKind } from '../errors';
 import { log } from '../utils/log';
@@ -31,12 +30,12 @@ export class NodeHandler implements ProtocolHandler {
             }
             const localPath = yield* this.findPolyfill(resolved);
             const specPath  = `node:${resolved}`;
-            return { specPath, localPath, format: detectFormat(localPath), fileKind: 'source' };
+            return { specPath, localPath, format: 'esm', fileKind: 'source' };
         }
 
         const specPath  = `node:${bare}`;
         const localPath = yield* this.findPolyfill(bare);
-        return { specPath, localPath, format: detectFormat(localPath), fileKind: 'source' };
+        return { specPath, localPath, format: 'esm', fileKind: 'source' };
     }
 
     localPath(specPath: string): string {

@@ -1,6 +1,6 @@
 // shell.ts — shell command parser + bin-wrapper script resolver
 
-import { dirname, joinPaths, normalizePath } from './utils/path';
+import { dirname, joinPaths, normalizePath, toPosixPath } from './utils/path';
 
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
@@ -147,7 +147,7 @@ export function resolveWinBinEntry(cmdPath: string): string | null {
         const dir = dirname(cmdPath);   // dirname already normalizes backslashes internally
 
         const tryRel = (raw: string): string | null => {
-            let rel = raw.replace(/\\/g, '/');
+            let rel = toPosixPath(raw);
             // %~dp0 already includes the trailing slash, while %dp0% wrappers often
             // write an extra slash after the variable.  Strip any leading separator
             // left by the matcher before joining with the wrapper directory.

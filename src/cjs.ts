@@ -8,15 +8,15 @@
 //   Circular CJS     → return partial exports (same as Node.js)
 //   Circular ESM→CJS→ESM → return empty namespace with warning
 
-import { dirname, joinPaths, isAbsolute, extname } from './utils/path';
+import { dirname, joinPaths, isAbsolute, extname, isRelative } from './utils/path';
 import { resolveFile } from './utils/io';
 import { safeParse } from './utils/misc';
-import { detectFormat, resolveMain, createCtx } from './pkg';
 import { log } from './utils/log';
 import { err, ErrorKind } from './errors';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+const napi = import.meta.use('nodeapi');
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,6 +44,14 @@ export interface CjsDeps {
     loadEsmSync(localPath: string, specPath: string): Record<string, any>;
     /** Resolve any external specifier → canonical/local path pair + format. */
     resolveExternal(req: string, parent: string): { path: string; specPath: string; isCjs: boolean } | null;
+    /** Prepare source for CJS execution (e.g. strip TS/JSX syntax). */
+    prepareSource?(code: string, filePath: string): string | null;
+}
+
+interface ResolvedCjsRequest {
+    path: string;
+    specPath: string;
+    isCjs: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,14 +60,14 @@ export interface CjsDeps {
 
 export const BUILTINS = new Set([
     'assert','buffer','child_process','cluster','console','constants',
-    'crypto','dgram','dns','domain','events','fs','http','http2','https',
+    'crypto','dgram','dns','domain','events','fs','http','http2','https','inspector',
     'module','net','os','path','perf_hooks','process','punycode',
     'querystring','readline','repl','sqlite','stream','string_decoder',
     'sqlite3','timers','tls','trace_events','tty','url','util','v8','vm',
     'worker_threads','zlib',
 ]);
 
-function isBuiltinSpecifier(id: string): boolean {
+export function isBuiltinSpecifier(id: string): boolean {
     const bare = id.startsWith('node:') ? id.slice(5) : id;
     const slash = bare.indexOf('/');
     const head = slash === -1 ? bare : bare.slice(0, slash);
@@ -100,9 +108,8 @@ export function clearDirPathsCache(): void {
 export class CjsLoader {
     // filename → module (includes in-progress modules for circular dep detection)
     readonly cache        = new Map<string, CjsModule>();
-    // modules currently executing (for circular dep detection)
-    private readonly loading = new Set<string>();
     private readonly builtinCache = new Map<string, CjsModule>();
+    private readonly esmInteropCache = new Map<string, CjsModule>();
 
     constructor(private readonly deps: CjsDeps) {}
 
@@ -178,8 +185,21 @@ export class CjsLoader {
     private exec(mod: CjsModule): void {
         const ext = extname(mod.filename);
         if (ext === '.json') { this.execJson(mod); return; }
-        if (ext === '.node') throw err(ErrorKind.ModuleNotFound, `Native (.node) modules not supported: ${mod.filename}`);
+        if (ext === '.node') {
+            this.execNodeAddon(mod);
+            return;
+        }
         this.execJs(mod);
+    }
+
+    private execNodeAddon(mod: CjsModule): void {
+        try {
+            mod.exports = napi.dlopen(mod.filename);
+            mod.loaded = true;
+        } catch (e) {
+            this.cache.delete(mod.filename);
+            throw err(ErrorKind.Generic, `Error loading native addon '${mod.filename}': ${e}`);
+        }
     }
 
     private execJson(mod: CjsModule): void {
@@ -194,6 +214,11 @@ export class CjsLoader {
 
     private execJs(mod: CjsModule): void {
         let src = engine.decodeString(fs.readFile(mod.filename));
+        // Transform TS/ESM source for CJS execution if a transformer is available
+        if (this.deps.prepareSource) {
+            const transformed = this.deps.prepareSource(src, mod.filename);
+            if (transformed !== null) src = transformed;
+        }
         this.execWithSource(mod, src);
     }
 
@@ -209,24 +234,26 @@ export class CjsLoader {
             __dirname:  dirname(mod.filename),
         };
         Reflect.set(globalThis, key, ctx);
-        this.loading.add(mod.filename);
 
         try {
-            const started = Date.now();
-            log.debug('cjs', () => `eval begin: ${mod.filename} (${src.length} chars)`);
+            const k = JSON.stringify(key);
             const wrapper =
-                `const global=globalThis,{exports,require,module,__filename,__dirname}` +
-                `=globalThis[${JSON.stringify(key)}];\n${src}`;
+                `(function(exports,require,module,__filename,__dirname){${src}\n})` +
+                `.call(globalThis[${k}].exports,` +
+                `globalThis[${k}].exports,` +
+                `globalThis[${k}].require,` +
+                `globalThis[${k}].module,` +
+                `globalThis[${k}].__filename,` +
+                `globalThis[${k}].__dirname);`;
             engine.eval(wrapper, mod.filename,
-                engine.EVAL_NEW_BACKTRACE | engine.EVAL_MODULE);
+                engine.EVAL_NEW_BACKTRACE | engine.EVAL_GLOBAL);
             mod.loaded = true;
-            log.debug('cjs', () => `eval done: ${mod.filename} in ${Date.now() - started}ms`);
         } catch (e) {
             this.cache.delete(mod.filename);
+            log.debug('cjs', () => `eval error: ${mod.filename}`, e);
             throw err(ErrorKind.Generic, `Error loading '${mod.filename}': ${e}`);
         } finally {
             Reflect.deleteProperty(globalThis, key);
-            this.loading.delete(mod.filename);
         }
     }
 
@@ -247,10 +274,11 @@ export class CjsLoader {
             if (!resolved) throw err(ErrorKind.ModuleNotFound, `Cannot find module '${id}' from '${parentPath}'`);
 
             const { path, specPath, isCjs } = resolved;
+            log.debug('cjs', () => `require('${id}') → ${path} isCjs=${isCjs}`);
 
             // 3. CJS → ESM interop: if resolved is ESM, load it via ESM pipeline
             if (!isCjs) {
-                return self.requireEsm(path, specPath, id, parentPath);
+                return self.requireEsm(path, specPath, parentPath);
             }
 
             // 4. Cache hit (includes in-progress = circular dep → return partial exports)
@@ -258,13 +286,7 @@ export class CjsLoader {
             if (hit) return hit.exports; // may be partial for circular deps
 
             // 5. Load CJS
-            const mod = self.make(path, parentMod);
-            self.cache.set(path, mod);
-            self.loading.add(path);
-            try { self.exec(mod); }
-            catch (e) { self.cache.delete(path); throw e; }
-            finally { self.loading.delete(path); }
-            return mod.exports;
+            return self.loadResolvedCjs(path, parentMod).exports;
         }
 
         require.resolve = function(id: string, opts?: { paths?: string[] }): string {
@@ -280,6 +302,7 @@ export class CjsLoader {
         require.extensions = {
             '.js':   (m: CjsModule) => self.execJs(m),
             '.json': (m: CjsModule) => self.execJson(m),
+            '.node': (m: CjsModule) => self.execNodeAddon(m),
         };
         return require as CjsRequireFn;
     }
@@ -294,10 +317,16 @@ export class CjsLoader {
      *
      * The result is cached so repeated require() calls return the same object.
      */
-    private requireEsm(localPath: string, specPath: string, specifier: string, parentPath: string): any {
+    private requireEsm(localPath: string, specPath: string, parentPath: string): any {
         const cacheKey = `__esm__${localPath}`;
-        const hit = this.builtinCache.get(cacheKey);
+        const hit = this.esmInteropCache.get(cacheKey);
         if (hit) return hit.exports;
+
+        // Native addons (.node) must go through CJS exec path, not ESM compile
+        if (extname(localPath) === '.node') {
+            const mod = this.loadAndGet(localPath, parentPath);
+            return mod.exports;
+        }
 
         const ns = this.deps.loadEsmSync(localPath, specPath);
 
@@ -308,8 +337,20 @@ export class CjsLoader {
         const result = 'default' in ns ? ns.default : synthetic;
         const mod = this.synth(localPath);
         mod.exports = result;
-        this.builtinCache.set(cacheKey, mod);
+        this.esmInteropCache.set(cacheKey, mod);
         return result;
+    }
+
+    private loadResolvedCjs(path: string, parent: CjsModule | null): CjsModule {
+        const mod = this.make(path, parent);
+        this.cache.set(path, mod);
+        try {
+            this.exec(mod);
+            return mod;
+        } catch (e) {
+            this.cache.delete(path);
+            throw e;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -326,9 +367,15 @@ export class CjsLoader {
         const mod = this.synth(localPath);
         // Builtins: spread named exports, keep default as the default export
         mod.exports = Object.assign(Object.create(null), ns);
-        if ('default' in ns && typeof ns.default === 'object' && ns.default !== null) {
-            // Merge default's own properties so `const { readFileSync } = require('fs')` works
-            Object.assign(mod.exports, ns.default);
+        if ('default' in ns && ns.default) {
+            if (typeof ns.default === 'object') {
+                Object.assign(mod.exports, ns.default);
+            } else if (typeof ns.default === 'function') {
+                mod.exports = ns.default;
+                for (const k of Object.keys(ns)) {
+                    if (k !== 'default') (mod.exports as any)[k] = ns[k];
+                }
+            }
         }
         this.builtinCache.set(name, mod);
         return mod;
@@ -338,49 +385,31 @@ export class CjsLoader {
     // Module resolution
     // -------------------------------------------------------------------------
 
-    private resolveId(id: string, parentPath: string): { path: string; specPath: string; isCjs: boolean } | null {
+    private resolveId(id: string, parentPath: string): ResolvedCjsRequest | null {
         // External resolver first (covers npm, jsr, http, aliases, import map)
         try {
             const ext = this.deps.resolveExternal(id, parentPath);
             if (ext) return ext;
         } catch {}
 
-        // Absolute path
-        if (isAbsolute(id)) {
-            try {
-                const path = resolveFile(id);
-                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
-            } catch { return null; }
-        }
-
-        // Relative path
-        if (id.startsWith('./') || id.startsWith('../') || id.startsWith('.\\') || id.startsWith('..\\')) {
-            const base = joinPaths(dirname(parentPath), id);
-            try {
-                const path = resolveFile(base);
-                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
-            } catch { return null; }
-        }
-
-        // require('.') — resolve to the package's main entry (package.json "main"),
-        // falling back to directory index (index.js etc.) if no package.json exists.
-        if (id === '.') {
-            const dir = dirname(parentPath);
-            try {
-                const ctx = createCtx(dir);
-                const mainPath = ctx ? resolveMain(ctx) : null;
-                const path = mainPath ?? resolveFile(dir);
-                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
-            } catch { return null; }
-        }
-
-        // node_modules walk
+        // Local filesystem fallback for contexts that bypass the resolver, such as
+        // internal createRequire() consumers operating directly on filenames.
+        if (isAbsolute(id)) return this.resolveLocalPath(id);
+        if (isRelative(id)) return this.resolveLocalPath(joinPaths(dirname(parentPath), id));
+        if (id === '.') return this.resolveLocalPath(dirname(parentPath));
         for (const dir of buildPaths(dirname(parentPath))) {
-            try {
-                const path = resolveFile(joinPaths(dir, id));
-                return { path, specPath: path, isCjs: detectFormat(path) === 'cjs' };
-            } catch {}
+            const resolved = this.resolveLocalPath(joinPaths(dir, id));
+            if (resolved) return resolved;
         }
         return null;
+    }
+
+    private resolveLocalPath(candidate: string): ResolvedCjsRequest | null {
+        try {
+            const path = resolveFile(candidate);
+            return { path, specPath: path, isCjs: true };
+        } catch {
+            return null;
+        }
     }
 }

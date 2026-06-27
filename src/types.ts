@@ -79,6 +79,7 @@ export interface PackageJson {
     imports?:      Record<string, string>;
     bin?:          string | Record<string, string>;
     dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
     os?:           string[];

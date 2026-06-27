@@ -35,7 +35,7 @@ export class Transformer {
 
     transform(code: string, filename: string, lang?: string): string {
         if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
-        const ext = lang ? `.${lang}` : filename.slice(filename.lastIndexOf('.'));
+        const ext = this.sourceExt(filename, lang);
         switch (ext) {
             case '.ts':
             case '.tsx':
@@ -60,6 +60,28 @@ export class Transformer {
         }
     }
 
+    /**
+     * Prepare source for CommonJS execution.
+     * This only strips TS/JSX syntax from files already classified as CJS;
+     * it does not rewrite ESM import/export semantics.
+     */
+    transformForCjs(code: string, filename: string, lang?: string): string {
+        if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
+        const ext = this.sourceExt(filename, lang);
+        switch (ext) {
+            case '.ts':
+            case '.cts':
+                return this.run(code, filename, ['typescript']);
+            case '.tsx':
+                return this.run(code, filename, ['typescript', 'jsx']);
+            case '.jsx':
+                return this.run(code, filename, ['jsx']);
+            default:
+                log.debug('transformer', () => `cjs passthrough: ${filename}`);
+                return code;
+        }
+    }
+
     private run(code: string, filename: string, transforms: Transform[]): string {
         try {
             const r = transform(code, { transforms, jsxPragma: this.jsxPragma,
@@ -72,6 +94,10 @@ export class Transformer {
         } catch (e) {
             throw this.toTransformError(e, filename);
         }
+    }
+
+    private sourceExt(filename: string, lang?: string): string {
+        return lang ? `.${lang}` : filename.slice(filename.lastIndexOf('.'));
     }
 
     private toTransformError(error: unknown, filename: string): Error {

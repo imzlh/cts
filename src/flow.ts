@@ -1,6 +1,8 @@
 import { readText, ensureDir, writeText } from './utils/io';
 import { unTarGz, type TarFile } from './utils/misc';
+import { fmtBytes } from './utils/misc';
 import { isEnabled, log } from './utils/log';
+import { dirname } from './utils/path';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -86,11 +88,6 @@ export type Step =
     | ArchiveUntarGzStep;
 
 export type Flow<T> = Generator<Step, T, any>;
-
-function bytesOf(data: Uint8Array | ArrayBuffer): Uint8Array | ArrayBuffer {
-    if (data instanceof Uint8Array) return data;
-    return data;
-}
 
 function parseHeaders(raw: string): Array<[string, string]> {
     let current: Array<[string, string]> = [];
@@ -223,7 +220,7 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => unknown): unknow
             writeText(step.path, step.text);
             return undefined;
         case StepType.FS_WRITE_BYTES:
-            fs.writeFile(step.path, bytesOf(step.data));
+            fs.writeFile(step.path, step.data);
             return undefined;
         case StepType.FS_ENSURE_DIR:
             ensureDir(step.path);
@@ -231,7 +228,7 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => unknown): unknow
         case StepType.NET_FETCH:
             return fetch(step);
         case StepType.ARCHIVE_UNTAR_GZ:
-            log.debug('archive', () => `untar.gz start ${fmtBytes(byteLengthOf(step.data))}`);
+            log.debug('archive', () => `untar.gz start ${fmtBytes(step.data.byteLength)}`);
             const started = Date.now();
             const files = unTarGz(step.data);
             log.debug('archive', () => `untar.gz done ${files.length} entries ${Date.now() - started}ms`);
@@ -254,8 +251,7 @@ async function existsAsync(path: string): Promise<boolean> {
 
 async function ensureDirAsync(dir: string): Promise<void> {
     if (await existsAsync(dir)) return;
-    const slash = dir.replace(/\\/g, '/').lastIndexOf('/');
-    const parent = slash > 0 ? dir.slice(0, slash) : '';
+    const parent = dirname(dir);
     if (parent && parent !== dir && parent !== '.') await ensureDirAsync(parent);
     try {
         await asyncfs.mkdir(dir, 0o755);
@@ -297,7 +293,7 @@ async function executeAsync(step: Step): Promise<unknown> {
         case StepType.NET_FETCH:
             return fetchAsync(step);
         case StepType.ARCHIVE_UNTAR_GZ:
-            log.debug('archive', () => `untar.gz start ${fmtBytes(byteLengthOf(step.data))}`);
+            log.debug('archive', () => `untar.gz start ${fmtBytes(step.data.byteLength)}`);
             const started = Date.now();
             const files = unTarGz(step.data);
             log.debug('archive', () => `untar.gz done ${files.length} entries ${Date.now() - started}ms`);
@@ -331,19 +327,9 @@ export async function runAsync<T>(flow: Flow<T>): Promise<T> {
 
 export type { TarFile };
 
-function byteLengthOf(data: Uint8Array | ArrayBuffer): number {
-    return data instanceof Uint8Array ? data.byteLength : data.byteLength;
-}
-
 function fmtProgress(done: number, total: number): string {
     if (total > 0) return `${fmtBytes(done)}/${fmtBytes(total)} ${Math.floor(done / total * 100)}%`;
     return `${fmtBytes(done)}`;
-}
-
-function fmtBytes(n: number): string {
-    if (n < 1024) return `${n}B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
-    return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
 function shortUrl(url: string): string {

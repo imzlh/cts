@@ -6,8 +6,8 @@ import { createRuntime } from './src/runtime';
 import { loadTasks } from './src/task';
 import { LockStore } from './src/lock';
 import { fatal, formatError } from './src/errors';
-import { dirname, normalizePath, isAbsolute, joinPaths } from './src/utils/path';
-import type { ConfigOptions, RuntimeConfig, ModuleInfo } from './src/types';
+import { dirname, normalizePath, isAbsolute, joinPaths, cwd as posixCwd, toPosixPath } from './src/utils/path';
+import type { ConfigOptions, RuntimeConfig } from './src/types';
 import { log } from './src/utils/log';
 import { stripJsonc } from './src/utils/misc';
 import { version } from './package.json';
@@ -94,13 +94,12 @@ function entryAndDir(raw: string): { entry: string; dir: string } {
     // Normalize the raw path: resolve relative to cwd, normalize separators
     let entry: string;
     if (hasProto || raw.startsWith('/') || isAbsolute(raw)) {
-        entry = raw;
+        entry = toPosixPath(raw);
     } else {
         // Relative path: resolve against cwd, normalize to forward slashes
-        const cwd = String(os.cwd).replace(/\\/g, '/');
-        entry = normalizePath(joinPaths(cwd, raw.replace(/\\/g, '/')));
+        entry = normalizePath(joinPaths(posixCwd(), toPosixPath(raw)));
     }
-    return { entry, dir: hasProto ? os.cwd : dirname(entry) };
+    return { entry, dir: hasProto ? posixCwd() : dirname(entry) };
 }
 
 // Known flags from config — used to warn on typos
@@ -261,7 +260,7 @@ async function run(
 }
 
 async function runEval(code: string, baseCfg: Partial<ConfigOptions>): Promise<void> {
-    const evalPath = joinPaths(String(os.cwd).replace(/\\/g, '/'), '<eval>.ts');
+    const evalPath = joinPaths(posixCwd(), '<eval>.ts');
     const fileCfg  = loadConfigFile(os.cwd);
     const cfg      = { ...fileCfg, ...baseCfg };
     const runtime  = createRuntime(cfg, os.cwd);
@@ -271,16 +270,9 @@ async function runEval(code: string, baseCfg: Partial<ConfigOptions>): Promise<v
         catch (e) { fatal(e, `loading polyfill ${runtime.config.polyfill}`); }
     }
 
-    const info: ModuleInfo = {
-        specPath: evalPath,
-        localPath: evalPath,
-        format: 'esm',
-        fileKind: 'source',
-    };
-
     const meta: Record<string, any> = { main: true };
     try {
-        const mod = runtime.loader.loadSource(code, info, meta);
+        const mod = runtime.loadSourceEntry(code, evalPath, meta);
         await mod.eval();
     } catch (e) { fatal(e, '<eval>'); }
 

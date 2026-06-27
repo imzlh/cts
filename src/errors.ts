@@ -191,7 +191,9 @@ const debugEnv = (() => { try {
 } catch { return false; } })();
 
 export function formatError(e: unknown, context?: string): string {
-    const error = e instanceof Error ? e : new Error(String(e));
+    const error = (e instanceof Error || (e != null && typeof e === 'object' && 'message' in e))
+        ? e as Error
+        : new Error(String(e));
     const msg   = error.message;
 
     // 1. Use .kind if available (set by internal throw sites via `err()`)

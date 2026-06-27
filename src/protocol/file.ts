@@ -6,7 +6,7 @@ import { guessFileKind } from './base';
 import { StepType, type Flow } from '../flow';
 import { normalizePath } from '../utils/path';
 import { detectFormat } from '../pkg';
-import { uname } from '../utils/index';
+import { isWindows } from '../utils/index';
 import { err, ErrorKind } from '../errors';
 
 export class FileHandler implements ProtocolHandler {
@@ -24,7 +24,7 @@ export class FileHandler implements ProtocolHandler {
 
     private strip(url: string): string {
         let p = url.startsWith('file://') ? decodeURIComponent(url.slice(7)) : url;
-        if (p.startsWith('/') && uname.sysname.includes('Windows') && p.length > 2 && p[2] === ':')
+        if (p.startsWith('/') && isWindows && p.length > 2 && p[2] === ':')
             p = p.slice(1);
         return normalizePath(p);
     }

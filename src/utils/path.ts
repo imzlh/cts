@@ -1,8 +1,32 @@
 // utils/path.ts — pure path utilities
+//
+// Convention: all public functions normalise backslashes to '/' internally so
+// callers never need to `.replace(/\\/g, '/')` before calling into this module.
 
 import { uname } from './index';
 
 const os = import.meta.use('os');
+
+/** Convert a Windows-style path to POSIX separators.  No-op on POSIX paths. */
+export function toPosixPath(p: string): string {
+    return p.includes('\\') ? p.replace(/\\/g, '/') : p;
+}
+
+/** Return the current working directory, always with POSIX separators. */
+export function cwd(): string {
+    return toPosixPath(String(os.cwd));
+}
+
+/**
+ * Return the filesystem root for the given path.
+ *   POSIX      → '/'
+ *   Windows    → 'C:/' (or 'D:/' etc.)
+ */
+export function pathRoot(p: string): string {
+    const s = toPosixPath(p);
+    const m = s.match(/^([a-zA-Z]:)\//);
+    return m ? m[1] + '/' : '/';
+}
 
 export function basename(p: string, ext?: string): string {
     const s = p.replace(/\\/g, '/').replace(/\/$/, '');
@@ -49,6 +73,8 @@ export function joinPaths(...parts: string[]): string {
 }
 
 export function normalizePath(p: string): string {
+    // Normalize backslashes first so all subsequent checks work with '/'
+    if (p.includes('\\')) p = p.replace(/\\/g, '/');
     if (!p.includes('/.') && !p.includes('./')) return p;
     // Detect drive-letter prefix (e.g. "C:/") as the absolute root
     const driveMatch = p.match(/^([a-zA-Z]:\/)/);
@@ -69,7 +95,7 @@ export function normalizePath(p: string): string {
 
 export function resolvePath(...parts: string[]): string {
     let r = joinPaths(...parts);
-    if (!isAbsolute(r)) r = joinPaths(String(os.cwd).replace(/\\/g, '/'), r);
+    if (!isAbsolute(r)) r = joinPaths(cwd(), r);
     return normalizePath(r);
 }
 
@@ -77,4 +103,9 @@ export function isAbsolute(p: string): boolean {
     if (p.startsWith('/')) return true;
     if (uname.sysname.includes('Windows') && /^[a-zA-Z]:[/\\]/.test(p)) return true;
     return false;
+}
+
+/** Check if a specifier is a relative import (./ or ../, with either separator). */
+export function isRelative(s: string): boolean {
+    return s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');
 }

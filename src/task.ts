@@ -9,13 +9,15 @@
 // are resolved via BinResolver (lock bin index + node_modules/.bin) and
 // executed directly. If a command cannot be resolved as a bin, it fails.
 
-import { dirname, joinPaths } from './utils/path';
+import { dirname, joinPaths, pathRoot, toPosixPath } from './utils/path';
 import { readText } from './utils/io';
-import { stripJsonc, safeParse, errMsg } from './utils/misc';
+import { stripJsonc, safeParse, errMsg, matchLatestVersion } from './utils/misc';
 import { log } from './utils/log';
-import { uname } from './utils/index';
+import { isWindows } from './utils/index';
 import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
+import { findLocalBin, WIN_BIN_EXTS } from './utils/bin';
+import { getBinMap, readPkgFresh } from './pkg';
 
 const os = import.meta.use('os');
 const console = import.meta.use('console');
@@ -51,13 +53,11 @@ export interface ResolvedBin {
     reason?: string;
 }
 
-const WIN_BIN_EXTS = ['.cmd', '.CMD', '.bat', '.BAT'];
-
 export class BinResolver {
     private readonly isWin: boolean;
 
     constructor(private lockStore: LockStore) {
-        this.isWin = uname.sysname.includes('Windows');
+        this.isWin = isWindows;
     }
 
     /**
@@ -73,39 +73,49 @@ export class BinResolver {
         if (name.startsWith('-')) return null;
 
         // 1. Local node_modules/.bin
-        const local = this.findLocalBin(name, cwd);
+        const local = findLocalBin(name, cwd);
         if (local) return this.resolveEntry(local);
 
         // 2. Lock bin index
         const lockBin = this.lockStore.getBin(name);
         if (lockBin) return this.resolveEntry(lockBin.path);
 
+        // 3. Cache fallback from direct project deps/devDeps when node_modules is absent.
+        const cached = this.resolveCachedProjectBin(name, cwd);
+        if (cached) return this.resolveEntry(cached);
+
         return null;
     }
 
-    private findLocalBin(name: string, cwd: string): string | null {
-        let dir = cwd.replace(/\\/g, '/');
-        const root = this.isWin ? dir.split(':')[0] + ':/' : '/';
-        while (true) {
-            const base = joinPaths(dir, 'node_modules', '.bin', name);
-            if (this.isWin) {
-                // On Windows package managers often create both an extensionless
-                // POSIX shell shim and a .CMD/.BAT wrapper.  Prefer the Windows
-                // wrapper; running/parsing the POSIX shim on Windows can silently
-                // go down the wrong path.
-                for (const ext of WIN_BIN_EXTS) {
-                    const c = base + ext;
-                    if (fs.exists(c)) return c;
-                }
-            }
-            // Unix: extensionless symlink/wrapper.  Also a last resort on Windows
-            // if no .cmd/.bat exists.
-            if (fs.exists(base)) return base;
-            if (dir === root) break;
-            const up = dirname(dir);
-            if (up === dir) break;
-            dir = up;
+    private resolveCachedProjectBin(name: string, cwd: string): string | null {
+        const pkgDir = findNearestPackageDir(cwd);
+        if (!pkgDir) return null;
+        const pkg = readPkgFresh(pkgDir);
+        if (!pkg) return null;
+
+        const deps = [
+            ...(pkg.dependencies ? Object.entries(pkg.dependencies) : []),
+            ...(pkg.devDependencies ? Object.entries(pkg.devDependencies) : []),
+            ...(pkg.optionalDependencies ? Object.entries(pkg.optionalDependencies) : []),
+        ];
+
+        // Prefer a direct package-name match first, then scan the rest for custom bin names.
+        deps.sort(([a], [b]) => (a === name ? -1 : b === name ? 1 : 0));
+
+        const cacheDir = resolveCacheDir();
+        for (const [pkgName, range] of deps) {
+            if (typeof range !== 'string' || !range) continue;
+            const installedDir = findCachedPackageDir(cacheDir, pkgName, range);
+            if (!installedDir) continue;
+            const cachedPkg = readPkgFresh(installedDir);
+            if (!cachedPkg) continue;
+            const binMap = getBinMap(cachedPkg);
+            const relPath = binMap[name];
+            if (!relPath) continue;
+            const absPath = joinPaths(installedDir, relPath);
+            if (fs.exists(absPath)) return absPath;
         }
+
         return null;
     }
 
@@ -115,7 +125,7 @@ export class BinResolver {
      * bin through cmd.exe / sh if the wrapper can't be parsed.
      */
     private resolveEntry(binPath: string): ResolvedBin {
-        const normPath = binPath.replace(/\\/g, '/');
+        const normPath = toPosixPath(binPath);
         const isNodeModulesBin = normPath.includes('/node_modules/.bin/');
 
         if (isNodeModulesBin) {
@@ -158,6 +168,56 @@ export class BinResolver {
         // Unknown — run as-is, likely will fallback to cmd.exe or chmod
         return { entry: binPath, binPath, fallback: true, reason: 'unknown-non-js' };
     }
+}
+
+function env(k: string): string | null {
+    try { return os.getenv(k); } catch { return null; }
+}
+
+function resolveCacheDir(): string {
+    const envDir = env('CTS_CACHE_DIR');
+    if (envDir) return toPosixPath(envDir);
+    const home = toPosixPath(String(os.homeDir || (isWindows ? env('USERPROFILE') : env('HOME')) || '/root'));
+    return joinPaths(home, '.cts');
+}
+
+function findNearestPackageDir(start: string): string | null {
+    let dir = toPosixPath(start);
+    const root = pathRoot(dir);
+    while (true) {
+        const pkgPath = joinPaths(dir, 'package.json');
+        if (fs.exists(pkgPath)) return dir;
+        if (dir === root) break;
+        const up = dirname(dir);
+        if (up === dir) break;
+        dir = up;
+    }
+    return null;
+}
+
+function findCachedPackageDir(cacheDir: string, pkgName: string, range: string): string | null {
+    const npmDir = joinPaths(cacheDir, 'npm');
+    const slash = pkgName.indexOf('/');
+    const scoped = pkgName.startsWith('@') && slash !== -1;
+    const baseDir = scoped ? joinPaths(npmDir, pkgName.slice(0, slash)) : npmDir;
+    const leaf = scoped ? pkgName.slice(slash + 1) : pkgName;
+    const exactDir = joinPaths(baseDir, `${leaf}@${range}`);
+    if (fs.exists(joinPaths(exactDir, 'package.json'))) return exactDir;
+
+    let entries: string[] = [];
+    try { entries = fs.readdir(baseDir) as string[]; } catch { return null; }
+    const prefix = `${leaf}@`;
+    const versions = entries
+        .filter((entry) => entry.startsWith(prefix) && fs.exists(joinPaths(baseDir, entry, 'package.json')))
+        .map((entry) => entry.slice(prefix.length));
+    if (!versions.length) return null;
+
+    const resolved = matchLatestVersion(versions, range)
+        ?? (versions.includes(range) ? range : null);
+    if (!resolved) return null;
+
+    const resolvedDir = joinPaths(baseDir, `${leaf}@${resolved}`);
+    return fs.exists(joinPaths(resolvedDir, 'package.json')) ? resolvedDir : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +418,7 @@ async function execTask(args: string[], env: Record<string, string>, cwd: string
 
 async function execBinary(resolved: ResolvedBin, args: string[], env: Record<string, string>, cwd: string): Promise<number> {
     const mergedEnv = { ...os.environ(), ...env };
-    const isWin = uname.sysname.includes('Windows');
+    const isWin = isWindows;
 
     log.debug('task', () => `exec bin: entry=${resolved.entry} binPath=${resolved.binPath} fallback=${resolved.fallback} reason=${resolved.reason ?? ''}`);
 
@@ -489,8 +549,8 @@ export class TaskRunner {
 
 /** Find and load the nearest deno.json/deno.jsonc or package.json containing tasks. */
 export function loadTasks(startDir: string, lockStore: LockStore): { runner: TaskRunner; configPath: string } | null {
-    let dir = startDir.replace(/\\/g, '/');
-    const isWin = uname.sysname.includes('Windows');
+    let dir = toPosixPath(startDir);
+    const isWin = isWindows;
     while (true) {
         // Collect tasks from both deno.json and package.json (deno.json takes priority)
         const merged: Record<string, TaskDef> = {};

@@ -29,7 +29,7 @@ export function ensureDir(dir: string): void {
 // Directories trigger a recursive index lookup.
 // ---------------------------------------------------------------------------
 
-const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.wasm'];
+const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.node', '.wasm'];
 const cache = new LRU<string, string>(2048);
 const negCache = new LRU<string, boolean>(4096);  // bounded: paths known not to exist
 

@@ -2,7 +2,7 @@
 //
 // Tables:
 //   modules: spec TEXT PK, local TEXT, format TEXT, kind TEXT
-//   sources: key TEXT PK ("spec\0parent"), spec TEXT
+//   sources: key TEXT PK (opaque resolver cache key), spec TEXT
 //   bins:    name TEXT PK, path TEXT, pkg TEXT
 //
 // Performance:
@@ -11,7 +11,7 @@
 //     transaction on flush() / rewrite() / close().
 
 import type { ModuleInfo, ModuleFormat, FileKind } from './types';
-import { joinPaths, dirname } from './utils/path';
+import { joinPaths, dirname, toPosixPath } from './utils/path';
 import { ensureDir } from './utils/io';
 import { log } from './utils/log';
 import { errMsg } from './utils';
@@ -56,7 +56,7 @@ export class LockStore {
 
     constructor(lockDir: string, readOnly: boolean) {
         this.readOnly = readOnly;
-        const dir = lockDir.replace(/\\/g, '/');
+        const dir = toPosixPath(lockDir);
         this.dbPath = joinPaths(dir, DB_FILENAME);
     }
 
@@ -222,7 +222,10 @@ export class LockStore {
     }
 
     getSource(spec: string, parent: string): string | undefined {
-        const key = `${spec}\0${parent}`;
+        return this.getSourceByKey(`${spec}\0${parent}`);
+    }
+
+    getSourceByKey(key: string): string | undefined {
         const pending = this.pendingSources.get(key);
         if (pending !== undefined) return pending;
         const rows = this.query('SELECT spec FROM sources WHERE key = ?', [key]);
@@ -245,8 +248,12 @@ export class LockStore {
     }
 
     setSource(spec: string, parent: string, sp: string): void {
+        this.setSourceByKey(`${spec}\0${parent}`, sp);
+    }
+
+    setSourceByKey(key: string, sp: string): void {
         if (this.readOnly) return;
-        this.pendingSources.set(`${spec}\0${parent}`, sp);
+        this.pendingSources.set(key, sp);
     }
 
     addBin(name: string, path: string, pkg: string): void {

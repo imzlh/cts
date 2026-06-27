@@ -18,6 +18,7 @@ export interface ProtocolHandler {
     readonly protocols: string[];
     resolve(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Flow<ModuleInfo>;
     localPath(specPath: string): string;
+    clearCache?(): void;
 }
 
 // ---------------------------------------------------------------------------

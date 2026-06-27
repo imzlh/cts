@@ -84,8 +84,6 @@ export interface WasmImportSource {
     require(spec: string, parentPath: string): Record<string, any> | null;
 }
 
-const loadedWasmModule: CModuleEngine.Module[] = [];
-
 /**
  * Look up a named export, falling back to `exports.default[name]`.
  *
@@ -378,7 +376,6 @@ export function buildWasmModule(
 
     mod.export('default', ns);
     mod.export('instance', wrappedInst);
-    loadedWasmModule.push(mod);
 
     log.debug('wasm', () => `loaded: ${exp.length} exports`);
     return { mod, instance: inst };
