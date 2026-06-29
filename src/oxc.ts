@@ -74,9 +74,15 @@ export function oxcExtPath(): string | null {
             if (fs.stat?.(preferred)) return preferred;
         } catch {}
 
-        // Legacy name — the current build outputs swc.dll / swc.so / swc.dylib
-        log.debug('oxc', () => `using legacy ext path: ${legacy}`);
-        return legacy;
+        try {
+            if (fs.stat?.(legacy)) {
+                log.debug('oxc', () => `using legacy ext path: ${legacy}`);
+                return legacy;
+            }
+        } catch {}
+
+        log.debug('oxc', () => `native extension not found: ${preferred} or ${legacy}`);
+        return null;
     } catch {
         return null;
     }

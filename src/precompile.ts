@@ -12,6 +12,7 @@ import { extractImports } from './scan';
 import { readText } from './utils/io';
 import { errMsg } from './utils/misc';
 import { log } from './utils/log';
+import { getMemoryTier, type MemoryTier } from './utils/tier';
 
 const { setTimeout, clearTimeout } = import.meta.use('timers');
 const os = import.meta.use('os');
@@ -26,7 +27,7 @@ interface WorkerTask {
     id: number;
     kind: 'transform' | 'scan';
     localPath: string;
-    source: string;
+    source?: string;   // scan: provided; transform: read lazily at dispatch
 }
 
 interface WorkerResult {
@@ -36,6 +37,49 @@ interface WorkerResult {
     code?: string;    // transform
     deps?: string[];  // scan
     error?: string;
+}
+
+interface WorkerPolicy {
+    maxWorkers: number;
+    source: string;
+}
+
+function availableParallelism(): number {
+    try {
+        const n = Number(os.availableParallelism ? os.availableParallelism() : 1);
+        return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+    } catch {
+        return 1;
+    }
+}
+
+function workersForTier(tier: MemoryTier): number {
+    if (tier === 'low') return 0;
+    if (tier === 'normal') return 2;
+    return availableParallelism();
+}
+
+function parseWorkerOverride(raw: string | null | undefined): number | null {
+    if (raw === null || raw === undefined || raw.trim() === '') return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(0, Math.floor(n));
+}
+
+function resolveWorkerPolicy(): WorkerPolicy {
+    let raw: string | null = null;
+    try { raw = os.getenv('CTS_WORKERS') ?? null; } catch {}
+    const overridden = parseWorkerOverride(raw);
+    if (overridden !== null) {
+        return { maxWorkers: overridden, source: `CTS_WORKERS=${raw}` };
+    }
+
+    const tier = getMemoryTier();
+    return { maxWorkers: workersForTier(tier), source: `memory-tier=${tier}` };
+}
+
+function hasImportSyntax(source: string): boolean {
+    return source.includes('import') || source.includes('export') || source.includes('require');
 }
 
 // ---------------------------------------------------------------------------
@@ -72,16 +116,21 @@ export async function runCompilerWorker(): Promise<void> {
     pipe.onmessage = (raw: any) => {
         const task = raw as WorkerTask;
         if (task?.id === undefined) return;
+        const source = task.source ?? '';
 
         if (task.kind === 'scan') {
             try {
+                if (!hasImportSyntax(source)) {
+                    pipe.postMessage({ id: task.id, kind: 'scan', localPath: task.localPath, deps: [] } as WorkerResult);
+                    return;
+                }
                 let deps: string[] | null = null;
                 if (oxcTranspiler) {
-                    try { deps = oxcTranspiler.scanImports(task.source, task.localPath); } catch {}
+                    try { deps = oxcTranspiler.scanImports(source, task.localPath); } catch {}
                 }
                 if (deps === null) {
                     const isTs = /\.[mc]?tsx?$/.test(task.localPath);
-                    deps = extractImports(task.source, isTs);
+                    deps = extractImports(source, isTs);
                 }
                 pipe.postMessage({ id: task.id, kind: 'scan', localPath: task.localPath, deps } as WorkerResult);
             } catch (e) {
@@ -91,7 +140,7 @@ export async function runCompilerWorker(): Promise<void> {
         }
 
         try {
-            const code = transformer.transform(task.source, task.localPath);
+            const code = transformer.transform(source, task.localPath);
             pipe.postMessage({ id: task.id, kind: 'transform', localPath: task.localPath, code } as WorkerResult);
         } catch (e) {
             pipe.postMessage({ id: task.id, kind: 'transform', localPath: task.localPath, error: errMsg(e) } as WorkerResult);
@@ -139,11 +188,18 @@ export class PrecompileDriver {
     private pending: WorkerTask[] = [];
     /** Scan tasks — dispatched first (lightweight, unblock BFS) */
     private scanQueue: WorkerTask[] = [];
-    private results = new Map<number, WorkerResult>();
     private scanCallbacks = new Map<number, (deps: string[]) => void>();
+    /** id → specPath for in-flight transform tasks (compiled+freed on arrival) */
+    private specMap = new Map<number, string>();
+    /** localPath → bytecode, the only thing kept; sources/code are freed per task */
+    private bytecodes = new Map<string, ArrayBuffer>();
+    /** optional sink: when set, compiled bytecode is consumed and not retained */
+    private onCompiled?: (localPath: string, bc: ArrayBuffer) => void;
     private nextId = 0;
     private maxWorkers: number;
     private oxcPath: string | null;
+    private oxc: OxcTranspiler | null;
+    private inlineTransformer: Transformer | null = null;
     private taskTimers = new Map<number, ReturnType<typeof setTimeout>>();
     private workerTaskId = new Map<number, number>(); // worker.idx → current task id
     private deadWorkers = new Set<number>();
@@ -158,20 +214,22 @@ export class PrecompileDriver {
     private static readonly GLOBAL_TIMEOUT_MS = 1200_000;
     private globalTimer: ReturnType<typeof setTimeout> | null = null;
 
-    constructor() {
-        try {
-            const n = os.getenv('CTS_WORKERS');
-            if (n) this.maxWorkers = Math.max(1, Math.min(+n, 16));
-            else this.maxWorkers = 4;
-        } catch { this.maxWorkers = 4; }
-        this.oxcPath = oxcExtPath();
+    constructor(oxc: OxcTranspiler | null = null) {
+        this.oxc = oxc;
+        this.oxcPath = oxc ? oxcExtPath() : null;
+        const policy = resolveWorkerPolicy();
+        this.maxWorkers = policy.maxWorkers;
         log.debug('precompile', () => `oxc path: ${this.oxcPath ?? 'not found'}`);
+        log.debug('precompile', () => `worker policy: ${this.maxWorkers === 0 ? 'inline' : `${this.maxWorkers} workers`} (${policy.source})`);
     }
 
-    /** Lazily start workers. Called by both scanFile() and precompile(). */
+    /** Lazily grow the worker pool to match queued/in-flight work. */
     private ensureWorkers(): void {
-        if (this.workers.length > 0) return;
-        while (this.workers.length < this.maxWorkers) {
+        if (this.maxWorkers <= 0) return;
+        const active = this.workerTaskId.size;
+        const queued = this.scanQueue.length + this.pending.length;
+        const desired = Math.min(this.maxWorkers, active + queued);
+        while (this.workers.length < desired) {
             const w = new TxWorker(this.workers.length, this.oxcPath, (r) => this.onWorkerResult(r));
             this.workers.push(w);
             log.debug('precompile', () => `spawned worker ${w.idx}`);
@@ -184,6 +242,7 @@ export class PrecompileDriver {
      * Can be called concurrently during BFS before precompile() is invoked.
      */
     async scanFile(source: string, localPath: string): Promise<string[]> {
+        if (this.maxWorkers <= 0) return this.scanInline(source, localPath);
         this.ensureWorkers();
         const id = this.nextId++;
         const task: WorkerTask = { id, kind: 'scan', localPath, source };
@@ -197,28 +256,28 @@ export class PrecompileDriver {
     async precompile(
         modules: Array<{ specPath: string; localPath: string }>,
         onProgress?: (done: number, total: number) => void,
+        onCompiled?: (localPath: string, bc: ArrayBuffer) => void,
     ): Promise<Map<string, ArrayBuffer>> {
         if (!modules.length) return new Map();
-
-        const bytecodes = new Map<string, ArrayBuffer>();
-
-        log.debug('precompile', () => `reading ${modules.length} sources`);
-
-        const tasks: WorkerTask[] = [];
-        const specMap = new Map<number, string>(); // id → specPath
-        for (const m of modules) {
-            let source: string;
-            try { source = readText(m.localPath); }
-            catch (e) {
-                log.debug('precompile', () => `read fail: ${m.localPath}: ${errMsg(e)}`);
-                continue;
-            }
-            const id = this.nextId++;
-            tasks.push({ id, kind: 'transform', localPath: m.localPath, source });
-            specMap.set(id, m.specPath);
+        if (this.maxWorkers <= 0) {
+            return this.precompileInline(modules, onProgress, onCompiled);
         }
 
-        if (!tasks.length) return bytecodes;
+        this.onCompiled = onCompiled;
+        this.bytecodes = new Map<string, ArrayBuffer>();
+
+        log.debug('precompile', () => `queuing ${modules.length} modules`);
+
+        // Tasks carry no source — it is read lazily at dispatch (and freed at
+        // result) so we never hold the whole graph's sources at once.
+        const tasks: WorkerTask[] = [];
+        for (const m of modules) {
+            const id = this.nextId++;
+            tasks.push({ id, kind: 'transform', localPath: m.localPath });
+            this.specMap.set(id, m.specPath);
+        }
+
+        if (!tasks.length) return this.bytecodes;
 
         this.taskTotal = tasks.length;
         this.transformDone = 0;
@@ -240,25 +299,69 @@ export class PrecompileDriver {
         await allTransformsDone;
 
         log.debug('precompile', () => `transforms: ${this.transformDone} ok, ${this.transformFail} fail`);
+        log.debug('precompile', () => `compiled ${this.bytecodes.size}/${tasks.length} (${this.workers.length} workers)`);
 
-        // Phase 2: QJS compile on main thread
-        let compileDone = 0;
-        for (const t of tasks) {
-            const r = this.results.get(t.id);
-            if (!r?.code) continue;
-            const specPath = specMap.get(t.id)!;
-            try {
-                const mod = new engine.Module(r.code, specPath);
-                const bc = mod.dump();
-                bytecodes.set(t.localPath, bc);
-            } catch (e) {
-                log.debug('precompile', () => `compile fail: ${t.localPath}: ${errMsg(e)}`);
+        const out = this.bytecodes;
+        this.bytecodes = new Map();
+        this.specMap.clear();
+        this.pending.length = 0;
+        this.onCompiled = undefined;
+        return out;
+    }
+
+    private scanInline(source: string, localPath: string): string[] {
+        try {
+            if (!hasImportSyntax(source)) return [];
+            if (this.oxc) {
+                const deps = this.oxc.scanImports(source, localPath);
+                if (deps !== null) return deps;
             }
-            compileDone++;
-            onProgress?.(this.taskTotal + compileDone, this.taskTotal * 2);
+            const isTs = /\.[mc]?tsx?$/.test(localPath);
+            return extractImports(source, isTs);
+        } catch (e) {
+            log.debug('precompile', () => `inline scan fail: ${localPath}: ${errMsg(e)}`);
+            return [];
+        }
+    }
+
+    private getInlineTransformer(): Transformer {
+        if (!this.inlineTransformer) {
+            const transformer = new Transformer({ sourceMaps: false });
+            if (this.oxc) transformer.setOxc(this.oxc);
+            this.inlineTransformer = transformer;
+        }
+        return this.inlineTransformer;
+    }
+
+    private async precompileInline(
+        modules: Array<{ specPath: string; localPath: string }>,
+        onProgress?: (done: number, total: number) => void,
+        onCompiled?: (localPath: string, bc: ArrayBuffer) => void,
+    ): Promise<Map<string, ArrayBuffer>> {
+        const bytecodes = new Map<string, ArrayBuffer>();
+        let done = 0;
+        let fail = 0;
+        const total = modules.length;
+        const transformer = this.getInlineTransformer();
+
+        log.debug('precompile', () => `inline precompile begin: ${total} modules`);
+        for (const m of modules) {
+            try {
+                const source = readText(m.localPath);
+                const code = transformer.transform(source, m.localPath);
+                const mod = new engine.Module(code, m.specPath);
+                const bc = mod.dump();
+                if (onCompiled) onCompiled(m.localPath, bc);
+                else bytecodes.set(m.localPath, bc);
+                done++;
+            } catch (e) {
+                fail++;
+                log.debug('precompile', () => `inline compile fail: ${m.localPath}: ${errMsg(e)}`);
+            }
+            onProgress?.(done + fail, total);
         }
 
-        log.debug('precompile', () => `compiled ${bytecodes.size}/${tasks.length} (${this.workers.length} workers)`);
+        log.debug('precompile', () => `inline transforms: ${done} ok, ${fail} fail`);
         return bytecodes;
     }
 
@@ -285,9 +388,26 @@ export class PrecompileDriver {
             return;
         }
 
-        this.results.set(r.id, r);
-        if (r.code) this.transformDone++;
-        else { this.transformFail++; log.debug('precompile', () => `transform fail: ${r.localPath}: ${r.error}`); }
+        // Transform result: compile to bytecode now and free the code string so
+        // we never retain every transpiled source at once (peak RSS bound).
+        const specPath = this.specMap.get(r.id);
+        if (specPath) this.specMap.delete(r.id);
+        if (r.code && specPath) {
+            try {
+                const mod = new engine.Module(r.code, specPath);
+                const bc = mod.dump();
+                // Sink consumes + drops it (precache → disk); else accumulate.
+                if (this.onCompiled) this.onCompiled(r.localPath, bc);
+                else this.bytecodes.set(r.localPath, bc);
+            } catch (e) {
+                log.debug('precompile', () => `compile fail: ${r.localPath}: ${errMsg(e)}`);
+            }
+            this.transformDone++;
+        } else {
+            this.transformFail++;
+            log.debug('precompile', () => `transform fail: ${r.localPath}: ${r.error}`);
+        }
+        r.code = undefined;
         this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
         this.drain();
         if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
@@ -340,6 +460,8 @@ export class PrecompileDriver {
     }
 
     private drain(): void {
+        this.ensureWorkers();
+
         // Scan tasks first — they're lightweight and unblock BFS
         while (this.scanQueue.length > 0) {
             const idle = this.workers.find(w => !w.busy && !this.deadWorkers.has(w.idx));
@@ -357,7 +479,19 @@ export class PrecompileDriver {
     }
 
     private dispatchTask(w: TxWorker, task: WorkerTask): void {
+        if (task.kind === 'transform' && task.source === undefined) {
+            try { task.source = readText(task.localPath); }
+            catch (e) {
+                log.debug('precompile', () => `read fail: ${task.localPath}: ${errMsg(e)}`);
+                this.specMap.delete(task.id);
+                this.transformFail++;
+                this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
+                if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
+                return;
+            }
+        }
         w.send(task);
+        task.source = '';   // worker copied it; drop our reference to bound peak RSS
         this.workerTaskId.set(w.idx, task.id);
         const timer = setTimeout(
             () => this.onTaskTimeout(task.id, task.localPath, task.kind, w.idx),

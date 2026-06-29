@@ -1,6 +1,6 @@
 {
   "name": "cts",
-  "version": "2.7.0",
+  "version": "3.0.0",
   "description": "cts - circu.js bootstrap to provide full typescript experience",
   "main": "src/main.ts",
   "scripts": {

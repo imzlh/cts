@@ -177,13 +177,14 @@ function collectSpecifiers(dir: string): Set<string> {
         // Don't break — also check package.json
     }
 
-    // package.json dependencies / devDependencies
+    // package.json runtime dependencies. Dev dependencies can pull in very
+    // large toolchains (typescript/esbuild) and make no-arg cache impractical.
     const pkgP = joinPaths(dir, 'package.json');
     if (fs.exists(pkgP)) {
         let pkg: Record<string, any> | null = null;
         try { pkg = JSON.parse(engine.decodeString(fs.readFile(pkgP))); } catch {}
         if (pkg) {
-            for (const field of ['dependencies', 'devDependencies'] as const) {
+            for (const field of ['dependencies'] as const) {
                 const deps = pkg[field];
                 if (!deps || typeof deps !== 'object') continue;
                 for (const [name, version] of Object.entries(deps)) {

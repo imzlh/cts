@@ -33,7 +33,7 @@ export class ModuleCompiler {
         // Install global require + internal bridge
         installGlobalRequire(
             (entry) => this.cjs.mkRequire(entry),
-            resolver.entry,
+            () => resolver.entry,
         );
         installInternalBridge(
             (entry) => this.cjs.mkRequire(entry),

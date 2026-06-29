@@ -146,15 +146,27 @@ export function resolveWinBinEntry(cmdPath: string): string | null {
         const content = engine.decodeString(fs.readFile(cmdPath));
         const dir = dirname(cmdPath);   // dirname already normalizes backslashes internally
 
+        const tryAbs = (abs: string): string | null => {
+            if (fs.exists(abs)) {
+                if (JS_EXT.test(abs)) return abs;
+                const shimEntry = resolveUnixBinEntry(abs);
+                if (shimEntry) return shimEntry;
+            }
+            for (const ext of ['.js', '.mjs', '.cjs']) {
+                const withExt = abs + ext;
+                if (fs.exists(withExt)) return withExt;
+            }
+            return null;
+        };
+
         const tryRel = (raw: string): string | null => {
             let rel = toPosixPath(raw);
             // %~dp0 already includes the trailing slash, while %dp0% wrappers often
             // write an extra slash after the variable.  Strip any leading separator
             // left by the matcher before joining with the wrapper directory.
             rel = rel.replace(/^[/\\]+/, '');
-            if (!JS_EXT.test(rel)) return null;
             const abs = normalizePath(joinPaths(dir, rel));
-            return fs.exists(abs) ? abs : null;
+            return tryAbs(abs);
         };
 
         // npm/pnpm/yarn wrappers on Windows commonly look like:
@@ -192,7 +204,7 @@ export function resolveWinBinEntry(cmdPath: string): string | null {
  */
 export function resolveUnixBinEntry(shPath: string): string | null {
     try {
-        const content = engine.decodeString(fs.readFile(shPath)).slice(0, 1024);
+        const content = engine.decodeString(fs.readFile(shPath));
         const lines = content.split('\n');
         const first = lines[0] || '';
         if (first.startsWith('#!')) {
@@ -202,13 +214,16 @@ export function resolveUnixBinEntry(shPath: string): string | null {
                 return shPath;
         }
         const dir = dirname(shPath);
-        // exec node  "$basedir/../pkg/bin/cli.js"
-        const m = content.match(/"\$basedir[/\\]([^"\n\r]+)/);
-        if (!m) return null;
-        const rel = m[1]!;
-        if (!JS_EXT.test(rel)) return null;
-        const abs = normalizePath(joinPaths(dir, rel));
-        return fs.exists(abs) ? abs : null;
+        // npm/pnpm wrappers may reference $basedir/node first, then the real JS entry.
+        // Scan all $basedir-relative targets and return the first existing JS file.
+        const re = /["']?\$basedir[/\\]([^"' \t\n\r]+)/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(content)) !== null) {
+            const rel = m[1]!;
+            if (!JS_EXT.test(rel)) continue;
+            const abs = normalizePath(joinPaths(dir, rel));
+            if (fs.exists(abs)) return abs;
+        }
+        return null;
     } catch { return null; }
 }
-

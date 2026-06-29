@@ -8,7 +8,6 @@ import type { OxcTranspiler } from './oxc';
 import { extractImports, SCANNABLE, WASM_EXT } from './scan';
 import { getMemoryTier } from './utils/tier';
 
-const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const asyncfs = import.meta.use('asyncfs');
 const wasm = import.meta.use('wasm');
@@ -33,6 +32,10 @@ async function extractImportsFast(
         }
     }
     return extractImports(source, isTs);
+}
+
+function hasImportSyntax(source: string): boolean {
+    return source.includes('import') || source.includes('export') || source.includes('require');
 }
 
 // ---------------------------------------------------------------------------
@@ -158,10 +161,10 @@ export class DepScanner {
                         this.seen.add(info.specPath);
                         this.found.push({ specPath: info.specPath, localPath: info.localPath });
 
-                        if (fs.exists(info.localPath) && (SCANNABLE.has(extname(info.localPath)) || extname(info.localPath) === WASM_EXT)) {
-                            const children = await this.parseOne(info.specPath, info.localPath);
-                            for (const child of children) enqueue(child.spec, info.specPath);
-                        }
+                        // parseOne self-gates on extension and tolerates a missing
+                        // file (readFile failure → []), so no extra fs.exists stat.
+                        const children = await this.parseOne(info.specPath, info.localPath);
+                        for (const child of children) enqueue(child.spec, info.specPath);
                     }
                 } catch (e) {
                     this.prog?.bumpResolved();
@@ -217,6 +220,7 @@ export class DepScanner {
         try {
             const bytes = await asyncfs.readFile(localPath);
             const src = engine.decodeString(bytes);
+            if (!hasImportSyntax(src)) return [];
             let imports: string[];
             if (this.scanWorker) {
                 imports = await this.scanWorker(src, localPath);

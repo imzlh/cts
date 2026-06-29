@@ -21,7 +21,7 @@ import { DataHandler }  from './protocols/data';
 import { LockStore }    from '../lock';
 import { isBuiltinSpecifier } from './builtins';
 import { runAsync, runSync } from '../flow';
-import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative } from '../utils/path';
+import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath } from '../utils/path';
 import { resolveFile } from '../utils/io';
 import { detectFormat } from './pkg';
 import { guessFileKind, applyAttrType } from './protocols/base';
@@ -152,18 +152,13 @@ export class ModuleResolver {
     async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
 
-        if (spec.includes('\\')) spec = spec.replace(/\\/g, '/');
+        if (spec.includes('\\') || spec[1] === ':') spec = canonicalizePath(spec);
 
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const transient = this.isTransientResolve(attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
         if (sourceHit) return sourceHit;
-
-        const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
-        if (localPreferred) {
-            return this.rememberResolved(mapped, parent, localPreferred, attr);
-        }
 
         // L1
         const srcKey = transient ? undefined : this.lock.getSourceByKey(sourceKey);
@@ -177,6 +172,11 @@ export class ModuleResolver {
                 if (!this.mainEntry) this.mainEntry = final.specPath;
                 return final;
             }
+        }
+
+        const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
+        if (localPreferred) {
+            return this.rememberResolved(mapped, parent, localPreferred, attr);
         }
 
         // L2
@@ -243,9 +243,10 @@ export class ModuleResolver {
     resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
-        // Normalize Windows backslashes to forward slashes for consistent handling.
+        // Normalize Windows backslashes to forward slashes and upper-case the
+        // drive letter so a case-insensitive volume can't split cache keys.
         // Must happen before import map lookup, protoOf check, and dispatch.
-        if (spec.includes('\\')) spec = spec.replace(/\\/g, '/');
+        spec = canonicalizePath(spec);
 
         // Fast path: exact (spec, parent) seen before — skip import map + L1/L2/dispatch
         if (!attr) {
@@ -263,11 +264,6 @@ export class ModuleResolver {
         const sourceHit = this.sourceInfoCache.get(sourceKey);
         if (sourceHit) return sourceHit;
 
-        const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
-        if (localPreferred) {
-            return this.rememberResolved(mapped, parent, localPreferred, attr);
-        }
-
         // L1 — source index: (mapped, parent) → specPath we've seen before
         const srcKey = transient ? undefined : this.lock.getSourceByKey(sourceKey);
         if (srcKey) {
@@ -282,6 +278,11 @@ export class ModuleResolver {
                 if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
                 return final;
             }
+        }
+
+        const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
+        if (localPreferred) {
+            return this.rememberResolved(mapped, parent, localPreferred, attr);
         }
 
         // L2 — module index: for canonical specifiers, check without dispatching
@@ -487,7 +488,7 @@ export class ModuleResolver {
 
     private isUsableInfo(info: ModuleInfo): boolean {
         const proto = protoOf(info.specPath);
-        // npm/node/jsr/http/data packages live in cacheDir or are runtime-provided — always usable
+        // npm/jsr/http/data packages live in cacheDir or are runtime-provided — always usable
         if (proto && proto !== 'file') return true;
         // Local files: stat cache avoids repeated sync syscalls on hot path
         const cached = this.statCache.get(info.localPath);

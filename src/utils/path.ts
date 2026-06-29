@@ -12,6 +12,20 @@ export function toPosixPath(p: string): string {
     return p.includes('\\') ? p.replace(/\\/g, '/') : p;
 }
 
+/**
+ * Canonicalise a path/specifier so a case-insensitive Windows volume cannot
+ * split cache keys: backslashes → '/', and a leading drive letter is upper-cased
+ * ("c:/x" and "C:/x" are the same file). No-op for paths without a drive prefix.
+ */
+export function canonicalizePath(p: string): string {
+    if (p.includes('\\')) p = p.replace(/\\/g, '/');
+    if (p.length >= 2 && p[1] === ':') {
+        const c = p.charCodeAt(0);
+        if (c >= 97 && c <= 122) p = p[0]!.toUpperCase() + p.slice(1); // a-z
+    }
+    return p;
+}
+
 /** Return the current working directory, always with POSIX separators. */
 export function cwd(): string {
     return toPosixPath(String(os.cwd));

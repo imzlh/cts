@@ -221,6 +221,18 @@ export class LockStore {
         return { specPath: sp, localPath: r.local, format: r.fmt as ModuleFormat, fileKind: r.kind as FileKind };
     }
 
+    findModuleSpecsByPrefix(prefix: string): string[] {
+        const specs = new Set<string>();
+        for (const spec of this.pendingModules.keys()) {
+            if (spec.startsWith(prefix)) specs.add(spec);
+        }
+        const rows = this.query('SELECT spec FROM modules WHERE spec LIKE ?', [`${prefix}%`]);
+        for (const row of rows) {
+            if (typeof row.spec === 'string') specs.add(row.spec);
+        }
+        return [...specs];
+    }
+
     getSource(spec: string, parent: string): string | undefined {
         return this.getSourceByKey(`${spec}\0${parent}`);
     }

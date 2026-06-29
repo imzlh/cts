@@ -429,10 +429,11 @@ async function execBinary(resolved: ResolvedBin, args: string[], env: Record<str
         }
         // Unix fallback: make executable
         try { fs.chmod(resolved.binPath, 0o755); } catch {}
+        return rawExec([resolved.binPath, ...args], mergedEnv, cwd);
     }
 
     // Run the JS entry through the same CLI path as user files.
-    return rawExec([os.exePath, 'run', resolved.entry, ...args], mergedEnv, cwd);
+    return rawExec([os.exePath, 'run', `--lock-dir=${cwd}`, resolved.entry, ...args], mergedEnv, cwd);
 }
 
 async function rawExec(argv: string[], env: Record<string, string>, cwd: string): Promise<number> {

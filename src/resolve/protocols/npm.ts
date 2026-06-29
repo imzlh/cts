@@ -4,7 +4,7 @@ import type { RuntimeConfig, ModuleInfo, ModuleFormat } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
-import { joinPaths, dirname, normalizePath, toPosixPath, pathRoot, cwd } from '../../utils/path';
+import { joinPaths, dirname, basename, normalizePath, toPosixPath, pathRoot, cwd } from '../../utils/path';
 import { readText, resolveFile } from '../../utils/io';
 declare const URL: any;
 import { matchLatestVersion, compareVersions, safeParse, fmtBytes } from '../../utils/misc';
@@ -429,18 +429,79 @@ export class NpmHandler implements ProtocolHandler {
     private localLookupBase(parent?: string): string {
         if (!parent) return cwd();
         const owner = this.findOwningPackageDir(parent);
-        if (owner) return owner;
+        if (owner) return this.realPath(owner) ?? owner;
         if (parent.startsWith('npm:')) return parent;
-        return dirname(parent);
+        return dirname(this.parentFsPath(parent));
+    }
+
+    private realPath(path: string): string | null {
+        try { return normalizePath(fs.realpath(path)); }
+        catch { return null; }
+    }
+
+    private parentFsPath(parent: string): string {
+        let path = parent.startsWith('file://') ? parent.slice(7) : parent;
+        if (/^\/[a-zA-Z]:/.test(path)) path = path.slice(1);
+        return normalizePath(path);
+    }
+
+    private resolvedParentLocalPath(parent?: string): string | null {
+        if (!parent?.startsWith('npm:')) return null;
+        const info = this.cfg.lockStore?.getModule(parent);
+        if (!info?.localPath) return null;
+        const localPath = normalizePath(info.localPath);
+        const cacheRoot = normalizePath(this.cacheDir);
+        return localPath === cacheRoot || localPath.startsWith(cacheRoot + '/') ? null : localPath;
+    }
+
+    private pushNodeModulesSearchDirs(startDir: string, out: string[], seen: Set<string>): void {
+        let dir = normalizePath(startDir);
+        const root = pathRoot(dir);
+        while (dir) {
+            const candidate = basename(dir) === 'node_modules' ? dir : joinPaths(dir, 'node_modules');
+            if (!seen.has(candidate)) {
+                seen.add(candidate);
+                out.push(candidate);
+            }
+            if (dir === root) break;
+            const up = dirname(dir);
+            if (up === dir) break;
+            dir = up;
+        }
+    }
+
+    private isVirtualProjectNodeModulesPath(path: string): boolean {
+        const norm = normalizePath(path);
+        return /\/node_modules\/\.[^/]+(?:\/|$)/.test(norm) && !norm.includes('/.pnpm/');
+    }
+
+    private lockedVersionForRange(name: string, range: string): string | null {
+        const lock = this.cfg.lockStore;
+        if (!lock) return null;
+        const prefix = `npm:${name}@`;
+        const specs = lock.findModuleSpecsByPrefix(prefix);
+        const versions = new Set<string>();
+        for (const spec of specs) {
+            try {
+                const parsed = parseNpmSpec(spec);
+                if (parsed.name === name && parsed.version) versions.add(parsed.version);
+            } catch {}
+        }
+        if (!versions.size) return null;
+        const list = [...versions];
+        return matchLatestVersion(list, range)
+            ?? (list.includes(range) ? range : null);
     }
 
     private parentOrigin(parent?: string): 'cache' | 'node_modules' | 'project' | 'none' {
         if (!parent) return 'none';
-        const norm = normalizePath(parent);
+        const resolvedLocal = this.resolvedParentLocalPath(parent);
+        const norm = normalizePath(resolvedLocal ?? (parent.startsWith('npm:') ? parent : this.parentFsPath(parent)));
         const cacheRoot = normalizePath(this.cacheDir);
-        if (parent.startsWith('npm:') || norm === cacheRoot || norm.startsWith(cacheRoot + '/')) {
+        if ((parent.startsWith('npm:') && !resolvedLocal) || norm === cacheRoot || norm.startsWith(cacheRoot + '/')) {
             return 'cache';
         }
+        if (this.isVirtualProjectNodeModulesPath(norm)) return 'project';
         if (norm.includes('/node_modules/')) return 'node_modules';
         return 'project';
     }
@@ -451,17 +512,27 @@ export class NpmHandler implements ProtocolHandler {
         if (cached !== undefined) return cached;
 
         const search: string[] = [];
+        const seen = new Set<string>();
+        const addSearchBase = (base?: string | null) => {
+            if (!base) return;
+            const normBase = normalizePath(base);
+            const real = this.realPath(base);
+            // For pnpm-linked package entries (for example .pnpm/node_modules/foo),
+            // prefer the real package directory first so package-private deps win
+            // over the hoisted virtual .pnpm/node_modules layer.
+            if (real && real !== normBase) {
+                this.pushNodeModulesSearchDirs(real, search, seen);
+            }
+            this.pushNodeModulesSearchDirs(normBase, search, seen);
+        };
         if (parent) {
-            let startDir = parent.startsWith('npm:') ? this.cacheDir : dirname(parent);
-            const root = pathRoot(startDir);
-            while (startDir && startDir !== root) {
-                search.push(joinPaths(startDir, 'node_modules'));
-                const up = dirname(startDir);
-                if (up === startDir) break;
-                startDir = up;
+            if (parent.startsWith('npm:')) addSearchBase(this.findOwningPackageDir(parent) ?? this.cacheDir);
+            else {
+                addSearchBase(dirname(this.parentFsPath(parent)));
+                addSearchBase(this.findOwningPackageDir(parent));
             }
         }
-        search.push(joinPaths(cwd(), 'node_modules'));
+        addSearchBase(cwd());
         for (const sp of search) {
             const p = joinPaths(sp, name);
             try {
@@ -479,6 +550,8 @@ export class NpmHandler implements ProtocolHandler {
     private findOwningPackageDir(parent: string): string | null {
         if (!parent) return null;
         if (parent.startsWith('npm:')) {
+            const resolvedLocal = this.resolvedParentLocalPath(parent);
+            if (resolvedLocal) return this.findOwningPackageDir(resolvedLocal);
             const { name, version } = parseNpmSpec(parent);
             if (/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
                 const pkgDir = joinPaths(this.cacheDir, `${name}@${version}`);
@@ -486,11 +559,11 @@ export class NpmHandler implements ProtocolHandler {
             }
             return null;
         }
-        let dir = dirname(parent);
+        let dir = dirname(this.parentFsPath(parent));
         const root = pathRoot(dir);
         while (dir && dir !== root) {
             const pkgPath = joinPaths(dir, 'package.json');
-            if (fs.exists(pkgPath)) return dir;
+            if (!this.isVirtualProjectNodeModulesPath(dir) && fs.exists(pkgPath)) return dir;
             const up = dirname(dir);
             if (up === dir) break;
             dir = up;
@@ -534,14 +607,19 @@ export class NpmHandler implements ProtocolHandler {
 
     private *ensureInstalled(name: string, version: string, parent?: string, onProgress?: ProgressCallback): Flow<{ dir: string; resolvedVer: string }> {
         const origin = this.parentOrigin(parent);
+        const locked = this.lockedVersionForRange(name, version);
+        if (locked) {
+            const lockedDir = joinPaths(this.cacheDir, `${name}@${locked}`);
+            const lockedExists = yield { type: StepType.FS_EXISTS, path: lockedDir };
+            if (lockedExists) {
+                return { dir: lockedDir, resolvedVer: locked };
+            }
+        }
         if (origin !== 'cache') {
             const local = this.findLocal(name, parent);
             if (local) {
                 const pkg = readPkg(local);
                 return { dir: local, resolvedVer: pkg?.version ?? version };
-            }
-            if (origin === 'node_modules') {
-                throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${name}" from "${parent}" in local node_modules graph`);
             }
         }
         if (/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {

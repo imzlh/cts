@@ -15,6 +15,7 @@ import { safeParse } from '../utils/misc';
 import { log } from '../utils/log';
 import { err, ErrorKind } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
+import { isWindows } from '../utils/index';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -61,6 +62,22 @@ interface ResolvedCjsRequest {
 // ---------------------------------------------------------------------------
 
 let _ctxId = 0;
+const INTERNAL_ID = Symbol('cts.cjs.id');
+const INTERNAL_FILENAME = Symbol('cts.cjs.filename');
+
+type InternalCjsModule = CjsModule & {
+    [INTERNAL_ID]: string;
+    [INTERNAL_FILENAME]: string;
+    path?: string;
+};
+
+function toHostPath(path: string): string {
+    return isWindows && path.includes('/') ? path.replace(/\//g, '\\') : path;
+}
+
+function getInternalFilename(mod: CjsModule): string {
+    return (mod as InternalCjsModule)[INTERNAL_FILENAME] ?? mod.filename;
+}
 const _dirPaths = new Map<string, string[]>(); // dir → node_modules search list
 
 export function buildPaths(dir: string): string[] {
@@ -81,6 +98,12 @@ export function buildPaths(dir: string): string[] {
 /** Clear the directory paths cache */
 export function clearDirPathsCache(): void {
     _dirPaths.clear();
+}
+
+function normalizeCJSExport(obj: any) {
+    if (typeof obj == 'object' && !Object.getPrototypeOf(obj)) {
+        return { ...obj };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,12 +163,16 @@ export class CjsLoader {
 
     private make(filename: string, parent: CjsModule | null): CjsModule {
         const dir  = dirname(filename);
-        const mod: CjsModule = {
-            id: filename, filename, loaded: false,
+        const visibleFilename = toHostPath(filename);
+        const mod: InternalCjsModule = {
+            id: visibleFilename, filename: visibleFilename, loaded: false,
             exports: Object.create(null),   // plain object, not Object.prototype
             require: null as any,
             children: [], parent,
-            paths: buildPaths(dir),
+            paths: buildPaths(dir).map(toHostPath),
+            [INTERNAL_ID]: filename,
+            [INTERNAL_FILENAME]: filename,
+            path: toHostPath(dir),
         };
         mod.require = this.mkRequire(filename, mod);
         if (parent) parent.children.push(mod);
@@ -153,11 +180,15 @@ export class CjsLoader {
     }
 
     private synth(filename: string): CjsModule {
+        const dir = dirname(filename);
         return {
-            id: filename, filename, loaded: true,
+            id: toHostPath(filename), filename: toHostPath(filename), loaded: true,
             exports: Object.create(null), require: null as any,
-            children: [], parent: null, paths: buildPaths(dirname(filename)),
-        };
+            children: [], parent: null, paths: buildPaths(dir).map(toHostPath),
+            [INTERNAL_ID]: filename,
+            [INTERNAL_FILENAME]: filename,
+            path: toHostPath(dir),
+        } as InternalCjsModule;
     }
 
     // -------------------------------------------------------------------------
@@ -165,7 +196,7 @@ export class CjsLoader {
     // -------------------------------------------------------------------------
 
     private exec(mod: CjsModule): void {
-        const ext = extname(mod.filename);
+        const ext = extname(getInternalFilename(mod));
         if (ext === '.json') { this.execJson(mod); return; }
         if (ext === '.node') {
             this.execNodeAddon(mod);
@@ -175,30 +206,33 @@ export class CjsLoader {
     }
 
     private execNodeAddon(mod: CjsModule): void {
+        const filename = getInternalFilename(mod);
         try {
-            mod.exports = napi.dlopen(mod.filename);
+            mod.exports = napi.dlopen(filename);
             mod.loaded = true;
         } catch (e) {
-            this.cache.delete(mod.filename);
-            throw err(ErrorKind.Generic, `Error loading native addon '${mod.filename}': ${e}`);
+            this.cache.delete(filename);
+            throw err(ErrorKind.Generic, `Error loading native addon '${filename}': ${e}`);
         }
     }
 
     private execJson(mod: CjsModule): void {
+        const filename = getInternalFilename(mod);
         try {
-            mod.exports = safeParse(engine.decodeString(fs.readFile(mod.filename)));
+            mod.exports = safeParse(engine.decodeString(fs.readFile(filename)));
             mod.loaded  = true;
         } catch (e) {
-            this.cache.delete(mod.filename);
-            throw err(ErrorKind.SyntaxError, `JSON parse error in '${mod.filename}': ${e}`);
+            this.cache.delete(filename);
+            throw err(ErrorKind.SyntaxError, `JSON parse error in '${filename}': ${e}`);
         }
     }
 
     private execJs(mod: CjsModule): void {
-        let src = engine.decodeString(fs.readFile(mod.filename));
+        const filename = getInternalFilename(mod);
+        let src = engine.decodeString(fs.readFile(filename));
         // Transform TS/ESM source for CJS execution if a transformer is available
         if (this.deps.prepareSource) {
-            const transformed = this.deps.prepareSource(src, mod.filename);
+            const transformed = this.deps.prepareSource(src, filename);
             if (transformed !== null) src = transformed;
         }
         this.execWithSource(mod, src);
@@ -207,13 +241,14 @@ export class CjsLoader {
     private execWithSource(mod: CjsModule, src: string): void {
         if (src.startsWith('#!')) src = src.slice(src.indexOf('\n'));
 
+        const filename = getInternalFilename(mod);
         const key = `__cts${_ctxId++}`;
         const ctx = {
             exports:    mod.exports,
             require:    mod.require,
             module:     mod,
             __filename: mod.filename,
-            __dirname:  dirname(mod.filename),
+            __dirname:  toHostPath(dirname(filename)),
         };
         Reflect.set(globalThis, key, ctx);
 
@@ -227,13 +262,13 @@ export class CjsLoader {
                 `globalThis[${k}].module,` +
                 `globalThis[${k}].__filename,` +
                 `globalThis[${k}].__dirname);`;
-            engine.eval(wrapper, mod.filename,
+            engine.eval(wrapper, filename,
                 engine.EVAL_NEW_BACKTRACE | engine.EVAL_GLOBAL);
             mod.loaded = true;
         } catch (e) {
-            this.cache.delete(mod.filename);
-            log.debug('cjs', () => `eval error: ${mod.filename}`, e);
-            throw err(ErrorKind.Generic, `Error loading '${mod.filename}': ${e}`);
+            this.cache.delete(filename);
+            log.debug('cjs', () => `eval error: ${filename}`, e);
+            throw err(ErrorKind.Generic, `Error loading '${filename}': ${e}`);
         } finally {
             Reflect.deleteProperty(globalThis, key);
         }
@@ -275,7 +310,7 @@ export class CjsLoader {
             const searchIn = opts?.paths ?? [parentPath];
             for (const p of searchIn) {
                 const r = self.resolveId(id, p);
-                if (r) return r.path;
+                if (r) return toHostPath(r.path);
             }
             throw err(ErrorKind.ModuleNotFound, `Cannot resolve module '${id}'`);
         };
@@ -311,7 +346,7 @@ export class CjsLoader {
 
         const result = this.deps.loadEsmSync(localPath, specPath);
         const mod = this.synth(localPath);
-        mod.exports = 'default' in result ? result['default'] : Object(result);
+        mod.exports = normalizeCJSExport('default' in result ? result['default'] : result);
         this.esmInteropCache.set(cacheKey, mod);
         return mod.exports;
     }
@@ -329,17 +364,32 @@ export class CjsLoader {
         const ns = this.deps.loadEsmSync(localPath, `node:${name}`);
 
         const mod = this.synth(localPath);
-        // Builtins: spread named exports, keep default as the default export
-        mod.exports = Object.assign(Object.create(null), ns);
-        if ('default' in ns && ns.default) {
-            if (typeof ns.default === 'object') {
-                Object.assign(mod.exports, ns.default);
-            } else if (typeof ns.default === 'function') {
-                mod.exports = ns.default;
-                for (const k of Object.keys(ns)) {
-                    if (k !== 'default') (mod.exports as any)[k] = ns[k];
-                }
+        const copyMissingExports = (target: any) => {
+            for (const k of Object.keys(ns)) {
+                if (k === 'default' || k in target) continue;
+                const desc = Object.getOwnPropertyDescriptor(ns, k);
+                if (!desc) continue;
+                try {
+                    Object.defineProperty(target, k, desc);
+                } catch {}
             }
+        };
+        // Builtins should preserve the prototype of their default export when one exists,
+        // otherwise CommonJS consumers observe a null-prototype object unlike Node.js.
+        if ('default' in ns && ns.default) {
+            if (typeof ns.default === 'function') {
+                mod.exports = ns.default;
+                copyMissingExports(mod.exports);
+            } else if (typeof ns.default === 'object') {
+                mod.exports = Object.isExtensible(ns.default)
+                    ? ns.default
+                    : Object.assign({}, ns.default);
+                copyMissingExports(mod.exports);
+            } else {
+                mod.exports = ns.default;
+            }
+        } else {
+            mod.exports = Object.assign({}, ns);
         }
         this.builtinCache.set(name, mod);
         return mod;

@@ -55,7 +55,7 @@ export class TypeScriptRuntime {
 
         this.compiler = new ModuleCompiler(this.resolver, cfg);
 
-        this.oxc = tryLoadOxc();
+        this.oxc = cfg.enableOxc === false ? null : tryLoadOxc();
         if (this.oxc) this.compiler.setOxc(this.oxc);
 
         // Install engine hooks
@@ -118,7 +118,7 @@ export class TypeScriptRuntime {
         scanFn: (scanner: DepScanner) => Promise<ScanResult>,
     ): Promise<ScanResult> {
         const prog = this.config.silent ? null : new PrecacheProgress(6);
-        const driver = new PrecompileDriver();
+        const driver = new PrecompileDriver(this.oxc);
         const scanner = new DepScanner(this.resolver, this.config, prog, this.oxc, driver.scanFile.bind(driver));
 
         let result: ScanResult;
@@ -148,29 +148,38 @@ export class TypeScriptRuntime {
         }
 
         const scannable = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
-        const toCompile = result.modules.filter(m => {
+        const scannableModules = result.modules.filter(m => {
             const dot = m.localPath.lastIndexOf('.');
             return dot !== -1 && scannable.has(m.localPath.slice(dot));
+        });
+        const toCompile = scannableModules.filter(m => {
+            const remote = isRemote(m.specPath);
+            return !this.compiler.esm.jsc.hasFresh(m.localPath, remote);
         });
 
         if (toCompile.length > 0) {
             try {
-                log.info(`[precache] precompile begin: ${toCompile.length} modules`);
+                log.info(`[precache] precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
                 prog?.setCompileProgress(0, toCompile.length);
-                const bytecodes = await driver.precompile(toCompile, (done, total) => {
-                    prog?.setCompileProgress(done, total);
-                });
-                for (const [localPath, bc] of bytecodes)
-                    this.compiler.esm.jsc.setMemory(localPath, bc);
-                for (const m of toCompile) {
-                    if (isRemote(m.specPath))
-                        this.compiler.esm.jsc.persistMemory(m.localPath);
-                }
-                log.debug('precompile', () => `${bytecodes.size}/${toCompile.length} modules precompiled`);
-                log.info(`[precache] precompile end: ${bytecodes.size}/${toCompile.length} bytecodes`);
+                const remoteSet = new Set<string>();
+                for (const m of toCompile) if (isRemote(m.specPath)) remoteSet.add(m.localPath);
+                // Stream each bytecode straight to disk and drop it — never hold
+                // the whole graph's bytecode in memory (peak RSS bound).
+                let written = 0;
+                await driver.precompile(
+                    toCompile,
+                    (done, total) => prog?.setCompileProgress(done, total),
+                    (localPath, bc) => {
+                        this.compiler.esm.jsc.persistBytecode(localPath, bc, remoteSet.has(localPath));
+                        written++;
+                    },
+                );
+                log.info(`[precache] precompile end: ${written}/${toCompile.length} bytecodes`);
             } catch (e) {
                 log.warn('precompile', () => `failed: ${errMsg(e)}`);
             }
+        } else if (scannableModules.length > 0) {
+            log.info(`[precache] precompile skipped: ${scannableModules.length} bytecodes fresh`);
         }
 
         log.info('[precache] worker terminate begin');
@@ -238,8 +247,6 @@ export class TypeScriptRuntime {
 
     async loadEntry(path: string, extra: Record<string, any> = {}, lang = 'ts'): Promise<CModuleEngine.Module> {
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
-        info.fileKind = 'source';
-        info.format = 'esm';
         const meta: Record<string, any> = { lang, ...extra };
         fillMeta(meta, info, this.resolver);
         meta.main = true;

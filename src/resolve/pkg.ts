@@ -241,7 +241,10 @@ export function resolveMain(ctx: ResolveCtx): ResolvedPath | null {
         const resolved = resolveTarget(ctx, ctx.pkg.main, undefined, 'require');
         if (resolved) return resolved;
     }
-    for (const f of ['index.js','index.mjs','index.cjs','index.ts']) {
+    const fallbacks = ctx.forceCjs
+        ? ['index.js', 'index.json', 'index.node', 'index.mjs', 'index.cjs', 'index.ts']
+        : ['index.js', 'index.mjs', 'index.cjs', 'index.ts'];
+    for (const f of fallbacks) {
         const p = joinPaths(ctx.pkgDir, f);
         if (fs.exists(p)) return { path: p, format: detectFormat(p) };
     }

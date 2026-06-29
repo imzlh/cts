@@ -164,11 +164,16 @@ function normalizeNpmSpec(spec: string): string {
  */
 export function installGlobalRequire(
     mkRequire: (parentPath: string) => any,
-    entry: string,
+    getEntry: () => string,
 ): void {
     let requireFn: Function | undefined;
+    let cachedEntry = '';
     const getter = () => {
-        if (!requireFn) requireFn = mkRequire(entry);
+        const entry = getEntry();
+        if (!requireFn || entry !== cachedEntry) {
+            cachedEntry = entry;
+            requireFn = mkRequire(entry);
+        }
         return requireFn;
     };
 

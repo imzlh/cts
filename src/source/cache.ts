@@ -100,6 +100,30 @@ export class JscCache {
     }
 
     /**
+     * Fast freshness check used by precache before scheduling precompile work.
+     * This avoids deserializing bytecode just to decide whether the file should
+     * be regenerated.
+     */
+    hasFresh(localPath: string, remote: boolean, cachedMtime?: number): boolean {
+        if (remote) {
+            try { return !!fs.stat(localPath + '.jsc'); }
+            catch { return false; }
+        }
+
+        const paths = this.localCachePath(localPath);
+        if (!paths) return false;
+
+        try {
+            const cachedMt = engine.decodeString(fs.readFile(paths.mt));
+            const currentMt = String(cachedMtime ?? fs.stat(localPath).mtim);
+            if (cachedMt !== currentMt) return false;
+            return !!fs.stat(paths.jsc);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
      * Clear all in-memory bytecode (for memory cleanup)
      */
     clearMemory(): void {
@@ -112,6 +136,27 @@ export class JscCache {
 
     setMemory(localPath: string, bc: ArrayBuffer): void {
         this.memory.set(localPath, bc);
+    }
+
+    // -------------------------------------------------------------------------
+    // Persist bytecode straight to disk without keeping it in memory.
+    // Used by precache: remote → next to file, local → cacheDir + mtime sidecar.
+    // -------------------------------------------------------------------------
+
+    persistBytecode(localPath: string, bc: ArrayBuffer, remote: boolean): void {
+        if (remote) {
+            const jscPath = localPath + '.jsc';
+            try { ensureDir(dirname(jscPath)); fs.writeFile(jscPath, bc); }
+            catch (e) { log.warn('jsc', `persist failed: ${jscPath}`, e); }
+            return;
+        }
+        const paths = this.localCachePath(localPath);
+        if (!paths) return;
+        try {
+            ensureDir(dirname(paths.jsc));
+            fs.writeFile(paths.jsc, bc);
+            fs.writeFile(paths.mt, engine.encodeString(String(fs.stat(localPath).mtim)));
+        } catch (e) { log.warn('jsc', `persistBytecode failed: ${paths.jsc}`, e); }
     }
 
     // -------------------------------------------------------------------------
