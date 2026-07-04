@@ -1,6 +1,6 @@
 // shell.ts — shell command parser + bin-wrapper script resolver
 
-import { dirname, joinPaths, normalizePath, toPosixPath } from './utils/path';
+import { dirname, joinPaths, normalizePath, toPosixPath } from './utils';
 
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');

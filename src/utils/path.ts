@@ -7,6 +7,15 @@ import { uname } from './index';
 
 const os = import.meta.use('os');
 
+function isAsciiAlpha(c: number): boolean {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+/** True for "/C:..." — a file:// URL's leading slash sitting in front of a Windows drive letter. */
+export function hasLeadingSlashDrive(p: string): boolean {
+    return p.charCodeAt(0) === 47 /* '/' */ && isAsciiAlpha(p.charCodeAt(1)) && p[2] === ':';
+}
+
 /** Convert a Windows-style path to POSIX separators.  No-op on POSIX paths. */
 export function toPosixPath(p: string): string {
     return p.includes('\\') ? p.replace(/\\/g, '/') : p;
@@ -38,25 +47,28 @@ export function cwd(): string {
  */
 export function pathRoot(p: string): string {
     const s = toPosixPath(p);
-    const m = s.match(/^([a-zA-Z]:)\//);
-    return m ? m[1] + '/' : '/';
+    if (s.length >= 3 && s[1] === ':' && s[2] === '/' && isAsciiAlpha(s.charCodeAt(0))) {
+        return s.slice(0, 2) + '/';
+    }
+    return '/';
 }
 
 export function basename(p: string, ext?: string): string {
-    const s = p.replace(/\\/g, '/').replace(/\/$/, '');
+    let s = p.includes('\\') ? p.replace(/\\/g, '/') : p;
+    if (s.endsWith('/')) s = s.slice(0, -1);
     let r = s.slice(s.lastIndexOf('/') + 1);
     if (ext && r.endsWith(ext)) r = r.slice(0, r.length - ext.length);
     return r;
 }
 
 export function dirname(p: string): string {
-    const s = p.replace(/\\/g, '/');
+    const s = p.includes('\\') ? p.replace(/\\/g, '/') : p;
     const i = s.lastIndexOf('/');
     if (i <= 0) return i === 0 ? '/' : '.';
     const dir = s.slice(0, i);
     // On Windows, "C:" (without trailing slash) means "current dir on C:",
     // not the root.  Ensure we always return "C:/" for drive-root children.
-    if (/^[a-zA-Z]:$/.test(dir)) return dir + '/';
+    if (dir.length === 2 && dir[1] === ':' && isAsciiAlpha(dir.charCodeAt(0))) return dir + '/';
     return dir;
 }
 
@@ -70,7 +82,7 @@ export function joinPaths(...parts: string[]): string {
     let out = '';
     for (let p of parts) {
         if (!p) continue;
-        p = p.replace(/\\/g, '/');
+        if (p.includes('\\')) p = p.replace(/\\/g, '/');
         if (!out) { out = p; continue;
         }
         const outSlash = out.endsWith('/');
@@ -115,11 +127,16 @@ export function resolvePath(...parts: string[]): string {
 
 export function isAbsolute(p: string): boolean {
     if (p.startsWith('/')) return true;
-    if (uname.sysname.includes('Windows') && /^[a-zA-Z]:[/\\]/.test(p)) return true;
+    if (uname.sysname.includes('Windows') && p.length >= 3 && p[1] === ':' && (p[2] === '/' || p[2] === '\\') && isAsciiAlpha(p.charCodeAt(0))) {
+        return true;
+    }
     return false;
 }
 
-/** Check if a specifier is a relative import (./ or ../, with either separator). */
+/** Check if a specifier is a relative import (./ or ../, with either separator).
+ *  Also matches the bare tokens "." and ".." — e.g. require("..") for a
+ *  directory-parent import — which have no trailing separator to prefix-match. */
 export function isRelative(s: string): boolean {
-    return s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');
+    return s === '.' || s === '..' ||
+        s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');
 }

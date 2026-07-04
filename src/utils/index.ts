@@ -1,8 +1,10 @@
-// utils/index.ts — re-export everything
+// utils/index.ts — barrel re-export of all utils modules
+export * from './platform';
 export * from './path';
 export * from './io';
 export * from './misc';
-
-const os = import.meta.use('os');
-export const uname = os.uname();
-export const isWindows = uname.sysname.includes('Windows');
+export * from './bin';
+export * from './log';
+export * from './lru';
+export * from './tier';
+export * from './progress';

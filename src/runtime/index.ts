@@ -3,26 +3,24 @@
 // Owns the top-level object graph: resolver + compiler + resources.
 // Installs engine hooks, manages precache lifecycle, loads entry/polyfill.
 
-import type { RuntimeConfig, NodeBuiltinResolver, ModuleInfo, ModuleFormat, FileKind } from '../types';
-import type { ScanResult } from '../deps';
-import { ModuleResolver } from '../resolve/index';
 import { ModuleCompiler } from '../compile/index';
-import { DepScanner } from '../deps';
 import { createConfig } from '../config';
-import { PrecompileDriver, isCompilerWorker, runCompilerWorker } from '../precompile';
-import { PrecacheProgress } from '../utils/progress';
-import { ResourceManager, createResourceManager } from './resources';
-import { installEngineHooks } from './hooks';
-import { fillMeta } from './meta';
-import { dirname, normalizePath, isAbsolute, joinPaths, toPosixPath, cwd as posixCwd } from '../utils/path';
-import { writeText, ensureDir, resolveFile } from '../utils/io';
-import { errMsg } from '../utils/misc';
-import { err, ErrorKind, formatError } from '../errors';
-import { guessFileKind } from '../resolve/protocols/base';
-import { uname, isWindows } from '../utils/index';
-import { log } from '../utils/log';
-import { isRemote } from '../source/cache';
+import type { ScanResult } from '../deps';
+import { DepScanner } from '../deps';
+import { formatError } from '../errors';
 import { tryLoadOxc, type OxcTranspiler } from '../oxc';
+import { ParseDriver } from '../parse';
+import { ModuleResolver } from '../resolve/index';
+import { LockStore } from '../lock';
+import { materializeNodeModules } from '../resolve/linker';
+import { guessFileKind } from '../resolve/protocols/base';
+import { parseShellCommand } from '../shell';
+import { isRemote } from '../source/cache';
+import type { FileKind, ModuleFormat, ModuleInfo, NodeBuiltinResolver, RuntimeConfig } from '../types';
+import { PrecacheProgress, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, cwd as posixCwd, resolveFile, toPosixPath, writeText } from '../utils';
+import { installEngineHooks, type EngineHooks } from './hooks';
+import { fillMeta } from './meta';
+import { ResourceManager, createResourceManager } from './resources';
 
 const os = import.meta.use('os');
 const console = import.meta.use('console');
@@ -30,12 +28,48 @@ const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 const process = import.meta.use('process');
 
+const fs = import.meta.use('fs');
+
+/** Nearest ancestor of `start` containing a project manifest, or undefined. */
+function findProjectRoot(start: string): string | undefined {
+    let cur = toPosixPath(start);
+    for (;;) {
+        for (const name of ['deno.json', 'deno.jsonc', 'package.json']) {
+            try { if (fs.exists(joinPaths(cur, name))) return cur; } catch {}
+        }
+        const up = dirname(cur);
+        if (up === cur) return undefined;
+        cur = up;
+    }
+}
+
+/**
+ * Decide where cts.lock lives and whether we may write it. The lock is a
+ * resolution cache, not something to scatter next to every script:
+ *   - --lock-dir           → that dir (writable only when persisting)
+ *   - cno cache (persist)  → project root, else the global cache dir
+ *   - run/eval/repl/test   → read-only; reuse a project lock if present,
+ *                            else the global cache dir (open if there, else
+ *                            purely in-memory). Never writes to disk.
+ */
+function resolveLockTarget(cfg: RuntimeConfig, entryDir?: string): { dir: string; readOnly: boolean } {
+    const persist = cfg.persistLock === true;
+    if (cfg.lockDir) return { dir: cfg.lockDir, readOnly: !persist };
+
+    const projectRoot = findProjectRoot(entryDir ?? os.cwd);
+    if (persist) return { dir: projectRoot ?? cfg.cacheDir, readOnly: false };
+
+    if (projectRoot && LockStore.existsAt(projectRoot)) return { dir: projectRoot, readOnly: true };
+    return { dir: cfg.cacheDir, readOnly: true };
+}
+
 export class TypeScriptRuntime {
     readonly resolver: ModuleResolver;
     readonly compiler: ModuleCompiler;
     readonly config: RuntimeConfig;
     readonly resources: ResourceManager;
     private readonly initHooks: Array<(specPath: string, info: ModuleInfo) => void> = [];
+    private readonly engineHooks: EngineHooks;
     private readonly oxc: OxcTranspiler | null;
 
     /** Register an additional callback to fire after each module's init hook. */
@@ -47,11 +81,14 @@ export class TypeScriptRuntime {
         this.config = cfg;
         this.resources = createResourceManager();
 
-        this.resolver = new ModuleResolver(
-            cfg,
-            cfg.disableLock ? undefined : (cfg.lockDir ?? entryDir ?? os.cwd),
-            cfg.disableLock ?? false,
-        );
+        // Lock location/mode: only `cno cache` persists to disk; run/eval/etc.
+        // are read-only or in-memory, and never in the entry file's directory.
+        if (cfg.disableLock) {
+            this.resolver = new ModuleResolver(cfg, undefined, true);
+        } else {
+            const lock = resolveLockTarget(cfg, entryDir);
+            this.resolver = new ModuleResolver(cfg, lock.dir, lock.readOnly);
+        }
 
         this.compiler = new ModuleCompiler(this.resolver, cfg);
 
@@ -59,10 +96,10 @@ export class TypeScriptRuntime {
         if (this.oxc) this.compiler.setOxc(this.oxc);
 
         // Install engine hooks
-        installEngineHooks(this.resolver, this.compiler, {
+        this.engineHooks = installEngineHooks(this.resolver, this.compiler, {
             onInitHook: (specPath, info) => {
                 for (const fn of this.initHooks) {
-                    try { fn(specPath, info); } catch {}
+                    try { fn(specPath, info); } catch { }
                 }
             },
             onSyntaxError: (e) => this.reportSyntax(e),
@@ -105,21 +142,29 @@ export class TypeScriptRuntime {
     async precache(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
         return this.runPrecache((scanner) =>
             scanner.scan(entrySpecPath, entryLocalPath)
-        );
+        , os.cwd);
     }
 
     async precacheFromSpecifiers(specifiers: string[], dir: string): Promise<ScanResult> {
         return this.runPrecache((scanner) =>
             scanner.scanFromSpecifiers(specifiers, dir)
-        );
+        , dir);
+    }
+
+    async precacheEntryAndSpecifiers(entrySpecPath: string, entryLocalPath: string, specifiers: string[], dir: string): Promise<ScanResult> {
+        return this.runPrecache((scanner) =>
+            scanner.scanEntryAndSpecifiers(entrySpecPath, entryLocalPath, specifiers, dir)
+        , dir);
     }
 
     private async runPrecache(
         scanFn: (scanner: DepScanner) => Promise<ScanResult>,
+        projectDir: string,
     ): Promise<ScanResult> {
         const prog = this.config.silent ? null : new PrecacheProgress(6);
-        const driver = new PrecompileDriver(this.oxc);
-        const scanner = new DepScanner(this.resolver, this.config, prog, this.oxc, driver.scanFile.bind(driver));
+        const parseDriver = new ParseDriver(this.oxc);
+        const scanner = new DepScanner(this.resolver, this.config, prog, this.oxc, parseDriver.scanFile.bind(parseDriver));
+        log.debug('precache', () => `pipeline: scan=${this.oxc ? 'oxc+fallback' : 'fallback-only'}, transform=${this.oxc ? 'oxc+sucrase fallback' : 'sucrase-only'}`);
 
         let result: ScanResult;
         try {
@@ -128,23 +173,49 @@ export class TypeScriptRuntime {
             result = await scanFn(scanner);
             log.debug('deps', () => `scan done in ${Date.now() - scanStarted}ms`);
         } catch (e) {
-            try { this.resolver.rewriteLock(); } catch {}
+            try { this.resolver.rewriteLock(); } catch { }
             prog?.stop();
             this.resources.release();
-            await driver.terminate();
+            await parseDriver.terminate();
             throw e;
         }
 
+        // The scan-phase spinner has nothing left to show once resolution
+        // finishes, and its 200ms redraw loop would otherwise clobber the
+        // scan-error lines below and deferred lifecycle scripts' own
+        // console/child output (both print while the old timer was ticking).
+        // Stopping here — not just at the very end — lets that output print
+        // cleanly, and setCompileProgress() below restarts a fresh spinner
+        // for precompile instead of redrawing stale scan-phase numbers.
+        prog?.stop();
+
         for (const { spec, parent, error } of result.errors)
             log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
-        log.info(`[precache] scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
+        log.debug('precache', () => `scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
         this.resolver.rewriteLock();
 
-        // Run postinstall lifecycle scripts
+        if (this.config.nodeModulesMode !== 'normal') {
+            const nodeModulesMode = this.config.nodeModulesMode;
+            log.debug('precache', () => 'materialize node_modules begin');
+            try {
+                await materializeNodeModules(
+                    result.edges,
+                    nodeModulesMode,
+                    this.config.cacheDir,
+                    projectDir,
+                    (done, total) => prog?.setLinkProgress(done, total),
+                );
+            } catch (e) {
+                log.warn('precache', () => `node_modules materialization failed: ${errMsg(e)}`);
+            }
+            log.debug('precache', () => 'materialize node_modules end');
+        }
+
+        // Run deferred npm lifecycle scripts
         if (!this.config.ignoreScripts) {
-            log.info('[precache] postinstall begin');
-            await this.runPostinstallScripts();
-            log.info('[precache] postinstall end');
+            log.debug('precache', () => 'lifecycle scripts begin');
+            await this.runLifecycleScripts();
+            log.debug('precache', () => 'lifecycle scripts end');
         }
 
         const scannable = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
@@ -159,14 +230,14 @@ export class TypeScriptRuntime {
 
         if (toCompile.length > 0) {
             try {
-                log.info(`[precache] precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
+                log.debug('precache', () => `precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
                 prog?.setCompileProgress(0, toCompile.length);
                 const remoteSet = new Set<string>();
                 for (const m of toCompile) if (isRemote(m.specPath)) remoteSet.add(m.localPath);
                 // Stream each bytecode straight to disk and drop it — never hold
                 // the whole graph's bytecode in memory (peak RSS bound).
                 let written = 0;
-                await driver.precompile(
+                await parseDriver.compileModules(
                     toCompile,
                     (done, total) => prog?.setCompileProgress(done, total),
                     (localPath, bc) => {
@@ -174,35 +245,36 @@ export class TypeScriptRuntime {
                         written++;
                     },
                 );
-                log.info(`[precache] precompile end: ${written}/${toCompile.length} bytecodes`);
+                log.debug('precache', () => `precompile end: ${written}/${toCompile.length} bytecodes`);
             } catch (e) {
                 log.warn('precompile', () => `failed: ${errMsg(e)}`);
             }
         } else if (scannableModules.length > 0) {
-            log.info(`[precache] precompile skipped: ${scannableModules.length} bytecodes fresh`);
+            log.debug('precache', () => `precompile skipped: ${scannableModules.length} bytecodes fresh`);
         }
 
-        log.info('[precache] worker terminate begin');
-        await driver.terminate();
-        log.info('[precache] worker terminate end');
+        log.debug('precache', () => 'worker terminate begin');
+        await parseDriver.terminate();
+        log.debug('precache', () => 'worker terminate end');
         prog?.stop();
         this.resources.release();
         return result;
     }
 
-    private async runPostinstallScripts(): Promise<void> {
-        const scripts = this.resolver.drainPostinstall();
+    private async runLifecycleScripts(): Promise<void> {
+        const scripts = this.resolver.drainLifecycleScripts();
         if (!scripts.length) return;
         const isWin = isWindows;
         const shell = isWin ? 'cmd.exe' : 'sh';
         const shellArg = isWin ? '/c' : '-c';
-        for (const { name, version, dir, script } of scripts) {
-            log.debug('postinstall', () => `${name}@${version}: ${script}`);
+        for (const { name, version, dir, lifecycle, script } of scripts) {
+            log.debug('lifecycle', () => `${lifecycle} ${name}@${version}: ${script}`);
             if (!this.config.silent) {
-                console.log(`  postinstall: ${name}@${version}`);
+                console.log(`  ${lifecycle}: ${name}@${version}`);
             }
             try {
-                const child = process.spawn([shell, shellArg, script], {
+                const argv = this.lifecycleArgv(script, shell, shellArg);
+                const child = process.spawn(argv, {
                     cwd: dir,
                     stdin: 'inherit',
                     stdout: 'inherit',
@@ -211,12 +283,39 @@ export class TypeScriptRuntime {
                 });
                 const info = await child.wait();
                 if (info.exit_status !== 0) {
-                    log.warn('postinstall', () => `${name}@${version} exited with code ${info.exit_status}`);
+                    log.warn('lifecycle', () => `${lifecycle} ${name}@${version} exited with code ${info.exit_status}`);
                 }
             } catch (e) {
-                log.warn('postinstall', () => `${name}@${version} failed: ${errMsg(e)}`);
+                log.warn('lifecycle', () => `${lifecycle} ${name}@${version} failed: ${errMsg(e)}`);
             }
         }
+    }
+
+    /**
+     * A bare "node <file> [args]" lifecycle script — the overwhelming
+     * majority of npm install/postinstall hooks (e.g. esbuild's install.js) — must
+     * run through our own runtime rather than a system `node`: the npm cache
+     * dir is a flat name@version layout, not a node_modules tree, so a real
+     * Node.js can't resolve the package's own sibling optionalDependencies
+     * (e.g. esbuild's platform binary packages) and fails with
+     * "Cannot find module". Inline `node -e/--eval` hooks should become
+     * `cno eval <code>`. Anything else keeps going through the shell as-is.
+     */
+    private lifecycleArgv(script: string, shell: string, shellArg: string): string[] {
+        const segments = parseShellCommand(script);
+        const seg = segments.length === 1 ? segments[0]! : null;
+        if (seg && seg.bin === 'node' && !seg.op) {
+            const [first, second] = seg.args;
+            if (first === '-e' || first === '--eval') {
+                if (second) return [os.exePath, 'eval', second];
+                return [shell, shellArg, script];
+            }
+            if (first?.startsWith('--eval=')) {
+                return [os.exePath, 'eval', first.slice('--eval='.length)];
+            }
+            return [os.exePath, 'run', ...seg.args];
+        }
+        return [shell, shellArg, script];
     }
 
     // -------------------------------------------------------------------------
@@ -286,12 +385,19 @@ export class TypeScriptRuntime {
             return;
         }
         this.compiler.clearLoadedModules();
+        this.engineHooks.clearLoadedModules();
         this.compiler.esm.jsc.clearMemory();
+        this.resolver.clearRuntimeCaches();
         this.resolver.clearHandlerCaches();
     }
 
     private reportSyntax(e: SyntaxError): never {
-        const { source, code, path } = e.cause as { source: SyntaxError; code: string; path: string };
+        const cause = e.cause as { source?: SyntaxError; code?: string; path?: string } | undefined;
+        if (!cause?.source || !cause.code || !cause.path) {
+            log.debug('runtime', () => `reportSyntax: malformed cause, rethrowing`);
+            throw e;
+        }
+        const { source, code, path } = cause;
         const hash = crypto.hexEncode(crypto.md5(engine.encodeString(path)));
         const logPath = `${this.config.cacheDir}/fail-${hash}.log`;
         ensureDir(dirname(logPath));

@@ -1,12 +1,8 @@
 import type { RuntimeConfig } from './types';
 import { ModuleResolver } from './resolve/index';
-import { extname } from './utils/path';
-import { errMsg } from './utils/misc';
-import { log } from './utils/log';
-import { PrecacheProgress } from './utils/progress';
+import { extname, errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName } from './utils';
 import type { OxcTranspiler } from './oxc';
 import { extractImports, SCANNABLE, WASM_EXT } from './scan';
-import { getMemoryTier } from './utils/tier';
 
 const engine = import.meta.use('engine');
 const asyncfs = import.meta.use('asyncfs');
@@ -47,12 +43,24 @@ export interface ScanResult {
     downloaded: number;
     errors: Array<{ spec: string; parent: string; error: string }>;
     modules: Array<{ specPath: string; localPath: string }>;
+    // Parent -> resolved-child edges, used to materialize a real node_modules
+    // tree (node_modules mode). Only npm: children with an eligible parent
+    // (an npm: package, or a synthetic project-root scan seed) are recorded —
+    // see isEligibleParent().
+    edges: Array<{ parentSpecPath: string; name: string; childSpecPath: string; childLocalPath: string }>;
+}
+
+/** Parents worth recording node_modules edges for: real npm packages, and the
+ *  synthetic project-root markers used to seed top-level scans. */
+function isEligibleParent(parent: string): boolean {
+    return parent.startsWith('npm:') || parent.endsWith('/<cache>') || parent.endsWith('/<entry>');
 }
 
 export class DepScanner {
     private readonly seen = new Set<string>();
     private readonly errs: ScanResult['errors'] = [];
     private readonly found: ScanResult['modules'] = [];
+    private readonly edges: ScanResult['edges'] = [];
     private downloaded = 0;
 
     constructor(
@@ -60,7 +68,7 @@ export class DepScanner {
         private readonly cfg: RuntimeConfig,
         private readonly prog: PrecacheProgress | null = null,
         private readonly oxc: OxcTranspiler | null = null,
-        private readonly scanWorker: ((source: string, localPath: string) => Promise<string[]>) | null = null,
+        private readonly parseImports: ((source: string, localPath: string) => Promise<string[]>) | null = null,
     ) { }
 
     async scan(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
@@ -75,13 +83,29 @@ export class DepScanner {
     async scanFromSpecifiers(specifiers: string[], parentDir: string): Promise<ScanResult> {
         this.init();
         if (!specifiers.length) {
-            return { visited: 0, downloaded: 0, errors: [], modules: [] };
+            return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [] };
         }
         const parent = `${parentDir}/<cache>`;
         const seeds: Array<{ spec: string; parent: string }> = [];
         for (const spec of specifiers) {
             seeds.push({ spec, parent });
         }
+        return this.queueLoopInternal(seeds);
+    }
+
+    /**
+     * BFS from the entry file's import graph *and* an explicit specifier set
+     * in one pass. Used by `cno cache <entry>` to also pull in package.json
+     * devDependencies (e.g. dev-tool bins) that aren't reachable from the
+     * entry's static imports but that `cno task` will need to resolve later.
+     */
+    async scanEntryAndSpecifiers(entrySpecPath: string, entryLocalPath: string, specifiers: string[], parentDir: string): Promise<ScanResult> {
+        this.init();
+        const seeds: Array<{ spec: string; parent: string }> = [
+            { spec: entrySpecPath, parent: `${os.cwd}/<entry>` },
+        ];
+        const parent = `${parentDir}/<cache>`;
+        for (const spec of specifiers) seeds.push({ spec, parent });
         return this.queueLoopInternal(seeds);
     }
 
@@ -93,6 +117,7 @@ export class DepScanner {
         this.seen.clear();
         this.errs.length = 0;
         this.found.length = 0;
+        this.edges.length = 0;
         this.downloaded = 0;
     }
 
@@ -111,7 +136,8 @@ export class DepScanner {
         const wakeWaiters: Array<() => void> = [];
 
         const wake = () => {
-            while (wakeWaiters.length) wakeWaiters.shift()!();
+            const waiters = wakeWaiters.splice(0);
+            for (const fn of waiters) fn();
         };
 
         const enqueue = (spec: string, parent: string) => {
@@ -127,7 +153,7 @@ export class DepScanner {
 
         // Guard: empty seed list — nothing to do
         if (pending === 0) {
-            return { visited: 0, downloaded: 0, errors: [], modules: [] };
+            return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [] };
         }
 
         const CONCURRENCY = { low: 4, normal: 8, high: 16 }[getMemoryTier()] ?? 8;
@@ -157,6 +183,27 @@ export class DepScanner {
                     this.prog?.bumpResolved();
                     this.prog?.finishDownload(item.spec);
 
+                    // Record the parent -> resolved-child edge unconditionally
+                    // (even if this child was already visited via a different
+                    // parent) — each parent needs its own node_modules/<name>
+                    // link, even though the child itself is only downloaded
+                    // and scanned once. Gate on the *resolved* specPath being
+                    // npm: (info.specPath, not the raw request item.spec,
+                    // which may be a range/alias/bare-name) and on the parent
+                    // being eligible (an npm: package or a synthetic
+                    // project-root scan seed).
+                    if (info.specPath.startsWith('npm:') && isEligibleParent(item.parent)) {
+                        const name = npmPackageName(info.specPath);
+                        const parentName = item.parent.startsWith('npm:') ? npmPackageName(item.parent) : null;
+                        // Skip package self-references like `axios` importing
+                        // `axios/...` from within axios itself. Materializing
+                        // those into `<pkg>/node_modules/<pkg>` causes an
+                        // infinite self-link chain in soft mode.
+                        if (name && name !== parentName) {
+                            this.edges.push({ parentSpecPath: item.parent, name, childSpecPath: info.specPath, childLocalPath: info.localPath });
+                        }
+                    }
+
                     if (!this.seen.has(info.specPath)) {
                         this.seen.add(info.specPath);
                         this.found.push({ specPath: info.specPath, localPath: info.localPath });
@@ -172,7 +219,12 @@ export class DepScanner {
                     this.errs.push({ spec: item.spec, parent: item.parent, error: errMsg(e) });
                 } finally {
                     pending--;
-                    wake();
+                    // Only wake waiters when all work is done (pending hits 0) so
+                    // they can exit. While in-flight resolves are still pending,
+                    // idle workers should keep sleeping — re-checking queue state
+                    // every time another resolve finishes just burns CPU in a
+                    // busy-loop without making progress.
+                    if (pending === 0) wake();
                 }
             }
         };
@@ -186,7 +238,7 @@ export class DepScanner {
             const e = this.errs.length ? `, ${this.errs.length} error(s)` : '';
             log.info(`✅ ${this.seen.size} modules${e}`);
         }
-        return { visited: this.seen.size, downloaded: this.downloaded, errors: [...this.errs], modules: this.found };
+        return { visited: this.seen.size, downloaded: this.downloaded, errors: [...this.errs], modules: this.found, edges: [...this.edges] };
     }
 
     // -------------------------------------------------------------------------
@@ -222,8 +274,8 @@ export class DepScanner {
             const src = engine.decodeString(bytes);
             if (!hasImportSyntax(src)) return [];
             let imports: string[];
-            if (this.scanWorker) {
-                imports = await this.scanWorker(src, localPath);
+            if (this.parseImports) {
+                imports = await this.parseImports(src, localPath);
             } else {
                 const isTs = /\.[mc]?tsx?$/.test(localPath);
                 imports = await extractImportsFast(src, localPath, isTs, this.cfg.enableOxc !== false ? this.oxc : null);

@@ -93,3 +93,30 @@ function _resolve(base: string, exts: string[]): string {
 }
 
 export function clearResolveCache(): void { cache.clear(); negCache.clear(); }
+
+// ---------------------------------------------------------------------------
+// hardlinkOrCopyDirRecursiveSync — used by node_modules 'hard' mode.
+// Hard-links each file when possible (same-volume, zero-copy, mirrors pnpm's
+// store-linking); falls back to a real copy only when hard-linking fails
+// (typically cross-volume EXDEV). Symlinks in the source are preserved as
+// symlinks rather than dereferenced or hard-linked.
+// ---------------------------------------------------------------------------
+
+export function hardlinkOrCopyDirRecursiveSync(src: string, dest: string): void {
+    ensureDir(dest);
+    for (const entry of fs.readdir(src, true)) {
+        const s = joinPaths(src, entry.name);
+        const d = joinPaths(dest, entry.name);
+        if (entry.isSymbolicLink) {
+            const target = fs.readlink(s);
+            try { fs.unlink(d); } catch {}
+            fs.symlink(target, d);
+        } else if (entry.isDirectory) {
+            hardlinkOrCopyDirRecursiveSync(s, d);
+        } else {
+            try { fs.unlink(d); } catch {}
+            try { fs.link(s, d); }
+            catch { fs.copy(s, d); }
+        }
+    }
+}

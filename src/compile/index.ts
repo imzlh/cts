@@ -8,7 +8,7 @@ import { err, ErrorKind } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 import type { ModuleResolver } from '../resolve/index';
 import { isTypeDecl } from '../resolve/protocols/base';
-import type { ModuleInfo, RuntimeConfig } from '../types';
+import { moduleRef, type ModuleInfo, type RuntimeConfig } from '../types';
 import { bridgeCjsToEsm, buildCjsDeps, installGlobalRequire, installInternalBridge } from './bridge';
 import { CjsLoader } from './cjs';
 import { EsmCompiler } from './esm';
@@ -68,8 +68,8 @@ export class ModuleCompiler {
         // CJS format: execute via CjsLoader, then bridge to ESM Module
         if (info.format === 'cjs' && info.fileKind === 'source') {
             const cjsMod = this.cjs.loadAndGet(info.localPath);
-            const mod = bridgeCjsToEsm(info.specPath, meta, cjsMod.exports);
-            this.esm.setCache(info.localPath, mod);
+            const mod = bridgeCjsToEsm(moduleRef(info), meta, cjsMod.exports);
+            this.esm.setCache(info, mod);
             return mod;
         }
 
@@ -84,8 +84,8 @@ export class ModuleCompiler {
         if (info.format === 'cjs') {
             const transformed = this.esm.transformer.transformForCjs(code, info.localPath, meta?.lang);
             const cjsMod = this.cjs.loadSourceAndGet(transformed, info.localPath);
-            const mod = bridgeCjsToEsm(info.specPath, meta, cjsMod.exports);
-            this.esm.setCache(info.localPath, mod);
+            const mod = bridgeCjsToEsm(moduleRef(info), meta, cjsMod.exports);
+            this.esm.setCache(info, mod);
             return mod;
         }
         return this.esm.loadSource(code, info, meta);

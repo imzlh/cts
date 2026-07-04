@@ -2,12 +2,34 @@
 
 export type ModuleFormat = 'esm' | 'cjs';
 export type FileKind     = 'source' | 'json' | 'wasm' | 'binary' | 'text';
+export type LifecycleScriptName = 'install' | 'postinstall';
+
+// 'normal': no node_modules generated (default).
+// 'soft': project top-level directory symlinks/junctions into the flat npm store.
+// 'hard': full nested node_modules materialization using per-file hard links,
+//         falling back to a copy only when the store and project are on
+//         different volumes.
+export type NodeModulesMode = 'normal' | 'soft' | 'hard';
 
 export interface ModuleInfo {
     specPath:  string;
     localPath: string;
     format:    ModuleFormat;
     fileKind:  FileKind;
+    /** QuickJS-facing runtime identity when a request needs a non-canonical module view. */
+    moduleId?: string;
+}
+
+export function moduleRef(info: Pick<ModuleInfo, 'specPath' | 'moduleId'>): string {
+    return info.moduleId ?? info.specPath;
+}
+
+export interface LifecycleScriptEntry {
+    name:      string;
+    version:   string;
+    dir:       string;
+    lifecycle: LifecycleScriptName;
+    script:    string;
 }
 
 // ---------------------------------------------------------------------------
@@ -35,35 +57,38 @@ export interface ConfigOptions {
     lockDir?:       string;   // dir containing cts.lock (default: entry file dir)
     frozen?:        boolean;  // refuse to resolve anything not already in lock
     disableLock?:   boolean;  // disable lock entirely
+    persistLock?:   boolean;  // write cts.lock to disk (only `cno cache`); else read-only/in-memory
     // Lifecycle scripts
-    ignoreScripts?: boolean;  // skip postinstall scripts during cno cache
+    ignoreScripts?: boolean;  // skip deferred npm lifecycle scripts during cno cache
+    // node_modules materialization (see NodeModulesMode)
+    nodeModulesMode?: NodeModulesMode;
     // JSX options
     jsxPragma?:     string;   // JSX element factory (default: React.createElement)
     jsxFragmentPragma?: string; // JSX fragment factory (default: React.Fragment)
 }
 
-// Fields that are always required after createConfig()
-// Optional fields remain optional (no value → feature disabled)
-export interface RuntimeConfig extends Required<Omit<ConfigOptions,
-    'pathAliases'|'baseUrl'|'importMap'|'memoryLimit'|'maxStackSize'|
-    'lockDir'|'frozen'|'disableLock'|'enableCache'|'eval'|'jsxPragma'|'jsxFragmentPragma'>> {
-    pathAliases?:  Record<string, string[]>;
-    baseUrl?:      string;
-    importMap?:    Record<string, string>;
-    memoryLimit?:  number;
-    maxStackSize?: number;
-    lockDir?:      string;
-    frozen?:       boolean;
-    disableLock?:  boolean;
-    enableCache?:  boolean;
-    eval?:         string;
-    jsxPragma?:    string;
-    jsxFragmentPragma?: string;
-    lockStore?:    import('./lock').LockStore;
+// RuntimeConfig: ConfigOptions with fields that createConfig() always fills
+// (via DEFAULTS) promoted to required. All other fields stay optional.
+export interface RuntimeConfig extends ConfigOptions {
+    // Always set by createConfig() (see config.ts DEFAULTS)
+    cacheDir:       string;
+    enableHttp:     boolean;
+    enableJsr:      boolean;
+    enableNode:     boolean;
+    silent:         boolean;
+    jsrCacheTTL:    number;
+    requestTimeout: number;
+    enableCache:    boolean;
+    enableOxc:      boolean;
+    ignoreScripts:  boolean;
+    nodeModulesMode: NodeModulesMode;
+    polyfill:       string;
+    // Injected by ModuleResolver constructor
+    lockStore?:     import('./lock').LockStore;
     // CLI parse output
-    _?:            string;
-    _args?:        string[];
-    _offset:       number;
+    _?:             string;
+    _args?:         string[];
+    _offset:        number;
 }
 
 // ---------------------------------------------------------------------------

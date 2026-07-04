@@ -75,6 +75,7 @@ export function compareVersions(a: string, b: string): number {
 
 function satisfies(ver: string, range: string): boolean {
     if (!ver || !range) return false;
+    if (range.includes('||')) return range.split('||').some(alt => satisfies(ver, alt));
     const v = pad(ver).slice(0, 3).join('.');
     let r = range.trim();
     if (/^\d+(\.\d+)?$/.test(r)) r += '.x';
@@ -118,10 +119,38 @@ export const matchLatestVersion = (vs: string[], r: string): string | null => {
 };
 
 // ---------------------------------------------------------------------------
+// npm specPath parsing — "npm:name@version[/subpath]" -> parts.
+// Operates on the already-resolved, canonical specPath (not the raw request
+// specifier, which may be a range/alias/bare-name and is messy to parse).
+// ---------------------------------------------------------------------------
+
+export function npmNameVersion(specPath: string): { name: string; version: string } | null {
+    if (!specPath.startsWith('npm:')) return null;
+    const rest = specPath.slice(4);
+    const nameEnd = rest.startsWith('@') ? rest.indexOf('@', 1) : rest.indexOf('@');
+    if (nameEnd === -1) return null;
+    const name = rest.slice(0, nameEnd);
+    const afterName = rest.slice(nameEnd + 1);
+    const slash = afterName.indexOf('/');
+    const version = slash === -1 ? afterName : afterName.slice(0, slash);
+    return { name, version };
+}
+
+export function npmPackageName(specPath: string): string | null {
+    return npmNameVersion(specPath)?.name ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // tar.gz extraction
 // ---------------------------------------------------------------------------
 
-export interface TarFile { path: string; content: Uint8Array; size: number; type: 'file'|'dir'|'link'|'other' }
+export interface TarFile {
+    path: string;
+    content: Uint8Array;
+    size: number;
+    mode: number;
+    type: 'file'|'dir'|'link'|'other';
+}
 
 export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
     const bytes = new Uint8Array(zlib.gunzip(data));
@@ -140,10 +169,10 @@ export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
     let pos = 0;
     while (pos < bytes.length) {
         if (zero(pos) && (pos + B >= bytes.length || zero(pos + B))) break;
-        const name = str(pos, 100), size = oct(pos + 124, 12), flag = str(pos + 156, 1);
+        const name = str(pos, 100), mode = oct(pos + 100, 8), size = oct(pos + 124, 12), flag = str(pos + 156, 1);
         if (!name || size < 0) { pos += B; continue; }
         const start = pos + B;
-        files.push({ path: name, content: bytes.slice(start, start + size), size,
+        files.push({ path: name, content: bytes.slice(start, start + size), size, mode,
             type: ({ '0': 'file', '\0': 'file', '5': 'dir', '2': 'link' } as any)[flag] ?? 'other' });
         pos = start + Math.ceil(size / B) * B;
     }

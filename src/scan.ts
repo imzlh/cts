@@ -1,8 +1,9 @@
 // scan.ts — import specifier extraction (sucrase token-based)
-// Lives here so precompile workers can import it without pulling in the full
+// Lives here so parse workers can import it without pulling in the full
 // BFS scanner (resolver, progress, asyncfs, wasm, etc.).
 
 import { parse } from '../deps/sucrase/src/parser';
+import { IdentifierRole } from '../deps/sucrase/src/parser/tokenizer';
 import { TokenType as tt } from '../deps/sucrase/src/parser/tokenizer/types';
 import { ContextualKeyword } from '../deps/sucrase/src/parser/tokenizer/keywords';
 
@@ -38,7 +39,7 @@ export function extractImports(source: string, isTs = true): string[] {
                 if (!afterType || afterType.contextualKeyword !== ContextualKeyword._from) continue;
             }
             const si = findFromString(tokens, i + 1);
-            if (si !== -1) specs.add(sv(si));
+            if (si !== -1 && hasRuntimeImportSpecifier(tokens, i + 1, si)) specs.add(sv(si));
             continue;
         }
         if (tok.type === tt._export) {
@@ -46,7 +47,7 @@ export function extractImports(source: string, isTs = true): string[] {
             const next = tokens[i + 1];
             if (next && next.type === tt.name && next.contextualKeyword === ContextualKeyword._type) continue;
             const si = findFromString(tokens, i + 1);
-            if (si !== -1) specs.add(sv(si));
+            if (si !== -1 && hasRuntimeExportSpecifier(tokens, i + 1, si)) specs.add(sv(si));
             continue;
         }
         if (tok.type === tt.name &&
@@ -58,8 +59,32 @@ export function extractImports(source: string, isTs = true): string[] {
     return [...specs];
 }
 
+type Tokens = ReturnType<typeof parse>['tokens'];
+
+function hasRuntimeImportSpecifier(tokens: Tokens, start: number, fromStringIndex: number): boolean {
+    let sawImportDeclaration = false;
+    for (let i = start; i < fromStringIndex; i++) {
+        const t = tokens[i]!;
+        if (t.identifierRole !== IdentifierRole.ImportDeclaration) continue;
+        sawImportDeclaration = true;
+        if (!t.isType) return true;
+    }
+    return !sawImportDeclaration;
+}
+
+function hasRuntimeExportSpecifier(tokens: Tokens, start: number, fromStringIndex: number): boolean {
+    let sawExportAccess = false;
+    for (let i = start; i < fromStringIndex; i++) {
+        const t = tokens[i]!;
+        if (t.identifierRole !== IdentifierRole.ExportAccess) continue;
+        sawExportAccess = true;
+        if (!t.isType) return true;
+    }
+    return !sawExportAccess;
+}
+
 function findFromString(
-    tokens: ReturnType<typeof parse>['tokens'],
+    tokens: Tokens,
     start: number,
 ): number {
     const limit = Math.min(start + 80, tokens.length);

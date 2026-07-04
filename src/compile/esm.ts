@@ -6,12 +6,11 @@
 //   - specPath dedup (QuickJS does not cache dynamic import() results)
 //   - Load special types: binary, text
 
-import type { RuntimeConfig, ModuleInfo } from '../types';
+import { moduleRef, type RuntimeConfig, type ModuleInfo } from '../types';
 import { Transformer } from '../source/transform';
 import { JscCache, isRemote } from '../source/cache';
-import { readText } from '../utils/io';
+import { readText, log } from '../utils';
 import { err, ErrorKind } from '../errors';
-import { log } from '../utils/log';
 import type { OxcTranspiler } from '../oxc';
 
 const fs = import.meta.use('fs');
@@ -20,8 +19,6 @@ const engine = import.meta.use('engine');
 export class EsmCompiler {
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
     private readonly esmLoading  = new Set<string>();
-    /** specPath -> Module dedup. Covers the same module resolved from different parents. */
-    private readonly specDedup   = new Map<string, CModuleEngine.Module>();
     readonly transformer: Transformer;
     readonly jsc: JscCache;
 
@@ -61,23 +58,8 @@ export class EsmCompiler {
     }
 
     /** Store a module in esmCache (for CJS bridge results that need strong ref). */
-    setCache(localPath: string, mod: CModuleEngine.Module): void {
-        this.esmCache.set(localPath, mod);
-    }
-
-    /** Check if a specPath is already compiled (for dedup in engine hooks). */
-    has(specPath: string): boolean {
-        return this.specDedup.has(specPath);
-    }
-
-    /** Get a previously compiled module by specPath. */
-    getBySpec(specPath: string): CModuleEngine.Module | undefined {
-        return this.specDedup.get(specPath);
-    }
-
-    /** Register a module under its specPath for dedup. */
-    registerSpec(specPath: string, mod: CModuleEngine.Module): void {
-        this.specDedup.set(specPath, mod);
+    setCache(info: ModuleInfo, mod: CModuleEngine.Module): void {
+        this.esmCache.set(this.cacheKey(info), mod);
     }
 
     // -------------------------------------------------------------------------
@@ -91,7 +73,7 @@ export class EsmCompiler {
         } catch (e) {
             if (e instanceof SyntaxError) {
                 const ne = err(ErrorKind.SyntaxError,
-                    `Syntax error in ${localPath}: ${e.message}`);
+                    `Syntax error in ${localPath}: ${e.message}`, e);
                 (ne as any).cause = { source: e, code, path: localPath };
                 throw ne;
             }
@@ -100,17 +82,18 @@ export class EsmCompiler {
     }
 
     private loadEsm(info: ModuleInfo, meta: Record<string, any>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
-        const hit = this.esmCache.get(info.localPath);
+        const cacheKey = this.cacheKey(info);
+        const hit = this.esmCache.get(cacheKey);
         if (hit) {
             if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
             return hit;
         }
 
         // Circular dependency guard
-        if (this.esmLoading.has(info.localPath)) {
+        if (this.esmLoading.has(cacheKey)) {
             log.debug('loader', () => `cycle: ${info.specPath} -- returning placeholder`);
-            const placeholder = engine.Module.create(info.specPath);
-            this.esmCache.set(info.localPath, placeholder);
+            const placeholder = engine.Module.create(moduleRef(info));
+            this.esmCache.set(cacheKey, placeholder);
             return placeholder;
         }
 
@@ -124,27 +107,27 @@ export class EsmCompiler {
             const cached = this.jsc.load(info.localPath, remote, resolveMtime?.(info.localPath));
             if (cached) {
                 Object.assign(cached.meta, meta);
-                this.esmCache.set(info.localPath, cached);
+                this.esmCache.set(cacheKey, cached);
                 return cached;
             }
         }
 
         // L2: read + transform + compile on main thread
-        this.esmLoading.add(info.localPath);
+        this.esmLoading.add(cacheKey);
         const text = readText(info.localPath);
-        const code = this.transformer.transform(text, info.localPath, meta?.lang);
+        const code = this.transformer.transform(text, info.localPath, meta?.lang, moduleRef(info));
         let mod: CModuleEngine.Module;
         try {
-            mod = this.compileEsm(code, info.specPath, info.localPath);
+            mod = this.compileEsm(code, moduleRef(info), info.localPath);
         } catch (e) {
-            this.esmLoading.delete(info.localPath);
-            this.esmCache.delete(info.localPath);
+            this.esmLoading.delete(cacheKey);
+            this.esmCache.delete(cacheKey);
             throw e;
         }
-        this.esmLoading.delete(info.localPath);
+        this.esmLoading.delete(cacheKey);
 
         // Populate placeholder if one was created during circular resolution
-        const cached = this.esmCache.get(info.localPath);
+        const cached = this.esmCache.get(cacheKey);
         if (cached && cached !== mod) {
             const ns = mod.namespace;
             for (const key of Object.keys(ns)) {
@@ -162,20 +145,21 @@ export class EsmCompiler {
         }
 
         Object.assign(mod.meta, meta);
-        this.esmCache.set(info.localPath, mod);
+        this.esmCache.set(cacheKey, mod);
         return mod;
     }
 
     loadEsmSource(code: string, info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
-        const hit = this.esmCache.get(info.localPath);
+        const cacheKey = this.cacheKey(info);
+        const hit = this.esmCache.get(cacheKey);
         if (hit) {
             if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
             return hit;
         }
-        const transformed = this.transformer.transform(code, info.localPath, meta?.lang);
-        const mod = this.compileEsm(transformed, info.specPath, info.localPath);
+        const transformed = this.transformer.transform(code, info.localPath, meta?.lang, moduleRef(info));
+        const mod = this.compileEsm(transformed, moduleRef(info), info.localPath);
         Object.assign(mod.meta, meta);
-        this.esmCache.set(info.localPath, mod);
+        this.esmCache.set(cacheKey, mod);
         return mod;
     }
 
@@ -184,19 +168,19 @@ export class EsmCompiler {
     // -------------------------------------------------------------------------
 
     private loadBytes(info: ModuleInfo): CModuleEngine.Module {
-        const mod = engine.Module.create(info.specPath);
+        const mod = engine.Module.create(moduleRef(info));
         mod.export('default', new Uint8Array(fs.readFile(info.localPath)));
         return mod;
     }
 
     private loadText(info: ModuleInfo): CModuleEngine.Module {
-        const mod = engine.Module.create(info.specPath);
+        const mod = engine.Module.create(moduleRef(info));
         mod.export('default', readText(info.localPath));
         return mod;
     }
 
     private loadTextSource(code: string, info: ModuleInfo): CModuleEngine.Module {
-        const mod = engine.Module.create(info.specPath);
+        const mod = engine.Module.create(moduleRef(info));
         mod.export('default', code);
         return mod;
     }
@@ -207,10 +191,13 @@ export class EsmCompiler {
 
     clearLoadedModules(): void {
         this.esmCache.clear();
-        this.specDedup.clear();
     }
 
     hasPendingLoads(): boolean {
         return this.esmLoading.size > 0;
+    }
+
+    private cacheKey(info: ModuleInfo): string {
+        return moduleRef(info);
     }
 }

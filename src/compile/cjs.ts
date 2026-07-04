@@ -9,13 +9,12 @@
 //   - BUILTINS (in resolve/builtins.ts)
 //   - CJS/ESM bridge (in compile/bridge.ts)
 
-import { dirname, joinPaths, isAbsolute, extname, isRelative } from '../utils/path';
-import { resolveFile } from '../utils/io';
-import { safeParse } from '../utils/misc';
-import { log } from '../utils/log';
+import type { ModuleInfo } from '../types';
+import { dirname, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows } from '../utils';
 import { err, ErrorKind } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
-import { isWindows } from '../utils/index';
+import { guessFileKind } from '../resolve/protocols/base';
+import { detectFormat } from '../resolve/pkg';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -33,27 +32,26 @@ export interface CjsModule {
 export interface CjsRequireFn {
     (id: string): any;
     resolve: (id: string, opts?: { paths?: string[] }) => string;
-    cache: Map<string, CjsModule>; main: CjsModule | null;
+    cache: Record<string, CjsModule>; main: CjsModule | null;
     extensions: Record<string, (m: CjsModule, f: string) => void>;
 }
 
 export interface CjsDeps {
-    /** Resolve a node: builtin name → local polyfill path. */
-    builtinToPath(name: string, parent: string): string;
+    /** Resolve a node builtin to its concrete module info. */
+    resolveBuiltin(name: string, parent: string): ModuleInfo;
     /**
      * Load an ESM module synchronously (for CJS->ESM interop).
      * Must call engine.promiseResult internally; returns the namespace.
      */
-    loadEsmSync(localPath: string, specPath: string): Record<string, any>;
-    /** Resolve any external specifier → canonical/local path pair + format. */
-    resolveExternal(req: string, parent: string): { path: string; specPath: string; isCjs: boolean } | null;
+    loadEsmSync(info: ModuleInfo): Record<string, any>;
+    /** Resolve any external specifier → concrete module info. */
+    resolveExternal(req: string, parent: string): ModuleInfo | null;
     /** Prepare source for CJS execution (e.g. strip TS/JSX syntax). */
     prepareSource?(code: string, filePath: string): string | null;
 }
 
 interface ResolvedCjsRequest {
-    path: string;
-    specPath: string;
+    info: ModuleInfo;
     isCjs: boolean;
 }
 
@@ -101,9 +99,21 @@ export function clearDirPathsCache(): void {
 }
 
 function normalizeCJSExport(obj: any) {
-    if (typeof obj == 'object' && !Object.getPrototypeOf(obj)) {
+    if (obj !== null && typeof obj === 'object' && !Object.getPrototypeOf(obj)) {
         return { ...obj };
     }
+    return obj;
+}
+
+function normalizeExecError(error: unknown, filename: string): Error {
+    const e = error instanceof Error ? error : new Error(String(error));
+    if (e.kind === undefined) {
+        e.kind = e instanceof SyntaxError ? ErrorKind.SyntaxError : ErrorKind.Generic;
+    }
+    if (e instanceof SyntaxError && !(e as any).cause) {
+        (e as any).cause = { source: { message: e.message }, path: filename };
+    }
+    return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +124,20 @@ export class CjsLoader {
     // filename → module (includes in-progress modules for circular dep detection)
     readonly cache        = new Map<string, CjsModule>();
     private readonly builtinCache = new Map<string, CjsModule>();
-    private readonly esmInteropCache = new Map<string, CjsModule>();
+    // Bracket-indexable view of `cache` for the public require.cache surface —
+    // Node's Module._cache/require.cache is a plain object (`cache[path]`),
+    // but the internal map stays a real Map for get/set/delete performance.
+    private readonly cacheView: Record<string, CjsModule> = new Proxy(Object.create(null), {
+        has: (_t, key) => this.cache.has(key as string),
+        get: (_t, key) => this.cache.get(key as string),
+        set: (_t, key, value) => { this.cache.set(key as string, value); return true; },
+        deleteProperty: (_t, key) => { this.cache.delete(key as string); return true; },
+        ownKeys: () => [...this.cache.keys()],
+        getOwnPropertyDescriptor: (_t, key) => {
+            if (!this.cache.has(key as string)) return undefined;
+            return { value: this.cache.get(key as string), writable: true, enumerable: true, configurable: true };
+        },
+    });
 
     constructor(private readonly deps: CjsDeps) {}
 
@@ -212,7 +235,7 @@ export class CjsLoader {
             mod.loaded = true;
         } catch (e) {
             this.cache.delete(filename);
-            throw err(ErrorKind.Generic, `Error loading native addon '${filename}': ${e}`);
+            throw err(ErrorKind.Generic, `Error loading native addon '${filename}': ${e}`, e);
         }
     }
 
@@ -223,7 +246,7 @@ export class CjsLoader {
             mod.loaded  = true;
         } catch (e) {
             this.cache.delete(filename);
-            throw err(ErrorKind.SyntaxError, `JSON parse error in '${filename}': ${e}`);
+            throw err(ErrorKind.SyntaxError, `JSON parse error in '${filename}': ${e}`, e);
         }
     }
 
@@ -268,7 +291,7 @@ export class CjsLoader {
         } catch (e) {
             this.cache.delete(filename);
             log.debug('cjs', () => `eval error: ${filename}`, e);
-            throw err(ErrorKind.Generic, `Error loading '${filename}': ${e}`);
+            throw normalizeExecError(e, filename);
         } finally {
             Reflect.deleteProperty(globalThis, key);
         }
@@ -290,12 +313,13 @@ export class CjsLoader {
             const resolved = self.resolveId(id, parentPath);
             if (!resolved) throw err(ErrorKind.ModuleNotFound, `Cannot find module '${id}' from '${parentPath}'`);
 
-            const { path, specPath, isCjs } = resolved;
+            const { info, isCjs } = resolved;
+            const path = info.localPath;
             log.debug('cjs', () => `require('${id}') → ${path} isCjs=${isCjs}`);
 
             // 3. CJS → ESM interop: if resolved is ESM, load it via ESM pipeline
             if (!isCjs) {
-                return self.requireEsm(path, specPath, parentPath);
+                return self.requireEsm(info, parentPath);
             }
 
             // 4. Cache hit (includes in-progress = circular dep → return partial exports)
@@ -310,11 +334,11 @@ export class CjsLoader {
             const searchIn = opts?.paths ?? [parentPath];
             for (const p of searchIn) {
                 const r = self.resolveId(id, p);
-                if (r) return toHostPath(r.path);
+                if (r) return toHostPath(r.info.localPath);
             }
             throw err(ErrorKind.ModuleNotFound, `Cannot resolve module '${id}'`);
         };
-        require.cache      = self.cache;
+        require.cache      = self.cacheView;
         require.main       = null;
         require.extensions = {
             '.js':   (m: CjsModule) => self.execJs(m),
@@ -331,23 +355,25 @@ export class CjsLoader {
     /**
      * CJS → ESM interop: synchronously load an ESM module.
      * Uses deps.loadEsmSync which handles promiseResult semantics.
-     * Result cached so repeated require() calls return the same object.
+     * Cached in the same map (keyed by localPath) as plain CJS modules so
+     * repeated require() calls return the same object AND the module shows
+     * up in require.cache, matching Node 22+ require(esm) semantics.
      */
-    private requireEsm(localPath: string, specPath: string, parentPath: string): any {
-        const cacheKey = `__esm__${localPath}`;
-        const hit = this.esmInteropCache.get(cacheKey);
+    private requireEsm(info: ModuleInfo, parentPath: string): any {
+        const path = info.localPath;
+        const hit = this.cache.get(path);
         if (hit) return hit.exports;
 
         // Native addons (.node) must go through CJS exec path, not ESM compile
-        if (extname(localPath) === '.node') {
-            const mod = this.loadAndGet(localPath, parentPath);
+        if (extname(path) === '.node') {
+            const mod = this.loadAndGet(path, parentPath);
             return mod.exports;
         }
 
-        const result = this.deps.loadEsmSync(localPath, specPath);
-        const mod = this.synth(localPath);
+        const result = this.deps.loadEsmSync(info);
+        const mod = this.synth(path);
         mod.exports = normalizeCJSExport('default' in result ? result['default'] : result);
-        this.esmInteropCache.set(cacheKey, mod);
+        this.cache.set(path, mod);
         return mod.exports;
     }
 
@@ -360,10 +386,10 @@ export class CjsLoader {
         const hit = this.builtinCache.get(name);
         if (hit) return hit;
 
-        const localPath = this.deps.builtinToPath(name, parent);
-        const ns = this.deps.loadEsmSync(localPath, `node:${name}`);
+        const info = this.deps.resolveBuiltin(name, parent);
+        const ns = this.deps.loadEsmSync(info);
 
-        const mod = this.synth(localPath);
+        const mod = this.synth(info.localPath);
         const copyMissingExports = (target: any) => {
             for (const k of Object.keys(ns)) {
                 if (k === 'default' || k in target) continue;
@@ -415,7 +441,12 @@ export class CjsLoader {
         // External resolver first (covers npm, jsr, http, aliases, import map)
         try {
             const ext = this.deps.resolveExternal(id, parentPath);
-            if (ext) return ext;
+            if (ext) {
+                return {
+                    info: ext,
+                    isCjs: ext.format === 'cjs' || ext.fileKind === 'json',
+                };
+            }
         } catch {}
 
         // Local filesystem fallback for contexts that bypass the resolver, such as
@@ -433,7 +464,19 @@ export class CjsLoader {
     private resolveLocalPath(candidate: string): ResolvedCjsRequest | null {
         try {
             const path = resolveFile(candidate);
-            return { path, specPath: path, isCjs: true };
+            // .node/.json always load through the CJS path below; for .js/.mjs/.cjs
+            // honor the nearest package.json "type" field like the external resolver
+            // does, otherwise an ESM file reached via a bare relative require() would
+            // be fed straight into the CJS eval and crash on `export`/`import` syntax.
+            const format = extname(path) === '.node' ? 'cjs' : detectFormat(path);
+            const fileKind = guessFileKind(path);
+            const info: ModuleInfo = {
+                specPath: path,
+                localPath: path,
+                format,
+                fileKind,
+            };
+            return { info, isCjs: format === 'cjs' || fileKind === 'json' };
         } catch {
             return null;
         }

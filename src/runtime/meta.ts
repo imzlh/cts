@@ -5,7 +5,7 @@
 
 import type { ModuleInfo } from '../types';
 import type { ModuleResolver } from '../resolve/index';
-import { dirname, isAbsolute } from '../utils/path';
+import { dirname, isAbsolute } from '../utils';
 
 const importMetaResolveCache = new Map<string, (s: string, p?: string, a?: Record<string, any>) => string>();
 

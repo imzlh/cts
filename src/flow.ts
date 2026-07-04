@@ -1,8 +1,5 @@
-import { readText, ensureDir, writeText } from './utils/io';
-import { unTarGz, type TarFile } from './utils/misc';
-import { fmtBytes } from './utils/misc';
-import { isEnabled, log } from './utils/log';
-import { dirname } from './utils/path';
+import { readText, ensureDir, writeText, unTarGz, type TarFile, fmtBytes, isEnabled, log, dirname } from './utils';
+import { getCurlInitHook } from './utils/curl';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -113,6 +110,7 @@ function parseHeaders(raw: string): Array<[string, string]> {
 }
 
 function configureCurl(curl: CModuleCURL.CURL, step: NetFetchStep): void {
+    getCurlInitHook()?.(curl);
     curl.setUrl(step.url)
         .setMethod('GET')
         .setFollowRedirects(true)

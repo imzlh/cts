@@ -1,11 +1,7 @@
 // pkg.ts — package.json utilities with bounded caches
 
 import type { PackageJson, ModuleFormat } from '../types';
-import { dirname, extname, joinPaths, normalizePath } from '../utils/path';
-import { resolveFile } from '../utils/io';
-import { safeParse } from '../utils/misc';
-import { LRU } from '../utils/lru';
-import { log } from '../utils/log';
+import { dirname, extname, joinPaths, normalizePath, resolveFile, safeParse, LRU, log } from '../utils';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -148,34 +144,56 @@ export function resolveExports(ctx: ResolveCtx, sub = '.'): ResolvedPath | null 
 }
 
 function conds(ctx: ResolveCtx): string[] {
-    // Standard condition resolution order per Node.js algorithm:
-    // ESM: import > module > default > node > require
-    // CJS: require > default > node
-    // Also include 'browser' and 'types' for broader compatibility
-    if (ctx.forceCjs) return ['require', 'default', 'node', 'browser'];
-    return ['import', 'module', 'default', 'node', 'require', 'browser'];
+    // Deliberately omit 'node': packages with divergent node/browser export
+    // maps (e.g. vue, which bundles everything into a single CJS file under
+    // 'node' but externalizes @vue/* packages under the browser/default ESM
+    // build) would otherwise resolve to a different file — and a different
+    // dependency graph — than bundlers like Vite/webpack pick, breaking
+    // --npm-mode's materialized node_modules for those tools. import>default
+    // for ESM, require>default for CJS. No 'module'/'browser' either — those
+    // are bundler-only conventions neither runtime honors by default.
+    return ctx.forceCjs ? ['require', 'default'] : ['import', 'default'];
+}
+
+function preferredFormatForPath(ctx: ResolveCtx, path: string, preferred?: ModuleFormat): ModuleFormat {
+    const ext = extname(path);
+    if (ext === '.cjs' || ext === '.cts' || ext === '.node') return 'cjs';
+    if (ext === '.mjs' || ext === '.mts') return 'esm';
+    if (preferred) return preferred;
+    // The exports map landed on an ambiguous condition (e.g. a bare "default"
+    // with no "import"/"require" branch). Some packages (vue, @vue/runtime-*)
+    // point "exports" at the very same file their "module" field names — the
+    // conventional (bundler-only) signal for "this is the package's ESM
+    // build" — without ever setting "type": "module", since they expect a
+    // bundler's own content-sniffing rather than Node's type/extension rules.
+    // Same package, same file: honor that signal instead of guessing 'cjs'.
+    if (ctx.pkg.module && resolvePath(ctx, ctx.pkg.module) === path) return 'esm';
+    return detectFormat(path);
 }
 
 function resolvePath(ctx: ResolveCtx, p: string): string | null {
     if (!p) return null;
-    if (p.includes('://') || /^(npm|jsr):/.test(p)) return p;
+    if (p.includes('://') || p.startsWith('npm:') || p.startsWith('jsr:')) return p;
     try { return resolveFile(joinPaths(ctx.pkgDir, p.startsWith('./') ? p.slice(2) : p)); }
     catch { return null; }
 }
 
-function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string, condition?: string): ResolvedPath | null {
+function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string, preferred?: ModuleFormat): ResolvedPath | null {
     if (typeof t === 'string') {
         const path = resolvePath(ctx, rep !== undefined ? t.replace('*', rep) : t);
-        return path ? { path, format: resolvedFormat(ctx, path, condition) } : null;
+        return path ? { path, format: preferredFormatForPath(ctx, path, preferred) } : null;
     }
     if (Array.isArray(t)) {
-        for (const e of t) { const r = resolveTarget(ctx, e, rep, condition); if (r) return r; }
+        for (const e of t) { const r = resolveTarget(ctx, e, rep, preferred); if (r) return r; }
         return null;
     }
     if (t && typeof t === 'object') {
         for (const c of conds(ctx)) {
             if (!(c in t)) continue;
-            const r = resolveTarget(ctx, (t as any)[c], rep, c);
+            const nextPreferred = c === 'import' ? 'esm'
+                : c === 'require' ? 'cjs'
+                : preferred;
+            const r = resolveTarget(ctx, (t as any)[c], rep, nextPreferred);
             if (r) return r;
         }
     }
@@ -229,16 +247,16 @@ export function resolveMain(ctx: ResolveCtx): ResolvedPath | null {
     if (ctx.pkg.exports && typeof ctx.pkg.exports === 'object') {
         const def = (ctx.pkg.exports as Record<string, unknown>)['default'];
         if (typeof def === 'string') {
-            const resolved = resolveTarget(ctx, def, undefined, 'default');
+            const resolved = resolveTarget(ctx, def);
             if (resolved) return resolved;
         }
     }
     if (!ctx.forceCjs && ctx.pkg.module) {
-        const resolved = resolveTarget(ctx, ctx.pkg.module, undefined, 'module');
+        const resolved = resolveTarget(ctx, ctx.pkg.module, undefined, 'esm');
         if (resolved) return resolved;
     }
     if (ctx.pkg.main) {
-        const resolved = resolveTarget(ctx, ctx.pkg.main, undefined, 'require');
+        const resolved = resolveTarget(ctx, ctx.pkg.main);
         if (resolved) return resolved;
     }
     const fallbacks = ctx.forceCjs
@@ -260,15 +278,4 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
             return { path, format: detectFormat(path) };
         } catch { return null; }
     })();
-}
-
-function resolvedFormat(ctx: ResolveCtx, path: string, condition?: string): ModuleFormat {
-    const detected = detectFormat(path);
-    if (ctx.forceCjs || condition === 'require') return detected;
-    return isAmbiguousScriptPath(path) ? 'esm' : detected;
-}
-
-function isAmbiguousScriptPath(path: string): boolean {
-    const ext = extname(path);
-    return ext === '.js' || ext === '.ts' || ext === '.tsx' || ext === '.jsx';
 }

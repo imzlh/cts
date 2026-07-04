@@ -66,9 +66,16 @@ declare global {
  * Use this instead of `new Error(...)` at internal throw sites so that
  * formatError can display the correct category without guessing.
  */
-export function err(kind: ErrorKind, msg: string): Error {
+export function err(kind: ErrorKind, msg: string, source?: unknown): Error {
     const e = new Error(msg);
     e.kind = kind;
+    if (source !== undefined) (e as any).cause = source;
+    if (source instanceof Error && typeof source.stack === 'string' && source.stack) {
+        const nl = source.stack.indexOf('\n');
+        e.stack = nl === -1
+            ? `${e.name}: ${msg}`
+            : `${e.name}: ${msg}\n${source.stack.slice(nl + 1)}`;
+    }
     return e;
 }
 

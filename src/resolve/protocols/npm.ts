@@ -1,14 +1,14 @@
 // protocol/npm.ts - npm registry handler
 
-import type { RuntimeConfig, ModuleInfo, ModuleFormat } from '../../types';
+import type { RuntimeConfig, ModuleInfo, ModuleFormat, LifecycleScriptEntry } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
-import { joinPaths, dirname, basename, normalizePath, toPosixPath, pathRoot, cwd } from '../../utils/path';
-import { readText, resolveFile } from '../../utils/io';
+import { joinPaths, dirname, basename, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
+import { readText, resolveFile, clearNegativeCache } from '../../utils/io';
 declare const URL: any;
 import { matchLatestVersion, compareVersions, safeParse, fmtBytes } from '../../utils/misc';
-import { detectFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, type ResolvedPath } from '../pkg';
+import { detectFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
@@ -56,7 +56,7 @@ function loadNpmConfig(): NpmConfig {
 interface ParsedNpmSpec { name: string; version: string; subpath: string }
 
 function parseNpmSpec(raw: string): ParsedNpmSpec {
-    let rest = raw.startsWith('npm:') ? raw.slice(4).replace(/^\//, '') : raw;
+    let rest = raw.startsWith('npm:') ? raw.slice(4) : raw;
     while (rest.startsWith('/')) rest = rest.slice(1);
     let name = '', ver = '', sub = '';
 
@@ -171,6 +171,11 @@ function matchesAbiVariant(pkgName: string, abi: string): boolean {
     return true;
 }
 
+// Hoisted so the pattern is compiled once and the RegExp object reused,
+// rather than re-literal'd on every call in a JIT-less interpreter.
+const EXACT_SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+const SEMVER_PREFIX_RE = /^\d+\.\d+\.\d+/;
+
 export class NpmHandler implements ProtocolHandler {
     readonly protocols = ['npm'];
     private readonly cacheDir: string;
@@ -178,7 +183,10 @@ export class NpmHandler implements ProtocolHandler {
     private readonly verCache = new Map<string, string>();
     /** Cache findLocal results per package name + lookup origin. */
     private readonly localCache = new Map<string, string | null>();
-    private readonly pendingPostinstall: Array<{ name: string; version: string; dir: string; script: string }> = [];
+    /** Cache findOwningPackageDir results per parent — same parent is looked up
+     *  more than once per resolve() call (self-reference check, then local lookup). */
+    private readonly ownerDirCache = new Map<string, string | null>();
+    private readonly pendingLifecycle: LifecycleScriptEntry[] = [];
 
     constructor(private readonly cfg: RuntimeConfig) {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
@@ -188,12 +196,13 @@ export class NpmHandler implements ProtocolHandler {
     clearCache(): void {
         this.verCache.clear();
         this.localCache.clear();
+        this.ownerDirCache.clear();
         this.npmCfg = null;
     }
 
-    /** Drain pending postinstall scripts (called by runtime after scan). */
-    drainPostinstall(): Array<{ name: string; version: string; dir: string; script: string }> {
-        const scripts = this.pendingPostinstall.splice(0);
+    /** Drain deferred npm lifecycle scripts (called by runtime after scan). */
+    drainLifecycleScripts(): LifecycleScriptEntry[] {
+        const scripts = this.pendingLifecycle.splice(0);
         return scripts;
     }
 
@@ -441,7 +450,7 @@ export class NpmHandler implements ProtocolHandler {
 
     private parentFsPath(parent: string): string {
         let path = parent.startsWith('file://') ? parent.slice(7) : parent;
-        if (/^\/[a-zA-Z]:/.test(path)) path = path.slice(1);
+        if (hasLeadingSlashDrive(path)) path = path.slice(1);
         return normalizePath(path);
     }
 
@@ -489,6 +498,9 @@ export class NpmHandler implements ProtocolHandler {
         }
         if (!versions.size) return null;
         const list = [...versions];
+        if (!range || range === 'latest' || range === '*') {
+            return list.slice().sort(compareVersions).at(-1)!;
+        }
         return matchLatestVersion(list, range)
             ?? (list.includes(range) ? range : null);
     }
@@ -548,12 +560,20 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private findOwningPackageDir(parent: string): string | null {
+        const cached = this.ownerDirCache.get(parent);
+        if (cached !== undefined) return cached;
+        const result = this._findOwningPackageDir(parent);
+        this.ownerDirCache.set(parent, result);
+        return result;
+    }
+
+    private _findOwningPackageDir(parent: string): string | null {
         if (!parent) return null;
         if (parent.startsWith('npm:')) {
             const resolvedLocal = this.resolvedParentLocalPath(parent);
             if (resolvedLocal) return this.findOwningPackageDir(resolvedLocal);
             const { name, version } = parseNpmSpec(parent);
-            if (/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+            if (EXACT_SEMVER_RE.test(version)) {
                 const pkgDir = joinPaths(this.cacheDir, `${name}@${version}`);
                 if (fs.exists(joinPaths(pkgDir, 'package.json'))) return pkgDir;
             }
@@ -610,8 +630,13 @@ export class NpmHandler implements ProtocolHandler {
         const locked = this.lockedVersionForRange(name, version);
         if (locked) {
             const lockedDir = joinPaths(this.cacheDir, `${name}@${locked}`);
-            const lockedExists = yield { type: StepType.FS_EXISTS, path: lockedDir };
+            // Check package.json, not just the directory — a directory can exist
+            // but be incomplete (interrupted extraction, crash mid-install), and
+            // a bare FS_EXISTS on the dir would wrongly treat that as "installed"
+            // forever, since nothing else ever re-triggers install() afterward.
+            const lockedExists = yield { type: StepType.FS_EXISTS, path: joinPaths(lockedDir, 'package.json') };
             if (lockedExists) {
+                yield* this.indexInstalledBins(name, locked, lockedDir);
                 return { dir: lockedDir, resolvedVer: locked };
             }
         }
@@ -622,17 +647,22 @@ export class NpmHandler implements ProtocolHandler {
                 return { dir: local, resolvedVer: pkg?.version ?? version };
             }
         }
-        if (/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+        if (EXACT_SEMVER_RE.test(version)) {
             const exactDir = joinPaths(this.cacheDir, `${name}@${version}`);
-            const exactExists = yield { type: StepType.FS_EXISTS, path: exactDir };
-            if (exactExists) return { dir: exactDir, resolvedVer: version };
+            const exactExists = yield { type: StepType.FS_EXISTS, path: joinPaths(exactDir, 'package.json') };
+            if (exactExists) {
+                yield* this.indexInstalledBins(name, version, exactDir);
+                return { dir: exactDir, resolvedVer: version };
+            }
         }
         const exactVer = yield* this.resolveVersion(name, version, onProgress);
         const pkgDir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
-        const exists = yield { type: StepType.FS_EXISTS, path: pkgDir };
+        const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(pkgDir, 'package.json') };
         if (!exists) {
             if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
             yield* this.install(name, exactVer, pkgDir, onProgress);
+        } else {
+            yield* this.indexInstalledBins(name, exactVer, pkgDir);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
     }
@@ -645,7 +675,7 @@ export class NpmHandler implements ProtocolHandler {
         let resolved: string;
         if (!range || range === 'latest') resolved = tags.latest ?? this.highestVersion(meta);
         else if (tags[range]) resolved = tags[range]!;
-        else if (/^\d+\.\d+\.\d+/.test(range) && meta.versions[range]) resolved = range;
+        else if (SEMVER_PREFIX_RE.test(range) && meta.versions[range]) resolved = range;
         else resolved = matchLatestVersion(Object.keys(meta.versions), range) ?? tags.latest ?? this.highestVersion(meta);
         this.verCache.set(key, resolved);
         return resolved;
@@ -705,14 +735,20 @@ export class NpmHandler implements ProtocolHandler {
         const writeStarted = Date.now();
         yield* this.writeArchive(dir, files);
         log.debug('npm', () => `wrote ${name}@${ver} in ${Date.now() - writeStarted}ms`);
+        // A concurrent worker resolving a sibling file mid-extraction (before this
+        // writeArchive call finished) may have permanently marked it as missing in
+        // the resolver's negative file-existence cache. Clear it now that this
+        // package is fully on disk so those siblings get a fair re-check.
+        clearNegativeCache();
         yield* this.indexInstalledBins(name, ver, dir);
         yield* this.installOptionalDeps(dir, onProgress);
-        // Record postinstall script for deferred execution (cno cache only)
+        // Record deferred npm lifecycle scripts for `cno cache`.
         const pkg = readPkg(dir);
-        const postinstall = pkg?.scripts?.postinstall;
-        if (postinstall && typeof postinstall === 'string' && postinstall.trim()) {
-            this.pendingPostinstall.push({ name, version: ver, dir, script: postinstall });
-            log.debug('npm', () => `postinstall queued: ${name}@${ver}`);
+        for (const lifecycle of ['install', 'postinstall'] as const) {
+            const script = pkg?.scripts?.[lifecycle];
+            if (!script || typeof script !== 'string' || !script.trim()) continue;
+            this.pendingLifecycle.push({ name, version: ver, dir, lifecycle, script });
+            log.debug('npm', () => `${lifecycle} queued: ${name}@${ver}`);
         }
     }
 
@@ -767,11 +803,20 @@ export class NpmHandler implements ProtocolHandler {
         }
     }
 
+    // package.json is written last, once every other file has landed on disk —
+    // ensureInstalled() treats "package.json exists" as "fully installed", and
+    // concurrent scan workers race to check that as soon as it becomes true.
+    // Writing it eagerly (in tarball order) lets a worker see "installed" while
+    // sibling files (e.g. a relative-import target) are still mid-extraction,
+    // which permanently poisons the resolver's negative file-existence cache.
     private *writeArchive(dir: string, files: TarFile[]): Flow<void> {
+        const archiveRoot = this.detectArchiveRoot(files);
         const seen = new Set<string>();
+        let pkgJsonFile: TarFile | null = null;
+        let pkgJsonTarget = '';
         for (const f of files) {
-            let p = f.path;
-            if (p.startsWith('package/')) p = p.slice(8);
+            let p = this.normalizeArchivePath(f.path, f.type, archiveRoot);
+            if (!p) continue;
             const target = joinPaths(dir, p);
             if (f.type === 'dir') {
                 if (!seen.has(target)) {
@@ -785,7 +830,52 @@ export class NpmHandler implements ProtocolHandler {
                 yield { type: StepType.FS_ENSURE_DIR, path: d };
                 seen.add(d);
             }
+            if (p === 'package.json') {
+                pkgJsonFile = f;
+                pkgJsonTarget = target;
+                continue;
+            }
             yield { type: StepType.FS_WRITE_BYTES, path: target, data: f.content };
+            if (f.type === 'file' && (f.mode & 0o111)) {
+                try { fs.chmod(target, f.mode & 0o777); } catch {}
+            }
         }
+        if (pkgJsonFile) {
+            yield { type: StepType.FS_WRITE_BYTES, path: pkgJsonTarget, data: pkgJsonFile.content };
+            if (pkgJsonFile.mode & 0o111) {
+                try { fs.chmod(pkgJsonTarget, pkgJsonFile.mode & 0o777); } catch {}
+            }
+        }
+    }
+
+    private detectArchiveRoot(files: TarFile[]): string | null {
+        let root: string | null = null;
+        for (const f of files) {
+            const p = this.cleanArchivePath(f.path);
+            if (!p || p === 'pax_global_header' || p.startsWith('pax_global_header/')) continue;
+            if (p === 'package' || p.startsWith('package/')) return 'package';
+            const slash = p.indexOf('/');
+            const seg = slash === -1 ? p : p.slice(0, slash);
+            if (!root) root = seg;
+            else if (root !== seg) return null;
+            if (slash === -1 && f.type !== 'dir') return null;
+        }
+        return root;
+    }
+
+    private normalizeArchivePath(path: string, type: TarFile['type'], archiveRoot: string | null): string | null {
+        let p = this.cleanArchivePath(path);
+        if (!p || p === 'pax_global_header' || p.startsWith('pax_global_header/')) return null;
+        if (archiveRoot) {
+            if (p === archiveRoot) return type === 'dir' ? null : '';
+            if (p.startsWith(archiveRoot + '/')) p = p.slice(archiveRoot.length + 1);
+        }
+        return p || null;
+    }
+
+    private cleanArchivePath(path: string): string {
+        let p = path;
+        while (p.startsWith('./')) p = p.slice(2);
+        return p;
     }
 }

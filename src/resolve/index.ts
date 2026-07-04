@@ -8,7 +8,7 @@
 // lock.modules IS the live in-process cache — no separate runCache needed.
 // lock.setModule() writes to both lock.modules and lock.dirtyModules.
 
-import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver, FileKind } from '../types';
+import { moduleRef, type RuntimeConfig, type ModuleInfo, type NodeBuiltinResolver, type FileKind, type LifecycleScriptEntry } from '../types';
 import type { ProtocolHandler } from './protocols/base';
 import type { ProgressCallback } from '../flow';
 import { err, ErrorKind } from '../errors';
@@ -21,13 +21,9 @@ import { DataHandler }  from './protocols/data';
 import { LockStore }    from '../lock';
 import { isBuiltinSpecifier } from './builtins';
 import { runAsync, runSync } from '../flow';
-import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath } from '../utils/path';
-import { resolveFile } from '../utils/io';
+import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, hasLeadingSlashDrive, assert, LRU, log } from '../utils';
 import { detectFormat } from './pkg';
 import { guessFileKind, applyAttrType } from './protocols/base';
-import { assert } from '../utils/misc';
-import { LRU } from '../utils/lru';
-import { log } from '../utils/log';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -98,6 +94,8 @@ export class ModuleResolver {
     private mainEntry = '';
     /** specPath → ModuleInfo — live resolution cache. */
     private readonly resolvedModules = new Map<string, ModuleInfo>();
+    /** runtime module ref → ModuleInfo for non-canonical engine-facing module views. */
+    private readonly runtimeModules = new Map<string, ModuleInfo>();
     /** In-memory (spec, parent) → ModuleInfo cache — skips SQLite on repeat resolves. */
     private readonly resolveCache = new LRU<string, ModuleInfo>(4096);
     /** Mode-aware source cache for cjs-vs-esm lookups in the current runtime. */
@@ -144,6 +142,10 @@ export class ModuleResolver {
         h.registerResolver(r);
     }
 
+    moduleRef(info: Pick<ModuleInfo, 'specPath' | 'moduleId'>): string {
+        return moduleRef(info);
+    }
+
     // -------------------------------------------------------------------------
     // Async resolution — used by DepScanner during precache for parallel downloads
     // Falls back to sync resolve when no async handler available (file, data, node).
@@ -152,45 +154,35 @@ export class ModuleResolver {
     async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
 
+        parent = this.normalizeParentRef(parent);
+        const requestSpec = spec;
         if (spec.includes('\\') || spec[1] === ':') spec = canonicalizePath(spec);
 
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
-        const transient = this.isTransientResolve(attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
         if (sourceHit) return sourceHit;
 
         // L1
-        const srcKey = transient ? undefined : this.lock.getSourceByKey(sourceKey);
+        const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
             if (cached && this.isUsableInfo(cached)) {
-                const fileKind = applyAttrType(cached.fileKind, attr);
-                const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
-                this.resolvedModules.set(final.specPath, final);
-                this.sourceInfoCache.set(sourceKey, final);
-                if (!this.mainEntry) this.mainEntry = final.specPath;
-                return final;
+                return this.publishResolved(requestSpec, mapped, parent, cached, attr);
             }
         }
 
         const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
         if (localPreferred) {
-            return this.rememberResolved(mapped, parent, localPreferred, attr);
+            return this.publishResolved(requestSpec, mapped, parent, localPreferred, attr, { persistModule: true, persistSource: true });
         }
 
         // L2
         const proto = protoOf(mapped);
-        if (!transient && proto && proto !== 'file') {
+        if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
             if (lockHit && this.isUsableInfo(lockHit)) {
-                const fileKind = applyAttrType(lockHit.fileKind, attr);
-                const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
-                this.resolvedModules.set(final.specPath, final);
-                this.lock.setSourceByKey(this.sourceCacheKey(mapped, parent, attr), final.specPath);
-                this.sourceInfoCache.set(sourceKey, final);
-                if (!this.mainEntry) this.mainEntry = final.specPath;
-                return final;
+                return this.publishResolved(requestSpec, mapped, parent, lockHit, attr, { persistSource: true });
             }
         }
 
@@ -200,7 +192,7 @@ export class ModuleResolver {
 
         // L3 — dispatch async if handler supports it, else sync
         const info = await this.dispatchAsync(mapped, parent, attr, onProgress);
-        return this.rememberResolved(mapped, parent, info, attr);
+        return this.publishResolved(requestSpec, mapped, parent, info, attr, { persistModule: true, persistSource: true });
     }
 
     private async dispatchAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
@@ -224,9 +216,9 @@ export class ModuleResolver {
             try {
                 const localPath = resolveFile(aliased);
                 const specPath  = localPath;
-                return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
+                return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
             } catch (e) {
-                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`);
+                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`, e);
             }
         }
         const npm = this.handlers.get('npm');
@@ -243,6 +235,8 @@ export class ModuleResolver {
     resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
+        parent = this.normalizeParentRef(parent);
+        const requestSpec = spec;
         // Normalize Windows backslashes to forward slashes and upper-case the
         // drive letter so a case-insensitive volume can't split cache keys.
         // Must happen before import map lookup, protoOf check, and dispatch.
@@ -260,45 +254,38 @@ export class ModuleResolver {
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
-        const transient = this.isTransientResolve(attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
         if (sourceHit) return sourceHit;
 
         // L1 — source index: (mapped, parent) → specPath we've seen before
-        const srcKey = transient ? undefined : this.lock.getSourceByKey(sourceKey);
+        const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
             if (cached && this.isUsableInfo(cached)) {
                 log.debug('resolver', () => `L1 hit: "${mapped}" → "${srcKey}"`);
-                const fileKind = applyAttrType(cached.fileKind, attr);
-                const final = fileKind !== cached.fileKind ? { ...cached, fileKind } : cached;
-                this.resolvedModules.set(final.specPath, final);
-                this.sourceInfoCache.set(sourceKey, final);
-                if (!this.mainEntry) this.mainEntry = final.specPath;
-                if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
-                return final;
+                return this.publishResolved(requestSpec, mapped, parent, cached, attr, { rememberExact: true });
             }
         }
 
         const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
         if (localPreferred) {
-            return this.rememberResolved(mapped, parent, localPreferred, attr);
+            return this.publishResolved(requestSpec, mapped, parent, localPreferred, attr, {
+                persistModule: true,
+                persistSource: true,
+                rememberExact: true,
+            });
         }
 
         // L2 — module index: for canonical specifiers, check without dispatching
         const proto = protoOf(mapped);
-        if (!transient && proto && proto !== 'file') {
+        if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
             if (lockHit && this.isUsableInfo(lockHit)) {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
-                const fileKind = applyAttrType(lockHit.fileKind, attr);
-                const final = fileKind !== lockHit.fileKind ? { ...lockHit, fileKind } : lockHit;
-                this.resolvedModules.set(final.specPath, final);
-                this.lock.setSourceByKey(this.sourceCacheKey(mapped, parent, attr), final.specPath);
-                this.sourceInfoCache.set(sourceKey, final);
-                if (!this.mainEntry) this.mainEntry = final.specPath;
-                if (!attr) this.resolveCache.set(`${spec}\0${parent}`, final);
-                return final;
+                return this.publishResolved(requestSpec, mapped, parent, lockHit, attr, {
+                    persistSource: true,
+                    rememberExact: true,
+                });
             }
         }
 
@@ -311,10 +298,16 @@ export class ModuleResolver {
             );
         }
         const info = this.dispatch(mapped, parent, attr);
-        return this.rememberResolved(mapped, parent, info, attr);
+        return this.publishResolved(requestSpec, mapped, parent, info, attr, {
+            persistModule: true,
+            persistSource: true,
+            rememberExact: true,
+        });
     }
 
     getInfo(specPath: string): ModuleInfo {
+        const runtime = this.runtimeModules.get(specPath);
+        if (runtime) return runtime;
         const cached = this.resolvedModules.get(specPath);
         if (cached) return cached;
         const hit = this.lock.getModule(specPath);
@@ -340,6 +333,7 @@ export class ModuleResolver {
     rewriteLock(): void { this.lock.rewrite(); }
     get lockSize(): number { return this.lock.size; }
     get lockDirty(): number { return this.lock.dirtyCount; }
+    get lockPath(): string { return this.lock.path; }
 
     /** Clear handler caches (for memory cleanup) */
     clearHandlerCaches(): void {
@@ -348,10 +342,19 @@ export class ModuleResolver {
         }
     }
 
-    /** Drain pending postinstall scripts from the npm handler. */
-    drainPostinstall(): Array<{ name: string; version: string; dir: string; script: string }> {
+    /** Clear runtime-only resolution caches while keeping persistent handler state intact. */
+    clearRuntimeCaches(): void {
+        this.runtimeModules.clear();
+        this.resolvedModules.clear();
+        this.resolveCache.clear();
+        this.sourceInfoCache.clear();
+        this.statCache.clear();
+    }
+
+    /** Drain deferred npm lifecycle scripts from the npm handler. */
+    drainLifecycleScripts(): LifecycleScriptEntry[] {
         const npm = this.handlers.get('npm');
-        if (npm instanceof NpmHandler) return npm.drainPostinstall();
+        if (npm instanceof NpmHandler) return npm.drainLifecycleScripts();
         return [];
     }
 
@@ -378,14 +381,14 @@ export class ModuleResolver {
         if (pp && pp !== 'file') { const h = this.handlers.get(pp); if (h) return runSync(h.resolve(spec, parent, attr)); }
         let base = parent.startsWith('file://') ? parent.slice(7) : parent;
         // file:///C:/... → /C:/... → strip leading / before drive letter
-        if (/^\/[a-zA-Z]:/.test(base)) base = base.slice(1);
+        if (hasLeadingSlashDrive(base)) base = base.slice(1);
         // Ensure base is an absolute path for correct relative resolution
         if (!isAbsolute(base)) base = resolvePath(base);
         base = dirname(base);
         const joined = joinPaths(base, spec);
         const localPath = resolveFile(normalizePath(joined));
         const specPath = localPath;
-        return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
+        return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
     }
 
     private async resolveRelativeAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
@@ -401,7 +404,7 @@ export class ModuleResolver {
         const aliased   = this.applyPathAlias(spec);
         const localPath = resolveFile(aliased !== spec ? aliased : spec);
         const specPath  = localPath;
-        return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
+        return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
     }
 
     private resolveBare(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
@@ -412,9 +415,9 @@ export class ModuleResolver {
             try {
                 const localPath = resolveFile(aliased);
                 const specPath  = localPath;
-                return { specPath, localPath, format: detectFormat(localPath), fileKind: applyAttrType(guessFileKind(localPath), attr) };
+                return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
             } catch (e) {
-                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`);
+                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`, e);
             }
         }
         const npm = this.handlers.get('npm');
@@ -470,20 +473,43 @@ export class ModuleResolver {
         }
     }
 
-    private rememberResolved(mapped: string, parent: string, info: ModuleInfo, attr?: Record<string, any>): ModuleInfo {
-        this.resolvedModules.set(info.specPath, info);
+    private publishResolved(
+        requestSpec: string,
+        mapped: string,
+        parent: string,
+        info: ModuleInfo,
+        attr?: Record<string, any>,
+        opts?: {
+            persistModule?: boolean;
+            persistSource?: boolean;
+            rememberExact?: boolean;
+        },
+    ): ModuleInfo {
+        const transient = this.isTransientResolve(attr);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
-        this.sourceInfoCache.set(sourceKey, info);
-        if (!this.isTransientResolve(attr)) {
-            this.lock.setModule(info);
-            this.lock.setSourceByKey(sourceKey, info.specPath);
+        const canonical = this.toCanonicalInfo(info);
+        const resolved = this.materializeRuntimeInfo(canonical, attr);
+
+        // Parent-scoped CJS resolves may intentionally choose different
+        // package conditions/format than canonical ESM module identity.
+        // Keep those results in the mode-aware source cache only.
+        this.sourceInfoCache.set(sourceKey, resolved);
+        this.rememberRuntimeInfo(resolved);
+
+        if (!transient) {
+            this.resolvedModules.set(canonical.specPath, canonical);
+            if (opts?.persistModule) this.lock.setModule(canonical);
+            if (opts?.persistSource) this.lock.setSourceByKey(sourceKey, canonical.specPath);
+            if (!this.mainEntry) {
+                this.mainEntry = canonical.specPath;
+                log.debug('resolver', () => `main: "${canonical.specPath}"`);
+            }
         }
-        if (!attr) this.resolveCache.set(`${mapped}\0${parent}`, info);
-        if (!this.mainEntry) {
-            this.mainEntry = info.specPath;
-            log.debug('resolver', () => `main: "${info.specPath}"`);
+
+        if (opts?.rememberExact && !attr) {
+            this.resolveCache.set(`${requestSpec}\0${parent}`, resolved);
         }
-        return info;
+        return resolved;
     }
 
     private isUsableInfo(info: ModuleInfo): boolean {
@@ -514,11 +540,51 @@ export class ModuleResolver {
     }
 
     private sourceCacheKey(spec: string, parent: string, attr?: Record<string, any>): string {
-        return `${attr?.cjs === true ? 'cjs' : 'esm'}\0${spec}\0${parent}`;
+        return `${attr?.cjs === true ? 'cjs' : 'esm'}\0${spec}\0${parent}\0${this.attrSignature(attr)}`;
+    }
+
+    private canReadSourceIndex(attr?: Record<string, any>): boolean {
+        return !this.isTransientResolve(attr);
     }
 
     private isTransientResolve(attr?: Record<string, any>): boolean {
         return attr?.cjs === true;
+    }
+
+    private normalizeParentRef(parent: string): string {
+        const runtime = this.runtimeModules.get(parent);
+        if (runtime) return runtime.specPath;
+        return canonicalizePath(parent);
+    }
+
+    private rememberRuntimeInfo(info: ModuleInfo): void {
+        const ref = moduleRef(info);
+        if (ref !== info.specPath) this.runtimeModules.set(ref, info);
+    }
+
+    private toCanonicalInfo(info: ModuleInfo): ModuleInfo {
+        if (!info.moduleId) return info;
+        const { moduleId: _moduleId, ...canonical } = info;
+        return canonical;
+    }
+
+    private materializeRuntimeInfo(info: ModuleInfo, attr?: Record<string, any>): ModuleInfo {
+        const fileKind = applyAttrType(info.fileKind, attr);
+        if (fileKind === info.fileKind) return info;
+        return {
+            ...info,
+            fileKind,
+            moduleId: `${info.specPath}#cts-view=${fileKind}`,
+        };
+    }
+
+    private attrSignature(attr?: Record<string, any>): string {
+        if (!attr) return '';
+        const pairs = Object.entries(attr)
+            .filter(([k, v]) => k !== 'cjs' && v !== undefined)
+            .sort(([a], [b]) => a.localeCompare(b));
+        if (!pairs.length) return '';
+        return pairs.map(([k, v]) => `${k}=${String(v)}`).join(',');
     }
 
 }

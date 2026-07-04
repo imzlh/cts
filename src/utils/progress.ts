@@ -1,7 +1,7 @@
 // progress.ts — unified precache progress UI
 //
 // PrecacheProgress spans the entire precache lifecycle (scan + precompile).
-// DepScanner and PrecompileDriver call its methods; it owns all rendering.
+// DepScanner and ParseDriver call its methods; it owns all rendering.
 //
 // TTY:  live multi-line render with spinner, colors, speed
 // pipe: per-download 📦 lines (from handlers via !isatty)
@@ -73,6 +73,8 @@ export class PrecacheProgress {
     // Global counters
     private resolved    = 0;
     private downloaded  = 0;
+    private linked      = 0;
+    private linkTotal   = 0;
     private compiled    = 0;
     private compileTotal = 0;
 
@@ -138,6 +140,12 @@ export class PrecacheProgress {
     }
 
     // ---- Precompile phase ----
+
+    setLinkProgress(done: number, total: number): void {
+        this.linked = done;
+        this.linkTotal = total;
+        this.kick();
+    }
 
     setCompileProgress(done: number, total: number): void {
         this.compiled = done;
@@ -207,6 +215,8 @@ export class PrecacheProgress {
         parts.push(`${C.cyan('resolved')} ${C.bold(String(this.resolved))}`);
         if (this.downloaded > 0)
             parts.push(`${C.yellow('downloaded')} ${C.bold(String(this.downloaded))}`);
+        if (this.linkTotal > 0)
+            parts.push(`${C.green('linked')} ${C.bold(`${this.linked}/${this.linkTotal}`)}`);
         if (this.compileTotal > 0)
             parts.push(`${C.blue('compiled')} ${C.bold(`${this.compiled}/${this.compileTotal}`)}`);
         if (this.speed > 1024)

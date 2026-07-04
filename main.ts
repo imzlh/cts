@@ -1,6 +1,6 @@
 // main.ts
 
-import { isCompilerWorker, runCompilerWorker } from './src/precompile';
+import { isParseWorker, runParseWorker } from './src/parse';
 import { createConfig, loadConfigFile, CLI_TPL } from './src/config';
 import { createRuntime } from './src/runtime/index';
 import { loadTasks } from './src/task';
@@ -351,7 +351,7 @@ async function runWorker(): Promise<void> {
     }
     
     const boot = worker.isWorker
-        ? (isCompilerWorker() ? runCompilerWorker() : runWorker())
+        ? (isParseWorker() ? runParseWorker() : runWorker())
         : runMain();
     boot.catch(e => fatal(e));
 }

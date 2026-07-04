@@ -1,7 +1,7 @@
 // jsc.ts — JSC bytecode cache (compilation artifact management)
 //
 // Two-tier cache:
-//   L1  in-memory bytecode (from precompile workers, same-process only)
+//   L1  in-memory bytecode (from parse workers, same-process only)
 //   L2  on-disk .jsc files   (persisted, survives process restart)
 //
 // Remote modules (npm:, jsr:, http:, https:, node:) are cached unconditionally
@@ -11,9 +11,7 @@
 // using a path-hash filename.  A .jsc.mt sidecar stores the source mtime;
 // on load, the cached bytecode is used only when the source hasn't changed.
 
-import { dirname, joinPaths } from '../utils/path';
-import { ensureDir } from '../utils/io';
-import { log } from '../utils/log';
+import { dirname, joinPaths, ensureDir, log } from '../utils';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -131,7 +129,7 @@ export class JscCache {
     }
 
     // -------------------------------------------------------------------------
-    // Store bytecode in memory (called by precompile driver)
+    // Store bytecode in memory (called by the parse driver)
     // -------------------------------------------------------------------------
 
     setMemory(localPath: string, bc: ArrayBuffer): void {

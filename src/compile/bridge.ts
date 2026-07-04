@@ -12,6 +12,7 @@ import type { CjsDeps } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
 import { BUILTINS } from '../resolve/builtins';
+import { errMsg, log } from '../utils';
 
 const engine = import.meta.use('engine');
 
@@ -76,21 +77,15 @@ export function loadEsmSync(
     resolveMtime?: (p: string) => number | undefined,
 ): Record<string, any> {
     const mod = esm.load(info, {}, resolveMtime);
-    const p = mod.eval();
+    const result = engine.promiseResult(mod.eval());
 
-    const result = engine.promiseResult(p);
-
-    // Case 1: error thrown during evaluation → propagate
-    // (promiseResult re-throws the error)
-
-    // Case 2: null → module has top-level await, cannot load synchronously
-    if (result === null && Object.keys(mod.namespace).length === 0) {
+    // null = top-level await unresolved; do NOT weaken with namespace check (causes silent dead-lock)
+    if (result === null) {
         throw new Error(
             `Cannot require() async ESM module '${info.specPath}'; use dynamic import() instead`
         );
     }
 
-    // Case 3: return the full namespace.
     return mod.namespace;
 }
 
@@ -107,28 +102,17 @@ export function buildCjsDeps(
     esm: EsmCompiler,
 ): CjsDeps {
     return {
-        builtinToPath(name: string, parent: string): string {
-            return resolver.resolve(`node:${name}`, parent).localPath;
+        resolveBuiltin(name: string, parent: string): ModuleInfo {
+            return resolver.resolve(`node:${name}`, parent);
         },
 
-        loadEsmSync(localPath: string, specPath: string): Record<string, any> {
-            let info: ModuleInfo;
-            try {
-                info = resolver.getInfo(specPath);
-            } catch {
-                info = { specPath, localPath, format: 'esm', fileKind: 'source' };
-            }
+        loadEsmSync(info: ModuleInfo): Record<string, any> {
             return loadEsmSync(info, esm, (p) => resolver.getCachedMtime(p));
         },
 
-        resolveExternal(req: string, parent: string): { path: string; specPath: string; isCjs: boolean } | null {
+        resolveExternal(req: string, parent: string): ModuleInfo | null {
             try {
-                const info = resolver.resolve(req, parent, { cjs: true });
-                return {
-                    path: info.localPath,
-                    specPath: info.specPath,
-                    isCjs: info.format === 'cjs' || info.fileKind === 'json',
-                };
+                return resolver.resolve(req, parent, { cjs: true });
             } catch { return null; }
         },
 
@@ -161,11 +145,15 @@ function normalizeNpmSpec(spec: string): string {
 
 /**
  * Install globalThis.require as a lazy getter that delegates to CjsLoader.
+ * Warns on re-install (second runtime in same process hijacks the first).
  */
 export function installGlobalRequire(
     mkRequire: (parentPath: string) => any,
     getEntry: () => string,
 ): void {
+    const prev = Reflect.get(globalThis, CTS_REQUIRE_GETTER);
+    if (prev) log.warn('bridge', () => 'globalThis.require re-installed — prior runtime hijacked');
+
     let requireFn: Function | undefined;
     let cachedEntry = '';
     const getter = () => {
@@ -180,9 +168,7 @@ export function installGlobalRequire(
     const desc = Object.getOwnPropertyDescriptor(globalThis, 'require');
     if (!desc) {
         Object.defineProperty(globalThis, 'require', {
-            get: getter,
-            enumerable: true,
-            configurable: true,
+            get: getter, enumerable: true, configurable: true,
         });
         Reflect.set(globalThis, CTS_REQUIRE_GETTER, getter);
         return;
@@ -190,17 +176,15 @@ export function installGlobalRequire(
 
     if (desc.configurable) {
         Object.defineProperty(globalThis, 'require', {
-            get: getter,
-            enumerable: desc.enumerable ?? true,
-            configurable: true,
+            get: getter, enumerable: desc.enumerable ?? true, configurable: true,
         });
         Reflect.set(globalThis, CTS_REQUIRE_GETTER, getter);
     }
 }
 
 /**
- * Install globalThis[Symbol.for('cts.internal')] bridge
- * exposing mkRequire, builtinModules, cache, specToLocalPath.
+ * Install globalThis[CTS_INTERNAL] bridge.
+ * Re-install overwrites the prior object's fields (with per-field error logging).
  */
 export function installInternalBridge(
     mkRequire: (parentPath: string) => any,
@@ -222,19 +206,15 @@ export function installInternalBridge(
     const desc = Object.getOwnPropertyDescriptor(globalThis, CTS_INTERNAL);
     if (!desc) {
         Object.defineProperty(globalThis, CTS_INTERNAL, {
-            value,
-            writable: false,
-            enumerable: false,
-            configurable: false,
+            value, writable: false, enumerable: false, configurable: false,
         });
         return;
     }
     if ('value' in desc && desc.value && typeof desc.value === 'object') {
-        try {
-            (desc.value as any).mkRequire = value.mkRequire;
-            (desc.value as any).builtinModules = value.builtinModules;
-            (desc.value as any).cache = value.cache;
-            (desc.value as any).specToLocalPath = value.specToLocalPath;
-        } catch {}
+        log.warn('bridge', () => 'CTS_INTERNAL re-installed — prior runtime hijacked');
+        for (const [k, v] of Object.entries(value)) {
+            try { (desc.value as any)[k] = v; }
+            catch (e) { log.debug('bridge', () => `CTS_INTERNAL field "${k}" overwrite failed: ${errMsg(e)}`); }
+        }
     }
 }

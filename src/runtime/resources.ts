@@ -6,11 +6,10 @@
 // Design: instance-based (not singleton) so each TypeScriptRuntime
 // can have its own ResourceManager. Supports REPL creating multiple runtimes.
 
-import { clearResolveCache, clearNegativeCache } from '../utils/io';
+import { clearResolveCache, clearNegativeCache, log } from '../utils';
 import { clearPkgCache } from '../resolve/pkg';
 import { clearDnsCache } from '@cnojs/http/dns-cache';
 import { closeConnectionPools } from '../flow';
-import { log } from '../utils/log';
 
 export interface Cleanup { (): void }
 
@@ -67,4 +66,3 @@ export function createResourceManager(): ResourceManager {
 // Each TypeScriptRuntime creates its own instance; this one is for
 // process exit cleanup when no runtime reference is available.
 export const resources = createResourceManager();
-

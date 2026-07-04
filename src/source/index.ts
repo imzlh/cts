@@ -6,8 +6,8 @@
 //   3. Returns clean JS source
 
 import type { ModuleInfo } from '../types';
-import { readText } from '../utils/io';
-import { log } from '../utils/log';
+import { moduleRef } from '../types';
+import { readText, log } from '../utils';
 import { Transformer } from './transform';
 
 export { Transformer } from './transform';
@@ -20,7 +20,7 @@ export type { TransformerOptions } from './transform';
  */
 export function readSource(info: ModuleInfo, transformer: Transformer, lang?: string): string {
     const raw = readText(info.localPath);
-    const code = transformer.transform(raw, info.localPath, lang);
+    const code = transformer.transform(raw, info.localPath, lang, moduleRef(info));
     if (code !== raw) {
         log.debug('source', () => `transformed: ${info.localPath}`);
     }

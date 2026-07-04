@@ -1,13 +1,8 @@
 // config.ts — configuration loading
 
 import type { RuntimeConfig, ConfigOptions } from './types';
-import { dirname, joinPaths, toPosixPath } from './utils/path';
-import { readText, writeText, ensureDir } from './utils/io';
-import { stripJsonc, safeParse, parseArgs } from './utils/misc';
-import { log } from './utils/log';
+import { dirname, joinPaths, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier } from './utils';
 import { err, ErrorKind } from './errors';
-import { uname, isWindows } from './utils/index';
-import { getMemoryTier } from './utils/tier';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -28,6 +23,7 @@ const DEFAULTS = {
     enableCache: true,
     enableOxc: true,
     ignoreScripts: false,
+    nodeModulesMode: 'normal',
     polyfill:    '',
     cacheDir:    '',
 } as const;
@@ -82,12 +78,9 @@ function envConfig(): Partial<ConfigOptions> {
     const v = (k: string) => env(E + k);
     const cacheDir = v('CACHE_DIR'); if (cacheDir) c.cacheDir = cacheDir;
     const dc  = bool(v('DISABLE_CACHE')); if (dc  !== undefined) c.enableCache = !dc;
-    // New OXC env vars (preferred)
+    // OXC env vars
     const no  = bool(v('NO_OXC'));         if (no === true) c.enableOxc = false;
     const oxc = bool(v('ENABLE_OXC'));     if (oxc !== undefined) c.enableOxc = oxc;
-    // Legacy SWC env vars — map to enableOxc for backward compat
-    const ns  = bool(v('NO_SWC'));         if (ns === true) c.enableOxc = false;
-    const swc = bool(v('ENABLE_SWC'));     if (swc !== undefined) c.enableOxc = swc;
     const http = bool(v('ENABLE_HTTP')); if (http !== undefined) c.enableHttp = http;
     const jsr  = bool(v('ENABLE_JSR'));  if (jsr  !== undefined) c.enableJsr  = jsr;
     const node = bool(v('ENABLE_NODE')); if (node !== undefined) c.enableNode = node;
@@ -177,11 +170,11 @@ const CLI_TPL = {
     'no-node':        'boolean',
     'disable-cache':  'boolean',
     'no-oxc':         'boolean',
-    'no-swc':         'boolean',
     'precache':       'boolean',
     'no-lock':        'boolean',
     'frozen':         'boolean',
     'ignore-scripts': 'boolean',
+    'npm-mode': 'string',
     'help':           'boolean',
     'h':              'boolean',
     'version':        'boolean',
@@ -199,7 +192,7 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     if (cli['eval'] || cli['e']) cfg.eval        = (cli['eval'] || cli['e']) as string;
     if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || env('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.enableCache  = false;
-    if (cli['no-oxc'] || cli['no-swc']) cfg.enableOxc = false;
+    if (cli['no-oxc']) cfg.enableOxc = false;
     if (cli['silent'])        cfg.silent        = true;
     if (cli['no-http'])       cfg.enableHttp    = false;
     if (cli['no-jsr'])        cfg.enableJsr     = false;
@@ -207,6 +200,11 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     if (cli['no-lock'])       cfg.disableLock    = true;
     if (cli['frozen'])        cfg.frozen        = true;
     if (cli['ignore-scripts']) cfg.ignoreScripts = true;
+    if (cli['npm-mode']) {
+        const m = cli['npm-mode'];
+        if (m === 'normal' || m === 'soft' || m === 'hard') cfg.nodeModulesMode = m;
+        else log.warn('config', () => `invalid --npm-mode "${m}", ignoring`);
+    }
     if (cli['memory-limit'] !== undefined)
         cfg.memoryLimit = parseSize(cli['memory-limit'] || env('CTS_MEMORY_LIMIT') || '1g');
     if (cli['max-stack-size'] !== undefined)
@@ -293,6 +291,8 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
                     // package.json imports use reversed merge priority (package > deno)
                     cfg.importMap = { ...filterImports(pkg.imports as Record<string, unknown>), ...cfg.importMap };
                 }
+                const nmm = pkg.cts?.nodeModulesMode;
+                if (nmm === 'normal' || nmm === 'soft' || nmm === 'hard') cfg.nodeModulesMode = nmm;
                 foundPkg = true;
             }
         }

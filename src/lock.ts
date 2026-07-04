@@ -11,11 +11,7 @@
 //     transaction on flush() / rewrite() / close().
 
 import type { ModuleInfo, ModuleFormat, FileKind } from './types';
-import { joinPaths, dirname, toPosixPath } from './utils/path';
-import { ensureDir } from './utils/io';
-import { log } from './utils/log';
-import { errMsg } from './utils';
-import { getMemoryTier } from './utils/tier';
+import { joinPaths, dirname, toPosixPath, ensureDir, errMsg, log, getMemoryTier } from './utils';
 
 const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
@@ -42,6 +38,17 @@ CREATE TABLE IF NOT EXISTS bins (
 
 export class LockStore {
     private static readonly openStores = new Set<LockStore>();
+
+    /** Does a persisted lock file exist in `dir`? Used to decide read-only reuse. */
+    static existsAt(dir: string): boolean {
+        try { return fs.exists(joinPaths(toPosixPath(dir), DB_FILENAME)); }
+        catch { return false; }
+    }
+
+    /** On-disk path of the lock (may not exist yet when in-memory/read-only). */
+    get path(): string { return this.dbPath; }
+    /** True when this store persists writes to disk. */
+    get writable(): boolean { return !this.readOnly; }
 
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
     private loadFailed = false;

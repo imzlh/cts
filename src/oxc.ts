@@ -1,13 +1,13 @@
-import { log } from './utils/log';
-import { errMsg } from './utils/misc';
+import { log, errMsg } from './utils';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
+const smap = import.meta.use('sourcemap');
 
 // ── oxc native extension types ────────────────────────────────────────────────
 
 export interface OxcModule {
-    transpile(source: string, opts?: { kind?: 'js' | 'jsx' | 'ts' | 'tsx'; depsOnly?: boolean }): { code: string; deps: string[] };
+    transpile(source: string, opts?: { kind?: 'js' | 'jsx' | 'ts' | 'tsx'; depsOnly?: boolean; filename?: string }): { code: string; deps: string[]; sourceMap?: string };
     scanImports(source: string, opts?: { kind?: 'js' | 'jsx' | 'ts' | 'tsx' }): string[];
     version: string;
 }
@@ -16,18 +16,43 @@ export interface OxcModule {
 
 export class OxcTranspiler {
     private mod: OxcModule;
+    private scanLogged = false;
 
     constructor(mod: OxcModule) {
         this.mod = mod;
         log.debug('oxc', () => `loaded ${mod.version}`);
     }
 
-    /** Transpile TS/TSX/JS/JSX to JS. Returns null if the extension errors. */
-    transpile(source: string, filename: string): string | null {
+    /** Transpile TS/TSX/JS/JSX to JS. Returns null if the extension errors.
+     *  `mapKey` is the module's runtime identity (e.g. specPath) — the same
+     *  name passed to `new engine.Module(code, mapKey)`. It is used both as
+     *  the sourcemap registry key AND as the embedded `sources` entry, so a
+     *  resolved stack frame shows that identity instead of the on-disk path
+     *  `filename` (which may sit in a shared, unrelated cache directory). */
+    transpile(source: string, filename: string, mapKey?: string): string | null {
         try {
             const kind = kindFromFilename(filename);
-            const { code } = this.mod.transpile(source, { kind });
+            const name = mapKey ?? filename;
+            const { code, sourceMap } = this.mod.transpile(source, { kind, filename: name });
+            if (sourceMap) {
+                try { smap.loadJSON(name, sourceMap); }
+                catch (e) { log.debug('oxc', () => `smap: ${filename}: ${errMsg(e)}`); }
+            }
             return code;
+        } catch (e) {
+            log.debug('oxc', () => `transpile failed for ${filename}: ${errMsg(e)}`);
+            return null;
+        }
+    }
+
+    /** Like transpile(), but returns the sourcemap instead of registering it
+     *  locally — for callers (e.g. a worker) whose JSContext isn't the one
+     *  that will actually run the compiled module and needs to register it. */
+    transpileCapture(source: string, filename: string, mapKey?: string): { code: string; sourceMap?: string } | null {
+        try {
+            const kind = kindFromFilename(filename);
+            const { code, sourceMap } = this.mod.transpile(source, { kind, filename: mapKey ?? filename });
+            return { code, sourceMap };
         } catch (e) {
             log.debug('oxc', () => `transpile failed for ${filename}: ${errMsg(e)}`);
             return null;
@@ -38,7 +63,12 @@ export class OxcTranspiler {
     scanImports(source: string, filename: string): string[] | null {
         try {
             const kind = kindFromFilename(filename);
-            return this.mod.scanImports(source, { kind });
+            const deps = this.mod.scanImports(source, { kind });
+            if (!this.scanLogged) {
+                this.scanLogged = true;
+                log.debug('oxc', () => `scan active: ${filename}`);
+            }
+            return deps;
         } catch (e) {
             log.debug('oxc', () => `scanImports failed for ${filename}: ${errMsg(e)}`);
             return null;
@@ -55,8 +85,7 @@ function kindFromFilename(filename: string): 'js' | 'jsx' | 'ts' | 'tsx' {
 
 /**
  * Resolve path to the OXC native extension.
- * Prefers <exeDir>/ext/oxc.{dll,so,dylib}; falls back to legacy swc.* name.
- * Returns null if neither exists.
+ * Returns null if not found.
  */
 export function oxcExtPath(): string | null {
     try {
@@ -65,23 +94,22 @@ export function oxcExtPath(): string | null {
         const suffix = os.platform === 'windows' ? 'dll'
                      : os.platform === 'darwin'  ? 'dylib'
                      : 'so';
-        const preferred = `${exeDir}${sep}ext${sep}oxc.${suffix}`;
-        const legacy    = `${exeDir}${sep}ext${sep}swc.${suffix}`;
+        const extPath = `${exeDir}${sep}ext${sep}oxc.${suffix}`;
+        const candidates = [extPath];
+        const stageSuffix = `${sep}build${sep}stage`;
 
-        // Check preferred name first (future build output)
-        try {
-            // Use a quick stat via os if available; otherwise fall through to legacy
-            if (fs.stat?.(preferred)) return preferred;
-        } catch {}
+        if (exeDir.endsWith(stageSuffix)) {
+            const repoRoot = exeDir.slice(0, -stageSuffix.length);
+            candidates.push(`${repoRoot}${sep}ext-oxc${sep}build${sep}oxc.${suffix}`);
+        }
 
-        try {
-            if (fs.stat?.(legacy)) {
-                log.debug('oxc', () => `using legacy ext path: ${legacy}`);
-                return legacy;
-            }
-        } catch {}
+        for (const path of candidates) {
+            try {
+                if (fs.stat?.(path)) return path;
+            } catch {}
+        }
 
-        log.debug('oxc', () => `native extension not found: ${preferred} or ${legacy}`);
+        log.debug('oxc', () => `native extension not found: ${candidates.join(', ')}`);
         return null;
     } catch {
         return null;

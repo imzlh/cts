@@ -1,7 +1,7 @@
 // utils/bin.ts — shared node_modules/.bin resolution
 
 import { joinPaths, dirname, pathRoot, toPosixPath } from './path';
-import { isWindows } from './index';
+import { isWindows } from './platform';
 
 const fs = import.meta.use('fs');
 

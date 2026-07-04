@@ -9,15 +9,13 @@
 // are resolved via BinResolver (lock bin index + node_modules/.bin) and
 // executed directly. If a command cannot be resolved as a bin, it fails.
 
-import { dirname, joinPaths, pathRoot, toPosixPath } from './utils/path';
-import { readText } from './utils/io';
-import { stripJsonc, safeParse, errMsg, matchLatestVersion } from './utils/misc';
-import { log } from './utils/log';
-import { isWindows } from './utils/index';
+import { basename, dirname, joinPaths, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows } from './utils';
 import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
-import { findLocalBin, WIN_BIN_EXTS } from './utils/bin';
 import { getBinMap, readPkgFresh } from './resolve/pkg';
+import { createConfig } from './config';
+import { NpmHandler } from './resolve/protocols/npm';
+import { runAsync } from './flow';
 
 const os = import.meta.use('os');
 const console = import.meta.use('console');
@@ -67,10 +65,19 @@ export class BinResolver {
      *
      * When possible, parses .cmd/.bat/shell wrappers to extract the real JS
      * entry so it can be run directly by the cts runtime.
+     *
+     * `opts.global` (used by `cno exec`) skips all cwd-scoped lookups (local
+     * node_modules/.bin, this project's lock bin index, this project's
+     * package.json deps) and resolves purely against the shared `~/.cts/npm`
+     * cache, the same as an explicit `npm:<name>` spec — pnpm-dlx/pnpx style,
+     * independent of which directory you run it from.
      */
-    resolve(name: string, cwd: string): ResolvedBin | null {
+    resolve(name: string, cwd: string, opts?: { global?: boolean }): ResolvedBin | null {
+        if (name.startsWith('npm:')) return this.resolveNpmSpecifierBin(name);
         if (name.startsWith('/') || name.startsWith('.') || name.includes('/')) return null;
         if (name.startsWith('-')) return null;
+
+        if (opts?.global) return this.resolveNpmSpecifierBin(`npm:${name}`);
 
         // 1. Local node_modules/.bin
         const local = findLocalBin(name, cwd);
@@ -85,6 +92,27 @@ export class BinResolver {
         if (cached) return this.resolveEntry(cached);
 
         return null;
+    }
+
+    private resolveNpmSpecifierBin(spec: string): ResolvedBin | null {
+        const parsed = parseNpmExecSpec(spec);
+        if (!parsed) return null;
+
+        const installedDir = findCachedPackageDir(resolveCacheDir(), parsed.name, parsed.version);
+        if (!installedDir) return null;
+
+        const pkg = readPkgFresh(installedDir);
+        if (!pkg) return null;
+
+        const binMap = getBinMap(pkg);
+        const binName = parsed.binName ?? defaultBinName(pkg.name ?? parsed.name, binMap);
+        if (!binName) return null;
+
+        const relPath = binMap[binName];
+        if (!relPath) return null;
+
+        const absPath = joinPaths(installedDir, relPath);
+        return fs.exists(absPath) ? this.resolveEntry(absPath) : null;
     }
 
     private resolveCachedProjectBin(name: string, cwd: string): string | null {
@@ -174,6 +202,70 @@ function env(k: string): string | null {
     try { return os.getenv(k); } catch { return null; }
 }
 
+interface NpmExecSpec {
+    name: string;
+    version: string;
+    binName?: string;
+}
+
+function parseNpmExecSpec(raw: string): NpmExecSpec | null {
+    let rest = raw.startsWith('npm:') ? raw.slice(4) : raw;
+    while (rest.startsWith('/')) rest = rest.slice(1);
+    if (!rest) return null;
+
+    let name = '';
+    let version = 'latest';
+    let binName: string | undefined;
+
+    if (rest.startsWith('@')) {
+        const slash = rest.indexOf('/');
+        if (slash <= 1) return null;
+        const scope = rest.slice(0, slash);
+        const tail = rest.slice(slash + 1);
+        const at = tail.indexOf('@');
+        const slash2 = tail.indexOf('/');
+        if (at !== -1 && (slash2 === -1 || at < slash2)) {
+            name = `${scope}/${tail.slice(0, at)}`;
+            const after = tail.slice(at + 1);
+            const slash3 = after.indexOf('/');
+            version = slash3 === -1 ? after : after.slice(0, slash3);
+            binName = slash3 === -1 ? undefined : after.slice(slash3 + 1);
+        } else if (slash2 !== -1) {
+            name = `${scope}/${tail.slice(0, slash2)}`;
+            binName = tail.slice(slash2 + 1);
+        } else {
+            name = `${scope}/${tail}`;
+        }
+    } else {
+        const at = rest.indexOf('@');
+        const slash = rest.indexOf('/');
+        if (at !== -1 && (slash === -1 || at < slash)) {
+            name = rest.slice(0, at);
+            const after = rest.slice(at + 1);
+            const slash2 = after.indexOf('/');
+            version = slash2 === -1 ? after : after.slice(0, slash2);
+            binName = slash2 === -1 ? undefined : after.slice(slash2 + 1);
+        } else if (slash !== -1) {
+            name = rest.slice(0, slash);
+            binName = rest.slice(slash + 1);
+        } else {
+            name = rest;
+        }
+    }
+
+    if (!name || !version || binName === '') return null;
+    return { name, version, binName };
+}
+
+function defaultBinName(pkgName: string, binMap: Record<string, string>): string | null {
+    const names = Object.keys(binMap);
+    if (!names.length) return null;
+    if (names.length === 1) return names[0]!;
+    if (pkgName && binMap[pkgName]) return pkgName;
+    const base = basename(pkgName);
+    return binMap[base] ? base : null;
+}
+
 function resolveCacheDir(): string {
     const envDir = env('CTS_CACHE_DIR');
     if (envDir) return toPosixPath(envDir);
@@ -212,8 +304,9 @@ function findCachedPackageDir(cacheDir: string, pkgName: string, range: string):
         .map((entry) => entry.slice(prefix.length));
     if (!versions.length) return null;
 
-    const resolved = matchLatestVersion(versions, range)
-        ?? (versions.includes(range) ? range : null);
+    const resolved = (!range || range === 'latest' || range === '*')
+        ? versions.slice().sort(compareVersions).at(-1)!
+        : matchLatestVersion(versions, range) ?? (versions.includes(range) ? range : null);
     if (!resolved) return null;
 
     const resolvedDir = joinPaths(baseDir, `${leaf}@${resolved}`);
@@ -315,6 +408,7 @@ async function execCommand(
     cwd: string,
     extraArgs: string[],
     resolver: BinResolver,
+    forwardedArgs: string[] = [],
 ): Promise<number> {
     // Expand environment variables in the command string before parsing
     const mergedEnv = { ...os.environ(), ...env };
@@ -336,12 +430,12 @@ async function execCommand(
                 console.error('[task] `deno run` with no entry file');
                 return 1;
             }
-            return execRun([...stripped, ...extraArgs], env, cwd);
+            return execRun([...stripped, ...extraArgs], env, cwd, forwardedArgs);
         }
 
         // deno task <name>
         if (seg.bin === 'deno' && seg.args[0] === 'task') {
-            return execTask([...seg.args.slice(1), ...extraArgs], env, cwd);
+            return execTask([...seg.args.slice(1), ...extraArgs], env, cwd, forwardedArgs);
         }
 
         // Try resolve as bin
@@ -372,10 +466,10 @@ async function execCommand(
                 console.error('[task] `deno run` with no entry file');
                 prevCode = 1;
             } else {
-                prevCode = await execRun(isLast ? [...stripped, ...extraArgs] : stripped, env, cwd);
+                prevCode = await execRun(isLast ? [...stripped, ...extraArgs] : stripped, env, cwd, forwardedArgs);
             }
         } else if (seg.bin === 'deno' && seg.args[0] === 'task') {
-            prevCode = await execTask(isLast ? [...seg.args.slice(1), ...extraArgs] : seg.args.slice(1), env, cwd);
+            prevCode = await execTask(isLast ? [...seg.args.slice(1), ...extraArgs] : seg.args.slice(1), env, cwd, forwardedArgs);
         } else {
             const resolved = resolver.resolve(seg.bin, cwd);
             if (!resolved) {
@@ -396,9 +490,9 @@ async function execCommand(
     return prevCode;
 }
 
-async function execRun(args: string[], env: Record<string, string>, cwd: string): Promise<number> {
+async function execRun(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
     const mergedEnv = { ...os.environ(), ...env };
-    const child = process.spawn([os.exePath, 'run', ...args], {
+    const child = process.spawn([os.exePath, ...forwardedArgs, 'run', ...args], {
         stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
         env: mergedEnv, cwd,
     });
@@ -406,9 +500,9 @@ async function execRun(args: string[], env: Record<string, string>, cwd: string)
     return info.exit_status ?? 0;
 }
 
-async function execTask(args: string[], env: Record<string, string>, cwd: string): Promise<number> {
+async function execTask(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
     const mergedEnv = { ...os.environ(), ...env };
-    const child = process.spawn([os.exePath, 'task', ...args], {
+    const child = process.spawn([os.exePath, ...forwardedArgs, 'task', ...args], {
         stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
         env: mergedEnv, cwd,
     });
@@ -459,13 +553,15 @@ export class TaskRunner {
     private readonly tasks: Record<string, TaskDef>;
     private readonly cwd: string;
     private readonly resolver: BinResolver;
+    private readonly forwardedArgs: string[];
     private readonly done = new Set<string>();
     private readonly running = new Set<string>();  // cycle detection
 
-    constructor(tasks: Record<string, TaskDef>, cwd: string, lockStore: LockStore) {
+    constructor(tasks: Record<string, TaskDef>, cwd: string, lockStore: LockStore, options?: { forwardedArgs?: string[] }) {
         this.tasks = tasks;
         this.cwd   = cwd;
         this.resolver = new BinResolver(lockStore);
+        this.forwardedArgs = options?.forwardedArgs ?? [];
     }
 
     list(): void {
@@ -537,7 +633,7 @@ export class TaskRunner {
 
         log.debug('task', () => `\n\x1b[32m$ ${command}\x1b[0m`);
         // Only pass extra args to the leaf task, not to dependencies
-        const code = await execCommand(command, env, this.cwd, extraArgs, this.resolver);
+        const code = await execCommand(command, env, this.cwd, extraArgs, this.resolver, this.forwardedArgs);
         if (code === 0) this.done.add(name);
         if (code !== 0) console.error(`\x1b[31m✖ Task \x1b[36m${name}\x1b[0m\x1b[31m exited with code ${code}\x1b[0m`);
         return code;
@@ -549,7 +645,7 @@ export class TaskRunner {
 // ---------------------------------------------------------------------------
 
 /** Find and load the nearest deno.json/deno.jsonc or package.json containing tasks. */
-export function loadTasks(startDir: string, lockStore: LockStore): { runner: TaskRunner; configPath: string } | null {
+export function loadTasks(startDir: string, lockStore: LockStore, options?: { forwardedArgs?: string[] }): { runner: TaskRunner; configPath: string } | null {
     let dir = toPosixPath(startDir);
     const isWin = isWindows;
     while (true) {
@@ -593,7 +689,7 @@ export function loadTasks(startDir: string, lockStore: LockStore): { runner: Tas
             }
         }
 
-        if (found) return { runner: new TaskRunner(merged, dir, lockStore), configPath };
+        if (found) return { runner: new TaskRunner(merged, dir, lockStore, options), configPath };
 
         const up = dirname(dir);
         if (up === dir) break;
