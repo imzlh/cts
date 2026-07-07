@@ -21,6 +21,7 @@ const DEFAULTS = {
     jsrCacheTTL: 7 * 24 * 60 * 60 * 1000,
     requestTimeout: 30000,
     enableCache: true,
+    cachedOnly: false,
     enableOxc: true,
     ignoreScripts: false,
     nodeModulesMode: 'normal',
@@ -44,6 +45,9 @@ const TIER_STACK_SIZE: Record<string, number> = {
     high:    6 * 1024 * 1024,  // 6 MB
 };
 
+const DEFAULT_MEM_LIMIT = TIER_MEM_LIMIT.normal;
+const DEFAULT_STACK_SIZE = TIER_STACK_SIZE.normal;
+
 // ---------------------------------------------------------------------------
 // Memory size parser  "256MB" → bytes
 // ---------------------------------------------------------------------------
@@ -52,23 +56,63 @@ export function parseSize(s: string | undefined): number | undefined {
     if (!s) return undefined;
     const m = s.match(/^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$/i);
     if (!m) throw err(ErrorKind.InvalidSpecifier, `Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
+    const value = m[1];
+    if (value === undefined) throw err(ErrorKind.InvalidSpecifier, `Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
     const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024**2, GB: 1024**3, TB: 1024**4 };
-    return Math.floor(parseFloat(m[1]!) * (units[(m[2] ?? 'B').toUpperCase()] ?? 1));
+    return Math.floor(parseFloat(value) * (units[(m[2] ?? 'B').toUpperCase()] ?? 1));
 }
 
 // ---------------------------------------------------------------------------
 // Environment
 // ---------------------------------------------------------------------------
 
-function env(k: string): string | null { try { return os.getenv(k); } catch { return null; } }
+function env(k: string): string | null {
+    try {
+        return os.getenv(k) ?? null;
+    } catch {
+        return null;
+    }
+}
 
 /** Filter import map entries: keep only string-valued, non-# entries. */
-function filterImports(raw: Record<string, unknown>): Record<string, string> {
+function filterImports(raw: unknown): Record<string, string> {
     const out: Record<string, string> = {};
+    if (!raw || typeof raw !== 'object') return out;
     for (const [k, v] of Object.entries(raw)) {
         if (!k.startsWith('#') && typeof v === 'string') out[k] = v;
     }
     return out;
+}
+
+interface ConfigJson {
+    compilerOptions?: {
+        paths?: unknown;
+        baseUrl?: unknown;
+    };
+    imports?: unknown;
+    importMap?: unknown;
+    cts?: {
+        nodeModulesMode?: unknown;
+    };
+}
+
+function filterPathAliases(raw: unknown): Record<string, string[]> | undefined {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const out: Record<string, string[]> = {};
+    let hasEntries = false;
+    for (const [key, value] of Object.entries(raw)) {
+        if (!Array.isArray(value)) continue;
+        const targets: string[] = [];
+        for (let i = 0; i < value.length; i++) {
+            const item = value[i];
+            if (typeof item === 'string') targets.push(item);
+        }
+        if (targets.length > 0) {
+            out[key] = targets;
+            hasEntries = true;
+        }
+    }
+    return hasEntries ? out : undefined;
 }
 
 function envConfig(): Partial<ConfigOptions> {
@@ -95,10 +139,53 @@ function envConfig(): Partial<ConfigOptions> {
 }
 
 function defaultCacheDir(): string {
-    let home: string | null = null;
-    try { home = os.homeDir; } catch {}
+    let home: string | null = getHomeDir();
     if (!home) home = env(isWindows ? 'USERPROFILE' : 'HOME') ?? '/root';
     return joinPaths(toPosixPath(home), '.cts');
+}
+
+function getHomeDir(): string | null {
+    try {
+        return os.homeDir;
+    } catch {
+        return null;
+    }
+}
+
+function statOrNull(path: string): CModuleFS.Stats | null {
+    try {
+        return fs.stat(path);
+    } catch {
+        return null;
+    }
+}
+
+function unlinkQuietly(path: string): void {
+    try {
+        fs.unlink(path);
+    } catch {
+        // Ignore best-effort cache cleanup failures.
+    }
+}
+
+function rmdirQuietly(path: string): void {
+    try {
+        fs.rmdir(path);
+    } catch {
+        // Ignore best-effort cache cleanup failures.
+    }
+}
+
+function readTextOrEmpty(path: string): string {
+    try {
+        return readText(path);
+    } catch {
+        return '';
+    }
+}
+
+function isJscArtifact(path: string): boolean {
+    return path.endsWith('.jsc') || path.endsWith('.jsc.mt');
 }
 
 // ---------------------------------------------------------------------------
@@ -106,16 +193,25 @@ function defaultCacheDir(): string {
 // ---------------------------------------------------------------------------
 
 function clearJsc(dir: string): void {
-    // Delete .jsc files in a background timer so we don't block startup.
-    timers.setTimeout(() => { try { clearJscSync(dir); } catch {} }, 0);
+    // Delete bytecode artifacts in a background timer so we don't block startup.
+    timers.setTimeout(() => {
+        try {
+            clearJscSync(dir);
+        } catch {}
+    }, 0);
 }
 
 function clearJscSync(dir: string): void {
     try {
         for (const e of fs.readdir(dir)) {
             const p = joinPaths(dir, e);
-            try { if (fs.stat(p).isDirectory) clearJscSync(p); else if (p.endsWith('.jsc')) fs.unlink(p); }
-            catch {}
+            const stat = statOrNull(p);
+            if (!stat) continue;
+            if (stat.isDirectory) {
+                clearJscSync(p);
+            } else if (isJscArtifact(p)) {
+                unlinkQuietly(p);
+            }
         }
     } catch {}
 }
@@ -125,12 +221,15 @@ function rmrf(dir: string): void {
     try {
         for (const e of fs.readdir(dir)) {
             const p = joinPaths(dir, e);
-            try {
-                if (fs.stat(p).isDirectory) rmrf(p);
-                else fs.unlink(p);
-            } catch {}
+            const stat = statOrNull(p);
+            if (!stat) continue;
+            if (stat.isDirectory) {
+                rmrf(p);
+            } else {
+                unlinkQuietly(p);
+            }
         }
-        try { fs.rmdir(dir); } catch {}
+        rmdirQuietly(dir);
     } catch {}
 }
 
@@ -141,8 +240,7 @@ function verifyCacheDir(dir: string): void {
         return;
     }
     const vf = joinPaths(dir, 'version');
-    let stored = '';
-    try { stored = readText(vf); } catch {}
+    const stored = readTextOrEmpty(vf);
     if (stored !== engine.versions.quickjs) {
         log.debug('config', 'cache version mismatch, clearing .jsc + local/');
         clearJscSync(dir);
@@ -169,6 +267,7 @@ const CLI_TPL = {
     'no-jsr':         'boolean',
     'no-node':        'boolean',
     'disable-cache':  'boolean',
+    'cached-only':    'boolean',
     'no-oxc':         'boolean',
     'precache':       'boolean',
     'no-lock':        'boolean',
@@ -189,9 +288,10 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
 
     if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || env('CTS_CACHE_DIR') || '';
     if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'];
-    if (cli['eval'] || cli['e']) cfg.eval        = (cli['eval'] || cli['e']) as string;
+    if (cli['eval'] || cli['e']) cfg.eval        = cli['eval'] || cli['e'];
     if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || env('CTS_LOCK_DIR') || '';
     if (cli['disable-cache']) cfg.enableCache  = false;
+    if (cli['cached-only'])   cfg.cachedOnly   = true;
     if (cli['no-oxc']) cfg.enableOxc = false;
     if (cli['silent'])        cfg.silent        = true;
     if (cli['no-http'])       cfg.enableHttp    = false;
@@ -210,7 +310,7 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     if (cli['max-stack-size'] !== undefined)
         cfg.maxStackSize = parseSize(cli['max-stack-size'] || env('CTS_MAX_STACK_SIZE') || '0');
     if (cli['jsr-cache-ttl'] !== undefined)
-        cfg.jsrCacheTTL = (cli['jsr-cache-ttl'] as number) * 24 * 60 * 60 * 1000;
+        cfg.jsrCacheTTL = cli['jsr-cache-ttl'] * 24 * 60 * 60 * 1000;
     if (cli['jsx-pragma']) cfg.jsxPragma = cli['jsx-pragma'];
     if (cli['jsx-fragment-pragma']) cfg.jsxFragmentPragma = cli['jsx-fragment-pragma'];
 
@@ -221,11 +321,11 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
 
     // Apply tier defaults unless explicitly overridden by CLI or env.
     const tier = getMemoryTier();
-    if (cfg.memoryLimit === undefined) cfg.memoryLimit = TIER_MEM_LIMIT[tier] ?? TIER_MEM_LIMIT['normal']!;
-    if (cfg.maxStackSize === undefined) cfg.maxStackSize = TIER_STACK_SIZE[tier] ?? TIER_STACK_SIZE['normal']!;
+    if (cfg.memoryLimit === undefined) cfg.memoryLimit = TIER_MEM_LIMIT[tier] ?? DEFAULT_MEM_LIMIT;
+    if (cfg.maxStackSize === undefined) cfg.maxStackSize = TIER_STACK_SIZE[tier] ?? DEFAULT_STACK_SIZE;
     engine.setMemoryLimit(cfg.memoryLimit);
     engine.setMaxStackSize(cfg.maxStackSize);
-    (cfg as any)._cli = cli;  // keep raw CLI args for unknown flag warning
+    cfg._cli = cli;  // keep raw CLI args for unknown flag warning
     return cfg;
 }
 
@@ -242,20 +342,21 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
         dirs.push(up); cur = up;
     }
 
-    const readJson = (p: string): Record<string, any> | null => {
+    const readJson = (p: string): ConfigJson | null => {
         try { return safeParse(stripJsonc(engine.decodeString(fs.readFile(p)))); }
         catch { return null; }
     };
 
-    for (const d of dirs) {
-        let foundTsconfig = false, foundDeno = false, foundPkg = false;
+    let foundTsconfig = false, foundDeno = false, foundPkg = false;
 
+    for (const d of dirs) {
         const tsP = joinPaths(d, 'tsconfig.json');
         if (!foundTsconfig && fs.exists(tsP)) {
             const ts = readJson(tsP);
             if (ts) {
-                if (ts.compilerOptions?.paths)   cfg.pathAliases = ts.compilerOptions.paths;
-                if (ts.compilerOptions?.baseUrl) cfg.baseUrl = joinPaths(d, ts.compilerOptions.baseUrl);
+                const paths = filterPathAliases(ts.compilerOptions?.paths);
+                if (paths) cfg.pathAliases = paths;
+                if (typeof ts.compilerOptions?.baseUrl === 'string') cfg.baseUrl = joinPaths(d, ts.compilerOptions.baseUrl);
                 log.debug('config', () => `tsconfig: ${tsP}`);
                 foundTsconfig = true;
             }
@@ -265,17 +366,22 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             if (foundDeno) break;
             const p = joinPaths(d, name);
             if (!fs.exists(p)) continue;
-            const dc = readJson(p); if (!dc) { foundDeno = true; break; }
-            if (dc.imports) {
-                cfg.importMap = { ...cfg.importMap, ...filterImports(dc.imports as Record<string, unknown>) };
+            const dc = readJson(p);
+            if (!dc) {
+                foundDeno = true;
+                break;
             }
-            if (dc.compilerOptions?.paths) cfg.pathAliases = { ...cfg.pathAliases, ...dc.compilerOptions.paths };
+            if (dc.imports) {
+                cfg.importMap = { ...cfg.importMap, ...filterImports(dc.imports) };
+            }
+            const paths = filterPathAliases(dc.compilerOptions?.paths);
+            if (paths) cfg.pathAliases = { ...cfg.pathAliases, ...paths };
             if (typeof dc.importMap === 'string') {
                 const mp = joinPaths(d, dc.importMap);
                 if (fs.exists(mp)) {
                     const mj = readJson(mp);
                     if (mj?.imports) {
-                        cfg.importMap = { ...cfg.importMap, ...filterImports(mj.imports as Record<string, unknown>) };
+                        cfg.importMap = { ...cfg.importMap, ...filterImports(mj.imports) };
                     }
                 }
             }
@@ -289,7 +395,7 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             if (pkg) {
                 if (pkg.imports && typeof pkg.imports === 'object') {
                     // package.json imports use reversed merge priority (package > deno)
-                    cfg.importMap = { ...filterImports(pkg.imports as Record<string, unknown>), ...cfg.importMap };
+                    cfg.importMap = { ...filterImports(pkg.imports), ...cfg.importMap };
                 }
                 const nmm = pkg.cts?.nodeModulesMode;
                 if (nmm === 'normal' || nmm === 'soft' || nmm === 'hard') cfg.nodeModulesMode = nmm;
@@ -297,7 +403,7 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             }
         }
 
-        if (foundTsconfig || foundDeno) break;
+        if (foundTsconfig && foundDeno && foundPkg) break;
     }
 
     return cfg;

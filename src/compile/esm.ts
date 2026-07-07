@@ -16,6 +16,33 @@ import type { OxcTranspiler } from '../oxc';
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
+function metaLang(meta: Record<string, unknown>): string | undefined {
+    return typeof meta.lang === 'string' ? meta.lang : undefined;
+}
+
+function isTransformSourcePath(path: string): boolean {
+    const length = path.length;
+    if (length < 3) return false;
+    const last = path.charCodeAt(length - 1);
+    if (last === 115) {
+        return path.charCodeAt(length - 2) === 116 && path.charCodeAt(length - 3) === 46;
+    }
+    if (last !== 120 || length < 4) return false;
+    const prev = path.charCodeAt(length - 2);
+    if (prev !== 115) return false;
+    const mid = path.charCodeAt(length - 3);
+    return (mid === 116 || mid === 106) && path.charCodeAt(length - 4) === 46;
+}
+
+function isCompiledSourcePath(path: string): boolean {
+    const length = path.length;
+    if (length < 3 || path.charCodeAt(length - 1) !== 115 || path.charCodeAt(length - 2) !== 106) {
+        return false;
+    }
+    const dot = path.charCodeAt(length - 3);
+    return dot === 46 || (length >= 4 && dot === 109 && path.charCodeAt(length - 4) === 46);
+}
+
 export class EsmCompiler {
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
     private readonly esmLoading  = new Set<string>();
@@ -39,7 +66,7 @@ export class EsmCompiler {
     // Public: load a module from its ModuleInfo (format-agnostic dispatch)
     // -------------------------------------------------------------------------
 
-    load(info: ModuleInfo, meta: Record<string, any> = {}, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
+    load(info: ModuleInfo, meta: Record<string, unknown> = {}, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
         log.debug('loader', () => `load ${info.specPath} kind=${info.fileKind} format=${info.format}`);
         log.debug('loader', () => `alias: ${info.specPath} -> ${info.localPath}`);
         switch (info.fileKind) {
@@ -51,7 +78,7 @@ export class EsmCompiler {
         return this.loadEsm(info, meta, resolveMtime);
     }
 
-    loadSource(code: string, info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
+    loadSource(code: string, info: ModuleInfo, meta: Record<string, unknown> = {}): CModuleEngine.Module {
         log.debug('loader', () => `loadSource ${info.specPath} kind=${info.fileKind} format=${info.format}`);
         if (info.fileKind === 'text') return this.loadTextSource(code, info);
         return this.loadEsmSource(code, info, meta);
@@ -74,18 +101,18 @@ export class EsmCompiler {
             if (e instanceof SyntaxError) {
                 const ne = err(ErrorKind.SyntaxError,
                     `Syntax error in ${localPath}: ${e.message}`, e);
-                (ne as any).cause = { source: e, code, path: localPath };
+                ne.cause = { source: e, code, path: localPath };
                 throw ne;
             }
             throw e;
         }
     }
 
-    private loadEsm(info: ModuleInfo, meta: Record<string, any>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
+    private loadEsm(info: ModuleInfo, meta: Record<string, unknown>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
         const cacheKey = this.cacheKey(info);
         const hit = this.esmCache.get(cacheKey);
         if (hit) {
-            if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
+            if (meta.main !== undefined) Reflect.set(hit.meta, 'main', meta.main);
             return hit;
         }
 
@@ -98,8 +125,8 @@ export class EsmCompiler {
         }
 
         const remote = isRemote(info.specPath);
-        const needsTransform = !remote && /\.(?:tsx?|jsx)$/.test(info.localPath);
-        const needsCompile  = !remote && !needsTransform && /\.(?:m?js)$/.test(info.localPath);
+        const needsTransform = !remote && isTransformSourcePath(info.localPath);
+        const needsCompile  = !remote && !needsTransform && isCompiledSourcePath(info.localPath);
         const cacheable = this.cfg.enableCache !== false && (remote || needsTransform || needsCompile);
 
         // L1: JSC bytecode cache (in-memory from precompile, or on-disk .jsc)
@@ -115,7 +142,7 @@ export class EsmCompiler {
         // L2: read + transform + compile on main thread
         this.esmLoading.add(cacheKey);
         const text = readText(info.localPath);
-        const code = this.transformer.transform(text, info.localPath, meta?.lang, moduleRef(info));
+        const code = this.transformer.transform(text, info.localPath, metaLang(meta), moduleRef(info));
         let mod: CModuleEngine.Module;
         try {
             mod = this.compileEsm(code, moduleRef(info), info.localPath);
@@ -131,7 +158,7 @@ export class EsmCompiler {
         if (cached && cached !== mod) {
             const ns = mod.namespace;
             for (const key of Object.keys(ns)) {
-                try { cached.export(key, ns[key]); } catch { /* ok */ }
+                this.exportPlaceholderBinding(cached, key, ns[key]);
             }
             // if no default defined, try to export full namespace
             // if (!('default' in ns)) cached.export('default', Object(ns));
@@ -149,14 +176,22 @@ export class EsmCompiler {
         return mod;
     }
 
-    loadEsmSource(code: string, info: ModuleInfo, meta: Record<string, any>): CModuleEngine.Module {
+    private exportPlaceholderBinding(mod: CModuleEngine.Module, key: string, value: unknown): void {
+        try {
+            mod.export(key, value);
+        } catch {
+            // Circular placeholders may already contain a binding with this name.
+        }
+    }
+
+    loadEsmSource(code: string, info: ModuleInfo, meta: Record<string, unknown>): CModuleEngine.Module {
         const cacheKey = this.cacheKey(info);
         const hit = this.esmCache.get(cacheKey);
         if (hit) {
-            if (meta.main !== undefined) (hit.meta as Record<string, any>).main = meta.main;
+            if (meta.main !== undefined) Reflect.set(hit.meta, 'main', meta.main);
             return hit;
         }
-        const transformed = this.transformer.transform(code, info.localPath, meta?.lang, moduleRef(info));
+        const transformed = this.transformer.transform(code, info.localPath, metaLang(meta), moduleRef(info));
         const mod = this.compileEsm(transformed, moduleRef(info), info.localPath);
         Object.assign(mod.meta, meta);
         this.esmCache.set(cacheKey, mod);

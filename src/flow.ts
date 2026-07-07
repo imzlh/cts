@@ -84,7 +84,25 @@ export type Step =
     | NetFetchStep
     | ArchiveUntarGzStep;
 
-export type Flow<T> = Generator<Step, T, any>;
+export type StepResult = boolean | string | Uint8Array | ArrayBuffer | NetFetchResult | TarFile[] | undefined;
+export type Flow<T> = Generator<Step, T, StepResult>;
+
+export function expectText(value: StepResult): string {
+    if (typeof value === 'string') return value;
+    throw new TypeError('Flow step did not return text');
+}
+
+export function expectFetch(value: StepResult): NetFetchResult {
+    if (value && typeof value === 'object' && !Array.isArray(value) && 'status' in value && 'body' in value) {
+        return value as NetFetchResult;
+    }
+    throw new TypeError('Flow step did not return fetch result');
+}
+
+export function expectTarFiles(value: StepResult): TarFile[] {
+    if (Array.isArray(value)) return value;
+    throw new TypeError('Flow step did not return tar files');
+}
 
 function parseHeaders(raw: string): Array<[string, string]> {
     let current: Array<[string, string]> = [];
@@ -206,7 +224,7 @@ export function closeConnectionPools(): void {
     }
 }
 
-function executeStep(step: Step, fetch: (step: NetFetchStep) => unknown): unknown {
+function executeStep(step: Step, fetch: (step: NetFetchStep) => NetFetchResult): StepResult {
     switch (step.type) {
         case StepType.FS_EXISTS:
             return fs.exists(step.path);
@@ -234,7 +252,7 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => unknown): unknow
     }
 }
 
-function executeSync(step: Step): unknown {
+function executeSync(step: Step): StepResult {
     return executeStep(step, fetchSync);
 }
 
@@ -258,8 +276,16 @@ async function ensureDirAsync(dir: string): Promise<void> {
     }
 }
 
+function arrayBufferBackedBytes(data: Uint8Array | ArrayBuffer): Uint8Array<ArrayBuffer> {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (data.buffer instanceof ArrayBuffer) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const copy = new Uint8Array(data.byteLength);
+    copy.set(data);
+    return copy;
+}
+
 async function writeFileAsync(path: string, data: Uint8Array | ArrayBuffer): Promise<void> {
-    const bytes = (data instanceof Uint8Array ? data : new Uint8Array(data)) as Uint8Array<ArrayBuffer>;
+    const bytes = arrayBufferBackedBytes(data);
     const file = await asyncfs.open(path, 'w');
     try {
         let off = 0;
@@ -271,7 +297,7 @@ async function writeFileAsync(path: string, data: Uint8Array | ArrayBuffer): Pro
     }
 }
 
-async function executeAsync(step: Step): Promise<unknown> {
+async function executeAsync(step: Step): Promise<StepResult> {
     switch (step.type) {
         case StepType.FS_EXISTS:
             return existsAsync(step.path);

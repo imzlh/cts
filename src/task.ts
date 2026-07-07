@@ -5,11 +5,11 @@
 //   tasks: { "name": { "command": "...", "dependencies": [...], "env": {...} } }
 //
 // `deno run [flags] <file>` in task commands is translated to a direct cts
-// re-invocation so the same cache/lock settings apply.  All other commands
-// are resolved via BinResolver (lock bin index + node_modules/.bin) and
-// executed directly. If a command cannot be resolved as a bin, it fails.
+// re-invocation so the same cache/lock settings apply.  Package/bin commands
+// are resolved via BinResolver when possible; otherwise the platform shell
+// handles Deno-compatible task commands such as `echo` and redirection.
 
-import { basename, dirname, joinPaths, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows } from './utils';
+import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows } from './utils';
 import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
 import { getBinMap, readPkgFresh } from './resolve/pkg';
@@ -32,8 +32,17 @@ type TaskDef = string | {
     env?: Record<string, string>;
 };
 
+type TaskSource = 'package' | 'deno';
+
 interface DenoConfig {
     tasks?: Record<string, TaskDef>;
+}
+
+interface LoadTasksOptions {
+    forwardedArgs?: string[];
+    configPath?: string;
+    runCwd?: string;
+    initCwd?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -53,9 +62,11 @@ export interface ResolvedBin {
 
 export class BinResolver {
     private readonly isWin: boolean;
+    private readonly cacheDir?: string;
 
-    constructor(private lockStore: LockStore) {
+    constructor(private lockStore: LockStore, opts: { cacheDir?: string } = {}) {
         this.isWin = isWindows;
+        this.cacheDir = opts.cacheDir;
     }
 
     /**
@@ -77,15 +88,19 @@ export class BinResolver {
         if (name.startsWith('/') || name.startsWith('.') || name.includes('/')) return null;
         if (name.startsWith('-')) return null;
 
-        if (opts?.global) return this.resolveNpmSpecifierBin(`npm:${name}`);
+        if (opts?.global) {
+            return this.resolveNpmSpecifierBin(`npm:${name}`)
+                ?? this.resolveLockBin(name)
+                ?? this.resolveCachedGlobalBin(name);
+        }
 
         // 1. Local node_modules/.bin
         const local = findLocalBin(name, cwd);
         if (local) return this.resolveEntry(local);
 
         // 2. Lock bin index
-        const lockBin = this.lockStore.getBin(name);
-        if (lockBin) return this.resolveEntry(lockBin.path);
+        const lockBin = this.resolveLockBin(name);
+        if (lockBin) return lockBin;
 
         // 3. Cache fallback from direct project deps/devDeps when node_modules is absent.
         const cached = this.resolveCachedProjectBin(name, cwd);
@@ -94,11 +109,16 @@ export class BinResolver {
         return null;
     }
 
+    private resolveLockBin(name: string): ResolvedBin | null {
+        const lockBin = this.lockStore.getBin(name);
+        return lockBin ? this.resolveEntry(lockBin.path) : null;
+    }
+
     private resolveNpmSpecifierBin(spec: string): ResolvedBin | null {
         const parsed = parseNpmExecSpec(spec);
         if (!parsed) return null;
 
-        const installedDir = findCachedPackageDir(resolveCacheDir(), parsed.name, parsed.version);
+        const installedDir = findCachedPackageDir(resolveCacheDir(this.cacheDir), parsed.name, parsed.version);
         if (!installedDir) return null;
 
         const pkg = readPkgFresh(installedDir);
@@ -111,7 +131,7 @@ export class BinResolver {
         const relPath = binMap[binName];
         if (!relPath) return null;
 
-        const absPath = joinPaths(installedDir, relPath);
+        const absPath = normalizePath(joinPaths(installedDir, relPath));
         return fs.exists(absPath) ? this.resolveEntry(absPath) : null;
     }
 
@@ -121,30 +141,51 @@ export class BinResolver {
         const pkg = readPkgFresh(pkgDir);
         if (!pkg) return null;
 
-        const deps = [
-            ...(pkg.dependencies ? Object.entries(pkg.dependencies) : []),
-            ...(pkg.devDependencies ? Object.entries(pkg.devDependencies) : []),
-            ...(pkg.optionalDependencies ? Object.entries(pkg.optionalDependencies) : []),
-        ];
-
         // Prefer a direct package-name match first, then scan the rest for custom bin names.
-        deps.sort(([a], [b]) => (a === name ? -1 : b === name ? 1 : 0));
+        const cacheDir = resolveCacheDir(this.cacheDir);
+        return findCachedBinInDeps(name, cacheDir, pkg.dependencies, true)
+            ?? findCachedBinInDeps(name, cacheDir, pkg.devDependencies, true)
+            ?? findCachedBinInDeps(name, cacheDir, pkg.optionalDependencies, true)
+            ?? findCachedBinInDeps(name, cacheDir, pkg.dependencies, false)
+            ?? findCachedBinInDeps(name, cacheDir, pkg.devDependencies, false)
+            ?? findCachedBinInDeps(name, cacheDir, pkg.optionalDependencies, false);
+    }
 
-        const cacheDir = resolveCacheDir();
-        for (const [pkgName, range] of deps) {
-            if (typeof range !== 'string' || !range) continue;
-            const installedDir = findCachedPackageDir(cacheDir, pkgName, range);
-            if (!installedDir) continue;
-            const cachedPkg = readPkgFresh(installedDir);
-            if (!cachedPkg) continue;
-            const binMap = getBinMap(cachedPkg);
-            const relPath = binMap[name];
-            if (!relPath) continue;
-            const absPath = joinPaths(installedDir, relPath);
-            if (fs.exists(absPath)) return absPath;
+    private resolveCachedGlobalBin(name: string): ResolvedBin | null {
+        const npmDir = joinPaths(resolveCacheDir(this.cacheDir), 'npm');
+        let entries: string[] = [];
+        try {
+            entries = fs.readdir(npmDir);
+        } catch {
+            return null;
         }
 
-        return null;
+        const matches: Array<{ version: string; path: string }> = [];
+        for (const entry of entries) {
+            if (entry.startsWith('@')) {
+                let scoped: string[] = [];
+                try {
+                    scoped = fs.readdir(joinPaths(npmDir, entry));
+                } catch {
+                    continue;
+                }
+                for (const child of scoped) this.collectCachedBinMatch(name, joinPaths(npmDir, entry, child), matches);
+            } else {
+                this.collectCachedBinMatch(name, joinPaths(npmDir, entry), matches);
+            }
+        }
+        if (!matches.length) return null;
+        matches.sort((a, b) => compareVersions(a.version, b.version));
+        return this.resolveEntry(matches[matches.length - 1].path);
+    }
+
+    private collectCachedBinMatch(name: string, dir: string, matches: Array<{ version: string; path: string }>): void {
+        const pkg = readPkgFresh(dir);
+        if (!pkg) return;
+        const relPath = getBinMap(pkg)[name];
+        if (!relPath) return;
+        const absPath = normalizePath(joinPaths(dir, relPath));
+        if (fs.exists(absPath)) matches.push({ version: String(pkg.version ?? '0.0.0'), path: absPath });
     }
 
     /**
@@ -187,10 +228,14 @@ export class BinResolver {
             }
         }
 
-        // Lock bin path (not in node_modules/.bin) — try to resolve JS entry
-        // from the path itself (it might be a direct JS file)
+        // Lock/cache bin path (not in node_modules/.bin) — try to resolve JS entry
+        // from the path itself (it might be a direct JS file or node shebang).
         if (normPath.toLowerCase().endsWith('.js') || normPath.toLowerCase().endsWith('.mjs') || normPath.toLowerCase().endsWith('.cjs')) {
             return { entry: binPath, binPath, fallback: false, reason: 'direct-js' };
+        }
+        if (!this.isWin) {
+            const entry = resolveUnixBinEntry(binPath);
+            if (entry) return { entry, binPath, fallback: false, reason: 'direct-node-shebang' };
         }
 
         // Unknown — run as-is, likely will fallback to cmd.exe or chmod
@@ -199,7 +244,11 @@ export class BinResolver {
 }
 
 function env(k: string): string | null {
-    try { return os.getenv(k); } catch { return null; }
+    try {
+        return os.getenv(k) ?? null;
+    } catch {
+        return null;
+    }
 }
 
 interface NpmExecSpec {
@@ -258,15 +307,19 @@ function parseNpmExecSpec(raw: string): NpmExecSpec | null {
 }
 
 function defaultBinName(pkgName: string, binMap: Record<string, string>): string | null {
-    const names = Object.keys(binMap);
-    if (!names.length) return null;
-    if (names.length === 1) return names[0]!;
     if (pkgName && binMap[pkgName]) return pkgName;
     const base = basename(pkgName);
-    return binMap[base] ? base : null;
+    if (binMap[base]) return base;
+    let onlyName: string | null = null;
+    for (const name in binMap) {
+        if (onlyName !== null) return null;
+        onlyName = name;
+    }
+    return onlyName;
 }
 
-function resolveCacheDir(): string {
+function resolveCacheDir(override?: string): string {
+    if (override) return toPosixPath(override);
     const envDir = env('CTS_CACHE_DIR');
     if (envDir) return toPosixPath(envDir);
     const home = toPosixPath(String(os.homeDir || (isWindows ? env('USERPROFILE') : env('HOME')) || '/root'));
@@ -297,20 +350,53 @@ function findCachedPackageDir(cacheDir: string, pkgName: string, range: string):
     if (fs.exists(joinPaths(exactDir, 'package.json'))) return exactDir;
 
     let entries: string[] = [];
-    try { entries = fs.readdir(baseDir) as string[]; } catch { return null; }
+    try {
+        entries = fs.readdir(baseDir);
+    } catch {
+        return null;
+    }
     const prefix = `${leaf}@`;
-    const versions = entries
-        .filter((entry) => entry.startsWith(prefix) && fs.exists(joinPaths(baseDir, entry, 'package.json')))
-        .map((entry) => entry.slice(prefix.length));
+    const versions: string[] = [];
+    for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry !== undefined &&
+            entry.startsWith(prefix) &&
+            fs.exists(joinPaths(baseDir, entry, 'package.json'))) {
+            versions.push(entry.slice(prefix.length));
+        }
+    }
     if (!versions.length) return null;
 
     const resolved = (!range || range === 'latest' || range === '*')
-        ? versions.slice().sort(compareVersions).at(-1)!
+        ? latestVersion(versions)
         : matchLatestVersion(versions, range) ?? (versions.includes(range) ? range : null);
     if (!resolved) return null;
 
     const resolvedDir = joinPaths(baseDir, `${leaf}@${resolved}`);
     return fs.exists(joinPaths(resolvedDir, 'package.json')) ? resolvedDir : null;
+}
+
+function findCachedBinInDeps(
+    binName: string,
+    cacheDir: string,
+    deps: Record<string, string> | undefined,
+    directOnly: boolean,
+): string | null {
+    if (!deps) return null;
+    for (const pkgName in deps) {
+        if (directOnly !== (pkgName === binName)) continue;
+        const range = deps[pkgName];
+        if (typeof range !== 'string' || !range) continue;
+        const installedDir = findCachedPackageDir(cacheDir, pkgName, range);
+        if (!installedDir) continue;
+        const cachedPkg = readPkgFresh(installedDir);
+        if (!cachedPkg) continue;
+        const relPath = getBinMap(cachedPkg)[binName];
+        if (!relPath) continue;
+        const absPath = normalizePath(joinPaths(installedDir, relPath));
+        if (fs.exists(absPath)) return absPath;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +434,8 @@ function stripDenoRunFlags(tokens: string[]): string[] {
     const out: string[] = [];
     let i = 0;
     while (i < tokens.length) {
-        const t = tokens[i]!;
+        const t = tokens[i];
+        if (t === undefined) break;
         if (!t.startsWith('-')) {
             // First non-flag = the entry file; everything after goes through unchanged
             out.push(...tokens.slice(i));
@@ -392,6 +479,72 @@ function expandVars(s: string, env: Record<string, string>): string {
     });
 }
 
+function isDirectTaskOperator(op: string | undefined): boolean {
+    return op === '&&' || op === '||' || op === ';';
+}
+
+function hasShellOnlySyntax(segments: ReturnType<typeof parseShellCommand>): boolean {
+    for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        if (!seg) continue;
+        if (seg.op && !isDirectTaskOperator(seg.op)) return true;
+        if (i === segments.length - 1 && seg.op && seg.op !== ';') return true;
+
+        const tokens = [seg.bin, ...seg.args];
+        if (seg.bin.includes('=')) return true;
+        if (tokens.some((token) => token.includes('<') || token.includes('>'))) return true;
+    }
+    return false;
+}
+
+function quoteShellArg(arg: string): string {
+    if (!arg) return isWindows ? '""' : "''";
+    if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg)) return arg;
+    if (isWindows) return `"${arg.replace(/(["^%])/g, '^$1')}"`;
+    return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+function shellCommand(script: string, extraArgs: string[]): string {
+    if (!extraArgs.length) return script;
+    return `${script} ${joinQuotedArgs(extraArgs)}`;
+}
+
+function shellEnv(env: Record<string, string>, cwd: string): Record<string, string> {
+    const merged = { ...os.environ(), ...env };
+    let pathKey = 'PATH';
+    if (isWindows) {
+        pathKey = 'Path';
+        for (const key in merged) {
+            if (key.toLowerCase() === 'path') {
+                pathKey = key;
+                break;
+            }
+        }
+    }
+    const sep = isWindows ? ';' : ':';
+    const localBin = joinPaths(cwd, 'node_modules', '.bin');
+    const current = merged[pathKey] ?? '';
+    return { ...env, PWD: cwd, [pathKey]: current ? `${localBin}${sep}${current}` : localBin };
+}
+
+function shellArgv(script: string): string[] {
+    return isWindows ? ['cmd.exe', '/c', script] : ['sh', '-c', script];
+}
+
+function joinQuotedArgs(args: string[]): string {
+    let out = '';
+    for (let i = 0; i < args.length; i++) {
+        if (i > 0) out += ' ';
+        out += quoteShellArg(args[i] ?? '');
+    }
+    return out;
+}
+
+function segmentCommand(bin: string, args: string[]): string {
+    if (!args.length) return quoteShellArg(bin);
+    return `${quoteShellArg(bin)} ${joinQuotedArgs(args)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Command parsing and execution
 // ---------------------------------------------------------------------------
@@ -400,7 +553,8 @@ function expandVars(s: string, env: Record<string, string>): string {
  * Execute a command string.
  * - `deno run [flags] <file> [args]` → re-invoke cts
  * - `deno task <name>` → re-invoke cts task
- * - Anything else → resolve each segment via BinResolver, fail if not found
+ * - Shell-only syntax → run through the platform shell
+ * - Plain commands → resolve each segment via BinResolver, fail if not found
  */
 async function execCommand(
     cmd: string,
@@ -416,10 +570,15 @@ async function execCommand(
 
     const segments = parseShellCommand(expanded);
     if (!segments.length) return 0;
+    if (hasShellOnlySyntax(segments)) {
+        const script = shellCommand(expanded, extraArgs);
+        return rawExec(shellArgv(script), shellEnv(env, cwd), cwd);
+    }
 
     // Single-command shortcuts
     if (segments.length === 1) {
-        const seg = segments[0]!;
+        const seg = segments[0];
+        if (!seg) return 0;
         if (!seg.bin) return 0;  // empty command after parsing
         const allArgs = [...seg.args, ...extraArgs];
 
@@ -444,18 +603,18 @@ async function execCommand(
             return execBinary(resolved, allArgs, env, cwd);
         }
 
-        console.error(`[task] Command '${seg.bin}' not found in bin index or node_modules/.bin`);
-        return 1;
+        return rawExec(shellArgv(shellCommand(expanded, extraArgs)), shellEnv(env, cwd), cwd);
     }
 
     // Multi-segment pipeline: op is on the segment BEFORE the operator.
     // seg.op === '&&': run next only if this succeeds; bail on failure
     // seg.op === '||': run next only if this fails; skip next on success
     // seg.op === ';':  always run next regardless of exit code
-    // seg.op === undefined (last seg / after '|'/'&'): bail on failure
+    // seg.op === undefined: last segment; unsupported shell ops handled above
     let prevCode = 0;
     for (let i = 0; i < segments.length; i++) {
-        const seg = segments[i]!;
+        const seg = segments[i];
+        if (!seg) break;
         const isLast = i === segments.length - 1;
         const segArgs = isLast ? [...seg.args, ...extraArgs] : seg.args;
 
@@ -473,10 +632,10 @@ async function execCommand(
         } else {
             const resolved = resolver.resolve(seg.bin, cwd);
             if (!resolved) {
-                console.error(`[task] Command '${seg.bin}' not found in bin index or node_modules/.bin`);
-                return 1;
+                prevCode = await rawExec(shellArgv(segmentCommand(seg.bin, segArgs)), shellEnv(env, cwd), cwd);
+            } else {
+                prevCode = await execBinary(resolved, segArgs, env, cwd);
             }
-            prevCode = await execBinary(resolved, segArgs, env, cwd);
         }
 
         if (prevCode !== 0) {
@@ -491,7 +650,7 @@ async function execCommand(
 }
 
 async function execRun(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...env };
+    const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
     const child = process.spawn([os.exePath, ...forwardedArgs, 'run', ...args], {
         stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
         env: mergedEnv, cwd,
@@ -501,7 +660,7 @@ async function execRun(args: string[], env: Record<string, string>, cwd: string,
 }
 
 async function execTask(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...env };
+    const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
     const child = process.spawn([os.exePath, ...forwardedArgs, 'task', ...args], {
         stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
         env: mergedEnv, cwd,
@@ -510,8 +669,16 @@ async function execTask(args: string[], env: Record<string, string>, cwd: string
     return info.exit_status ?? 0;
 }
 
+function chmodExecutableQuietly(path: string): void {
+    try {
+        fs.chmod(path, 0o755);
+    } catch {
+        // Fallback execution will surface real permission errors.
+    }
+}
+
 async function execBinary(resolved: ResolvedBin, args: string[], env: Record<string, string>, cwd: string): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...env };
+    const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
     const isWin = isWindows;
 
     log.debug('task', () => `exec bin: entry=${resolved.entry} binPath=${resolved.binPath} fallback=${resolved.fallback} reason=${resolved.reason ?? ''}`);
@@ -522,7 +689,7 @@ async function execBinary(resolved: ResolvedBin, args: string[], env: Record<str
             return rawExec(['cmd', '/c', resolved.binPath, ...args], mergedEnv, cwd);
         }
         // Unix fallback: make executable
-        try { fs.chmod(resolved.binPath, 0o755); } catch {}
+        chmodExecutableQuietly(resolved.binPath);
         return rawExec([resolved.binPath, ...args], mergedEnv, cwd);
     }
 
@@ -532,7 +699,7 @@ async function execBinary(resolved: ResolvedBin, args: string[], env: Record<str
 
 async function rawExec(argv: string[], env: Record<string, string>, cwd: string): Promise<number> {
     try {
-        const mergedEnv = { ...os.environ(), ...env };
+        const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
         const child = process.spawn(argv, {
             stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
             env: mergedEnv, cwd,
@@ -552,16 +719,20 @@ async function rawExec(argv: string[], env: Record<string, string>, cwd: string)
 export class TaskRunner {
     private readonly tasks: Record<string, TaskDef>;
     private readonly cwd: string;
+    private readonly initCwd: string;
     private readonly resolver: BinResolver;
     private readonly forwardedArgs: string[];
+    private readonly taskSources: Record<string, TaskSource>;
     private readonly done = new Set<string>();
     private readonly running = new Set<string>();  // cycle detection
 
-    constructor(tasks: Record<string, TaskDef>, cwd: string, lockStore: LockStore, options?: { forwardedArgs?: string[] }) {
+    constructor(tasks: Record<string, TaskDef>, cwd: string, lockStore: LockStore, options?: { forwardedArgs?: string[]; taskSources?: Record<string, TaskSource>; initCwd?: string }) {
         this.tasks = tasks;
         this.cwd   = cwd;
+        this.initCwd = options?.initCwd ?? cwd;
         this.resolver = new BinResolver(lockStore);
         this.forwardedArgs = options?.forwardedArgs ?? [];
+        this.taskSources = options?.taskSources ?? {};
     }
 
     list(): void {
@@ -572,7 +743,8 @@ export class TaskRunner {
         }
         const maxLen = names.reduce((m, n) => Math.max(m, n.length), 0);
         for (const name of names) {
-            const def  = this.tasks[name]!;
+            const def = this.tasks[name];
+            if (!def) continue;
             const cmd  = typeof def === 'string' ? def : def.command;
             const deps = typeof def === 'string' ? [] : (def.dependencies ?? []);
             const pad  = ' '.repeat(maxLen - name.length + 2);
@@ -585,7 +757,7 @@ export class TaskRunner {
         return this.tasks[name] !== undefined;
     }
 
-    async run(name: string, extraArgs: string[] = []): Promise<number> {
+    async run(name: string, extraArgs: string[] = [], includeLifecycle = true): Promise<number> {
         const def = this.tasks[name];
         if (!def) {
             const names = Object.keys(this.tasks);
@@ -606,7 +778,11 @@ export class TaskRunner {
 
         const command = typeof def === 'string' ? def : def.command;
         const deps    = typeof def === 'string' ? [] : (def.dependencies ?? []);
-        const env     = typeof def === 'string' ? {} : (def.env ?? {});
+        const inheritedInitCwd = os.environ().INIT_CWD;
+        const env     = {
+            INIT_CWD: inheritedInitCwd ?? this.initCwd,
+            ...(typeof def === 'string' ? {} : (def.env ?? {})),
+        };
 
         // Validate: empty command string
         if (!command || !command.trim()) {
@@ -631,12 +807,29 @@ export class TaskRunner {
 
         if (this.done.has(name)) return 0;
 
+        if (includeLifecycle && this.taskSources[name] === 'package') {
+            const preName = `pre${name}`;
+            if (this.tasks[preName] !== undefined) {
+                const preCode = await this.run(preName, [], false);
+                if (preCode !== 0) return preCode;
+            }
+        }
+
         log.debug('task', () => `\n\x1b[32m$ ${command}\x1b[0m`);
         // Only pass extra args to the leaf task, not to dependencies
         const code = await execCommand(command, env, this.cwd, extraArgs, this.resolver, this.forwardedArgs);
         if (code === 0) this.done.add(name);
         if (code !== 0) console.error(`\x1b[31m✖ Task \x1b[36m${name}\x1b[0m\x1b[31m exited with code ${code}\x1b[0m`);
-        return code;
+        if (code !== 0) return code;
+
+        if (includeLifecycle && this.taskSources[name] === 'package') {
+            const postName = `post${name}`;
+            if (this.tasks[postName] !== undefined) {
+                return await this.run(postName, [], false);
+            }
+        }
+
+        return 0;
     }
 }
 
@@ -644,13 +837,52 @@ export class TaskRunner {
 // Public API
 // ---------------------------------------------------------------------------
 
+function taskRunnerForConfig(
+    configPath: string,
+    startDir: string,
+    lockStore: LockStore,
+    options: LoadTasksOptions,
+): { runner: TaskRunner; configPath: string } | null {
+    if (!fs.exists(configPath)) return null;
+    const merged: Record<string, TaskDef> = {};
+    const taskSources: Record<string, TaskSource> = {};
+    try {
+        const base = basename(configPath);
+        if (base === 'package.json') {
+            const pkg = safeParse<{ scripts?: Record<string, string> }>(readText(configPath));
+            for (const [k, v] of Object.entries(pkg?.scripts ?? {})) {
+                merged[k] = String(v);
+                taskSources[k] = 'package';
+            }
+        } else {
+            const cfg = safeParse<DenoConfig>(stripJsonc(readText(configPath)));
+            for (const [k, v] of Object.entries(cfg.tasks ?? {})) {
+                merged[k] = v;
+                taskSources[k] = 'deno';
+            }
+        }
+    } catch (e) {
+        log.warn('task', () => `Failed to parse ${configPath}: ${errMsg(e)}`);
+        return null;
+    }
+    if (!Object.keys(merged).length) return null;
+    const configDir = dirname(configPath);
+    const runCwd = options.runCwd ?? configDir;
+    const initCwd = options.initCwd ?? toPosixPath(startDir);
+    return { runner: new TaskRunner(merged, runCwd, lockStore, { ...options, initCwd, taskSources }), configPath };
+}
+
 /** Find and load the nearest deno.json/deno.jsonc or package.json containing tasks. */
-export function loadTasks(startDir: string, lockStore: LockStore, options?: { forwardedArgs?: string[] }): { runner: TaskRunner; configPath: string } | null {
+export function loadTasks(startDir: string, lockStore: LockStore, options: LoadTasksOptions = {}): { runner: TaskRunner; configPath: string } | null {
+    if (options.configPath) {
+        return taskRunnerForConfig(toPosixPath(options.configPath), startDir, lockStore, options);
+    }
     let dir = toPosixPath(startDir);
     const isWin = isWindows;
     while (true) {
         // Collect tasks from both deno.json and package.json (deno.json takes priority)
         const merged: Record<string, TaskDef> = {};
+        const taskSources: Record<string, TaskSource> = {};
         let found = false;
         let configPath = '';
 
@@ -662,6 +894,7 @@ export function loadTasks(startDir: string, lockStore: LockStore, options?: { fo
                 if (pkg?.scripts && typeof pkg.scripts === 'object') {
                     for (const [k, v] of Object.entries(pkg.scripts)) {
                         merged[k] = String(v);
+                        taskSources[k] = 'package';
                     }
                     found = true;
                     configPath = pkgP;
@@ -680,6 +913,7 @@ export function loadTasks(startDir: string, lockStore: LockStore, options?: { fo
                 if (cfg.tasks && typeof cfg.tasks === 'object') {
                     for (const [k, v] of Object.entries(cfg.tasks)) {
                         merged[k] = v;
+                        taskSources[k] = 'deno';
                     }
                     found = true;
                     configPath = p;  // deno.json is the primary config
@@ -689,7 +923,16 @@ export function loadTasks(startDir: string, lockStore: LockStore, options?: { fo
             }
         }
 
-        if (found) return { runner: new TaskRunner(merged, dir, lockStore, options), configPath };
+        if (found) {
+            return {
+                runner: new TaskRunner(merged, options.runCwd ?? dir, lockStore, {
+                    ...options,
+                    initCwd: options.initCwd ?? toPosixPath(startDir),
+                    taskSources,
+                }),
+                configPath,
+            };
+        }
 
         const up = dirname(dir);
         if (up === dir) break;

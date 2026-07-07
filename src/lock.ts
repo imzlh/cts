@@ -17,6 +17,20 @@ const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
 
 const DB_FILENAME = 'cts.lock';
+type LockValue = CModuleSQLite3.SqliteValue;
+type LockRow = CModuleSQLite3.SqliteRow;
+
+function unlinkIfExists(path: string): void {
+    try {
+        if (fs.exists(path)) fs.unlink(path);
+    } catch {}
+}
+
+function closeDbQuietly(db: CModuleSQLite3.Sqlite3Handle): void {
+    try {
+        db.close();
+    } catch {}
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS modules (
@@ -41,8 +55,11 @@ export class LockStore {
 
     /** Does a persisted lock file exist in `dir`? Used to decide read-only reuse. */
     static existsAt(dir: string): boolean {
-        try { return fs.exists(joinPaths(toPosixPath(dir), DB_FILENAME)); }
-        catch { return false; }
+        try {
+            return fs.exists(joinPaths(toPosixPath(dir), DB_FILENAME));
+        } catch {
+            return false;
+        }
     }
 
     /** On-disk path of the lock (may not exist yet when in-memory/read-only). */
@@ -69,15 +86,21 @@ export class LockStore {
 
     static closeAll(): void {
         for (const store of [...LockStore.openStores]) {
-            try { store.close(); }
-            catch (e) { log.warn('lock', `close failed: ${errMsg(e)}`); }
+            try {
+                store.close();
+            } catch (e) {
+                log.warn('lock', `close failed: ${errMsg(e)}`);
+            }
         }
     }
 
     static closeAllFast(): void {
         for (const store of [...LockStore.openStores]) {
-            try { store.closeFast(); }
-            catch (e) { log.debug('lock', () => `fast close failed: ${errMsg(e)}`); }
+            try {
+                store.closeFast();
+            } catch (e) {
+                log.debug('lock', () => `fast close failed: ${errMsg(e)}`);
+            }
         }
     }
 
@@ -87,10 +110,7 @@ export class LockStore {
 
     private cleanupSidecars(): void {
         for (const suffix of ['-wal', '-shm']) {
-            try {
-                const p = this.dbPath + suffix;
-                if (fs.exists(p)) fs.unlink(p);
-            } catch {}
+            unlinkIfExists(this.dbPath + suffix);
         }
     }
 
@@ -98,7 +118,9 @@ export class LockStore {
         if (this.db || this.loadFailed) return;
 
         if (!this.readOnly) {
-            try { ensureDir(dirname(this.dbPath)); } catch {}
+            try {
+                ensureDir(dirname(this.dbPath));
+            } catch {}
             this.cleanupSidecars();
         }
 
@@ -120,16 +142,22 @@ export class LockStore {
             return;
         }
 
+        const db = this.db;
+        if (!db) {
+            this.loadFailed = true;
+            return;
+        }
+
         try {
-            this.db!.exec('PRAGMA journal_mode = DELETE');
-            this.db!.exec('PRAGMA synchronous = NORMAL');
-            this.db!.exec(`PRAGMA cache_size = ${{ low: -256, normal: -2000, high: -8000 }[getMemoryTier()] ?? -2000}`);
-            this.db!.exec('PRAGMA temp_store = MEMORY');
-            this.db!.exec('PRAGMA busy_timeout = 3000');
-            this.db!.exec(SCHEMA);
+            db.exec('PRAGMA journal_mode = DELETE');
+            db.exec('PRAGMA synchronous = NORMAL');
+            db.exec(`PRAGMA cache_size = ${{ low: -256, normal: -2000, high: -8000 }[getMemoryTier()] ?? -2000}`);
+            db.exec('PRAGMA temp_store = MEMORY');
+            db.exec('PRAGMA busy_timeout = 3000');
+            db.exec(SCHEMA);
         } catch (e) {
             log.warn('lock', `schema init failed: ${errMsg(e)}`);
-            try { this.db!.close(); } catch {}
+            closeDbQuietly(db);
             this.db = null;
             if (!this.readOnly && !this.recoveredInvalidLock) {
                 this.recoveredInvalidLock = true;
@@ -148,11 +176,11 @@ export class LockStore {
 
     private backupInvalidLock(): void {
         const bak = `${this.dbPath}.bak`;
-        try { if (fs.exists(bak)) fs.unlink(bak); } catch {}
+        unlinkIfExists(bak);
         try {
             if (fs.exists(this.dbPath)) fs.rename(this.dbPath, bak);
         } catch {
-            try { if (fs.exists(this.dbPath)) fs.unlink(this.dbPath); } catch {}
+            unlinkIfExists(this.dbPath);
         }
         this.cleanupSidecars();
     }
@@ -162,7 +190,7 @@ export class LockStore {
         return this.db;
     }
 
-    private query(sql: string, params: any[] = []): any[] {
+    private query(sql: string, params: CModuleSQLite3.SqliteValue[] = []): LockRow[] {
         const db = this.getDb(); if (!db) return [];
         try {
             const stmt = db.prepare(sql);
@@ -175,7 +203,7 @@ export class LockStore {
         }
     }
 
-    private exec(sql: string, params: any[]): void {
+    private exec(sql: string, params: CModuleSQLite3.SqliteValue[]): void {
         const db = this.getDb(); if (!db) return;
         const stmt = db.prepare(sql);
         stmt.run(params);
@@ -196,6 +224,14 @@ export class LockStore {
         this.pendingRemovedBinPkgs.clear();
     }
 
+    private rollbackQuietly(db: CModuleSQLite3.Sqlite3Handle): void {
+        try {
+            db.exec('ROLLBACK');
+        } catch {
+            // Preserve the original flush warning; rollback is best-effort.
+        }
+    }
+
     private applyPendingWrites(): void {
         if (this.readOnly || !this.hasPendingWrites()) return;
         const db = this.getDb(); if (!db) return;
@@ -214,7 +250,7 @@ export class LockStore {
             db.exec('COMMIT');
             this.clearPendingWrites();
         } catch (e) {
-            try { db.exec('ROLLBACK'); } catch {}
+            this.rollbackQuietly(db);
             log.warn('lock', `flush failed: ${errMsg(e)}`);
         }
     }
@@ -225,7 +261,7 @@ export class LockStore {
         const rows = this.query('SELECT local, fmt, kind FROM modules WHERE spec = ?', [sp]);
         if (!rows.length) return undefined;
         const r = rows[0];
-        return { specPath: sp, localPath: r.local, format: r.fmt as ModuleFormat, fileKind: r.kind as FileKind };
+        return { specPath: sp, localPath: String(r.local), format: r.fmt as ModuleFormat, fileKind: r.kind as FileKind };
     }
 
     findModuleSpecsByPrefix(prefix: string): string[] {
@@ -248,7 +284,7 @@ export class LockStore {
         const pending = this.pendingSources.get(key);
         if (pending !== undefined) return pending;
         const rows = this.query('SELECT spec FROM sources WHERE key = ?', [key]);
-        return rows.length ? rows[0].spec : undefined;
+        return rows.length ? String(rows[0].spec) : undefined;
     }
 
     getBin(name: string): { path: string; pkg: string } | undefined {
@@ -256,7 +292,7 @@ export class LockStore {
         if (pending) return pending;
         const rows = this.query('SELECT path, pkg FROM bins WHERE name = ?', [name]);
         if (!rows.length) return undefined;
-        const bin = { path: rows[0].path, pkg: rows[0].pkg };
+        const bin = { path: String(rows[0].path), pkg: String(rows[0].pkg) };
         if (this.pendingRemovedBinPkgs.has(bin.pkg)) return undefined;
         return bin;
     }
@@ -289,7 +325,6 @@ export class LockStore {
     }
 
     flush(): void {
-        if (!this.db) return;
         this.applyPendingWrites();
     }
 
@@ -298,9 +333,14 @@ export class LockStore {
     }
 
     close(): void {
-        const db = this.db;
-        if (!db) return;
         this.applyPendingWrites();
+        const db = this.db;
+        if (!db) {
+            this.clearPendingWrites();
+            if (!this.readOnly) this.cleanupSidecars();
+            LockStore.openStores.delete(this);
+            return;
+        }
         try { db.close(); }
         finally {
             this.db = null;
@@ -324,7 +364,7 @@ export class LockStore {
 
     get size(): number {
         const rows = this.query('SELECT COUNT(*) AS n FROM modules');
-        let total = rows[0]?.n ?? 0;
+        let total = Number(rows[0]?.n ?? 0);
         if (this.pendingModules.size > 0) {
             const existing = new Set<string>();
             const specs = [...this.pendingModules.keys()];
@@ -334,7 +374,7 @@ export class LockStore {
                 const hits = this.query(
                     `SELECT spec FROM modules WHERE spec IN (${placeholders})`, batch
                 );
-                for (const h of hits) existing.add(h.spec);
+                for (const h of hits) existing.add(String(h.spec));
             }
             for (const key of this.pendingModules.keys()) {
                 if (!existing.has(key)) total++;

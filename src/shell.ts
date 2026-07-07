@@ -8,8 +8,10 @@ const fs = import.meta.use('fs');
 export interface CommandSegment {
     bin: string;
     args: string[];
-    op?: '&&' | '||' | ';';  // operator AFTER this segment (connecting it to the next one)
+    op?: ShellOperator;  // operator AFTER this segment (connecting it to the next one)
 }
+
+export type ShellOperator = '&&' | '||' | ';' | '|' | '&';
 
 /**
  * Split a shell command string into segments by operators.
@@ -21,7 +23,7 @@ export function parseShellCommand(input: string): CommandSegment[] {
     let current = '';
     let i = 0;
 
-    const flush = (op?: '&&' | '||' | ';') => {
+    const flush = (op?: ShellOperator) => {
         const trimmed = current.trim();
         if (trimmed) {
             const seg = parseSegment(trimmed);
@@ -32,7 +34,7 @@ export function parseShellCommand(input: string): CommandSegment[] {
     };
 
     while (i < input.length) {
-        const ch = input[i]!;
+        const ch = input.charAt(i);
 
         // Handle quoted strings — consume everything inside quotes without splitting
         if (ch === '"' || ch === "'") {
@@ -42,15 +44,18 @@ export function parseShellCommand(input: string): CommandSegment[] {
             while (i < input.length && input[i] !== quote) {
                 // Handle escaped quote inside the string
                 if (input[i] === '\\' && i + 1 < input.length) {
-                    current += input[i]! + input[i + 1]!;
+                    current += input.charAt(i) + input.charAt(i + 1);
                     i += 2;
                 } else {
-                    current += input[i]!;
+                    current += input.charAt(i);
                     i++;
                 }
             }
             // Closing quote
-            if (i < input.length) { current += input[i]!; i++; }
+            if (i < input.length) {
+                current += input.charAt(i);
+                i++;
+            }
             continue;
         }
 
@@ -62,9 +67,16 @@ export function parseShellCommand(input: string): CommandSegment[] {
             continue;
         }
 
-        if (ch === ';') { flush(';'); i++; continue; }
-        // '|' and '&' (single): we split on them but don't assign a named op
-        if (ch === '|' || ch === '&') { flush(); i++; continue; }
+        if (ch === ';') {
+            flush(';');
+            i++;
+            continue;
+        }
+        if (ch === '|' || ch === '&') {
+            flush(ch);
+            i++;
+            continue;
+        }
 
         current += ch;
         i++;
@@ -84,17 +96,17 @@ function parseSegment(raw: string): CommandSegment {
     let i = 0;
 
     while (i < raw.length) {
-        const ch = raw[i]!;
+        const ch = raw.charAt(i);
 
         if (ch === '"' || ch === "'") {
             const quote = ch;
             i++; // skip opening quote
             while (i < raw.length && raw[i] !== quote) {
                 if (raw[i] === '\\' && i + 1 < raw.length) {
-                    current += raw[i + 1]!;
+                    current += raw.charAt(i + 1);
                     i += 2;
                 } else {
-                    current += raw[i]!;
+                    current += raw.charAt(i);
                     i++;
                 }
             }
@@ -103,13 +115,16 @@ function parseSegment(raw: string): CommandSegment {
         }
 
         if (ch === '\\' && i + 1 < raw.length) {
-            current += raw[i + 1]!;
+            current += raw.charAt(i + 1);
             i += 2;
             continue;
         }
 
         if (/\s/.test(ch)) {
-            if (current) { parts.push(current); current = ''; }
+            if (current) {
+                parts.push(current);
+                current = '';
+            }
             i++;
             continue;
         }
@@ -177,7 +192,9 @@ export function resolveWinBinEntry(cmdPath: string): string | null {
         const dp0Re = /%(?:dp0%|~dp0)([/\\]?[^"'\s%\r\n]+?\.(?:m|c)?jsx?)/ig;
         let m: RegExpExecArray | null;
         while ((m = dp0Re.exec(content)) !== null) {
-            const abs = tryRel(m[1]!);
+            const rel = m[1];
+            if (!rel) continue;
+            const abs = tryRel(rel);
             if (abs) return abs;
         }
 
@@ -185,12 +202,16 @@ export function resolveWinBinEntry(cmdPath: string): string | null {
         // variable later.  Accept the common variable names as a second pass.
         const varRe = /%(?:_?basedir|_?progdir)%([/\\][^"'\s%\r\n]+?\.(?:m|c)?jsx?)/ig;
         while ((m = varRe.exec(content)) !== null) {
-            const abs = tryRel(m[1]!);
+            const rel = m[1];
+            if (!rel) continue;
+            const abs = tryRel(rel);
             if (abs) return abs;
         }
 
         return null;
-    } catch { return null; }
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -219,7 +240,8 @@ export function resolveUnixBinEntry(shPath: string): string | null {
         const re = /["']?\$basedir[/\\]([^"' \t\n\r]+)/g;
         let m: RegExpExecArray | null;
         while ((m = re.exec(content)) !== null) {
-            const rel = m[1]!;
+            const rel = m[1];
+            if (!rel) continue;
             if (!JS_EXT.test(rel)) continue;
             const abs = normalizePath(joinPaths(dir, rel));
             if (fs.exists(abs)) return abs;

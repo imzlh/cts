@@ -28,11 +28,21 @@ function init(): void {
     if (initialised) return;
     initialised = true;
     let raw = '';
-    try { raw = os.getenv('DEBUG') ?? ''; } catch {}
+    try {
+        raw = os.getenv('DEBUG') ?? '';
+    } catch {}
     if (!raw) return;
-    for (const tok of raw.split(',').map(s => s.trim()).filter(Boolean)) {
-        if (tok.startsWith('!')) disabled.add(tok.slice(1));
-        else enabled.add(tok);
+    let start = 0;
+    for (let i = 0; i <= raw.length; i++) {
+        if (i !== raw.length && raw.charCodeAt(i) !== 44) continue;
+        let lo = start, hi = i;
+        while (lo < hi && raw.charCodeAt(lo) <= 32) lo++;
+        while (hi > lo && raw.charCodeAt(hi - 1) <= 32) hi--;
+        if (lo < hi) {
+            if (raw.charCodeAt(lo) === 33) disabled.add(raw.slice(lo + 1, hi));
+            else enabled.add(raw.slice(lo, hi));
+        }
+        start = i + 1;
     }
 }
 
@@ -48,6 +58,10 @@ export function isEnabled(category: string): boolean {
 
 type Lazy = () => string;
 type Msg  = string | Lazy;
+type ConsoleMethod = (...args: unknown[]) => void;
+type ConsoleWithOriginals = typeof console & {
+    __originals__?: Partial<Record<'log' | 'warn' | 'error', ConsoleMethod>>;
+};
 
 function resolve(msg: Msg): string {
     return typeof msg === 'function' ? msg() : msg;
@@ -60,18 +74,18 @@ function resolve(msg: Msg): string {
 // forwarding internal debug logs to DevTools.
 // ---------------------------------------------------------------------------
 
-function nativeLog(...args: any[]): void {
-    const origs = (console as any).__originals__;
+function nativeLog(...args: unknown[]): void {
+    const origs = (console as ConsoleWithOriginals).__originals__;
     const fn = origs?.log ?? console.log;
     fn.apply(console, args);
 }
-function nativeWarn(...args: any[]): void {
-    const origs = (console as any).__originals__;
+function nativeWarn(...args: unknown[]): void {
+    const origs = (console as ConsoleWithOriginals).__originals__;
     const fn = origs?.warn ?? console.warn;
     fn.apply(console, args);
 }
-function nativeError(...args: any[]): void {
-    const origs = (console as any).__originals__;
+function nativeError(...args: unknown[]): void {
+    const origs = (console as ConsoleWithOriginals).__originals__;
     const fn = origs?.error ?? console.error;
     fn.apply(console, args);
 }
@@ -83,21 +97,21 @@ export const log = {
      * @param msg       string or () => string
      * @param rest      additional args (passed to console.log)
      */
-    debug(category: string, msg: Msg, ...rest: any[]): void {
+    debug(category: string, msg: Msg, ...rest: unknown[]): void {
         if (!isEnabled(category)) return;
         nativeLog(`\x1b[2m[${category}]\x1b[0m ${resolve(msg)}`, ...rest);
     },
 
     /** Always shown regardless of DEBUG. */
-    info(msg: string, ...rest: any[]): void {
+    info(msg: string, ...rest: unknown[]): void {
         nativeLog(msg, ...rest);
     },
 
-    warn(category: string, msg: Msg, ...rest: any[]): void {
+    warn(category: string, msg: Msg, ...rest: unknown[]): void {
         nativeWarn(`[${category}] ${resolve(msg)}`, ...rest);
     },
 
-    error(category: string, msg: Msg, ...rest: any[]): void {
+    error(category: string, msg: Msg, ...rest: unknown[]): void {
         nativeError(`[${category}] ${resolve(msg)}`, ...rest);
     },
 

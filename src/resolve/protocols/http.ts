@@ -3,10 +3,10 @@
 import type { RuntimeConfig, ModuleInfo } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow, type ProgressCallback } from '../../flow';
+import { expectFetch, StepType, type Flow, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname } from '../../utils/path';
 import { cacheFilename } from '../../utils/misc';
-declare const URL: any;
+declare const URL: typeof globalThis.URL;
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
 import { err, ErrorKind } from '../../errors';
@@ -17,19 +17,19 @@ export class HttpHandler implements ProtocolHandler {
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
-    *resolve(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
+    *resolve(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
         const url = this.normalizeUrl(spec, parent);
         const cachePath = this.cachePath(url);
         if (!this.resolved.has(url)) {
             const cached = yield { type: StepType.FS_EXISTS, path: cachePath };
             if (!cached) {
                 if (!this.cfg.silent && !isatty) log.download(url);
-                const result = yield {
+                const result = expectFetch(yield {
                     type: StepType.NET_FETCH,
                     url,
                     timeout: this.cfg.requestTimeout,
                     onProgress,
-                };
+                });
                 if (result.status < 200 || result.status >= 300) {
                     throw err(ErrorKind.ModuleNotFound,
                         `HTTP ${result.status} fetching ${url}`);
@@ -39,7 +39,7 @@ export class HttpHandler implements ProtocolHandler {
             }
             this.resolved.set(url, cachePath);
         }
-        const localPath = this.resolved.get(url)!;
+        const localPath = this.resolved.get(url) ?? cachePath;
         return { specPath: url, localPath, format: 'esm', fileKind: guessFileKind(localPath) };
     }
 

@@ -14,11 +14,11 @@ import { ModuleResolver } from '../resolve/index';
 import { LockStore } from '../lock';
 import { materializeNodeModules } from '../resolve/linker';
 import { guessFileKind } from '../resolve/protocols/base';
-import { parseShellCommand } from '../shell';
 import { isRemote } from '../source/cache';
 import type { FileKind, ModuleFormat, ModuleInfo, NodeBuiltinResolver, RuntimeConfig } from '../types';
-import { PrecacheProgress, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, cwd as posixCwd, resolveFile, toPosixPath, writeText } from '../utils';
+import { PrecacheProgress, clearNegativeCache, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
 import { installEngineHooks, type EngineHooks } from './hooks';
+import { planLifecycleScript, resolveLifecycleCommandArgv, runLifecyclePlan, type LifecycleCommand } from './lifecycle';
 import { fillMeta } from './meta';
 import { ResourceManager, createResourceManager } from './resources';
 
@@ -27,15 +27,116 @@ const console = import.meta.use('console');
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 const process = import.meta.use('process');
+const worker = import.meta.use('worker');
 
 const fs = import.meta.use('fs');
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function isWebWorkerRuntime(): boolean {
+    const data = worker.workerData;
+    return !!worker.isWorker
+        && !!worker.pipe
+        && isRecord(data)
+        && typeof data.__cts_entry === 'string'
+        && !('__node_workerData' in data);
+}
+
+function isNodeWorkerRuntime(): boolean {
+    const data = worker.workerData;
+    return !!worker.isWorker
+        && !!worker.pipe
+        && isRecord(data)
+        && '__node_workerData' in data;
+}
+
+function runtimeErrorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return String(error);
+}
+
+function postNodeWorkerError(error: unknown): boolean {
+    if (!isNodeWorkerRuntime()) return false;
+    const pipe = worker.pipe;
+    if (!pipe) return false;
+    pipe.postMessage({ __cno_node_worker_error__: runtimeErrorInfo(error) });
+    return true;
+}
+
+function runtimeErrorInfo(error: unknown): { name: string; message: string; stack?: string } {
+    if (error instanceof Error) {
+        return {
+            name: error.name,
+            message: error.message,
+            stack: typeof error.stack === 'string' ? error.stack : undefined,
+        };
+    }
+    return { name: 'Error', message: String(error) };
+}
+
+function envPathKey(env: Record<string, string>): string {
+    if (!isWindows) return 'PATH';
+    for (const key in env) {
+        if (key.toLowerCase() === 'path') return key;
+    }
+    return 'Path';
+}
+
+function lifecyclePathValue(cwd: string, existing: string, sep: string): string {
+    let value = '';
+    let dir = toPosixPath(cwd);
+    const root = pathRoot(dir);
+    while (true) {
+        if (value) value += sep;
+        value += joinPaths(dir, 'node_modules', '.bin');
+        if (dir === root) break;
+        const up = dirname(dir);
+        if (up === dir) break;
+        dir = up;
+    }
+    return existing ? `${value}${sep}${existing}` : value;
+}
+
+function isPrecompilePath(filename: string): boolean {
+    const length = filename.length;
+    if (length < 3) return false;
+    const last = filename.charCodeAt(length - 1);
+    if (last === 115) {
+        const prev = filename.charCodeAt(length - 2);
+        if (prev === 116) return filename.charCodeAt(length - 3) === 46;
+        if (prev !== 106) return false;
+        const third = filename.charCodeAt(length - 3);
+        return third === 46 ||
+            (length >= 4 &&
+                (third === 109 || third === 99) &&
+                filename.charCodeAt(length - 4) === 46);
+    }
+    if (last !== 120 || length < 4) return false;
+    const prev = filename.charCodeAt(length - 2);
+    if (prev !== 115) return false;
+    const third = filename.charCodeAt(length - 3);
+    return (third === 116 || third === 106) &&
+        filename.charCodeAt(length - 4) === 46;
+}
+
+function lifecycleEnv(cwd: string): Record<string, string> {
+    const env = os.environ();
+    const key = envPathKey(env);
+    const sep = isWindows ? ';' : ':';
+    env[key] = lifecyclePathValue(cwd, env[key] ?? '', sep);
+    return env;
+}
 
 /** Nearest ancestor of `start` containing a project manifest, or undefined. */
 function findProjectRoot(start: string): string | undefined {
     let cur = toPosixPath(start);
     for (;;) {
         for (const name of ['deno.json', 'deno.jsonc', 'package.json']) {
-            try { if (fs.exists(joinPaths(cur, name))) return cur; } catch {}
+            try {
+                if (fs.exists(joinPaths(cur, name))) return cur;
+            } catch {}
         }
         const up = dirname(cur);
         if (up === cur) return undefined;
@@ -99,7 +200,9 @@ export class TypeScriptRuntime {
         this.engineHooks = installEngineHooks(this.resolver, this.compiler, {
             onInitHook: (specPath, info) => {
                 for (const fn of this.initHooks) {
-                    try { fn(specPath, info); } catch { }
+                    try {
+                        fn(specPath, info);
+                    } catch { }
                 }
             },
             onSyntaxError: (e) => this.reportSyntax(e),
@@ -116,11 +219,26 @@ export class TypeScriptRuntime {
     // -------------------------------------------------------------------------
 
     private hookEvents(): void {
-        const trace = new Set();
-        engine.onEvent((name: number, data: any) => {
+        const trace = new Set<unknown>();
+        engine.onEvent((name: number, data: unknown) => {
             const ET = engine.EventType;
             if (name === ET.UNHANDLED_REJECTION) {
-                const r = data[1] as Error;
+                const r = Array.isArray(data) ? data[1] : data;
+                if (postNodeWorkerError(r)) return false;
+                if (isWebWorkerRuntime()) {
+                    const pipe = worker.pipe;
+                    if (pipe) {
+                        pipe.postMessage({
+                            __cno_role: 'error',
+                            message: runtimeErrorMessage(r),
+                            error: runtimeErrorInfo(r),
+                            filename: '',
+                            lineno: 0,
+                            colno: 0,
+                        });
+                        return false;
+                    }
+                }
                 if (trace.size > 20) trace.clear();
                 else if (trace.has(r)) return false;
                 trace.add(r);
@@ -128,6 +246,21 @@ export class TypeScriptRuntime {
                 return false;
             }
             if (name === ET.JOB_EXCEPTION) {
+                if (postNodeWorkerError(data)) return true;
+                if (isWebWorkerRuntime()) {
+                    const pipe = worker.pipe;
+                    if (pipe) {
+                        pipe.postMessage({
+                            __cno_role: 'error',
+                            message: runtimeErrorMessage(data),
+                            error: runtimeErrorInfo(data),
+                            filename: '',
+                            lineno: 0,
+                            colno: 0,
+                        });
+                        return true;
+                    }
+                }
                 log.warn('runtime', formatError(data, 'unhandled job exception'));
                 return true;
             }
@@ -173,7 +306,9 @@ export class TypeScriptRuntime {
             result = await scanFn(scanner);
             log.debug('deps', () => `scan done in ${Date.now() - scanStarted}ms`);
         } catch (e) {
-            try { this.resolver.rewriteLock(); } catch { }
+            try {
+                this.resolver.rewriteLock();
+            } catch { }
             prog?.stop();
             this.resources.release();
             await parseDriver.terminate();
@@ -188,11 +323,6 @@ export class TypeScriptRuntime {
         // cleanly, and setCompileProgress() below restarts a fresh spinner
         // for precompile instead of redrawing stale scan-phase numbers.
         prog?.stop();
-
-        for (const { spec, parent, error } of result.errors)
-            log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
-        log.debug('precache', () => `scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
-        this.resolver.rewriteLock();
 
         if (this.config.nodeModulesMode !== 'normal') {
             const nodeModulesMode = this.config.nodeModulesMode;
@@ -214,34 +344,54 @@ export class TypeScriptRuntime {
         // Run deferred npm lifecycle scripts
         if (!this.config.ignoreScripts) {
             log.debug('precache', () => 'lifecycle scripts begin');
-            await this.runLifecycleScripts();
+            try {
+                const count = await this.runLifecycleScripts();
+                if (count > 0 && result.errors.length > 0) {
+                    clearNegativeCache();
+                    await this.retryScanErrors(result);
+                }
+            } catch (e) {
+                prog?.stop();
+                this.resources.release();
+                await parseDriver.terminate();
+                throw e;
+            }
             log.debug('precache', () => 'lifecycle scripts end');
         }
 
-        const scannable = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
-        const scannableModules = result.modules.filter(m => {
-            const dot = m.localPath.lastIndexOf('.');
-            return dot !== -1 && scannable.has(m.localPath.slice(dot));
-        });
-        const toCompile = scannableModules.filter(m => {
-            const remote = isRemote(m.specPath);
-            return !this.compiler.esm.jsc.hasFresh(m.localPath, remote);
-        });
+        for (const { spec, parent, error } of result.errors)
+            log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
+        log.debug('precache', () => `scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
+        this.resolver.rewriteLock();
+        if (result.errors.length > 0) {
+            prog?.stop();
+            this.resources.release();
+            await parseDriver.terminate();
+            throw new Error(`Precache failed with ${result.errors.length} dependency error(s)`);
+        }
+
+        const scannableModules: Array<{ specPath: string; localPath: string }> = [];
+        const toCompile: Array<{ specPath: string; localPath: string }> = [];
+        for (const m of result.modules) {
+            if (!isPrecompilePath(m.localPath)) continue;
+            scannableModules.push(m);
+            if (!this.compiler.esm.jsc.hasFresh(m.localPath, isRemote(m.specPath))) {
+                toCompile.push(m);
+            }
+        }
 
         if (toCompile.length > 0) {
             try {
                 log.debug('precache', () => `precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
                 prog?.setCompileProgress(0, toCompile.length);
-                const remoteSet = new Set<string>();
-                for (const m of toCompile) if (isRemote(m.specPath)) remoteSet.add(m.localPath);
                 // Stream each bytecode straight to disk and drop it — never hold
                 // the whole graph's bytecode in memory (peak RSS bound).
                 let written = 0;
                 await parseDriver.compileModules(
                     toCompile,
                     (done, total) => prog?.setCompileProgress(done, total),
-                    (localPath, bc) => {
-                        this.compiler.esm.jsc.persistBytecode(localPath, bc, remoteSet.has(localPath));
+                    (localPath, bc, specPath) => {
+                        this.compiler.esm.jsc.persistBytecode(localPath, bc, isRemote(specPath));
                         written++;
                     },
                 );
@@ -261,9 +411,34 @@ export class TypeScriptRuntime {
         return result;
     }
 
-    private async runLifecycleScripts(): Promise<void> {
+    private async retryScanErrors(result: ScanResult): Promise<void> {
+        if (!result.errors.length) return;
+        const known = new Set<string>();
+        for (let i = 0; i < result.modules.length; i++) {
+            const module = result.modules[i];
+            if (module) known.add(module.specPath);
+        }
+        const remaining: ScanResult['errors'] = [];
+        for (const item of result.errors) {
+            try {
+                const info = await this.resolver.resolveAsync(item.spec, item.parent);
+                if (!known.has(info.specPath)) {
+                    known.add(info.specPath);
+                    result.modules.push({ specPath: info.specPath, localPath: info.localPath });
+                }
+                log.debug('deps', () => `retry ok "${item.spec}" from "${item.parent}"`);
+            } catch (e) {
+                const message = errMsg(e);
+                log.debug('deps', () => `retry failed "${item.spec}" from "${item.parent}": ${message}`);
+                remaining.push({ ...item, error: message });
+            }
+        }
+        result.errors.splice(0, result.errors.length, ...remaining);
+    }
+
+    private async runLifecycleScripts(): Promise<number> {
         const scripts = this.resolver.drainLifecycleScripts();
-        if (!scripts.length) return;
+        if (!scripts.length) return 0;
         const isWin = isWindows;
         const shell = isWin ? 'cmd.exe' : 'sh';
         const shellArg = isWin ? '/c' : '-c';
@@ -272,50 +447,40 @@ export class TypeScriptRuntime {
             if (!this.config.silent) {
                 console.log(`  ${lifecycle}: ${name}@${version}`);
             }
+            let code: number;
             try {
-                const argv = this.lifecycleArgv(script, shell, shellArg);
-                const child = process.spawn(argv, {
-                    cwd: dir,
-                    stdin: 'inherit',
-                    stdout: 'inherit',
-                    stderr: 'inherit',
-                    env: os.environ(),
-                });
-                const info = await child.wait();
-                if (info.exit_status !== 0) {
-                    log.warn('lifecycle', () => `${lifecycle} ${name}@${version} exited with code ${info.exit_status}`);
-                }
+                code = await this.runLifecycleScript(script, dir, shell, shellArg);
             } catch (e) {
-                log.warn('lifecycle', () => `${lifecycle} ${name}@${version} failed: ${errMsg(e)}`);
+                const message = `${lifecycle} ${name}@${version} failed: ${errMsg(e)}`;
+                log.warn('lifecycle', () => message);
+                throw new Error(message);
+            }
+            if (code !== 0) {
+                const message = `${lifecycle} ${name}@${version} exited with code ${code}`;
+                log.warn('lifecycle', () => message);
+                throw new Error(message);
             }
         }
+        return scripts.length;
     }
 
-    /**
-     * A bare "node <file> [args]" lifecycle script — the overwhelming
-     * majority of npm install/postinstall hooks (e.g. esbuild's install.js) — must
-     * run through our own runtime rather than a system `node`: the npm cache
-     * dir is a flat name@version layout, not a node_modules tree, so a real
-     * Node.js can't resolve the package's own sibling optionalDependencies
-     * (e.g. esbuild's platform binary packages) and fails with
-     * "Cannot find module". Inline `node -e/--eval` hooks should become
-     * `cno eval <code>`. Anything else keeps going through the shell as-is.
-     */
-    private lifecycleArgv(script: string, shell: string, shellArg: string): string[] {
-        const segments = parseShellCommand(script);
-        const seg = segments.length === 1 ? segments[0]! : null;
-        if (seg && seg.bin === 'node' && !seg.op) {
-            const [first, second] = seg.args;
-            if (first === '-e' || first === '--eval') {
-                if (second) return [os.exePath, 'eval', second];
-                return [shell, shellArg, script];
-            }
-            if (first?.startsWith('--eval=')) {
-                return [os.exePath, 'eval', first.slice('--eval='.length)];
-            }
-            return [os.exePath, 'run', ...seg.args];
-        }
-        return [shell, shellArg, script];
+    private async runLifecycleScript(script: string, cwd: string, shell: string, shellArg: string): Promise<number> {
+        const plan = planLifecycleScript(script, { exePath: os.exePath, shell, shellArg });
+        return runLifecyclePlan(plan, (command) => this.spawnLifecycleCommand(command, cwd));
+    }
+
+    private async spawnLifecycleCommand(command: LifecycleCommand, cwd: string): Promise<number> {
+        const argv = resolveLifecycleCommandArgv(command.argv, (name) => this.resolver.resolveBin(name, cwd));
+        log.debug('lifecycle', () => `spawn: ${argv.join(' ')}`);
+        const child = process.spawn(argv, {
+            cwd,
+            stdin: 'inherit',
+            stdout: 'inherit',
+            stderr: 'inherit',
+            env: lifecycleEnv(cwd),
+        });
+        const info = await child.wait();
+        return info.exit_status ?? 0;
     }
 
     // -------------------------------------------------------------------------
@@ -331,7 +496,7 @@ export class TypeScriptRuntime {
             format: 'esm',
             fileKind: guessFileKind(localPath),
         };
-        const meta: Record<string, any> = {};
+        const meta: Record<string, unknown> = {};
         fillMeta(meta, info, this.resolver);
         meta.polyfill = true;
         await this.compiler.load(info, meta).eval();
@@ -344,18 +509,25 @@ export class TypeScriptRuntime {
         return resolveFile(normalizePath(joinPaths(posixCwd(), normalized)));
     }
 
-    async loadEntry(path: string, extra: Record<string, any> = {}, lang = 'ts'): Promise<CModuleEngine.Module> {
+    async loadEntry(path: string, extra: Record<string, unknown> = {}, lang = 'ts'): Promise<CModuleEngine.Module> {
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
-        const meta: Record<string, any> = { lang, ...extra };
+        const meta: Record<string, unknown> = { lang, ...extra };
         fillMeta(meta, info, this.resolver);
         meta.main = true;
+        return this.compiler.load(info, meta);
+    }
+
+    async loadModule(path: string, extra: Record<string, unknown> = {}, lang = 'ts'): Promise<CModuleEngine.Module> {
+        const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
+        const meta: Record<string, unknown> = { lang, ...extra };
+        fillMeta(meta, info, this.resolver);
         return this.compiler.load(info, meta);
     }
 
     loadSourceEntry(
         code: string,
         path: string,
-        extra: Record<string, any> = {},
+        extra: Record<string, unknown> = {},
         opts: { lang?: string; format?: ModuleFormat; fileKind?: FileKind } = {},
     ): CModuleEngine.Module {
         this.resolver.entry = path;
@@ -365,7 +537,7 @@ export class TypeScriptRuntime {
             format: opts.format ?? 'esm',
             fileKind: opts.fileKind ?? 'source',
         };
-        const meta: Record<string, any> = { lang: opts.lang ?? 'ts', ...extra };
+        const meta: Record<string, unknown> = { lang: opts.lang ?? 'ts', ...extra };
         fillMeta(meta, info, this.resolver);
         meta.main = true;
         return this.compiler.loadSource(code, info, meta);
@@ -392,12 +564,18 @@ export class TypeScriptRuntime {
     }
 
     private reportSyntax(e: SyntaxError): never {
-        const cause = e.cause as { source?: SyntaxError; code?: string; path?: string } | undefined;
-        if (!cause?.source || !cause.code || !cause.path) {
+        const cause = e.cause;
+        if (!cause || typeof cause !== 'object') {
             log.debug('runtime', () => `reportSyntax: malformed cause, rethrowing`);
             throw e;
         }
-        const { source, code, path } = cause;
+        const source = Reflect.get(cause, 'source');
+        const code = Reflect.get(cause, 'code');
+        const path = Reflect.get(cause, 'path');
+        if (!(source instanceof SyntaxError) || typeof code !== 'string' || typeof path !== 'string') {
+            log.debug('runtime', () => `reportSyntax: malformed cause, rethrowing`);
+            throw e;
+        }
         const hash = crypto.hexEncode(crypto.md5(engine.encodeString(path)));
         const logPath = `${this.config.cacheDir}/fail-${hash}.log`;
         ensureDir(dirname(logPath));

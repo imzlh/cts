@@ -16,7 +16,7 @@ export type { ModuleInfo };
 
 export interface ProtocolHandler {
     readonly protocols: string[];
-    resolve(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Flow<ModuleInfo>;
+    resolve(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Flow<ModuleInfo>;
     localPath(specPath: string): string;
     clearCache?(): void;
 }
@@ -25,7 +25,7 @@ export interface ProtocolHandler {
 // Helpers shared by all protocol handlers
 // ---------------------------------------------------------------------------
 
-const TEXT_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.jsonc']); 
+const TEXT_EXTS = new Set(['.ts', '.tsx', '.cts', '.mts', '.js', '.jsx', '.mjs', '.cjs', '.json', '.jsonc']);
 
 export function guessFileKind(localPath: string): FileKind {
     const ext = extname(localPath);
@@ -38,11 +38,12 @@ export function guessFileKind(localPath: string): FileKind {
 
 /**
  * Override fileKind based on import attribute `type`.
- * Supports `import ... with { type: 'text' }` and `with { type: 'json' }`.
+ * Supports `import ... with { type: 'text' | 'bytes' | 'json' }`.
  */
-export function applyAttrType(kind: FileKind, attr?: Record<string, any>): FileKind {
+export function applyAttrType(kind: FileKind, attr?: Record<string, unknown>): FileKind {
     const t = attr?.type;
     if (t === 'text') return 'text';
+    if (t === 'bytes') return 'binary';
     if (t === 'json') return 'json';
     return kind;
 }

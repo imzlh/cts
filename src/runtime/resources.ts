@@ -27,7 +27,7 @@ export class ResourceManager {
         this.done = true;
 
         for (let i = this.cleanups.length - 1; i >= 0; i--) {
-            try { this.cleanups[i]!(); }
+            try { this.cleanups[i]?.(); }
             catch (e) { log.debug('resources', 'cleanup error', e); }
         }
         this.cleanups.length = 0;

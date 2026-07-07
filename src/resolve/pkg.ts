@@ -1,7 +1,9 @@
 // pkg.ts — package.json utilities with bounded caches
 
-import type { PackageJson, ModuleFormat } from '../types';
+import type { FileKind, PackageJson, ModuleFormat } from '../types';
+import { hasEsmSyntax } from '../scan';
 import { dirname, extname, joinPaths, normalizePath, resolveFile, safeParse, LRU, log } from '../utils';
+import { err, ErrorKind } from '../errors';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -21,6 +23,7 @@ const formatDirCache = new LRU<string, ModuleFormat>(512);
 const exportsCache = new LRU<string, ResolvedPath | null>(1024);
 
 const PKG_TTL = 5 * 60 * 1000;
+const PACKAGE_SUBPATH_EXTS = ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.json', '.node', '.wasm'];
 
 export function readPkg(dir: string): PackageJson | null {
     const hit = pkgCache.get(dir);
@@ -42,12 +45,18 @@ export function readPkg(dir: string): PackageJson | null {
 export function readPkgFresh(dir: string): PackageJson | null {
     const pkgPath = joinPaths(dir, 'package.json');
     if (!fs.exists(pkgPath)) return null;
-    try { return safeParse<PackageJson>(engine.decodeString(fs.readFile(pkgPath))); }
-    catch { return null; }
+    try {
+        return safeParse<PackageJson>(engine.decodeString(fs.readFile(pkgPath)));
+    } catch {
+        return null;
+    }
 }
 
 export function clearPkgCache(): void {
-    pkgCache.clear(); formatCache.clear(); formatDirCache.clear(); exportsCache.clear();
+    pkgCache.clear();
+    formatCache.clear();
+    formatDirCache.clear();
+    exportsCache.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +83,23 @@ export function detectFormat(localPath: string): ModuleFormat {
     return result;
 }
 
+export function detectPackageJsonFormat(localPath: string): ModuleFormat | null {
+    const ext = extname(localPath);
+    if (ext === '.cjs' || ext === '.cts' || ext === '.node') return 'cjs';
+    if (ext === '.mjs' || ext === '.mts') return 'esm';
+    if (ext !== '.js') return null;
+
+    let dir = dirname(localPath);
+    while (dir !== '/' && dir !== '.') {
+        const pkg = readPkg(dir);
+        if (pkg) return pkg.type === 'module' ? 'esm' : 'cjs';
+        const up = dirname(dir);
+        if (up === dir) break;
+        dir = up;
+    }
+    return null;
+}
+
 function _detectFormat(localPath: string): ModuleFormat {
     const ext = extname(localPath);
     if (ext === '.mjs' || ext === '.mts' || ext === '.ts' || ext === '.tsx' || ext === '.jsx') return 'esm';
@@ -89,7 +115,7 @@ function _detectFormat(localPath: string): ModuleFormat {
         if (cached !== undefined) {
             // Back-fill visited dirs with the same result
             for (const v of visited) formatDirCache.set(v, cached);
-            return cached;
+            return applyJsFormatOverride(localPath, cached, cached === 'cjs');
         }
         visited.push(dir);
         // Deno projects default to ESM
@@ -101,27 +127,40 @@ function _detectFormat(localPath: string): ModuleFormat {
         if (pkg) {
             const fmt: ModuleFormat = pkg.type === 'module' ? 'esm' : 'cjs';
             for (const v of visited) formatDirCache.set(v, fmt);
-            return fmt;
+            return applyJsFormatOverride(localPath, fmt, fmt === 'cjs');
         }
-        const up = dirname(dir); if (up === dir) break; dir = up;
+        const up = dirname(dir);
+        if (up === dir) break;
+        dir = up;
     }
-    // No package.json found — default to CJS, cache all visited
-    for (const v of visited) formatDirCache.set(v, 'cjs');
-    return 'cjs';
+    // No package.json found — Deno-style local .js defaults to ESM. Packages
+    // without a "type" field still stay CJS through the package.json branch.
+    for (const v of visited) formatDirCache.set(v, 'esm');
+    return 'esm';
+}
+
+function applyJsFormatOverride(localPath: string, format: ModuleFormat, detectEsmSyntax: boolean): ModuleFormat {
+    if (format === 'esm' || !detectEsmSyntax) return format;
+    try {
+        return hasEsmSyntax(engine.decodeString(fs.readFile(localPath))) ? 'esm' : format;
+    } catch {
+        return format;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Resolution context
 // ---------------------------------------------------------------------------
 
-export interface ResolveCtx { pkgDir: string; pkg: PackageJson; forceCjs?: boolean }
+export interface ResolveCtx { pkgDir: string; pkg: PackageJson; forceCjs?: boolean; conditions?: string[] }
 
 export interface ResolvedPath {
     path: string;
     format: ModuleFormat;
+    fileKind?: FileKind;
 }
 
-export function createCtx(dir: string, opts: { forceCjs?: boolean } = {}): ResolveCtx | null {
+export function createCtx(dir: string, opts: { forceCjs?: boolean; conditions?: string[] } = {}): ResolveCtx | null {
     const pkg = readPkg(dir);
     return pkg ? { pkgDir: dir, pkg, ...opts } : null;
 }
@@ -131,7 +170,7 @@ export function createCtx(dir: string, opts: { forceCjs?: boolean } = {}): Resol
 // ---------------------------------------------------------------------------
 
 function exportsKey(ctx: ResolveCtx, sub: string): string {
-    return `${ctx.pkgDir}\0${sub}\0${ctx.forceCjs ? '1' : '0'}`;
+    return `${ctx.pkgDir}\0${sub}\0${ctx.forceCjs ? '1' : '0'}\0${ctx.conditions?.join('\0') ?? ''}`;
 }
 
 export function resolveExports(ctx: ResolveCtx, sub = '.'): ResolvedPath | null {
@@ -143,16 +182,43 @@ export function resolveExports(ctx: ResolveCtx, sub = '.'): ResolvedPath | null 
     return result;
 }
 
+export function isPackageSubpathBlockedByExports(ctx: ResolveCtx, sub: string): boolean {
+    if (!ctx.pkg.exports) return false;
+    if (!sub || sub === '.' || sub === './') return resolveExports(ctx, '.') === null;
+    const norm = sub.startsWith('./') ? sub : `./${sub}`;
+    return resolveExports(ctx, norm) === null;
+}
+
+export function packagePathNotExportedError(spec: string): Error {
+    const error = err(ErrorKind.ModuleNotFound, `Package subpath is not exported: ${spec}`);
+    Object.defineProperty(error, 'code', {
+        value: 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
+    return error;
+}
+
+export function packageImportNotDefinedError(spec: string, pkgDir: string, parent: string): Error {
+    const error = err(ErrorKind.ModuleNotFound,
+        `Package import specifier "${spec}" is not defined in package ${joinPaths(pkgDir, 'package.json')} imported from "${parent}"`);
+    Object.defineProperty(error, 'code', {
+        value: 'ERR_PACKAGE_IMPORT_NOT_DEFINED',
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
+    return error;
+}
+
 function conds(ctx: ResolveCtx): string[] {
-    // Deliberately omit 'node': packages with divergent node/browser export
-    // maps (e.g. vue, which bundles everything into a single CJS file under
-    // 'node' but externalizes @vue/* packages under the browser/default ESM
-    // build) would otherwise resolve to a different file — and a different
-    // dependency graph — than bundlers like Vite/webpack pick, breaking
-    // --npm-mode's materialized node_modules for those tools. import>default
-    // for ESM, require>default for CJS. No 'module'/'browser' either — those
-    // are bundler-only conventions neither runtime honors by default.
-    return ctx.forceCjs ? ['require', 'default'] : ['import', 'default'];
+    // Prefer explicit import/require branches, then Node runtime branches,
+    // then default. Keeping import/require first avoids switching packages
+    // that already publish a format-specific runtime entry.
+    return ctx.forceCjs
+        ? ['require', ...(ctx.conditions ?? []), 'node', 'default']
+        : ['import', ...(ctx.conditions ?? []), 'node', 'default'];
 }
 
 function preferredFormatForPath(ctx: ResolveCtx, path: string, preferred?: ModuleFormat): ModuleFormat {
@@ -168,14 +234,47 @@ function preferredFormatForPath(ctx: ResolveCtx, path: string, preferred?: Modul
     // bundler's own content-sniffing rather than Node's type/extension rules.
     // Same package, same file: honor that signal instead of guessing 'cjs'.
     if (ctx.pkg.module && resolvePath(ctx, ctx.pkg.module) === path) return 'esm';
-    return detectFormat(path);
+    return detectPackageJsonFormat(path) ?? detectFormat(path);
 }
 
 function resolvePath(ctx: ResolveCtx, p: string): string | null {
     if (!p) return null;
     if (p.includes('://') || p.startsWith('npm:') || p.startsWith('jsr:')) return p;
-    try { return resolveFile(joinPaths(ctx.pkgDir, p.startsWith('./') ? p.slice(2) : p)); }
-    catch { return null; }
+    try {
+        return resolvePackageSubpath(joinPaths(ctx.pkgDir, p.startsWith('./') ? p.slice(2) : p));
+    } catch {
+        return null;
+    }
+}
+
+function tryPackageFile(path: string): string | null {
+    try {
+        const st = fs.stat(path);
+        if (st.isFile) return path;
+        if (st.isDirectory) return tryPackageIndex(path);
+    } catch {}
+    return null;
+}
+
+function tryPackageIndex(dir: string): string | null {
+    const base = joinPaths(dir, 'index');
+    for (const ext of PACKAGE_SUBPATH_EXTS) {
+        try {
+            const path = base + ext;
+            if (fs.stat(path).isFile) return path;
+        } catch {}
+    }
+    return null;
+}
+
+function resolvePackageSubpath(base: string): string {
+    const exact = tryPackageFile(base);
+    if (exact) return exact;
+    for (const ext of PACKAGE_SUBPATH_EXTS) {
+        const path = tryPackageFile(base + ext);
+        if (path) return path;
+    }
+    return resolveFile(base, PACKAGE_SUBPATH_EXTS);
 }
 
 function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string, preferred?: ModuleFormat): ResolvedPath | null {
@@ -184,7 +283,10 @@ function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string, preferred?: Mo
         return path ? { path, format: preferredFormatForPath(ctx, path, preferred) } : null;
     }
     if (Array.isArray(t)) {
-        for (const e of t) { const r = resolveTarget(ctx, e, rep, preferred); if (r) return r; }
+        for (const e of t) {
+            const r = resolveTarget(ctx, e, rep, preferred);
+            if (r) return r;
+        }
         return null;
     }
     if (t && typeof t === 'object') {
@@ -193,7 +295,7 @@ function resolveTarget(ctx: ResolveCtx, t: unknown, rep?: string, preferred?: Mo
             const nextPreferred = c === 'import' ? 'esm'
                 : c === 'require' ? 'cjs'
                 : preferred;
-            const r = resolveTarget(ctx, (t as any)[c], rep, nextPreferred);
+            const r = resolveTarget(ctx, Reflect.get(t, c), rep, nextPreferred);
             if (r) return r;
         }
     }
@@ -206,14 +308,19 @@ function _resolveExports(ctx: ResolveCtx, sub: string): ResolvedPath | null {
     if (typeof exports === 'string')
         return (sub === '.' || sub === './') ? resolveTarget(ctx, exports) : null;
     if (typeof exports !== 'object') return null;
-    const map = exports as Record<string, unknown>;
-    const direct = resolveTarget(ctx, map[sub]); if (direct) return direct;
-    for (const [k, v] of Object.entries(map)) {
+    const direct = resolveTarget(ctx, Reflect.get(exports, sub));
+    if (direct) return direct;
+    if (sub === '.' || sub === './') {
+        const root = resolveTarget(ctx, exports);
+        if (root) return root;
+    }
+    for (const [k, v] of Object.entries(exports)) {
         if (!k.includes('*')) continue;
         const pre = k.slice(0, k.indexOf('*')), suf = k.slice(k.indexOf('*') + 1);
         if (sub.startsWith(pre) && sub.endsWith(suf)) {
             const rep = sub.slice(pre.length, suf.length ? -suf.length : undefined);
-            const r = resolveTarget(ctx, v, rep); if (r) return r;
+            const r = resolveTarget(ctx, v, rep);
+            if (r) return r;
         }
     }
     return null;
@@ -223,12 +330,11 @@ function _resolveExports(ctx: ResolveCtx, sub: string): ResolvedPath | null {
 export function resolveImports(ctx: ResolveCtx, spec: string): ResolvedPath | null {
     const { imports } = ctx.pkg;
     if (!imports || typeof imports !== 'object') return null;
-    const map = imports as Record<string, unknown>;
     // Direct match: "#foo" → "./path"
-    const direct = resolveTarget(ctx, map[spec]);
+    const direct = resolveTarget(ctx, Reflect.get(imports, spec));
     if (direct) return direct;
     // Wildcard match: "#foo/*" → "./bar/*"
-    for (const [k, v] of Object.entries(map)) {
+    for (const [k, v] of Object.entries(imports)) {
         if (!k.includes('*')) continue;
         const pre = k.slice(0, k.indexOf('*')), suf = k.slice(k.indexOf('*') + 1);
         if (spec.startsWith(pre) && spec.endsWith(suf)) {
@@ -241,11 +347,12 @@ export function resolveImports(ctx: ResolveCtx, spec: string): ResolvedPath | nu
 }
 
 export function resolveMain(ctx: ResolveCtx): ResolvedPath | null {
-    const e = resolveExports(ctx, '.'); if (e) return e;
+    const e = resolveExports(ctx, '.');
+    if (e) return e;
     // Some packages (e.g. devlop@1.1.0) use a "default" export condition
     // without a "." key — try it as a fallback
     if (ctx.pkg.exports && typeof ctx.pkg.exports === 'object') {
-        const def = (ctx.pkg.exports as Record<string, unknown>)['default'];
+        const def = Reflect.get(ctx.pkg.exports, 'default');
         if (typeof def === 'string') {
             const resolved = resolveTarget(ctx, def);
             if (resolved) return resolved;
@@ -272,10 +379,24 @@ export function resolveMain(ctx: ResolveCtx): ResolvedPath | null {
 export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | null {
     if (!sub || sub === '.' || sub === './') return resolveMain(ctx);
     const norm = sub.startsWith('./') ? sub : `./${sub}`;
-    return resolveExports(ctx, norm) ?? (() => {
+    const exported = resolveExports(ctx, norm);
+    if (exported) return exported;
+    const base = joinPaths(ctx.pkgDir, norm.slice(2));
+    if (!ctx.forceCjs) {
         try {
-            const path = resolveFile(joinPaths(ctx.pkgDir, norm.slice(2)));
-            return { path, format: detectFormat(path) };
-        } catch { return null; }
-    })();
+            const st = fs.stat(base);
+            if (!st.isFile) return null;
+            if (!extname(base)) return { path: base, format: 'cjs', fileKind: 'source' };
+            return { path: base, format: detectFormat(base) };
+        } catch {
+            return null;
+        }
+    }
+    try {
+        const path = resolvePackageSubpath(base);
+        if (!extname(path)) return { path, format: 'cjs', fileKind: 'source' };
+        return { path, format: detectFormat(path) };
+    } catch {
+        return null;
+    }
 }

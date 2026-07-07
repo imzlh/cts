@@ -31,17 +31,24 @@ const C = {
 // TTY
 // ---------------------------------------------------------------------------
 
+function getEnv(name: string): string | null {
+    try {
+        return os.getenv(name) ?? null;
+    } catch {
+        return null;
+    }
+}
+
 export const isatty = (() => {
-    try { return os.guessHandle(os.STDOUT_FILENO) === 'tty'; }
-    catch { return false; }
+    try {
+        return os.guessHandle(os.STDOUT_FILENO) === 'tty';
+    } catch {
+        return false;
+    }
 })();
 let termWidth = (() => {
-    try {
-        const cols = Number(os.getenv('COLUMNS') ?? '');
-        return Number.isFinite(cols) && cols > 20 ? cols : 80;
-    } catch {
-        return 80;
-    }
+    const cols = Number(getEnv('COLUMNS') ?? '');
+    return Number.isFinite(cols) && cols > 20 ? cols : 80;
 })();
 
 function write(s: string): void {
@@ -156,7 +163,10 @@ export class PrecacheProgress {
     // ---- Lifecycle ----
 
     stop(): void {
-        if (this.timer) { clearInterval(this.timer); this.timer = null; }
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null;
+        }
         if (isatty && this.drawn) this.clearLines(this.drawn);
         this.drawn = 0;
     }
@@ -201,10 +211,10 @@ export class PrecacheProgress {
     private render(): void {
         if (!isatty) return;
         this.tick = (this.tick + 1) % SPIN.length;
-        const spin = SPIN[this.tick]!;
+        const spin = SPIN[this.tick] ?? SPIN[0] ?? '';
 
-        const active  = this.order.filter(k => !this.items.get(k)!.finished);
-        const finished = this.order.filter(k => this.items.get(k)!.finished);
+        const active  = this.order.filter(k => this.items.get(k)?.finished === false);
+        const finished = this.order.filter(k => this.items.get(k)?.finished === true);
         const visible = [...active.slice(0, this.maxLines - 1), ...finished.slice(-1)];
 
         const elapsed = (Date.now() - this.startMs) / 1000;
@@ -226,7 +236,8 @@ export class PrecacheProgress {
 
         // Detail lines (big downloads)
         for (const key of visible.slice(0, this.maxLines)) {
-            const item = this.items.get(key)!;
+            const item = this.items.get(key);
+            if (!item) continue;
             const lbl = truncate(item.label, termWidth - 30);
             if (item.error) {
                 lines.push(`  ${C.red('✗')} ${lbl} ${C.red(item.error)}`);

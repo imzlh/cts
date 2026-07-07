@@ -7,19 +7,64 @@ const smap = import.meta.use('sourcemap');
 // ── oxc native extension types ────────────────────────────────────────────────
 
 export interface OxcModule {
-    transpile(source: string, opts?: { kind?: 'js' | 'jsx' | 'ts' | 'tsx'; depsOnly?: boolean; filename?: string }): { code: string; deps: string[]; sourceMap?: string };
-    scanImports(source: string, opts?: { kind?: 'js' | 'jsx' | 'ts' | 'tsx' }): string[];
+    transpile(source: string, opts?: OxcOptions): { code: string; deps: string[]; sourceMap?: string };
+    scanImports(source: string, opts?: OxcOptions): string[];
+    transpileFast?: (source: string, kind: OxcKind, filename: string) => OxcTransformResult;
+    scanImportsFast?: (source: string, kind: OxcKind) => string[];
     version: string;
+}
+
+interface OxcTransformResult {
+    code: string;
+    sourceMap?: string;
+}
+
+type OxcKind = 0 | 1 | 2 | 3;
+type OxcOptionKind = 'js' | 'jsx' | 'ts' | 'tsx';
+
+interface OxcOptions {
+    kind?: OxcOptionKind;
+    depsOnly?: boolean;
+    filename?: string;
+}
+
+const OXC_KIND_JS = 0;
+const OXC_KIND_JSX = 1;
+const OXC_KIND_TS = 2;
+const OXC_KIND_TSX = 3;
+
+const OXC_SCAN_JS_OPTIONS: OxcOptions = { kind: 'js' };
+const OXC_SCAN_JSX_OPTIONS: OxcOptions = { kind: 'jsx' };
+const OXC_SCAN_TS_OPTIONS: OxcOptions = { kind: 'ts' };
+const OXC_SCAN_TSX_OPTIONS: OxcOptions = { kind: 'tsx' };
+
+export function isOxcModule(value: unknown): value is OxcModule {
+    return value !== null
+        && typeof value === 'object'
+        && typeof Reflect.get(value, 'transpile') === 'function'
+        && typeof Reflect.get(value, 'scanImports') === 'function'
+        && typeof Reflect.get(value, 'version') === 'string';
 }
 
 // ── OxcTranspiler — wraps the native oxc extension ───────────────────────────
 
 export class OxcTranspiler {
     private mod: OxcModule;
+    private transpileOptions: OxcOptions = { kind: 'js', filename: '' };
+    private transpileFast: ((source: string, kind: OxcKind, filename: string) => OxcTransformResult) | null = null;
+    private scanImportsFast: ((source: string, kind: OxcKind) => string[]) | null = null;
     private scanLogged = false;
 
     constructor(mod: OxcModule) {
         this.mod = mod;
+        const transpileFast = Reflect.get(mod, 'transpileFast');
+        if (typeof transpileFast === 'function') {
+            this.transpileFast = transpileFast;
+        }
+        const scanImportsFast = Reflect.get(mod, 'scanImportsFast');
+        if (typeof scanImportsFast === 'function') {
+            this.scanImportsFast = scanImportsFast;
+        }
         log.debug('oxc', () => `loaded ${mod.version}`);
     }
 
@@ -33,7 +78,9 @@ export class OxcTranspiler {
         try {
             const kind = kindFromFilename(filename);
             const name = mapKey ?? filename;
-            const { code, sourceMap } = this.mod.transpile(source, { kind, filename: name });
+            const { code, sourceMap } = this.transpileFast
+                ? this.transpileFast(source, kind, name)
+                : this.transpileCompat(source, kind, name);
             if (sourceMap) {
                 try { smap.loadJSON(name, sourceMap); }
                 catch (e) { log.debug('oxc', () => `smap: ${filename}: ${errMsg(e)}`); }
@@ -51,7 +98,10 @@ export class OxcTranspiler {
     transpileCapture(source: string, filename: string, mapKey?: string): { code: string; sourceMap?: string } | null {
         try {
             const kind = kindFromFilename(filename);
-            const { code, sourceMap } = this.mod.transpile(source, { kind, filename: mapKey ?? filename });
+            const name = mapKey ?? filename;
+            const { code, sourceMap } = this.transpileFast
+                ? this.transpileFast(source, kind, name)
+                : this.transpileCompat(source, kind, name);
             return { code, sourceMap };
         } catch (e) {
             log.debug('oxc', () => `transpile failed for ${filename}: ${errMsg(e)}`);
@@ -63,7 +113,9 @@ export class OxcTranspiler {
     scanImports(source: string, filename: string): string[] | null {
         try {
             const kind = kindFromFilename(filename);
-            const deps = this.mod.scanImports(source, { kind });
+            const deps = this.scanImportsFast
+                ? this.scanImportsFast(source, kind)
+                : this.mod.scanImports(source, scanOptionsForKind(kind));
             if (!this.scanLogged) {
                 this.scanLogged = true;
                 log.debug('oxc', () => `scan active: ${filename}`);
@@ -74,13 +126,55 @@ export class OxcTranspiler {
             return null;
         }
     }
+
+    private transpileCompat(source: string, kind: OxcKind, filename: string): OxcTransformResult {
+        const opts = this.transpileOptions;
+        opts.kind = optionKindForKind(kind);
+        opts.filename = filename;
+        return this.mod.transpile(source, opts);
+    }
 }
 
-function kindFromFilename(filename: string): 'js' | 'jsx' | 'ts' | 'tsx' {
-    if (filename.endsWith('.tsx')) return 'tsx';
-    if (filename.endsWith('.ts'))  return 'ts';
-    if (filename.endsWith('.jsx')) return 'jsx';
-    return 'js';
+function kindFromFilename(filename: string): OxcKind {
+    const length = filename.length;
+    if (length >= 3 &&
+        filename.charCodeAt(length - 1) === 115 &&
+        filename.charCodeAt(length - 2) === 116) {
+        const third = filename.charCodeAt(length - 3);
+        if (third === 46 ||
+            (length >= 4 &&
+                (third === 109 || third === 99) &&
+                filename.charCodeAt(length - 4) === 46)) {
+            return OXC_KIND_TS;
+        }
+    }
+    if (length >= 4 &&
+        filename.charCodeAt(length - 1) === 120 &&
+        filename.charCodeAt(length - 2) === 115 &&
+        filename.charCodeAt(length - 4) === 46) {
+        const lang = filename.charCodeAt(length - 3);
+        if (lang === 116) return OXC_KIND_TSX;
+        if (lang === 106) return OXC_KIND_JSX;
+    }
+    return OXC_KIND_JS;
+}
+
+function scanOptionsForKind(kind: OxcKind): OxcOptions {
+    switch (kind) {
+        case OXC_KIND_TS: return OXC_SCAN_TS_OPTIONS;
+        case OXC_KIND_TSX: return OXC_SCAN_TSX_OPTIONS;
+        case OXC_KIND_JSX: return OXC_SCAN_JSX_OPTIONS;
+        default: return OXC_SCAN_JS_OPTIONS;
+    }
+}
+
+function optionKindForKind(kind: OxcKind): OxcOptionKind {
+    switch (kind) {
+        case OXC_KIND_TS: return 'ts';
+        case OXC_KIND_TSX: return 'tsx';
+        case OXC_KIND_JSX: return 'jsx';
+        default: return 'js';
+    }
 }
 
 /**
@@ -96,12 +190,6 @@ export function oxcExtPath(): string | null {
                      : 'so';
         const extPath = `${exeDir}${sep}ext${sep}oxc.${suffix}`;
         const candidates = [extPath];
-        const stageSuffix = `${sep}build${sep}stage`;
-
-        if (exeDir.endsWith(stageSuffix)) {
-            const repoRoot = exeDir.slice(0, -stageSuffix.length);
-            candidates.push(`${repoRoot}${sep}ext-oxc${sep}build${sep}oxc.${suffix}`);
-        }
 
         for (const path of candidates) {
             try {
@@ -124,8 +212,8 @@ export function tryLoadOxc(): OxcTranspiler | null {
 
     try {
         import.meta.register('oxc', extPath);
-        const oxcMod = import.meta.use('oxc') as any as OxcModule;
-        if (typeof oxcMod?.transpile !== 'function') {
+        const oxcMod: unknown = import.meta.use('oxc');
+        if (!isOxcModule(oxcMod)) {
             log.debug('oxc', () => `register succeeded but module API unexpected`);
             return null;
         }

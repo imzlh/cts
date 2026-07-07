@@ -49,8 +49,10 @@ export interface ConfigOptions {
     pathAliases?:   Record<string, string[]>;
     baseUrl?:       string;
     importMap?:     Record<string, string>;
+    conditions?:    string[];
     polyfill?:      string;
     enableCache?:   boolean;
+    cachedOnly?:    boolean;
     enableOxc?:     boolean;
     eval?:          string;   // inline code to evaluate (-e / --eval)
     // Lock options
@@ -79,6 +81,7 @@ export interface RuntimeConfig extends ConfigOptions {
     jsrCacheTTL:    number;
     requestTimeout: number;
     enableCache:    boolean;
+    cachedOnly:     boolean;
     enableOxc:      boolean;
     ignoreScripts:  boolean;
     nodeModulesMode: NodeModulesMode;
@@ -89,6 +92,7 @@ export interface RuntimeConfig extends ConfigOptions {
     _?:             string;
     _args?:         string[];
     _offset:        number;
+    _cli?:          import('./utils/misc').ParsedArgs;
 }
 
 // ---------------------------------------------------------------------------

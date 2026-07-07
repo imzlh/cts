@@ -15,6 +15,7 @@ const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const console = import.meta.use('console');
+const worker = import.meta.use('worker');
 
 // ---------------------------------------------------------------------------
 // ErrorKind — the single source of truth for error categories
@@ -57,6 +58,36 @@ declare global {
     }
 }
 
+function isErrorKind(value: unknown): value is ErrorKind {
+    return typeof value === 'string' && Object.values<string>(ErrorKind).includes(value);
+}
+
+function errorFromUnknown(value: unknown): Error {
+    if (value instanceof Error) return value;
+    if (value !== null && typeof value === 'object' && 'message' in value) {
+        const out = new Error(String(Reflect.get(value, 'message')));
+        const name = Reflect.get(value, 'name');
+        if (typeof name === 'string') out.name = name;
+        const stack = Reflect.get(value, 'stack');
+        if (typeof stack === 'string') out.stack = stack;
+        const kind = Reflect.get(value, 'kind');
+        if (isErrorKind(kind)) out.kind = kind;
+        return out;
+    }
+    return new Error(String(value));
+}
+
+function syntaxCause(error: SyntaxError): { source?: SyntaxError; path?: string } | null {
+    const cause = Reflect.get(error, 'cause');
+    if (!cause || typeof cause !== 'object') return null;
+    const source = Reflect.get(cause, 'source');
+    const path = Reflect.get(cause, 'path');
+    return {
+        source: source instanceof SyntaxError ? source : undefined,
+        path: typeof path === 'string' ? path : undefined,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Helper: create an Error with .kind attached
 // ---------------------------------------------------------------------------
@@ -69,7 +100,22 @@ declare global {
 export function err(kind: ErrorKind, msg: string, source?: unknown): Error {
     const e = new Error(msg);
     e.kind = kind;
-    if (source !== undefined) (e as any).cause = source;
+    if (kind === ErrorKind.ModuleNotFound) {
+        Object.defineProperty(e, 'code', {
+            value: 'MODULE_NOT_FOUND',
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    }
+    if (source !== undefined) {
+        Object.defineProperty(e, 'cause', {
+            value: source,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+    }
     if (source instanceof Error && typeof source.stack === 'string' && source.stack) {
         const nl = source.stack.indexOf('\n');
         e.stack = nl === -1
@@ -191,16 +237,21 @@ function sourceContext(file: string, line: number, col: number): string {
 // Main formatting function
 // ---------------------------------------------------------------------------
 
-const debugEnv = (() => { try {
-    const str = os.getenv('DEBUG') ?? '';
-    if (str == '*') return true;
-    if (str.includes('stack')) return true;
-} catch { return false; } })();
+function readDebugEnv(): string {
+    try {
+        return os.getenv('DEBUG') ?? '';
+    } catch {
+        return '';
+    }
+}
+
+const debugEnv = (() => {
+    const str = readDebugEnv();
+    return str === '*' || str.includes('stack');
+})();
 
 export function formatError(e: unknown, context?: string): string {
-    const error = (e instanceof Error || (e != null && typeof e === 'object' && 'message' in e))
-        ? e as Error
-        : new Error(String(e));
+    const error = errorFromUnknown(e);
     const msg   = error.message;
 
     // 1. Use .kind if available (set by internal throw sites via `err()`)
@@ -221,12 +272,12 @@ export function formatError(e: unknown, context?: string): string {
     lines.push(`  ${cleanMsg}`);
 
     // Source context for syntax errors
-    if (error instanceof SyntaxError && (error as any).cause) {
-        const cause = (error as any).cause as { source?: SyntaxError; path?: string };
-        if (cause.path) {
+    if (error instanceof SyntaxError) {
+        const cause = syntaxCause(error);
+        if (cause?.path) {
             const locMatch = cause.source?.message?.match(/(\d+):(\d+)/);
-            const line = locMatch ? +locMatch[1]! : 0;
-            const col  = locMatch ? +locMatch[2]! : 0;
+            const line = locMatch?.[1] ? +locMatch[1] : 0;
+            const col  = locMatch?.[2] ? +locMatch[2] : 0;
             lines.push(C.dim(`  ${cause.path}${line ? `:${line}:${col}` : ''}`));
             if (line) lines.push(sourceContext(cause.path, line, col));
         }
@@ -292,11 +343,37 @@ function classifyFallback(msg: string): ErrorKind {
     return ErrorKind.Generic;
 }
 
+function errorInfo(e: unknown): { name: string; message: string; stack?: string } {
+    if (e instanceof Error) {
+        return {
+            name: e.name,
+            message: e.message,
+            stack: typeof e.stack === 'string' ? e.stack : undefined,
+        };
+    }
+    return { name: 'Error', message: String(e) };
+}
+
 // ---------------------------------------------------------------------------
 // Fatal error — print and exit
 // ---------------------------------------------------------------------------
 
 export function fatal(e: unknown, context?: string): never {
+    const workerData = worker.workerData;
+    if (
+        worker.isWorker
+        && worker.pipe
+        && workerData
+        && typeof workerData === 'object'
+        && '__node_workerData' in workerData
+    ) {
+        worker.pipe.postMessage({
+            __cno_node_worker_error__: errorInfo(e),
+        });
+        if (e instanceof Error) throw e;
+        throw new Error(String(e));
+    }
+
     const msg = formatError(e, context) + '\n';
     console.error(msg);
     os.exit(1);

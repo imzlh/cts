@@ -1,16 +1,13 @@
 import type { RuntimeConfig } from './types';
 import { ModuleResolver } from './resolve/index';
-import { extname, errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName } from './utils';
+import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName } from './utils';
 import type { OxcTranspiler } from './oxc';
-import { extractImports, SCANNABLE, WASM_EXT } from './scan';
+import { extractImports, hasImportExportOrRequire, isScannablePath, isTsLikePath, isWasmPath } from './scan';
 
 const engine = import.meta.use('engine');
 const asyncfs = import.meta.use('asyncfs');
 const wasm = import.meta.use('wasm');
 const os = import.meta.use('os');
-
-// WASI module names — provided by the runtime, no JS resolution needed.
-const WASI_MODS = new Set(['wasi_unstable', 'wasi_snapshot_preview1']);
 
 async function extractImportsFast(
     source: string,
@@ -18,7 +15,7 @@ async function extractImportsFast(
     isTs: boolean,
     acc: OxcTranspiler | null,
 ): Promise<string[]> {
-    if (!source.includes('import') && !source.includes('export') && !source.includes('require')) return [];
+    if (!hasImportExportOrRequire(source)) return [];
     if (acc) {
         try {
             const deps = acc.scanImports(source, filename);
@@ -30,8 +27,8 @@ async function extractImportsFast(
     return extractImports(source, isTs);
 }
 
-function hasImportSyntax(source: string): boolean {
-    return source.includes('import') || source.includes('export') || source.includes('require');
+function isWasiModuleName(name: string): boolean {
+    return name === 'wasi_unstable' || name === 'wasi_snapshot_preview1';
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +159,7 @@ export class DepScanner {
                 if (pending === 0) return null;
                 await new Promise<void>(resolve => { wakeWaiters.push(resolve); });
             }
-            return queue.shift()!;
+            return queue.shift() ?? null;
         };
 
         const rootedWorker = async () => {
@@ -249,38 +246,43 @@ export class DepScanner {
         specPath: string,
         localPath: string,
     ): Promise<Array<{ spec: string; parent: string }>> {
-        const ext = extname(localPath);
-        if (ext === WASM_EXT) {
+        if (isWasmPath(localPath)) {
             if (!wasm) return [];
             try {
                 const bytes = await asyncfs.readFile(localPath);
                 const wmod = wasm.parseModule(new Uint8Array(bytes));
                 const seen = new Set<string>();
                 for (const imp of wasm.moduleImports(wmod)) {
-                    if (WASI_MODS.has(imp.module)) continue;
+                    if (isWasiModuleName(imp.module)) continue;
                     if (imp.module === 'env') continue;
                     if (seen.has(imp.module)) continue;
                     seen.add(imp.module);
                 }
-                return [...seen].map(spec => ({ spec, parent: specPath }));
+                const imports: Array<{ spec: string; parent: string }> = [];
+                for (const spec of seen) imports.push({ spec, parent: specPath });
+                return imports;
             } catch (e) {
                 log.debug('deps', () => `wasm scan failed for ${localPath}: ${errMsg(e)}`);
                 return [];
             }
         }
-        if (!SCANNABLE.has(ext)) return [];
+        if (!isScannablePath(localPath)) return [];
         try {
             const bytes = await asyncfs.readFile(localPath);
             const src = engine.decodeString(bytes);
-            if (!hasImportSyntax(src)) return [];
+            if (!hasImportExportOrRequire(src)) return [];
             let imports: string[];
             if (this.parseImports) {
                 imports = await this.parseImports(src, localPath);
             } else {
-                const isTs = /\.[mc]?tsx?$/.test(localPath);
-                imports = await extractImportsFast(src, localPath, isTs, this.cfg.enableOxc !== false ? this.oxc : null);
+                imports = await extractImportsFast(src, localPath, isTsLikePath(localPath), this.cfg.enableOxc !== false ? this.oxc : null);
             }
-            return imports.map(spec => ({ spec, parent: specPath }));
+            const out: Array<{ spec: string; parent: string }> = [];
+            for (let i = 0; i < imports.length; i++) {
+                const spec = imports[i];
+                if (spec !== undefined) out.push({ spec, parent: specPath });
+            }
+            return out;
         } catch { return []; }
     }
 }

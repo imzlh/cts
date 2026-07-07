@@ -29,8 +29,8 @@ export class LRU<K, V> {
         this.map.set(key, value);
         // Evict LRU entry if over capacity
         if (this.map.size > this.cap) {
-            const oldest = this.map.keys().next().value as K;
-            this.map.delete(oldest);
+            const oldest = this.map.keys().next();
+            if (!oldest.done) this.map.delete(oldest.value);
         }
     }
 

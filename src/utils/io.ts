@@ -11,6 +11,12 @@ export const readText  = (p: string) => engine.decodeString(fs.readFile(p));
 export const writeText = (p: string, s: string) => fs.writeFile(p, engine.encodeString(s));
 export const readBytes = (p: string) => new Uint8Array(fs.readFile(p));
 
+function unlinkIfExists(path: string): void {
+    try {
+        fs.unlink(path);
+    } catch {}
+}
+
 export function ensureDir(dir: string): void {
     if (fs.exists(dir)) return;
     const parent = dirname(dir);
@@ -109,14 +115,17 @@ export function hardlinkOrCopyDirRecursiveSync(src: string, dest: string): void 
         const d = joinPaths(dest, entry.name);
         if (entry.isSymbolicLink) {
             const target = fs.readlink(s);
-            try { fs.unlink(d); } catch {}
+            unlinkIfExists(d);
             fs.symlink(target, d);
         } else if (entry.isDirectory) {
             hardlinkOrCopyDirRecursiveSync(s, d);
         } else {
-            try { fs.unlink(d); } catch {}
-            try { fs.link(s, d); }
-            catch { fs.copy(s, d); }
+            unlinkIfExists(d);
+            try {
+                fs.link(s, d);
+            } catch {
+                fs.copy(s, d);
+            }
         }
     }
 }

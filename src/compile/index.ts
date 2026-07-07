@@ -14,6 +14,12 @@ import { CjsLoader } from './cjs';
 import { EsmCompiler } from './esm';
 import { WasmCompiler } from './wasm';
 
+const engine = import.meta.use('engine');
+
+function metaLang(meta: Record<string, unknown>): string | undefined {
+    return typeof meta.lang === 'string' ? meta.lang : undefined;
+}
+
 export class ModuleCompiler {
     readonly esm: EsmCompiler;
     readonly cjs: CjsLoader;
@@ -27,7 +33,18 @@ export class ModuleCompiler {
         this.wasm = new WasmCompiler();
 
         // Wire CjsLoader to resolver + ESM compiler via bridge callbacks
-        const deps = buildCjsDeps(resolver, this.esm);
+        const deps = buildCjsDeps(resolver, this.esm, (info) => {
+            const mod = this.wasm.load(
+                info,
+                (spec, parent) => this.resolver.resolve(spec, parent),
+                (resolved, meta) => this.load(resolved, meta),
+            );
+            const result = engine.promiseResult(mod.eval());
+            if (result === null) {
+                throw new Error(`Cannot require() async WASM module '${info.specPath}'`);
+            }
+            return mod.namespace;
+        });
         this.cjs = new CjsLoader(deps);
 
         // Install global require + internal bridge
@@ -37,6 +54,7 @@ export class ModuleCompiler {
         );
         installInternalBridge(
             (entry) => this.cjs.mkRequire(entry),
+            (id, parentPath) => this.cjs.preloadModule(id, parentPath),
             this.cjs.cache,
             resolver,
         );
@@ -50,7 +68,7 @@ export class ModuleCompiler {
     // Public API: load a module from its ModuleInfo
     // -------------------------------------------------------------------------
 
-    load(info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
+    load(info: ModuleInfo, meta: Record<string, unknown> = {}): CModuleEngine.Module {
         if (isTypeDecl(info.localPath)) {
             throw err(ErrorKind.FileNotFound,
                 `Cannot load type declaration file "${info.localPath}" as a module.`);
@@ -67,7 +85,7 @@ export class ModuleCompiler {
 
         // CJS format: execute via CjsLoader, then bridge to ESM Module
         if (info.format === 'cjs' && info.fileKind === 'source') {
-            const cjsMod = this.cjs.loadAndGet(info.localPath);
+            const cjsMod = this.cjs.loadAndGet(info.localPath, undefined, info.specPath === this.resolver.entry);
             const mod = bridgeCjsToEsm(moduleRef(info), meta, cjsMod.exports);
             this.esm.setCache(info, mod);
             return mod;
@@ -77,12 +95,12 @@ export class ModuleCompiler {
         return this.esm.load(info, meta, (p) => this.resolver.getCachedMtime(p));
     }
 
-    loadSource(code: string, info: ModuleInfo, meta: Record<string, any> = {}): CModuleEngine.Module {
+    loadSource(code: string, info: ModuleInfo, meta: Record<string, unknown> = {}): CModuleEngine.Module {
         if (info.fileKind === 'text') {
             return this.esm.loadSource(code, info, meta);
         }
         if (info.format === 'cjs') {
-            const transformed = this.esm.transformer.transformForCjs(code, info.localPath, meta?.lang);
+            const transformed = this.esm.transformer.transformForCjs(code, info.localPath, metaLang(meta));
             const cjsMod = this.cjs.loadSourceAndGet(transformed, info.localPath);
             const mod = bridgeCjsToEsm(moduleRef(info), meta, cjsMod.exports);
             this.esm.setCache(info, mod);
@@ -95,7 +113,7 @@ export class ModuleCompiler {
         this.cjs.preRegister(localPath, parentPath);
     }
 
-    requireInternal(id: string, parentPath?: string): any {
+    requireInternal(id: string, parentPath?: string): unknown {
         return this.cjs.mkRequire(parentPath ?? `${this.resolver.entry}/../<internal>`)(id);
     }
 

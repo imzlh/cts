@@ -1,13 +1,16 @@
 // transformer.ts — TS/JSX → JS via oxc (native, fast) or Sucrase (fallback)
 
-import { transform, type Transform, type Options } from '../../deps/sucrase/src/index';
+import { transformCnoCode } from '../../deps/sucrase/src/index';
 import { errMsg, log } from '../utils';
 import { err, ErrorKind, TransformError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 
-const smap = import.meta.use('sourcemap');
-
-const BASE: Partial<Options> = { disableESTransforms: true, production: false };
+const KIND_OTHER = 0;
+const KIND_TS = 1;
+const KIND_TSX = 2;
+const KIND_JSX = 3;
+const KIND_CTS = 4;
+const KIND_JSON = 5;
 
 export interface TransformerOptions {
     sourceMaps?: boolean;
@@ -33,12 +36,12 @@ export class Transformer {
     }
 
     transform(code: string, filename: string, lang?: string, mapKey?: string): string {
-        if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
-        const ext = this.sourceExt(filename, lang);
-        switch (ext) {
-            case '.ts':
-            case '.tsx':
-            case '.jsx': {
+        code = stripShebang(code);
+        const kind = sourceKind(filename, lang);
+        switch (kind) {
+            case KIND_TS:
+            case KIND_TSX:
+            case KIND_JSX: {
                 if (this.oxc) {
                     const result = this.oxc.transpile(code, filename, mapKey);
                     if (result !== null) {
@@ -47,12 +50,9 @@ export class Transformer {
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
-                const transforms: Transform[] = ext === '.jsx' ? ['jsx']
-                    : ext === '.tsx' ? ['typescript', 'jsx']
-                    : ['typescript'];
-                return this.run(code, filename, transforms, mapKey);
+                return this.run(code, filename, kind !== KIND_JSX, kind !== KIND_TS, mapKey);
             }
-            case '.json': return `export default ${code};`;
+            case KIND_JSON: return `export default ${code};`;
             default:
                 log.debug('transformer', () => `passthrough: ${filename}`);
                 return code;
@@ -63,12 +63,12 @@ export class Transformer {
      *  locally — for a caller whose JSContext (e.g. a worker) isn't the one
      *  that will run the compiled module. See Transformer.transform(). */
     transformCapture(code: string, filename: string, lang?: string, mapKey?: string): { code: string; sourceMap?: string | object } {
-        if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
-        const ext = this.sourceExt(filename, lang);
-        switch (ext) {
-            case '.ts':
-            case '.tsx':
-            case '.jsx': {
+        code = stripShebang(code);
+        const kind = sourceKind(filename, lang);
+        switch (kind) {
+            case KIND_TS:
+            case KIND_TSX:
+            case KIND_JSX: {
                 if (this.oxc) {
                     const result = this.oxc.transpileCapture(code, filename, mapKey);
                     if (result !== null) {
@@ -77,12 +77,9 @@ export class Transformer {
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
-                const transforms: Transform[] = ext === '.jsx' ? ['jsx']
-                    : ext === '.tsx' ? ['typescript', 'jsx']
-                    : ['typescript'];
-                return this.runCapture(code, filename, transforms, mapKey);
+                return this.runCapture(code, filename, kind !== KIND_JSX, kind !== KIND_TS, mapKey);
             }
-            case '.json': return { code: `export default ${code};` };
+            case KIND_JSON: return { code: `export default ${code};` };
             default:
                 log.debug('transformer', () => `passthrough: ${filename}`);
                 return { code };
@@ -95,49 +92,65 @@ export class Transformer {
      * it does not rewrite ESM import/export semantics.
      */
     transformForCjs(code: string, filename: string, lang?: string): string {
-        if (code.startsWith('#!')) code = code.slice(code.indexOf('\n'));
-        const ext = this.sourceExt(filename, lang);
-        switch (ext) {
-            case '.ts':
-            case '.cts':
-                return this.run(code, filename, ['typescript']);
-            case '.tsx':
-                return this.run(code, filename, ['typescript', 'jsx']);
-            case '.jsx':
-                return this.run(code, filename, ['jsx']);
+        code = stripShebang(code);
+        switch (sourceKind(filename, lang)) {
+            case KIND_TS:
+            case KIND_CTS:
+                return this.run(code, filename, true, false, undefined, true);
+            case KIND_TSX:
+                return this.run(code, filename, true, true, undefined, true);
+            case KIND_JSX:
+                return this.run(code, filename, false, true);
             default:
                 log.debug('transformer', () => `cjs passthrough: ${filename}`);
                 return code;
         }
     }
 
-    private run(code: string, filename: string, transforms: Transform[], mapKey?: string): string {
+    private run(
+        code: string,
+        filename: string,
+        isTypeScriptEnabled: boolean,
+        isJSXEnabled: boolean,
+        mapKey?: string,
+        keepUnusedImports = false,
+    ): string {
         try {
             const name = mapKey ?? filename;
-            const r = transform(code, { transforms, jsxPragma: this.jsxPragma,
-                jsxFragmentPragma: this.jsxFragmentPragma, filePath: name, ...BASE });
-            if (this.sourceMaps && r.sourceMap) {
-                try { smap.load(name, r.sourceMap); }
-                catch (e) { log.warn('transformer', () => `smap: ${filename}`, e); }
-            }
-            return r.code;
+            return transformCnoCode(
+                code,
+                name,
+                isTypeScriptEnabled,
+                isJSXEnabled,
+                this.jsxPragma,
+                this.jsxFragmentPragma,
+                keepUnusedImports,
+            );
         } catch (e) {
             throw this.toTransformError(e, filename);
         }
     }
 
-    private runCapture(code: string, filename: string, transforms: Transform[], mapKey?: string): { code: string; sourceMap?: object } {
+    private runCapture(
+        code: string,
+        filename: string,
+        isTypeScriptEnabled: boolean,
+        isJSXEnabled: boolean,
+        mapKey?: string,
+    ): { code: string; sourceMap?: object } {
         try {
-            const r = transform(code, { transforms, jsxPragma: this.jsxPragma,
-                jsxFragmentPragma: this.jsxFragmentPragma, filePath: mapKey ?? filename, ...BASE });
-            return { code: r.code, sourceMap: this.sourceMaps ? r.sourceMap : undefined };
+            const codeOut = transformCnoCode(
+                code,
+                mapKey ?? filename,
+                isTypeScriptEnabled,
+                isJSXEnabled,
+                this.jsxPragma,
+                this.jsxFragmentPragma,
+            );
+            return { code: codeOut };
         } catch (e) {
             throw this.toTransformError(e, filename);
         }
-    }
-
-    private sourceExt(filename: string, lang?: string): string {
-        return lang ? `.${lang}` : filename.slice(filename.lastIndexOf('.'));
     }
 
     private toTransformError(error: unknown, filename: string): Error {
@@ -152,4 +165,58 @@ export class Transformer {
         }
         return new TransformError(clean, filename, Number(match[1]), Number(match[2]));
     }
+}
+
+function sourceKind(filename: string, lang?: string): number {
+    if (lang) {
+        switch (lang) {
+            case 'ts': return KIND_TS;
+            case 'tsx': return KIND_TSX;
+            case 'jsx': return KIND_JSX;
+            case 'cts': return KIND_CTS;
+            case 'json': return KIND_JSON;
+            default: return KIND_OTHER;
+        }
+    }
+    const length = filename.length;
+    if (length < 3) return KIND_OTHER;
+    const last = filename.charCodeAt(length - 1);
+    if (last === 115) {
+        if (filename.charCodeAt(length - 2) !== 116) return KIND_OTHER;
+        const third = filename.charCodeAt(length - 3);
+        if (third === 46) return KIND_TS;
+        if (third === 109 && length >= 4 && filename.charCodeAt(length - 4) === 46) {
+            return KIND_TS;
+        }
+        if (third === 99 && length >= 4 && filename.charCodeAt(length - 4) === 46) {
+            return KIND_CTS;
+        }
+        return KIND_OTHER;
+    }
+    if (last === 120 && length >= 4) {
+        const third = filename.charCodeAt(length - 3);
+        if (filename.charCodeAt(length - 2) !== 115 ||
+            filename.charCodeAt(length - 4) !== 46) {
+            return KIND_OTHER;
+        }
+        if (third === 116) return KIND_TSX;
+        if (third === 106) return KIND_JSX;
+        return KIND_OTHER;
+    }
+    if (last === 110 && length >= 5 &&
+        filename.charCodeAt(length - 2) === 111 &&
+        filename.charCodeAt(length - 3) === 115 &&
+        filename.charCodeAt(length - 4) === 106 &&
+        filename.charCodeAt(length - 5) === 46) {
+        return KIND_JSON;
+    }
+    return KIND_OTHER;
+}
+
+function stripShebang(code: string): string {
+    if (code.length < 2 || code.charCodeAt(0) !== 35 || code.charCodeAt(1) !== 33) {
+        return code;
+    }
+    const newlineIndex = code.indexOf('\n');
+    return newlineIndex === -1 ? '' : code.slice(newlineIndex);
 }

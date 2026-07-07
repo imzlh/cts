@@ -40,12 +40,7 @@ export class NodeHandler implements ProtocolHandler {
 
     localPath(specPath: string): string {
         const bare = specPath.startsWith('node:') ? specPath.slice(5) : specPath;
-        if (bare.includes('/')) {
-            const parts = bare.split('/');
-            const topModule = parts[0]!;
-            const lastPart = parts[parts.length - 1]!;
-            return joinPaths(this.cfg.cacheDir, 'node', topModule, `${lastPart}.ts`);
-        }
+        if (bare.includes('/')) return joinPaths(this.cfg.cacheDir, 'node', `${bare}.ts`);
         return joinPaths(this.cfg.cacheDir, 'node', bare, 'index.ts');
     }
 

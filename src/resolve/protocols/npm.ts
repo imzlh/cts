@@ -3,22 +3,56 @@
 import type { RuntimeConfig, ModuleInfo, ModuleFormat, LifecycleScriptEntry } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
-import { StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
-import { joinPaths, dirname, basename, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
-import { readText, resolveFile, clearNegativeCache } from '../../utils/io';
-declare const URL: any;
-import { matchLatestVersion, compareVersions, safeParse, fmtBytes } from '../../utils/misc';
-import { detectFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, type ResolveCtx, type ResolvedPath } from '../pkg';
+import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
+import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
+import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
+declare const URL: typeof globalThis.URL;
+import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes } from '../../utils/misc';
+import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, isPackageSubpathBlockedByExports, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
 import { uname, isWindows } from '../../utils/index';
 import { findLocalBin } from '../../utils/bin';
-import { version } from '../../../package.json';
+import pkg from '../../../package.json';
+
+const version = String(pkg.version ?? '0.0.0');
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+
+function env(name: string): string | null {
+    try {
+        return os.getenv(name) ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function chmodQuietly(path: string, mode: number): void {
+    try {
+        fs.chmod(path, mode);
+    } catch {
+        // Preserve install/link progress; execution will surface permissions.
+    }
+}
+
+function normalizeNpmrcValue(raw: string): string {
+    let value = raw.trim();
+    for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        if ((c === 35 || c === 59) && i > 0 && value.charCodeAt(i - 1) <= 32) {
+            value = value.slice(0, i).trimEnd();
+            break;
+        }
+    }
+    const first = value.charCodeAt(0);
+    const last = value.charCodeAt(value.length - 1);
+    return value.length >= 2 && (first === 34 || first === 39) && last === first
+        ? value.slice(1, -1)
+        : value;
+}
 
 interface NpmConfig {
     registry: string;
@@ -35,25 +69,44 @@ function loadNpmConfig(): NpmConfig {
             if (!line || line[0] === '#' || line[0] === ';') continue;
             const eq = line.indexOf('='); if (eq === -1) continue;
             const k = line.slice(0, eq).trim();
-            const v = line.slice(eq + 1).trim().replace(/\s+[#;].*$/, '').replace(/^['"]|['"]$/g, '');
+            const v = normalizeNpmrcValue(line.slice(eq + 1));
             if (k === 'registry' && (override || cfg.registry === 'https://registry.npmjs.org'))
-                cfg.registry = v.replace(/\/$/, '');
+                cfg.registry = trimRegistry(v);
             else if ((k === '_authToken' || k === 'authToken') && (override || !cfg.authToken))
                 cfg.authToken = v;
             else if (k.startsWith('@') && k.endsWith(':registry'))
-                cfg.scopeRegistries[k.slice(0, -9)] ??= v.replace(/\/$/, '');
+                cfg.scopeRegistries[k.slice(0, -9)] ??= trimRegistry(v);
             else if (k.includes(':_authToken') || k.includes(':authToken'))
                 cfg.scopeTokens[k] ??= v;
         }
     };
-    try { const p = joinPaths(cwd(), '.npmrc'); if (fs.exists(p)) parse(readText(p), true); } catch {}
-    try { const p = joinPaths(toPosixPath(String(os.homeDir ?? '/root')), '.npmrc'); if (fs.exists(p)) parse(readText(p), false); } catch {}
-    try { const r = os.getenv?.('NPM_CONFIG_REGISTRY'); if (r) cfg.registry = r.replace(/\/$/, ''); } catch {}
-    try { const t = os.getenv?.('NPM_TOKEN') ?? os.getenv?.('NODE_AUTH_TOKEN'); if (t) cfg.authToken = t; } catch {}
+    try {
+        const p = joinPaths(cwd(), '.npmrc');
+        if (fs.exists(p)) parse(readText(p), true);
+    } catch {}
+    try {
+        const p = joinPaths(toPosixPath(String(os.homeDir ?? '/root')), '.npmrc');
+        if (fs.exists(p)) parse(readText(p), false);
+    } catch {}
+    const registry = env('NPM_CONFIG_REGISTRY');
+    if (registry) cfg.registry = trimRegistry(registry);
+    const token = env('NPM_TOKEN') ?? env('NODE_AUTH_TOKEN');
+    if (token) cfg.authToken = token;
     return cfg;
 }
 
 interface ParsedNpmSpec { name: string; version: string; subpath: string }
+
+function rejectVersionAfterSubpath(raw: string, name: string, subpath: string): void {
+    const at = subpath.lastIndexOf('@');
+    if (at <= 0) return;
+    const version = subpath.slice(at + 1);
+    if (!startsWithVersionish(version)) return;
+    const fixedSubpath = subpath.slice(0, at);
+    throw err(ErrorKind.InvalidSpecifier,
+        `Invalid package specifier '${raw}'. Did you mean to write 'npm:${name}@${version}/${fixedSubpath}'? ` +
+        `If not, add a version requirement to the specifier.`);
+}
 
 function parseNpmSpec(raw: string): ParsedNpmSpec {
     let rest = raw.startsWith('npm:') ? raw.slice(4) : raw;
@@ -85,10 +138,15 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
             const sl2 = after.indexOf('/');
             ver = sl2 === -1 ? after : after.slice(0, sl2);
             sub = sl2 === -1 ? '' : after.slice(sl2 + 1);
-        } else if (sl !== -1) { name = rest.slice(0, sl); sub = rest.slice(sl + 1); }
-        else name = rest;
+        } else if (sl !== -1) {
+            name = rest.slice(0, sl);
+            sub = rest.slice(sl + 1);
+        } else {
+            name = rest;
+        }
     }
     if (!name) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (no package name): ${raw}`);
+    rejectVersionAfterSubpath(raw, name, sub);
     return { name, version: ver || 'latest', subpath: sub };
 }
 
@@ -124,10 +182,8 @@ function currentCpu(): string {
 function currentAbi(): 'msvc' | 'gnu' | 'musl' | '' {
     const sys = String(uname.sysname || '').toLowerCase();
     const machine = String(uname.machine || '').toLowerCase();
-    let msystem = '';
-    let ostype = '';
-    try { msystem = String(os.getenv?.('MSYSTEM') ?? '').toLowerCase(); } catch {}
-    try { ostype = String(os.getenv?.('OSTYPE') ?? '').toLowerCase(); } catch {}
+    const msystem = String(env('MSYSTEM') ?? '').toLowerCase();
+    const ostype = String(env('OSTYPE') ?? '').toLowerCase();
 
     if (sys.includes('windows')) {
         if (sys.includes('mingw') || sys.includes('msys') || sys.includes('cygwin')
@@ -171,10 +227,113 @@ function matchesAbiVariant(pkgName: string, abi: string): boolean {
     return true;
 }
 
-// Hoisted so the pattern is compiled once and the RegExp object reused,
-// rather than re-literal'd on every call in a JIT-less interpreter.
-const EXACT_SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
-const SEMVER_PREFIX_RE = /^\d+\.\d+\.\d+/;
+function recordKeysForLog(record: Record<string, string>): string {
+    let out = '';
+    for (const key in record) {
+        if (out) out += ', ';
+        out += key;
+    }
+    return out;
+}
+
+function isDigitCode(c: number): boolean {
+    return c >= 48 && c <= 57;
+}
+
+function isAsciiAlpha(c: number): boolean {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+function isSemverSuffixCode(c: number): boolean {
+    return isDigitCode(c) || isAsciiAlpha(c) || c === 45 || c === 46;
+}
+
+function hasSemverPrefix(value: string): boolean {
+    let dots = 0, partDigits = 0;
+    for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        if (isDigitCode(c)) {
+            partDigits++;
+            continue;
+        }
+        if (c !== 46 || partDigits === 0) break;
+        dots++;
+        if (dots === 3) return false;
+        if (dots === 2) return i + 1 < value.length && isDigitCode(value.charCodeAt(i + 1));
+        partDigits = 0;
+    }
+    return false;
+}
+
+function isExactSemver(value: string): boolean {
+    let dots = 0, partDigits = 0, suffix = false;
+    for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        if (!suffix) {
+            if (isDigitCode(c)) {
+                partDigits++;
+                continue;
+            }
+            if (c === 46 && dots < 2 && partDigits > 0) {
+                dots++;
+                partDigits = 0;
+                continue;
+            }
+            if ((c === 45 || c === 43) && dots === 2 && partDigits > 0 && i + 1 < value.length) {
+                suffix = true;
+                continue;
+            }
+            return false;
+        }
+        if (!isSemverSuffixCode(c)) return false;
+    }
+    return dots === 2 && partDigits > 0;
+}
+
+function canUseLocalPackageForRange(range: string): boolean {
+    return !range || range === 'latest' || range === '*';
+}
+
+function localPackageMatchesRange(version: string | undefined, range: string): boolean {
+    if (!version) return canUseLocalPackageForRange(range);
+    if (canUseLocalPackageForRange(range)) return true;
+    return version === range || matchLatestVersion([version], range) === version;
+}
+
+function startsWithVersionish(value: string): boolean {
+    let i = 0;
+    while (i < value.length && isDigitCode(value.charCodeAt(i))) i++;
+    return i > 0 && (i === value.length || value.charCodeAt(i) === 46);
+}
+
+function trimRegistry(value: string): string {
+    return value.endsWith('/') ? value.slice(0, -1) : value;
+}
+
+function lastPathSegment(path: string): string {
+    const slash = path.lastIndexOf('/');
+    return slash === -1 ? path : path.slice(slash + 1);
+}
+
+function packageScope(name: string): string | undefined {
+    if (!name.startsWith('@')) return undefined;
+    const slash = name.indexOf('/');
+    return slash === -1 ? name : name.slice(0, slash);
+}
+
+function isWindowsDrivePath(path: string): boolean {
+    return path.length >= 3 && isAsciiAlpha(path.charCodeAt(0)) && path.charCodeAt(1) === 58 && path.charCodeAt(2) === 47;
+}
+
+function isVirtualProjectNodeModules(norm: string): boolean {
+    if (norm.includes('/.pnpm/')) return false;
+    let index = -1;
+    while ((index = norm.indexOf('/node_modules/.', index + 1)) !== -1) {
+        const next = norm.charCodeAt(index + 16);
+        if (next !== 47 && !Number.isNaN(next)) return true;
+    }
+    return false;
+}
 
 export class NpmHandler implements ProtocolHandler {
     readonly protocols = ['npm'];
@@ -186,7 +345,11 @@ export class NpmHandler implements ProtocolHandler {
     /** Cache findOwningPackageDir results per parent — same parent is looked up
      *  more than once per resolve() call (self-reference check, then local lookup). */
     private readonly ownerDirCache = new Map<string, string | null>();
+    private readonly specFormat = new Map<string, ModuleFormat>();
+    private readonly specLocalPath = new Map<string, string>();
+    private readonly dependenciesChecked = new Set<string>();
     private readonly pendingLifecycle: LifecycleScriptEntry[] = [];
+    private readonly queuedLifecycle = new Set<string>();
 
     constructor(private readonly cfg: RuntimeConfig) {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
@@ -197,6 +360,9 @@ export class NpmHandler implements ProtocolHandler {
         this.verCache.clear();
         this.localCache.clear();
         this.ownerDirCache.clear();
+        this.specFormat.clear();
+        this.specLocalPath.clear();
+        this.dependenciesChecked.clear();
         this.npmCfg = null;
     }
 
@@ -206,7 +372,11 @@ export class NpmHandler implements ProtocolHandler {
         return scripts;
     }
 
-    *resolve(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
+    private ctxOptions(forceCjs?: boolean): { forceCjs?: boolean; conditions?: string[] } {
+        return { forceCjs, conditions: this.cfg.conditions };
+    }
+
+    *resolve(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
         const forceCjs = this.isCjsRequest(attr);
         if ((spec.startsWith('./') || spec.startsWith('../')) && parent.startsWith('npm:')) {
             return yield* this.resolveRelative(spec, parent, forceCjs, onProgress);
@@ -221,7 +391,7 @@ export class NpmHandler implements ProtocolHandler {
         if (spec.startsWith('#')) {
             const pkgDir = this.findOwningPackageDir(parent);
             if (pkgDir) {
-                const ctx = createCtx(pkgDir, { forceCjs });
+                    const ctx = createCtx(pkgDir, this.ctxOptions(forceCjs));
                 if (ctx) {
                     const resolved = resolveImports(ctx, spec);
                     if (resolved) {
@@ -231,7 +401,7 @@ export class NpmHandler implements ProtocolHandler {
                         return this.toPackageModuleInfo(name, ver, pkgDir, resolved);
                     }
                 }
-                throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${spec}" in ${pkgDir} - not found in package.json "imports"`);
+                throw packageImportNotDefinedError(spec, pkgDir, parent);
             }
         }
         const { name, version: parsedRange, subpath } = parseNpmSpec(spec);
@@ -244,7 +414,7 @@ export class NpmHandler implements ProtocolHandler {
         return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
     }
 
-    tryResolveLocal(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo | null {
+    tryResolveLocal(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo | null {
         if (!spec || spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) return null;
         const forceCjs = this.isCjsRequest(attr);
         let parsed: ParsedNpmSpec;
@@ -253,17 +423,30 @@ export class NpmHandler implements ProtocolHandler {
         } catch {
             return null;
         }
+        if (!canUseLocalPackageForRange(parsed.version)) return null;
 
         const selfRef = this.resolveSelfReference(parent, parsed.name, parsed.subpath, forceCjs);
         if (selfRef) return selfRef;
 
-        if (this.parentOrigin(parent) === 'cache') return null;
+        const origin = this.parentOrigin(parent);
+        if (origin === 'cache') return null;
 
         const local = this.findLocal(parsed.name, parent);
         if (!local) return null;
         const pkg = readPkg(local);
         const resolvedVer = pkg?.version ?? parsed.version;
         return this.resolvePkg(local, resolvedVer, parsed.name, parsed.subpath, forceCjs);
+    }
+
+    tryResolveLocalFile(localPath: string, attr?: Record<string, unknown>): ModuleInfo | null {
+        const normalized = normalizePath(localPath);
+        if (!normalized.includes('/node_modules/')) return null;
+        const pkgDir = this.findOwningPackageDir(normalized);
+        if (!pkgDir) return null;
+        const pkg = readPkg(pkgDir);
+        if (!pkg?.name) return null;
+        const format = detectPackageJsonFormat(normalized) ?? detectFormat(normalized);
+        return this.toLocalModuleInfo(pkg.name, pkg.version ?? '0.0.0', pkgDir, normalized, format);
     }
 
     /**
@@ -288,7 +471,7 @@ export class NpmHandler implements ProtocolHandler {
         const { name, version, subpath } = parseNpmSpec(specPath);
         const pkgDir = joinPaths(this.cacheDir, `${name}@${version}`);
         if (!fs.exists(pkgDir)) throw err(ErrorKind.ModuleNotFound, `Package not in cache: ${specPath}`);
-        const ctx = createCtx(pkgDir);
+        const ctx = createCtx(pkgDir, this.ctxOptions());
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkgDir}`);
         const resolved = resolveSubpath(ctx, subpath || '.');
         if (!resolved) throw err(ErrorKind.ModuleNotFound, `Cannot resolve path for ${specPath}`);
@@ -307,7 +490,7 @@ export class NpmHandler implements ProtocolHandler {
     private *resolveRelative(spec: string, parent: string, forceCjs: boolean, onProgress?: ProgressCallback): Flow<ModuleInfo> {
         const { name, version, subpath } = parseNpmSpec(parent);
         const pkg = yield* this.ensureInstalled(name, version, parent, onProgress);
-        const ctx = createCtx(pkg.dir, { forceCjs });
+        const ctx = createCtx(pkg.dir, this.ctxOptions(forceCjs));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
 
         /* When the parent is the package root (no subpath), relative imports
@@ -320,7 +503,8 @@ export class NpmHandler implements ProtocolHandler {
         } else {
             let parentLocal: string | null = resolveSubpath(ctx, subpath)?.path ?? null;
             if (!parentLocal) {
-                const targetName = subpath.split('/').pop()!;
+                const targetName = lastPathSegment(subpath);
+                if (!targetName) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath}" in ${name}@${pkg.resolvedVer}`);
                 parentLocal = this.findFileByBasename(pkg.dir, targetName, subpath);
             }
             if (!parentLocal) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath}" in ${name}@${pkg.resolvedVer}`);
@@ -330,22 +514,26 @@ export class NpmHandler implements ProtocolHandler {
         const targetLocal = normalizePath(joinPaths(baseDir, spec));
         const resolvedLocal = resolveFile(targetLocal);
         if (!resolvedLocal) throw err(ErrorKind.FileNotFound, `Cannot resolve "${spec}" from "${parent}": file not found at ${targetLocal}`);
-        return this.toLocalModuleInfo(name, pkg.resolvedVer, pkg.dir, resolvedLocal);
+        return this.toLocalModuleInfo(name, pkg.resolvedVer, pkg.dir, resolvedLocal,
+            this.relativeFormat(parent, resolvedLocal, forceCjs));
     }
 
     private *resolveSubpathImport(spec: string, parent: string, forceCjs: boolean, onProgress?: ProgressCallback): Flow<ModuleInfo> {
         const { name, version } = parseNpmSpec(parent);
         const pkg = yield* this.ensureInstalled(name, version, parent, onProgress);
-        const ctx = createCtx(pkg.dir, { forceCjs });
+        const ctx = createCtx(pkg.dir, this.ctxOptions(forceCjs));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
         const resolved = resolveImports(ctx, spec);
-        if (!resolved) throw err(ErrorKind.ModuleNotFound, `Cannot resolve "${spec}" in ${name}@${pkg.resolvedVer} - not found in package.json "imports"`);
+        if (!resolved) throw packageImportNotDefinedError(spec, pkg.dir, parent);
         return this.toPackageModuleInfo(name, pkg.resolvedVer, pkg.dir, resolved);
     }
 
     private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
-        const ctx = createCtx(dir, { forceCjs });
+        const ctx = createCtx(dir, this.ctxOptions(forceCjs));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
+        if (isPackageSubpathBlockedByExports(ctx, subpath)) {
+            throw packagePathNotExportedError(NpmHandler.specPath(name, ver, subpath));
+        }
         const resolved = resolveSubpath(ctx, subpath);
         if (!resolved) {
             // Root entry (subpath === '') with no main/exports: the package has been
@@ -374,7 +562,9 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private highestVersion(meta: NpmMeta): string {
-        return Object.keys(meta.versions).sort(compareVersions).at(-1)!;
+        const version = latestRecordVersion(meta.versions);
+        if (!version) throw err(ErrorKind.VersionNotFound, 'No versions found in npm metadata');
+        return version;
     }
 
     private findFileByBasename(dir: string, basename: string, subpath: string): string | null {
@@ -382,7 +572,11 @@ export class NpmHandler implements ProtocolHandler {
         const results: string[] = [];
         const walk = (d: string) => {
             let entries: string[];
-            try { entries = fs.readdir(d); } catch { return; }
+            try {
+                entries = fs.readdir(d);
+            } catch {
+                return;
+            }
             for (const e of entries) {
                 const p = joinPaths(d, e);
                 try {
@@ -402,7 +596,7 @@ export class NpmHandler implements ProtocolHandler {
                 if (rel.endsWith(subSuffix + '/' + basename)) return r;
             }
         }
-        return results[0]!;
+        return results[0] ?? null;
     }
 
     private resolveSelfReference(parent: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo | null {
@@ -415,11 +609,14 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private toPackageModuleInfo(name: string, version: string, pkgDir: string, resolved: ResolvedPath): ModuleInfo {
+        const specPath = NpmHandler.specPath(name, version, NpmHandler.canonicalSubpath(pkgDir, resolved.path));
+        this.specFormat.set(specPath, resolved.format);
+        this.specLocalPath.set(specPath, resolved.path);
         return {
-            specPath: NpmHandler.specPath(name, version, NpmHandler.canonicalSubpath(pkgDir, resolved.path)),
+            specPath,
             localPath: resolved.path,
             format: resolved.format,
-            fileKind: guessFileKind(resolved.path),
+            fileKind: resolved.fileKind ?? guessFileKind(resolved.path),
         };
     }
 
@@ -427,7 +624,36 @@ export class NpmHandler implements ProtocolHandler {
         return this.toPackageModuleInfo(name, version, pkgDir, { path: localPath, format });
     }
 
-    private isCjsRequest(attr?: Record<string, any>): boolean {
+    private relativeFormat(parent: string, localPath: string, forceCjs: boolean): ModuleFormat {
+        const ext = extname(localPath);
+        if (ext === '.cjs' || ext === '.cts' || ext === '.node') return 'cjs';
+        if (ext === '.mjs' || ext === '.mts') return 'esm';
+        if (forceCjs) return detectPackageJsonFormat(localPath) ?? detectFormat(localPath);
+        const parentFormat = this.specFormat.get(parent);
+        if (parentFormat === 'esm' && this.shouldInheritEsmFormat(parent, localPath)) return 'esm';
+        const parentInfo = this.cfg.lockStore?.getModule(parent);
+        if (parentInfo?.format === 'esm' && this.shouldInheritEsmFormat(parent, localPath)) return 'esm';
+        return detectFormat(localPath);
+    }
+
+    private parentLocalPath(parent: string): string | null {
+        return this.specLocalPath.get(parent)
+            ?? this.cfg.lockStore?.getModule(parent)?.localPath
+            ?? null;
+    }
+
+    private shouldInheritEsmFormat(parent: string, localPath: string): boolean {
+        const parentLocal = this.parentLocalPath(parent);
+        if (!parentLocal) return true;
+        const parentExt = extname(parentLocal);
+        if (parentExt === '.mjs' || parentExt === '.mts') return false;
+        const parentScope = this.findOwningPackageDir(parentLocal);
+        const targetScope = this.findOwningPackageDir(localPath);
+        if (!parentScope || !targetScope) return true;
+        return normalizePath(parentScope) === normalizePath(targetScope);
+    }
+
+    private isCjsRequest(attr?: Record<string, unknown>): boolean {
         return attr?.cjs === true;
     }
 
@@ -444,8 +670,11 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private realPath(path: string): string | null {
-        try { return normalizePath(fs.realpath(path)); }
-        catch { return null; }
+        try {
+            return normalizePath(fs.realpath(path));
+        } catch {
+            return null;
+        }
     }
 
     private parentFsPath(parent: string): string {
@@ -456,10 +685,29 @@ export class NpmHandler implements ProtocolHandler {
 
     private resolvedParentLocalPath(parent?: string): string | null {
         if (!parent?.startsWith('npm:')) return null;
+        const tracked = this.specLocalPath.get(parent);
+        if (tracked) {
+            const localPath = normalizePath(tracked);
+            const cacheRoot = normalizePath(this.cacheDir);
+            return localPath === cacheRoot || localPath.startsWith(cacheRoot + '/') ? null : localPath;
+        }
         const info = this.cfg.lockStore?.getModule(parent);
         if (!info?.localPath) return null;
         const localPath = normalizePath(info.localPath);
         const cacheRoot = normalizePath(this.cacheDir);
+        if (localPath !== cacheRoot && !localPath.startsWith(cacheRoot + '/')) {
+            try {
+                if (fs.exists(localPath) && (this.isVirtualProjectNodeModulesPath(localPath) || localPath.includes('/node_modules/'))) {
+                    return localPath;
+                }
+            } catch {}
+            return null;
+        }
+        try {
+            if (normalizePath(this.localPath(parent)) !== localPath) return null;
+        } catch {
+            return null;
+        }
         return localPath === cacheRoot || localPath.startsWith(cacheRoot + '/') ? null : localPath;
     }
 
@@ -481,7 +729,7 @@ export class NpmHandler implements ProtocolHandler {
 
     private isVirtualProjectNodeModulesPath(path: string): boolean {
         const norm = normalizePath(path);
-        return /\/node_modules\/\.[^/]+(?:\/|$)/.test(norm) && !norm.includes('/.pnpm/');
+        return isVirtualProjectNodeModules(norm);
     }
 
     private lockedVersionForRange(name: string, range: string): string | null {
@@ -499,7 +747,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!versions.size) return null;
         const list = [...versions];
         if (!range || range === 'latest' || range === '*') {
-            return list.slice().sort(compareVersions).at(-1)!;
+            return latestVersion(list);
         }
         return matchLatestVersion(list, range)
             ?? (list.includes(range) ? range : null);
@@ -573,7 +821,7 @@ export class NpmHandler implements ProtocolHandler {
             const resolvedLocal = this.resolvedParentLocalPath(parent);
             if (resolvedLocal) return this.findOwningPackageDir(resolvedLocal);
             const { name, version } = parseNpmSpec(parent);
-            if (EXACT_SEMVER_RE.test(version)) {
+            if (isExactSemver(version)) {
                 const pkgDir = joinPaths(this.cacheDir, `${name}@${version}`);
                 if (fs.exists(joinPaths(pkgDir, 'package.json'))) return pkgDir;
             }
@@ -636,79 +884,106 @@ export class NpmHandler implements ProtocolHandler {
             // forever, since nothing else ever re-triggers install() afterward.
             const lockedExists = yield { type: StepType.FS_EXISTS, path: joinPaths(lockedDir, 'package.json') };
             if (lockedExists) {
+                this.linkCacheAlias(name, lockedDir);
                 yield* this.indexInstalledBins(name, locked, lockedDir);
+                yield* this.installDependencies(name, locked, lockedDir, onProgress);
+                yield* this.installOptionalDeps(lockedDir, onProgress);
+                this.queueLifecycleScripts(name, locked, lockedDir);
                 return { dir: lockedDir, resolvedVer: locked };
             }
         }
         if (origin !== 'cache') {
             const local = this.findLocal(name, parent);
-            if (local) {
-                const pkg = readPkg(local);
+            const pkg = local ? readPkg(local) : null;
+            if (local && localPackageMatchesRange(pkg?.version, version)) {
                 return { dir: local, resolvedVer: pkg?.version ?? version };
             }
         }
-        if (EXACT_SEMVER_RE.test(version)) {
+        if (isExactSemver(version)) {
             const exactDir = joinPaths(this.cacheDir, `${name}@${version}`);
             const exactExists = yield { type: StepType.FS_EXISTS, path: joinPaths(exactDir, 'package.json') };
             if (exactExists) {
+                this.linkCacheAlias(name, exactDir);
                 yield* this.indexInstalledBins(name, version, exactDir);
+                yield* this.installDependencies(name, version, exactDir, onProgress);
+                yield* this.installOptionalDeps(exactDir, onProgress);
+                this.queueLifecycleScripts(name, version, exactDir);
                 return { dir: exactDir, resolvedVer: version };
+            }
+            const local = this.findLocal(name, parent);
+            const pkg = local ? readPkg(local) : null;
+            if (local && pkg?.version === version) {
+                return { dir: local, resolvedVer: version };
             }
         }
         const exactVer = yield* this.resolveVersion(name, version, onProgress);
         const pkgDir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(pkgDir, 'package.json') };
         if (!exists) {
+            if (this.cfg.cachedOnly) {
+                throw err(ErrorKind.ModuleNotFound, `npm package not found in cache: "${name}", --cached-only is specified.`);
+            }
             if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
             yield* this.install(name, exactVer, pkgDir, onProgress);
         } else {
+            this.linkCacheAlias(name, pkgDir);
             yield* this.indexInstalledBins(name, exactVer, pkgDir);
+            yield* this.installDependencies(name, exactVer, pkgDir, onProgress);
+            yield* this.installOptionalDeps(pkgDir, onProgress);
+            this.queueLifecycleScripts(name, exactVer, pkgDir);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
     }
 
     private *resolveVersion(name: string, range: string, onProgress?: ProgressCallback): Flow<string> {
         const key = `${name}@${range}`;
-        if (this.verCache.has(key)) return this.verCache.get(key)!;
+        const cached = this.verCache.get(key);
+        if (cached !== undefined) return cached;
         const meta = yield* this.fetchMeta(name, onProgress);
         const tags = meta['dist-tags'] ?? {};
         let resolved: string;
         if (!range || range === 'latest') resolved = tags.latest ?? this.highestVersion(meta);
-        else if (tags[range]) resolved = tags[range]!;
-        else if (SEMVER_PREFIX_RE.test(range) && meta.versions[range]) resolved = range;
-        else resolved = matchLatestVersion(Object.keys(meta.versions), range) ?? tags.latest ?? this.highestVersion(meta);
+        else if (tags[range]) resolved = tags[range];
+        else if (hasSemverPrefix(range) && meta.versions[range]) resolved = range;
+        else {
+            const matched = matchLatestRecordVersion(meta.versions, range);
+            if (!matched) throw err(ErrorKind.VersionNotFound, `Could not find npm package '${name}' matching '${range}'.`);
+            resolved = matched;
+        }
         this.verCache.set(key, resolved);
         return resolved;
     }
 
     private *fetchMeta(name: string, onProgress?: ProgressCallback): Flow<NpmMeta> {
         const cfg = this.getNpmCfg();
-        const registry = (name.startsWith('@') && cfg.scopeRegistries[name.split('/')[0]!])
-            ? cfg.scopeRegistries[name.split('/')[0]!]!
-            : cfg.registry;
+        const scope = packageScope(name);
+        const registry = scope ? cfg.scopeRegistries[scope] ?? cfg.registry : cfg.registry;
         const cacheFile = joinPaths(this.cacheDir, name, 'meta.json');
         const cacheTs = cacheFile + '.ts';
         const hasMeta = yield { type: StepType.FS_EXISTS, path: cacheFile };
         const hasTs = yield { type: StepType.FS_EXISTS, path: cacheTs };
         if (hasMeta && hasTs) {
             try {
-                const tsText = (yield { type: StepType.FS_READ_TEXT, path: cacheTs }) as string;
+                const tsText = expectText(yield { type: StepType.FS_READ_TEXT, path: cacheTs });
                 const age = Date.now() - +(tsText || '0');
                 if (age < 24 * 60 * 60 * 1000) {
-                    return safeParse<NpmMeta>((yield { type: StepType.FS_READ_TEXT, path: cacheFile }) as string);
+                    return safeParse<NpmMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: cacheFile }));
                 }
             } catch {}
+        }
+        if (this.cfg.cachedOnly) {
+            throw err(ErrorKind.ModuleNotFound, `npm package not found in cache: "${name}", --cached-only is specified.`);
         }
         const url = `${registry}/${name}`;
         log.debug('npm', () => `fetch meta ${name} <- ${url}`);
         const started = Date.now();
-        const { body } = yield {
+        const { body } = expectFetch(yield {
             type: StepType.NET_FETCH,
             url,
             headers: { 'User-Agent': 'cts/' + version, Accept: 'application/json' },
             timeout: this.cfg.requestTimeout,
             onProgress,
-        };
+        });
         log.debug('npm', () => `fetched meta ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - started}ms`);
         const meta = safeParse<NpmMeta>(engine.decodeString(body));
         yield { type: StepType.FS_ENSURE_DIR, path: dirname(cacheFile) };
@@ -723,46 +998,82 @@ export class NpmHandler implements ProtocolHandler {
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
         log.debug('npm', () => `fetch tarball ${name}@${ver} <- ${tarball}`);
         const fetchStarted = Date.now();
-        const { body } = yield { type: StepType.NET_FETCH, url: tarball, timeout: this.cfg.requestTimeout, onProgress };
+        const { body } = expectFetch(yield { type: StepType.NET_FETCH, url: tarball, timeout: this.cfg.requestTimeout, onProgress });
         log.debug('npm', () => `fetched tarball ${name}@${ver} ${fmtBytes(body.byteLength)} in ${Date.now() - fetchStarted}ms`);
         log.debug('npm', () => `extract ${name}@${ver} ${fmtBytes(body.byteLength)}`);
         const extractStarted = Date.now();
-        const files = (yield { type: StepType.ARCHIVE_UNTAR_GZ, data: body }) as TarFile[];
-        const fileBytes = files.reduce((n, f) => n + (f.type === 'file' ? f.size : 0), 0);
+        const files = expectTarFiles(yield { type: StepType.ARCHIVE_UNTAR_GZ, data: body });
+        let fileBytes = 0;
+        for (let i = 0; i < files.length; i++) {
+            const f = files[i];
+            if (f?.type === 'file') fileBytes += f.size;
+        }
         log.debug('npm', () => `extracted ${name}@${ver}: ${files.length} entries, ${fmtBytes(fileBytes)} in ${Date.now() - extractStarted}ms`);
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
         log.debug('npm', () => `write ${name}@${ver} -> ${dir}`);
         const writeStarted = Date.now();
         yield* this.writeArchive(dir, files);
         log.debug('npm', () => `wrote ${name}@${ver} in ${Date.now() - writeStarted}ms`);
+        this.linkCacheAlias(name, dir);
         // A concurrent worker resolving a sibling file mid-extraction (before this
         // writeArchive call finished) may have permanently marked it as missing in
         // the resolver's negative file-existence cache. Clear it now that this
         // package is fully on disk so those siblings get a fair re-check.
         clearNegativeCache();
         yield* this.indexInstalledBins(name, ver, dir);
+        yield* this.installDependencies(name, ver, dir, onProgress);
         yield* this.installOptionalDeps(dir, onProgress);
-        // Record deferred npm lifecycle scripts for `cno cache`.
+        this.queueLifecycleScripts(name, ver, dir);
+    }
+
+    private queueLifecycleScripts(name: string, ver: string, dir: string): void {
+        if (!this.cfg.persistLock || this.cfg.ignoreScripts) return;
         const pkg = readPkg(dir);
         for (const lifecycle of ['install', 'postinstall'] as const) {
             const script = pkg?.scripts?.[lifecycle];
             if (!script || typeof script !== 'string' || !script.trim()) continue;
+            const key = `${name}@${ver}\0${lifecycle}`;
+            if (this.queuedLifecycle.has(key)) continue;
+            this.queuedLifecycle.add(key);
             this.pendingLifecycle.push({ name, version: ver, dir, lifecycle, script });
             log.debug('npm', () => `${lifecycle} queued: ${name}@${ver}`);
+        }
+    }
+
+    private *installDependencies(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
+        if (!this.cfg.persistLock) return;
+
+        const key = `${name}@${ver}`;
+        if (this.dependenciesChecked.has(key)) return;
+        this.dependenciesChecked.add(key);
+
+        const pkg = readPkg(dir);
+        const deps = pkg?.dependencies;
+        if (!deps) return;
+
+        const depNames = recordKeysForLog(deps);
+        if (!depNames) return;
+        log.debug('npm', () => `deps for ${key}: ${depNames}`);
+        for (const depName in deps) {
+            const depRange = deps[depName];
+            const dep = yield* this.ensureInstalled(depName, depRange, `npm:${name}@${ver}`, onProgress);
+            this.linkDependency(dir, depName, dep.dir);
         }
     }
 
     /** Try to install each optionalDependency. Failures are non-fatal (platform mismatch, etc). */
     private *installOptionalDeps(dir: string, onProgress?: ProgressCallback): Flow<void> {
         const pkg = readPkg(dir);
-        if (!pkg?.optionalDependencies) return;
-        const opts = Object.entries(pkg.optionalDependencies);
-        if (!opts.length) return;
-        log.debug('npm', () => `optional deps for ${pkg.name}: ${opts.map(([n]) => n).join(', ')}`);
+        const opts = pkg?.optionalDependencies;
+        if (!opts) return;
+        const optionalDepNames = recordKeysForLog(opts);
+        if (!optionalDepNames) return;
+        log.debug('npm', () => `optional deps for ${pkg.name}: ${optionalDepNames}`);
         const osName = currentOs();
         const cpuName = currentCpu();
         const abiName = currentAbi();
-        for (const [depName, depRange] of opts) {
+        for (const depName in opts) {
+            const depRange = opts[depName];
             try {
                 const depMeta = yield* this.fetchMeta(depName, onProgress);
                 const exactVer = yield* this.resolveVersion(depName, depRange, onProgress);
@@ -777,14 +1088,69 @@ export class NpmHandler implements ProtocolHandler {
                     continue;
                 }
                 const depDir = joinPaths(this.cacheDir, `${depName}@${exactVer}`);
-                const exists = yield { type: StepType.FS_EXISTS, path: depDir };
+                const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(depDir, 'package.json') };
                 if (!exists) {
                     if (!this.cfg.silent && !isatty) log.download(`${depName}@${exactVer} (optional)`);
                     yield* this.install(depName, exactVer, depDir, onProgress);
                     log.debug('npm', () => `optional dep installed: ${depName}@${exactVer}`);
                 }
+                this.linkDependency(dir, depName, depDir);
             } catch (e) {
                 log.debug('npm', () => `optional dep skipped: ${depName} (${e instanceof Error ? e.message : String(e)})`);
+            }
+        }
+    }
+
+    private linkDependency(parentDir: string, depName: string, depDir: string): void {
+        const target = joinPaths(parentDir, 'node_modules', depName);
+        try {
+            if (!fs.exists(joinPaths(depDir, 'package.json'))) return;
+            if (!fs.exists(joinPaths(target, 'package.json'))) {
+                ensureDir(dirname(target));
+                fs.symlink(depDir, target);
+            }
+            this.linkDependencyBins(parentDir, depDir);
+        } catch (e) {
+            log.debug('npm', () => `dependency link skipped: ${depName} -> ${target} (${e instanceof Error ? e.message : String(e)})`);
+        }
+    }
+
+    private linkCacheAlias(name: string, dir: string): void {
+        const target = joinPaths(this.cacheDir, name);
+        try {
+            if (target === dir) return;
+            if (fs.exists(joinPaths(target, 'package.json'))) return;
+            if (fs.exists(target)) {
+                for (const entry of fs.readdir(dir)) {
+                    const source = joinPaths(dir, entry);
+                    const dest = joinPaths(target, entry);
+                    if (fs.exists(dest)) continue;
+                    fs.symlink(source, dest);
+                }
+                return;
+            }
+            ensureDir(dirname(target));
+            fs.symlink(dir, target);
+        } catch (e) {
+            log.debug('npm', () => `cache alias skipped: ${name} -> ${target} (${e instanceof Error ? e.message : String(e)})`);
+        }
+    }
+
+    private linkDependencyBins(parentDir: string, depDir: string): void {
+        const pkg = readPkg(depDir);
+        if (!pkg) return;
+        const binMap = getBinMap(pkg);
+        const binDir = joinPaths(parentDir, 'node_modules', '.bin');
+        for (const [binName, relPath] of Object.entries(binMap)) {
+            const source = joinPaths(depDir, relPath);
+            const target = joinPaths(binDir, binName);
+            try {
+                if (!fs.exists(source) || fs.exists(target)) continue;
+                ensureDir(binDir);
+                fs.symlink(source, target);
+                chmodQuietly(source, 0o755);
+            } catch (e) {
+                log.debug('bin', () => `bin link skipped: ${binName} -> ${target} (${e instanceof Error ? e.message : String(e)})`);
             }
         }
     }
@@ -805,7 +1171,7 @@ export class NpmHandler implements ProtocolHandler {
 
     // package.json is written last, once every other file has landed on disk —
     // ensureInstalled() treats "package.json exists" as "fully installed", and
-    // concurrent scan workers race to check that as soon as it becomes true.
+    // concurrent scan workers race to check immediately after it becomes true.
     // Writing it eagerly (in tarball order) lets a worker see "installed" while
     // sibling files (e.g. a relative-import target) are still mid-extraction,
     // which permanently poisons the resolver's negative file-existence cache.
@@ -837,13 +1203,13 @@ export class NpmHandler implements ProtocolHandler {
             }
             yield { type: StepType.FS_WRITE_BYTES, path: target, data: f.content };
             if (f.type === 'file' && (f.mode & 0o111)) {
-                try { fs.chmod(target, f.mode & 0o777); } catch {}
+                chmodQuietly(target, f.mode & 0o777);
             }
         }
         if (pkgJsonFile) {
             yield { type: StepType.FS_WRITE_BYTES, path: pkgJsonTarget, data: pkgJsonFile.content };
             if (pkgJsonFile.mode & 0o111) {
-                try { fs.chmod(pkgJsonTarget, pkgJsonFile.mode & 0o777); } catch {}
+                chmodQuietly(pkgJsonTarget, pkgJsonFile.mode & 0o777);
             }
         }
     }
@@ -876,6 +1242,17 @@ export class NpmHandler implements ProtocolHandler {
     private cleanArchivePath(path: string): string {
         let p = path;
         while (p.startsWith('./')) p = p.slice(2);
+        p = normalizePath(p);
+        if (
+            p.startsWith('/') ||
+            hasLeadingSlashDrive(p) ||
+            isWindowsDrivePath(p) ||
+            p === '..' ||
+            p.startsWith('../') ||
+            p.includes('/../')
+        ) {
+            throw err(ErrorKind.InvalidSpecifier, `Unsafe npm tarball path: ${path}`);
+        }
         return p;
     }
 }

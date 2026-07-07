@@ -5,7 +5,7 @@ import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { StepType, type Flow } from '../../flow';
 import { normalizePath } from '../../utils/path';
-import { detectFormat } from '../pkg';
+import { detectFormat, detectPackageJsonFormat } from '../pkg';
 import { isWindows } from '../../utils/index';
 import { err, ErrorKind } from '../../errors';
 
@@ -17,13 +17,17 @@ export class FileHandler implements ProtocolHandler {
         const localPath = this.strip(spec);
         const exists = yield { type: StepType.FS_EXISTS, path: localPath };
         if (!exists) throw err(ErrorKind.FileNotFound, `File not found: ${localPath}`);
-        return { specPath: spec, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+        return { specPath: spec, localPath, format: detectPackageJsonFormat(localPath) ?? detectFormat(localPath), fileKind: guessFileKind(localPath) };
     }
 
     localPath(specPath: string): string { return this.strip(specPath); }
 
     private strip(url: string): string {
         let p = url.startsWith('file://') ? decodeURIComponent(url.slice(7)) : url;
+        const query = p.indexOf('?');
+        const hash = p.indexOf('#');
+        const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
+        if (cut !== -1) p = p.slice(0, cut);
         if (p.startsWith('/') && isWindows && p.length > 2 && p[2] === ':')
             p = p.slice(1);
         return normalizePath(p);

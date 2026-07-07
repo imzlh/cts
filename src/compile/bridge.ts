@@ -8,7 +8,7 @@
 //   - buildCjsDeps: construct the CjsDeps callback interface
 
 import type { ModuleInfo } from '../types';
-import type { CjsDeps } from './cjs';
+import type { CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
 import { BUILTINS } from '../resolve/builtins';
@@ -18,6 +18,24 @@ const engine = import.meta.use('engine');
 
 const CTS_INTERNAL = Symbol.for('cts.internal');
 const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
+let cjsBridgeId = 0;
+
+function buildCjsEsmWrapper(specPath: string, exports: Record<string, unknown>): CModuleEngine.Module {
+    const slot = `__cts_cjs_bridge_${cjsBridgeId++}`;
+    Reflect.set(globalThis, slot, exports);
+
+    let code = `const __cts = globalThis[${JSON.stringify(slot)}];\n`;
+    let index = 0;
+    for (const key of Object.keys(exports)) {
+        const local = `__cts_export_${index++}`;
+        code += `const ${local} = __cts[${JSON.stringify(key)}];\n`;
+        code += key === 'default'
+            ? `export default ${local};\n`
+            : `export { ${local} as ${JSON.stringify(key)} };\n`;
+    }
+    code += `delete globalThis[${JSON.stringify(slot)}];\n`;
+    return new engine.Module(code, specPath);
+}
 
 // ---------------------------------------------------------------------------
 // ESM -> CJS bridge: wrap CJS exports as an ESM Module
@@ -29,30 +47,38 @@ const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
  */
 export function bridgeCjsToEsm(
     specPath: string,
-    meta: Record<string, any>,
-    exports: any,
+    meta: Record<string, unknown>,
+    exports: unknown,
 ): CModuleEngine.Module {
-    const mod = engine.Module.create(specPath);
-    Object.assign(mod.meta, meta);
+    const out: Record<string, unknown> = Object.create(null);
 
-    if (exports !== null && typeof exports === 'object' && exports.__esModule === true) {
+    const exportRecord = exports !== null && (typeof exports === 'object' || typeof exports === 'function')
+        ? exports
+        : null;
+
+    if (exportRecord && Reflect.get(exportRecord, '__esModule') === true) {
         // Babel/tsc transpiled: each key is a named export, default comes from exports.default
-        for (const k of Object.keys(exports)) {
-            if (k !== '__esModule') mod.export(k, exports[k]);
+        for (const k of Object.keys(exportRecord)) {
+            if (k !== '__esModule') out[k] = Reflect.get(exportRecord, k);
         }
-        if (!Object.prototype.hasOwnProperty.call(exports, 'default')) {
-            mod.export('default', undefined);
+        if (!Object.prototype.hasOwnProperty.call(exportRecord, 'default')) {
+            out.default = undefined;
         }
     } else {
         // True CJS: each key is a named export, default is the whole exports object
-        if (exports !== null && typeof exports === 'object') {
-            for (const k of Object.keys(exports)) {
-                if (k !== 'default') mod.export(k, exports[k]);
+        if (exportRecord) {
+            for (const k of Object.keys(exportRecord)) {
+                if (k !== 'default') out[k] = Reflect.get(exportRecord, k);
             }
         }
-        mod.export('default', exports);
+        if (!exportRecord || !Object.prototype.hasOwnProperty.call(exportRecord, 'module.exports')) {
+            out['module.exports'] = exports;
+        }
+        out.default = exports;
     }
 
+    const mod = buildCjsEsmWrapper(specPath, out);
+    Object.assign(mod.meta, meta);
     return mod;
 }
 
@@ -75,7 +101,7 @@ export function loadEsmSync(
     info: ModuleInfo,
     esm: EsmCompiler,
     resolveMtime?: (p: string) => number | undefined,
-): Record<string, any> {
+): Record<string, unknown> {
     const mod = esm.load(info, {}, resolveMtime);
     const result = engine.promiseResult(mod.eval());
 
@@ -100,15 +126,18 @@ export function loadEsmSync(
 export function buildCjsDeps(
     resolver: ModuleResolver,
     esm: EsmCompiler,
+    loadWasmSync?: (info: ModuleInfo) => Record<string, unknown>,
 ): CjsDeps {
     return {
         resolveBuiltin(name: string, parent: string): ModuleInfo {
             return resolver.resolve(`node:${name}`, parent);
         },
 
-        loadEsmSync(info: ModuleInfo): Record<string, any> {
+        loadEsmSync(info: ModuleInfo): Record<string, unknown> {
             return loadEsmSync(info, esm, (p) => resolver.getCachedMtime(p));
         },
+
+        loadWasmSync,
 
         resolveExternal(req: string, parent: string): ModuleInfo | null {
             try {
@@ -133,12 +162,21 @@ function normalizeNpmSpec(spec: string): string {
     const slash = body.indexOf('/');
     if (slash === -1) return spec;
     const pkg = body.slice(0, slash);
-    const parts = body.slice(slash + 1).split('/');
     const normalized: string[] = [];
-    for (const p of parts) {
-        if (p === '.' || p === '') continue;
-        if (p === '..') { normalized.pop(); continue; }
-        normalized.push(p);
+    let start = slash + 1;
+    for (let i = start; i <= body.length; i++) {
+        if (i !== body.length && body.charCodeAt(i) !== 47) continue;
+        const len = i - start;
+        if (len === 0 || (len === 1 && body.charCodeAt(start) === 46)) {
+            start = i + 1;
+            continue;
+        }
+        if (len === 2 && body.charCodeAt(start) === 46 && body.charCodeAt(start + 1) === 46) {
+            normalized.pop();
+        } else {
+            normalized.push(body.slice(start, i));
+        }
+        start = i + 1;
     }
     return normalized.length > 0 ? `npm:${pkg}/${normalized.join('/')}` : `npm:${pkg}`;
 }
@@ -148,13 +186,13 @@ function normalizeNpmSpec(spec: string): string {
  * Warns on re-install (second runtime in same process hijacks the first).
  */
 export function installGlobalRequire(
-    mkRequire: (parentPath: string) => any,
+    mkRequire: (parentPath: string) => (id: string) => unknown,
     getEntry: () => string,
 ): void {
     const prev = Reflect.get(globalThis, CTS_REQUIRE_GETTER);
     if (prev) log.warn('bridge', () => 'globalThis.require re-installed — prior runtime hijacked');
 
-    let requireFn: Function | undefined;
+    let requireFn: ((id: string) => unknown) | undefined;
     let cachedEntry = '';
     const getter = () => {
         const entry = getEntry();
@@ -187,12 +225,14 @@ export function installGlobalRequire(
  * Re-install overwrites the prior object's fields (with per-field error logging).
  */
 export function installInternalBridge(
-    mkRequire: (parentPath: string) => any,
-    cache: Map<string, any>,
+    mkRequire: (parentPath: string) => CjsRequireFn,
+    preloadModule: (id: string, parentPath: string) => unknown,
+    cache: Map<string, unknown>,
     resolver: ModuleResolver,
 ): void {
     const value = {
         mkRequire,
+        preloadModule,
         builtinModules: [...BUILTINS],
         cache,
         specToLocalPath(specPath: string): string | null {
@@ -213,7 +253,7 @@ export function installInternalBridge(
     if ('value' in desc && desc.value && typeof desc.value === 'object') {
         log.warn('bridge', () => 'CTS_INTERNAL re-installed — prior runtime hijacked');
         for (const [k, v] of Object.entries(value)) {
-            try { (desc.value as any)[k] = v; }
+            try { Reflect.set(desc.value, k, v); }
             catch (e) { log.debug('bridge', () => `CTS_INTERNAL field "${k}" overwrite failed: ${errMsg(e)}`); }
         }
     }

@@ -15,6 +15,16 @@ const engine = import.meta.use('engine');
 const SUPPORTED_ATTRS = new Set(['type', 'raw', 'text', 'bytes']);
 let activeInstall = false;
 
+function unknownAttrNames(attr: Record<string, unknown>): string {
+    let out = '';
+    for (const key in attr) {
+        if (SUPPORTED_ATTRS.has(key)) continue;
+        if (out) out += ', ';
+        out += key;
+    }
+    return out;
+}
+
 export interface EngineHookCallbacks {
     onInitHook?: (specPath: string, info: ModuleInfo) => void;
     onSyntaxError?: (e: SyntaxError) => never;
@@ -22,6 +32,11 @@ export interface EngineHookCallbacks {
 
 export interface EngineHooks {
     clearLoadedModules(): void;
+}
+
+function hasSyntaxSourceCause(error: SyntaxError): boolean {
+    const cause = Reflect.get(error, 'cause');
+    return !!cause && typeof cause === 'object' && Reflect.get(cause, 'source') instanceof SyntaxError;
 }
 
 /**
@@ -41,7 +56,7 @@ export function installEngineHooks(
     const loadedModules = new Map<string, CModuleEngine.Module>();
 
     engine.onModule({
-        resolve(spec: string, parent: string, attr?: Record<string, any>): string {
+        resolve(spec: string, parent: string, attr?: Record<string, unknown>): string {
             try {
                 const info = resolver.resolve(spec, parent, attr);
                 compiler.preRegister(info.localPath, parentLocal(parent));
@@ -56,7 +71,7 @@ export function installEngineHooks(
             log.debug('runtime', () => `load hook: ${specPath}`);
             const info = resolver.getInfo(specPath);
             const key = moduleKey(info);
-            const meta: Record<string, any> = {};
+            const meta: Record<string, unknown> = {};
             fillMeta(meta, info, resolver);
 
             const dedup = loadedModules.get(key);
@@ -67,23 +82,23 @@ export function installEngineHooks(
                 loadedModules.set(key, mod);
                 return mod;
             } catch (e) {
-                if (e instanceof SyntaxError && (e.cause as any)?.source && callbacks.onSyntaxError) {
+                if (e instanceof SyntaxError && hasSyntaxSourceCause(e) && callbacks.onSyntaxError) {
                     callbacks.onSyntaxError(e);
                 }
                 throw e;
             }
         },
 
-        init(specPath: string, importMeta: Record<string, any>): void {
+        init(specPath: string, importMeta: Record<string, unknown>): void {
             log.debug('runtime', () => `init hook: ${specPath}`);
             const info = resolver.getInfo(specPath);
             fillMeta(importMeta, info, resolver);
             callbacks.onInitHook?.(info.specPath, info);
         },
 
-        attrchk(attr: Record<string, any>): void {
-            const unknown = Object.keys(attr).filter(k => !SUPPORTED_ATTRS.has(k));
-            if (unknown.length) log.debug('runtime', () => `unknown attrs: ${unknown.join(', ')}`);
+        attrchk(attr: Record<string, unknown>): void {
+            const unknown = unknownAttrNames(attr);
+            if (unknown) log.debug('runtime', () => `unknown attrs: ${unknown}`);
         },
     });
 

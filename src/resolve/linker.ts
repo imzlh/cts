@@ -22,6 +22,18 @@ const engine = import.meta.use('engine');
 
 const MANIFEST = '.cts-node-modules.json';
 
+function safeUnlink(path: string): void {
+    try {
+        fs.unlink(path);
+    } catch {}
+}
+
+function safeRmdir(path: string): void {
+    try {
+        fs.rmdir(path);
+    } catch {}
+}
+
 export async function materializeNodeModules(
     edges: ScanResult['edges'],
     mode: Exclude<NodeModulesMode, 'normal'>,
@@ -31,10 +43,15 @@ export async function materializeNodeModules(
 ): Promise<void> {
     const storeRoot = joinPaths(cacheDir, 'npm');
     const { internalEdges, rootEdges } = partitionEdges(edges);
-    const pending = (mode === 'soft'
-        ? rootEdges
-        : [...sortInternalEdges(internalEdges), ...rootEdges])
-        .filter(edge => canLinkEdge(edge, storeRoot, projectDir));
+    const pending: ScanResult['edges'] = [];
+    if (mode !== 'soft') {
+        for (const edge of sortInternalEdges(internalEdges)) {
+            if (canLinkEdge(edge, storeRoot, projectDir)) pending.push(edge);
+        }
+    }
+    for (const edge of rootEdges) {
+        if (canLinkEdge(edge, storeRoot, projectDir)) pending.push(edge);
+    }
 
     if (mode !== 'soft') resetStorePackages(edges, storeRoot);
     resetProjectRoots(projectDir, rootEdges);
@@ -47,7 +64,15 @@ export async function materializeNodeModules(
         onLinked?.(linked, pending.length);
     }
 
-    writeProjectManifest(projectDir, rootEdges.map(edge => edge.name));
+    writeProjectManifest(projectDir, edgeNames(rootEdges));
+}
+
+function edgeNames(edges: ScanResult['edges']): string[] {
+    const names = new Array<string>(edges.length);
+    for (let i = 0; i < edges.length; i++) {
+        names[i] = edges[i]?.name ?? '';
+    }
+    return names;
 }
 
 function resolveTargetDir(edge: ScanResult['edges'][number], storeRoot: string, projectDir: string): string | null {
@@ -88,16 +113,20 @@ async function linkOne(linkSource: string, targetDir: string, mode: Exclude<Node
     ensureDir(dirname(targetDir));
 
     let existing: ReturnType<typeof fs.lstat> | null = null;
-    try { existing = fs.lstat(targetDir); } catch {}
+    try {
+        existing = fs.lstat(targetDir);
+    } catch {}
     if (existing) {
         if (mode === 'soft' && existing.isSymbolicLink) {
-            try { if (fs.readlink(targetDir) === linkSource) return; } catch {}
+            try {
+                if (fs.readlink(targetDir) === linkSource) return;
+            } catch {}
         }
         removeExisting(targetDir, existing);
     }
 
     if (mode === 'soft') {
-        if (isWindows) await asyncfs.symlink(linkSource, targetDir, asyncfs.SymlinkType.JUNCTION);
+        if (isWindows) await asyncfs.symlink(linkSource, targetDir, asyncfs.FS_SYMLINK_JUNCTION);
         else fs.symlink(linkSource, targetDir);
     } else {
         hardlinkOrCopyDirRecursiveSync(linkSource, targetDir);
@@ -175,7 +204,8 @@ function resetStorePackages(edges: ScanResult['edges'], storeRoot: string): void
 function resetProjectRoots(projectDir: string, rootEdges: ScanResult['edges']): void {
     const nodeModulesDir = joinPaths(projectDir, 'node_modules');
     const previous = readProjectManifest(projectDir);
-    const next = new Set(rootEdges.map(edge => edge.name));
+    const next = new Set<string>();
+    for (const edge of rootEdges) next.add(edge.name);
     for (const name of previous) {
         if (!next.has(name)) removeIfExists(joinPaths(nodeModulesDir, name));
     }
@@ -184,8 +214,14 @@ function resetProjectRoots(projectDir: string, rootEdges: ScanResult['edges']): 
 function readProjectManifest(projectDir: string): string[] {
     const p = joinPaths(projectDir, 'node_modules', MANIFEST);
     try {
-        const parsed = JSON.parse(engine.decodeString(fs.readFile(p)));
-        return Array.isArray(parsed) ? parsed.filter(v => typeof v === 'string') : [];
+        const parsed: unknown = JSON.parse(engine.decodeString(fs.readFile(p)));
+        if (!Array.isArray(parsed)) return [];
+        const out: string[] = [];
+        for (let i = 0; i < parsed.length; i++) {
+            const value = parsed[i];
+            if (typeof value === 'string') out.push(value);
+        }
+        return out;
     } catch {
         return [];
     }
@@ -195,27 +231,46 @@ function writeProjectManifest(projectDir: string, names: string[]): void {
     const nodeModulesDir = joinPaths(projectDir, 'node_modules');
     if (!names.length && !fs.exists(nodeModulesDir)) return;
     ensureDir(nodeModulesDir);
-    fs.writeFile(joinPaths(nodeModulesDir, MANIFEST), engine.encodeString(JSON.stringify([...new Set(names)].sort())));
+    const unique = new Set<string>();
+    for (let i = 0; i < names.length; i++) {
+        const name = names[i];
+        if (name) unique.add(name);
+    }
+    const sorted: string[] = [];
+    for (const name of unique) sorted.push(name);
+    sorted.sort();
+    fs.writeFile(joinPaths(nodeModulesDir, MANIFEST), engine.encodeString(JSON.stringify(sorted)));
 }
 
 function removeIfExists(p: string): void {
     let stat: ReturnType<typeof fs.lstat> | null = null;
-    try { stat = fs.lstat(p); } catch {}
+    try {
+        stat = fs.lstat(p);
+    } catch {}
     if (!stat) return;
     removeExisting(p, stat);
 }
 
 function removeExisting(p: string, stat: { isDirectory: boolean; isSymbolicLink: boolean }): void {
-    if (stat.isSymbolicLink) { try { fs.unlink(p); } catch {} return; }
-    if (stat.isDirectory) { removeDirRecursiveSync(p); return; }
-    try { fs.unlink(p); } catch {}
+    if (stat.isSymbolicLink) {
+        safeUnlink(p);
+        return;
+    }
+    if (stat.isDirectory) {
+        removeDirRecursiveSync(p);
+        return;
+    }
+    safeUnlink(p);
 }
 
 function removeDirRecursiveSync(dir: string): void {
     for (const entry of fs.readdir(dir, true)) {
         const p = joinPaths(dir, entry.name);
-        if (entry.isSymbolicLink || !entry.isDirectory) { try { fs.unlink(p); } catch {} }
-        else removeDirRecursiveSync(p);
+        if (entry.isSymbolicLink || !entry.isDirectory) {
+            safeUnlink(p);
+        } else {
+            removeDirRecursiveSync(p);
+        }
     }
-    try { fs.rmdir(dir); } catch {}
+    safeRmdir(dir);
 }

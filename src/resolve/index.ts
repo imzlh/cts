@@ -18,6 +18,7 @@ import { JsrHandler }   from './protocols/jsr';
 import { NpmHandler }   from './protocols/npm';
 import { NodeHandler }  from './protocols/node';
 import { DataHandler }  from './protocols/data';
+import { BlobHandler }  from './protocols/blob';
 import { LockStore }    from '../lock';
 import { isBuiltinSpecifier } from './builtins';
 import { runAsync, runSync } from '../flow';
@@ -43,6 +44,15 @@ function protoOf(s: string): string {
         if (c < 97 || c > 122) return '';      // not a-z
     }
     return proto;
+}
+
+function splitLocalSpecifier(spec: string): { path: string; suffix: string } {
+    const query = spec.indexOf('?');
+    const hash = spec.indexOf('#');
+    const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
+    return cut === -1
+        ? { path: spec, suffix: '' }
+        : { path: spec.slice(0, cut), suffix: spec.slice(cut) };
 }
 
 // ---------------------------------------------------------------------------
@@ -71,13 +81,26 @@ interface PathAliasEntry {
     target:   string;
 }
 
-function buildAliasIndex(aliases: Record<string, string[]>): PathAliasEntry[] {
-    return Object.entries(aliases).flatMap(([alias, targets]) => {
-        const target = targets?.[0]; if (!target) return [];
+function isExternalAliasTarget(target: string): boolean {
+    return protoOf(target) !== '' || target.startsWith('//');
+}
+
+function normalizeAliasTarget(target: string, baseUrl?: string): string {
+    if (!baseUrl || isExternalAliasTarget(target) || isAbsolute(target)) return target;
+    return normalizePath(joinPaths(baseUrl, target));
+}
+
+function buildAliasIndex(aliases: Record<string, string[]>, baseUrl?: string): PathAliasEntry[] {
+    const entries: PathAliasEntry[] = [];
+    for (const alias in aliases) {
+        const targets = aliases[alias];
+        const target = targets?.[0];
+        if (!target) continue;
         const wildcard = alias.endsWith('/*');
-        return [{ prefix: wildcard ? alias.slice(0,-2) : alias, wildcard,
-                  target: target.endsWith('/*') ? target.slice(0,-2) : target }];
-    });
+        const normalizedTarget = normalizeAliasTarget(target.endsWith('/*') ? target.slice(0,-2) : target, baseUrl);
+        entries.push({ prefix: wildcard ? alias.slice(0,-2) : alias, wildcard, target: normalizedTarget });
+    }
+    return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,11 +134,12 @@ export class ModuleResolver {
         this.lock        = new LockStore(lockDir ?? os.cwd, lockReadOnly);
         cfg.lockStore = this.lock;
         this.importIndex = cfg.importMap    ? buildImportMapIndex(cfg.importMap) : null;
-        this.aliasIndex  = cfg.pathAliases  ? buildAliasIndex(cfg.pathAliases)  : [];
+        this.aliasIndex  = cfg.pathAliases  ? buildAliasIndex(cfg.pathAliases, cfg.baseUrl) : [];
         this.lock.load();
 
         this.reg(new FileHandler(cfg));
         this.reg(new DataHandler(cfg));
+        this.reg(new BlobHandler(cfg));
         this.reg(new NpmHandler(cfg));
 
         const flagged: Array<[ProtocolHandler, keyof RuntimeConfig]> = [
@@ -151,7 +175,7 @@ export class ModuleResolver {
     // Falls back to sync resolve when no async handler available (file, data, node).
     // -------------------------------------------------------------------------
 
-    async resolveAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+    async resolveAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
 
         parent = this.normalizeParentRef(parent);
@@ -167,7 +191,7 @@ export class ModuleResolver {
         const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
-            if (cached && this.isUsableInfo(cached)) {
+            if (cached && this.canUseSourceIndexHit(mapped, cached)) {
                 return this.publishResolved(requestSpec, mapped, parent, cached, attr);
             }
         }
@@ -181,7 +205,7 @@ export class ModuleResolver {
         const proto = protoOf(mapped);
         if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
-            if (lockHit && this.isUsableInfo(lockHit)) {
+            if (lockHit && this.canUseCachedInfo(lockHit)) {
                 return this.publishResolved(requestSpec, mapped, parent, lockHit, attr, { persistSource: true });
             }
         }
@@ -195,7 +219,7 @@ export class ModuleResolver {
         return this.publishResolved(requestSpec, mapped, parent, info, attr, { persistModule: true, persistSource: true });
     }
 
-    private async dispatchAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+    private async dispatchAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         const proto = protoOf(spec);
         if (proto) {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
@@ -208,7 +232,7 @@ export class ModuleResolver {
         return this.resolveBareAsync(spec, parent, attr, onProgress);
     }
 
-    private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+    private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
         if (isBuiltinSpecifier(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
         const aliased = this.applyPathAlias(spec);
@@ -232,7 +256,7 @@ export class ModuleResolver {
     // Main resolution — three-level cache
     // -------------------------------------------------------------------------
 
-    resolve(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
+    resolve(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
         parent = this.normalizeParentRef(parent);
@@ -261,7 +285,7 @@ export class ModuleResolver {
         const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
-            if (cached && this.isUsableInfo(cached)) {
+            if (cached && this.canUseSourceIndexHit(mapped, cached)) {
                 log.debug('resolver', () => `L1 hit: "${mapped}" → "${srcKey}"`);
                 return this.publishResolved(requestSpec, mapped, parent, cached, attr, { rememberExact: true });
             }
@@ -280,7 +304,7 @@ export class ModuleResolver {
         const proto = protoOf(mapped);
         if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
-            if (lockHit && this.isUsableInfo(lockHit)) {
+            if (lockHit && this.canUseCachedInfo(lockHit)) {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
                 return this.publishResolved(requestSpec, mapped, parent, lockHit, attr, {
                     persistSource: true,
@@ -358,11 +382,17 @@ export class ModuleResolver {
         return [];
     }
 
+    resolveBin(name: string, cwd: string): string | null {
+        const npm = this.handlers.get('npm');
+        if (npm instanceof NpmHandler) return npm.resolveBin(name, cwd);
+        return null;
+    }
+
     // -------------------------------------------------------------------------
     // Dispatch
     // -------------------------------------------------------------------------
 
-    private dispatch(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
+    private dispatch(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         const proto = protoOf(spec);
         if (proto) {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
@@ -375,23 +405,30 @@ export class ModuleResolver {
         return this.resolveBare(spec, parent, attr);
     }
 
-    private resolveRelative(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
+    private resolveRelative(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         const pp = protoOf(parent);
         // Delegate to protocol handler for non-file protocols (npm:, jsr:, http:, etc.)
-        if (pp && pp !== 'file') { const h = this.handlers.get(pp); if (h) return runSync(h.resolve(spec, parent, attr)); }
+        if (pp && pp !== 'file') {
+            const handler = this.handlers.get(pp);
+            if (handler) return runSync(handler.resolve(spec, parent, attr));
+        }
         let base = parent.startsWith('file://') ? parent.slice(7) : parent;
+        base = splitLocalSpecifier(base).path;
         // file:///C:/... → /C:/... → strip leading / before drive letter
         if (hasLeadingSlashDrive(base)) base = base.slice(1);
         // Ensure base is an absolute path for correct relative resolution
         if (!isAbsolute(base)) base = resolvePath(base);
         base = dirname(base);
-        const joined = joinPaths(base, spec);
+        const specParts = splitLocalSpecifier(spec);
+        const joined = joinPaths(base, specParts.path);
         const localPath = resolveFile(normalizePath(joined));
-        const specPath = localPath;
+        const specPath = localPath + specParts.suffix;
+        const localNpm = this.canonicalizeLocalNpmFile(localPath, attr);
+        if (localNpm && !specParts.suffix) return localNpm;
         return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
     }
 
-    private async resolveRelativeAsync(spec: string, parent: string, attr?: Record<string, any>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+    private async resolveRelativeAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         const pp = protoOf(parent);
         if (pp && pp !== 'file') {
             const h = this.handlers.get(pp);
@@ -400,14 +437,17 @@ export class ModuleResolver {
         return this.resolveRelative(spec, parent, attr);
     }
 
-    private resolveAbsolute(spec: string, attr?: Record<string, any>): ModuleInfo {
-        const aliased   = this.applyPathAlias(spec);
-        const localPath = resolveFile(aliased !== spec ? aliased : spec);
-        const specPath  = localPath;
+    private resolveAbsolute(spec: string, attr?: Record<string, unknown>): ModuleInfo {
+        const specParts = splitLocalSpecifier(spec);
+        const aliased   = this.applyPathAlias(specParts.path);
+        const localPath = resolveFile(aliased !== specParts.path ? aliased : specParts.path);
+        const specPath  = localPath + specParts.suffix;
+        const localNpm = this.canonicalizeLocalNpmFile(localPath, attr);
+        if (localNpm && !specParts.suffix) return localNpm;
         return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
     }
 
-    private resolveBare(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo {
+    private resolveBare(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         if (spec.startsWith('@std/')) return this.dispatch(`jsr:${spec}`, parent, attr);
         if (isBuiltinSpecifier(spec)) return this.dispatch(`node:${spec}`, parent, attr);
         const aliased = this.applyPathAlias(spec);
@@ -438,11 +478,11 @@ export class ModuleResolver {
             if (spec.startsWith(prefix)) return target + spec.slice(prefix.length);
         }
         // Bare specifier with subpath
-        const parts = spec.split('/');
-        for (let i = parts.length - 1; i > 0; i--) {
-            const base = parts.slice(0, i).join('/');
-            const m    = idx.exact.get(base);
-            if (m !== undefined) return `${m}/${parts.slice(i).join('/')}`;
+        let slash = spec.lastIndexOf('/');
+        while (slash > 0) {
+            const m = idx.exact.get(spec.slice(0, slash));
+            if (m !== undefined) return `${m}/${spec.slice(slash + 1)}`;
+            slash = spec.lastIndexOf('/', slash - 1);
         }
         return spec;
     }
@@ -459,18 +499,20 @@ export class ModuleResolver {
         return spec;
     }
 
-    private tryResolveLocalNpm(spec: string, parent: string, attr?: Record<string, any>): ModuleInfo | null {
+    private tryResolveLocalNpm(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo | null {
         if (!spec || spec[0] === '.' || spec[0] === '/' || spec.startsWith('#')) return null;
         const proto = protoOf(spec);
         if (proto && proto !== 'npm') return null;
         if (spec.startsWith('@std/') || isBuiltinSpecifier(spec)) return null;
         const npm = this.handlers.get('npm');
         if (!(npm instanceof NpmHandler)) return null;
-        try {
-            return npm.tryResolveLocal(spec, parent, attr);
-        } catch {
-            return null;
-        }
+        return npm.tryResolveLocal(spec, parent, attr);
+    }
+
+    private canonicalizeLocalNpmFile(localPath: string, attr?: Record<string, unknown>): ModuleInfo | null {
+        const npm = this.handlers.get('npm');
+        if (!(npm instanceof NpmHandler)) return null;
+        return npm.tryResolveLocalFile(localPath, attr);
     }
 
     private publishResolved(
@@ -478,7 +520,7 @@ export class ModuleResolver {
         mapped: string,
         parent: string,
         info: ModuleInfo,
-        attr?: Record<string, any>,
+        attr?: Record<string, unknown>,
         opts?: {
             persistModule?: boolean;
             persistSource?: boolean;
@@ -496,10 +538,11 @@ export class ModuleResolver {
         this.sourceInfoCache.set(sourceKey, resolved);
         this.rememberRuntimeInfo(resolved);
 
+        const cacheLockEntry = protoOf(canonical.specPath) !== 'node';
         if (!transient) {
             this.resolvedModules.set(canonical.specPath, canonical);
-            if (opts?.persistModule) this.lock.setModule(canonical);
-            if (opts?.persistSource) this.lock.setSourceByKey(sourceKey, canonical.specPath);
+            if (cacheLockEntry && opts?.persistModule) this.lock.setModule(canonical);
+            if (cacheLockEntry && opts?.persistSource) this.lock.setSourceByKey(sourceKey, canonical.specPath);
             if (!this.mainEntry) {
                 this.mainEntry = canonical.specPath;
                 log.debug('resolver', () => `main: "${canonical.specPath}"`);
@@ -512,19 +555,52 @@ export class ModuleResolver {
         return resolved;
     }
 
+    private canUseCachedInfo(info: ModuleInfo): boolean {
+        if (!this.isUsableInfo(info)) return false;
+        return !(this.cfg.persistLock && !this.cfg.ignoreScripts && protoOf(info.specPath) === 'npm');
+    }
+
+    private canUseSourceIndexHit(mapped: string, info: ModuleInfo): boolean {
+        if (!this.canUseCachedInfo(info)) return false;
+        const proto = protoOf(mapped);
+        if (!proto || proto === 'file') return true;
+        const h = this.handlers.get(proto);
+        if (!h) return true;
+        try {
+            return normalizePath(info.localPath) === normalizePath(h.localPath(mapped));
+        } catch {
+            return false;
+        }
+    }
+
     private isUsableInfo(info: ModuleInfo): boolean {
         const proto = protoOf(info.specPath);
-        // npm/jsr/http/data packages live in cacheDir or are runtime-provided — always usable
-        if (proto && proto !== 'file') return true;
+        if (proto) {
+            const h = this.handlers.get(proto);
+            if (h) {
+                let expected: string;
+                try {
+                    expected = normalizePath(h.localPath(info.specPath));
+                } catch {
+                    return false;
+                }
+                if (normalizePath(info.localPath) !== expected) return false;
+                if (detectFormat(expected) !== info.format) return false;
+            }
+        }
+        return this.localPathExists(info.localPath);
+    }
+
+    private localPathExists(localPath: string): boolean {
         // Local files: stat cache avoids repeated sync syscalls on hot path
-        const cached = this.statCache.get(info.localPath);
+        const cached = this.statCache.get(localPath);
         if (cached) return cached.exists;
         try {
-            const st = fs.stat(info.localPath);
-            this.statCache.set(info.localPath, { exists: true, mtime: st.mtim.getTime() });
+            const st = fs.stat(localPath);
+            this.statCache.set(localPath, { exists: true, mtime: st.mtim.getTime() });
             return true;
         } catch {
-            this.statCache.set(info.localPath, { exists: false, mtime: 0 });
+            this.statCache.set(localPath, { exists: false, mtime: 0 });
             return false;
         }
     }
@@ -539,15 +615,15 @@ export class ModuleResolver {
         return this.statCache.get(localPath)?.mtime;
     }
 
-    private sourceCacheKey(spec: string, parent: string, attr?: Record<string, any>): string {
+    private sourceCacheKey(spec: string, parent: string, attr?: Record<string, unknown>): string {
         return `${attr?.cjs === true ? 'cjs' : 'esm'}\0${spec}\0${parent}\0${this.attrSignature(attr)}`;
     }
 
-    private canReadSourceIndex(attr?: Record<string, any>): boolean {
+    private canReadSourceIndex(attr?: Record<string, unknown>): boolean {
         return !this.isTransientResolve(attr);
     }
 
-    private isTransientResolve(attr?: Record<string, any>): boolean {
+    private isTransientResolve(attr?: Record<string, unknown>): boolean {
         return attr?.cjs === true;
     }
 
@@ -568,7 +644,7 @@ export class ModuleResolver {
         return canonical;
     }
 
-    private materializeRuntimeInfo(info: ModuleInfo, attr?: Record<string, any>): ModuleInfo {
+    private materializeRuntimeInfo(info: ModuleInfo, attr?: Record<string, unknown>): ModuleInfo {
         const fileKind = applyAttrType(info.fileKind, attr);
         if (fileKind === info.fileKind) return info;
         return {
@@ -578,13 +654,22 @@ export class ModuleResolver {
         };
     }
 
-    private attrSignature(attr?: Record<string, any>): string {
+    private attrSignature(attr?: Record<string, unknown>): string {
         if (!attr) return '';
-        const pairs = Object.entries(attr)
-            .filter(([k, v]) => k !== 'cjs' && v !== undefined)
-            .sort(([a], [b]) => a.localeCompare(b));
-        if (!pairs.length) return '';
-        return pairs.map(([k, v]) => `${k}=${String(v)}`).join(',');
+        const keys: string[] = [];
+        for (const key in attr) {
+            if (key !== 'cjs' && attr[key] !== undefined) keys.push(key);
+        }
+        if (!keys.length) return '';
+        keys.sort();
+        let out = '';
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (key === undefined) continue;
+            if (out) out += ',';
+            out += `${key}=${String(attr[key])}`;
+        }
+        return out;
     }
 
 }
