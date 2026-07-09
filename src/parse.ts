@@ -8,15 +8,16 @@
 // lifetime/timeout/error-handling policy instead of being split across layers.
 
 import { Transformer } from './source/transform';
-import { OxcTranspiler, isOxcModule, oxcExtPath } from './oxc';
-import { extractImports, hasImportExportOrRequire, isTsLikePath } from './scan';
-import { readText, errMsg, log, getMemoryTier, type MemoryTier } from './utils';
+import { OxcTranspiler, isOxcModule, oxcExtPath, tryLoadOxc } from './oxc';
+import { extractImports, isTsLikePath } from './scan';
+import { errMsg, log, getMemoryTier, readText, type MemoryTier } from './utils';
 
 const { setTimeout, clearTimeout } = import.meta.use('timers');
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const worker = import.meta.use('worker');
 const smap = import.meta.use('sourcemap');
+const asyncfs = import.meta.use('asyncfs');
 
 // ---------------------------------------------------------------------------
 // Worker protocol
@@ -27,7 +28,6 @@ interface WorkerTask {
     kind: 'transform' | 'scan';
     localPath: string;
     specPath?: string; // transform only: the module's runtime identity (see Transformer.transform's mapKey)
-    source?: string;   // scan: provided; transform: read lazily at dispatch
 }
 
 interface WorkerResult {
@@ -47,7 +47,6 @@ interface WorkerPolicy {
 
 interface ParseWorkerData {
     __cts_role?: unknown;
-    __oxc_path?: unknown;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -130,46 +129,39 @@ export async function runParseWorker(): Promise<void> {
     // registered here — this worker's JSContext is not where compiled
     // modules run, so a local smap.load() would be invisible to stack traces.
     const transformer = new Transformer({ sourceMaps: true });
-    let oxcTranspiler: OxcTranspiler | null = null;
-
-    const extPath = typeof wd.__oxc_path === 'string' ? wd.__oxc_path : null;
-    if (extPath) {
-        try {
-            import.meta.register('oxc', extPath);
-            const oxcMod: unknown = import.meta.use('oxc');
-            if (isOxcModule(oxcMod)) {
-                oxcTranspiler = new OxcTranspiler(oxcMod);
-                transformer.setOxc(oxcTranspiler);
-                log.debug('precompile', () => `worker: oxc loaded from ${extPath}`);
-            } else {
-                log.debug('precompile', () => `worker: oxc module API unexpected`);
-            }
-        } catch (e) {
-            log.debug('precompile', () => `worker: oxc unavailable: ${errMsg(e)}`);
-        }
-    }
-
+    let oxcTranspiler: OxcTranspiler | null = tryLoadOxc();
     const postResult = (result: WorkerResult) => pipe.postMessage(result);
 
-    pipe.onmessage = (raw: unknown) => {
+    pipe.onmessage = async (raw: unknown) => {
         if (!isWorkerTask(raw)) return;
         const task = raw;
-        const source = task.source ?? '';
+        let bytes: Uint8Array;
+        try {
+            bytes = await asyncfs.readFile(task.localPath);
+        } catch (e) {
+            postResult({ id: task.id, kind: task.kind, localPath: task.localPath, error: errMsg(e) });
+            return;
+        }
 
         if (task.kind === 'scan') {
             try {
-                if (!hasImportExportOrRequire(source)) {
-                    postResult({ id: task.id, kind: 'scan', localPath: task.localPath, deps: [] });
-                    return;
-                }
                 let deps: string[] | null = null;
                 if (oxcTranspiler) {
                     try {
-                        deps = oxcTranspiler.scanImports(source, task.localPath);
+                        deps = oxcTranspiler.scanImportsBytes(bytes, task.localPath);
                     } catch {}
                 }
+                let source: string | null = null;
                 if (deps === null) {
-                    deps = extractImports(source, isTsLikePath(task.localPath));
+                    source = engine.decodeString(bytes);
+                    if (oxcTranspiler) {
+                        try {
+                            deps = oxcTranspiler.scanImports(source, task.localPath);
+                        } catch {}
+                    }
+                }
+                if (deps === null) {
+                    deps = extractImports(source ?? engine.decodeString(bytes), isTsLikePath(task.localPath));
                 }
                 postResult({ id: task.id, kind: 'scan', localPath: task.localPath, deps });
             } catch (e) {
@@ -179,7 +171,12 @@ export async function runParseWorker(): Promise<void> {
         }
 
         try {
-            const { code, sourceMap } = transformer.transformCapture(source, task.localPath, undefined, task.specPath);
+            let result = transformer.transformCaptureBytes(bytes, task.localPath, undefined, task.specPath);
+            if (result === null) {
+                const source = engine.decodeString(bytes);
+                result = transformer.transformCapture(source, task.localPath, undefined, task.specPath);
+            }
+            const { code, sourceMap } = result;
             postResult({ id: task.id, kind: 'transform', localPath: task.localPath, code, sourceMap });
         } catch (e) {
             postResult({ id: task.id, kind: 'transform', localPath: task.localPath, error: errMsg(e) });
@@ -204,7 +201,7 @@ class TxWorker {
         onError: (workerIdx: number, error: unknown) => void,
     ) {
         this.idx = idx;
-        this.w = new worker.Worker({ __cts_role: 'parse', __oxc_path: oxcPath });
+        this.w = new worker.Worker({ __cts_role: 'parse' });
         this.pipe = this.w.messagePipe;
         this.pipe.onmessage = (data: unknown) => {
             this.busy = false;
@@ -258,7 +255,7 @@ export class ParseDriver {
     private taskTimers = new Map<number, ReturnType<typeof setTimeout>>();
     private workerTaskId = new Map<number, number>(); // worker.idx → current task id
     private taskInfo = new Map<number, { kind: WorkerTask['kind']; localPath: string; workerIdx: number }>();
-    private scanFallbacks = new Map<number, { source: string; localPath: string }>();
+    private scanFallbacks = new Map<number, { localPath: string }>();
     private deadWorkers = new Set<number>();
     private settled = false;
     private closing = false;
@@ -307,14 +304,14 @@ export class ParseDriver {
      * Workers handle OXC (if available) with Sucrase fallback.
      * Can be called concurrently during BFS before compileModules() is invoked.
      */
-    async scanFile(source: string, localPath: string): Promise<string[]> {
+    async scanFile(localPath: string): Promise<string[]> {
         if (this.closing) return [];
-        if (this.maxWorkers <= 0) return this.scanInline(source, localPath);
+        if (this.maxWorkers <= 0) return this.scanInlineFile(localPath);
         this.ensureWorkers();
         const id = this.nextId++;
-        const task: WorkerTask = { id, kind: 'scan', localPath, source };
+        const task: WorkerTask = { id, kind: 'scan', localPath };
         return new Promise<string[]>(resolve => {
-            this.scanFallbacks.set(id, { source, localPath });
+            this.scanFallbacks.set(id, { localPath });
             this.scanQueue.push(task);
             const wrappedResolve = (deps: string[]) => {
                 this.scanFallbacks.delete(id);
@@ -384,7 +381,6 @@ export class ParseDriver {
 
     private scanInline(source: string, localPath: string): string[] {
         try {
-            if (!hasImportExportOrRequire(source)) return [];
             if (this.oxc) {
                 const deps = this.oxc.scanImports(source, localPath);
                 if (deps !== null) return deps;
@@ -392,6 +388,15 @@ export class ParseDriver {
             return extractImports(source, isTsLikePath(localPath));
         } catch (e) {
             log.debug('precompile', () => `inline scan fail: ${localPath}: ${errMsg(e)}`);
+            return [];
+        }
+    }
+
+    private scanInlineFile(localPath: string): string[] {
+        try {
+            return this.scanInline(readText(localPath), localPath);
+        } catch (e) {
+            log.debug('precompile', () => `inline scan read fail: ${localPath}: ${errMsg(e)}`);
             return [];
         }
     }
@@ -589,17 +594,10 @@ export class ParseDriver {
     }
 
     private dispatchTask(w: TxWorker, task: WorkerTask): void {
-        if (task.kind === 'transform' && task.source === undefined) {
-            try { task.source = readText(task.localPath); }
-            catch (e) {
-                log.debug('precompile', () => `read fail: ${task.localPath}: ${errMsg(e)}`);
-                this.specMap.delete(task.id);
-                this.transformFail++;
-                this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
-                if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
-                return;
-            }
-        }
+        this.sendToWorker(w, task);
+    }
+
+    private sendToWorker(w: TxWorker, task: WorkerTask): void {
         try {
             w.send(task);
         } catch (e) {
@@ -621,7 +619,6 @@ export class ParseDriver {
             this.drain();
             return;
         }
-        task.source = '';   // worker copied it; drop our reference to bound peak RSS
         this.workerTaskId.set(w.idx, task.id);
         this.taskInfo.set(task.id, { kind: task.kind, localPath: task.localPath, workerIdx: w.idx });
         const timeout = task.kind === 'scan'
@@ -708,7 +705,7 @@ export class ParseDriver {
         if (!fallback) return [];
 
         log.debug('precompile', () => `${reason}, fallback inline: ${fallback.localPath}`);
-        return this.scanInline(fallback.source, fallback.localPath);
+        return this.scanInlineFile(fallback.localPath);
     }
 
     async terminate(): Promise<void> {

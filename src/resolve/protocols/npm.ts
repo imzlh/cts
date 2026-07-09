@@ -6,9 +6,8 @@ import { guessFileKind } from './base';
 import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
-declare const URL: typeof globalThis.URL;
 import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes } from '../../utils/misc';
-import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, isPackageSubpathBlockedByExports, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
+import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
@@ -390,19 +389,13 @@ export class NpmHandler implements ProtocolHandler {
         // # imports from local node_modules files — resolve via owning package's "imports"
         if (spec.startsWith('#')) {
             const pkgDir = this.findOwningPackageDir(parent);
-            if (pkgDir) {
-                    const ctx = createCtx(pkgDir, this.ctxOptions(forceCjs));
-                if (ctx) {
-                    const resolved = resolveImports(ctx, spec);
-                    if (resolved) {
-                        const pkg = readPkg(pkgDir);
-                        const ver = pkg?.version ?? '0.0.0';
-                        const name = pkg?.name ?? 'unknown';
-                        return this.toPackageModuleInfo(name, ver, pkgDir, resolved);
-                    }
-                }
-                throw packageImportNotDefinedError(spec, pkgDir, parent);
+            const ctx = pkgDir ? createCtx(pkgDir, this.ctxOptions(forceCjs)) : null;
+            const resolved = ctx ? resolveImports(ctx, spec) : null;
+            if (resolved && pkgDir) {
+                const pkg = readPkg(pkgDir);
+                return this.toPackageModuleInfo(pkg?.name ?? 'unknown', pkg?.version ?? '0.0.0', pkgDir, resolved);
             }
+            throw packageImportNotDefinedError(spec, pkgDir ?? '', parent);
         }
         const { name, version: parsedRange, subpath } = parseNpmSpec(spec);
         const selfRef = this.resolveSelfReference(parent, name, subpath, forceCjs);
@@ -473,8 +466,16 @@ export class NpmHandler implements ProtocolHandler {
         if (!fs.exists(pkgDir)) throw err(ErrorKind.ModuleNotFound, `Package not in cache: ${specPath}`);
         const ctx = createCtx(pkgDir, this.ctxOptions());
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkgDir}`);
-        const resolved = resolveSubpath(ctx, subpath || '.');
-        if (!resolved) throw err(ErrorKind.ModuleNotFound, `Cannot resolve path for ${specPath}`);
+        const blockedByExports = isPackageSubpathBlockedByExports(ctx, subpath);
+        if (blockedByExports && (subpath || !isRootExportRuntimeless(ctx))) {
+            throw packagePathNotExportedError(NpmHandler.specPath(name, version, subpath));
+        }
+        const resolved = blockedByExports ? null : resolveSubpath(ctx, subpath || '.');
+        if (!resolved) {
+            // Mirrors resolvePkg()'s types-only-exports marker: keep in sync.
+            if (!subpath) return joinPaths(pkgDir, 'package.json');
+            throw err(ErrorKind.ModuleNotFound, `Cannot resolve path for ${specPath}`);
+        }
         return resolved.path;
     }
 
@@ -531,10 +532,13 @@ export class NpmHandler implements ProtocolHandler {
     private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
         const ctx = createCtx(dir, this.ctxOptions(forceCjs));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
-        if (isPackageSubpathBlockedByExports(ctx, subpath)) {
+        // types-only "." exports (e.g. @types/react 19.x) fall through to the marker below;
+        // a real format mismatch (e.g. cjs-only package required via import) still throws.
+        const blockedByExports = isPackageSubpathBlockedByExports(ctx, subpath);
+        if (blockedByExports && (subpath || !isRootExportRuntimeless(ctx))) {
             throw packagePathNotExportedError(NpmHandler.specPath(name, ver, subpath));
         }
-        const resolved = resolveSubpath(ctx, subpath);
+        const resolved = blockedByExports ? null : resolveSubpath(ctx, subpath);
         if (!resolved) {
             // Root entry (subpath === '') with no main/exports: the package has been
             // installed but exposes no runtime entry (e.g. @types/* declaration packages).
@@ -987,7 +991,9 @@ export class NpmHandler implements ProtocolHandler {
         log.debug('npm', () => `fetched meta ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - started}ms`);
         const meta = safeParse<NpmMeta>(engine.decodeString(body));
         yield { type: StepType.FS_ENSURE_DIR, path: dirname(cacheFile) };
-        yield { type: StepType.FS_WRITE_TEXT, path: cacheFile, text: JSON.stringify(meta, null, 2) };
+        // Cache the raw response bytes verbatim — avoids re-serializing the
+        // whole (often multi-MB) metadata object just to persist it.
+        yield { type: StepType.FS_WRITE_BYTES, path: cacheFile, data: body };
         yield { type: StepType.FS_WRITE_TEXT, path: cacheTs, text: String(Date.now()) };
         return meta;
     }
@@ -1055,7 +1061,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!depNames) return;
         log.debug('npm', () => `deps for ${key}: ${depNames}`);
         for (const depName in deps) {
-            const depRange = deps[depName];
+            const depRange = deps[depName]!;
             const dep = yield* this.ensureInstalled(depName, depRange, `npm:${name}@${ver}`, onProgress);
             this.linkDependency(dir, depName, dep.dir);
         }
@@ -1073,7 +1079,7 @@ export class NpmHandler implements ProtocolHandler {
         const cpuName = currentCpu();
         const abiName = currentAbi();
         for (const depName in opts) {
-            const depRange = opts[depName];
+            const depRange = opts[depName]!;
             try {
                 const depMeta = yield* this.fetchMeta(depName, onProgress);
                 const exactVer = yield* this.resolveVersion(depName, depRange, onProgress);

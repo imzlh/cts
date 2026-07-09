@@ -87,7 +87,8 @@ export class PrecacheProgress {
 
     // Active big downloads (for detail lines)
     private items  = new Map<string, DownloadItem>();
-    private order  : string[] = [];
+    private activeOrder: string[] = [];
+    private lastFinished: DownloadItem | null = null;
     private itemDone = 0;
     private itemTotal = 0;
 
@@ -143,6 +144,9 @@ export class PrecacheProgress {
         item.error = error;
         this.itemDone++;
         if (item.downloaded) this.downloaded++;
+        this.removeActive(key);
+        this.lastFinished = item;
+        this.items.delete(key);
         this.kick();
     }
 
@@ -171,6 +175,11 @@ export class PrecacheProgress {
         this.drawn = 0;
     }
 
+    clearForOutput(): void {
+        if (isatty && this.drawn) this.clearLines(this.drawn);
+        this.drawn = 0;
+    }
+
     // ---- Internals ----
 
     private kick(): void {
@@ -183,9 +192,14 @@ export class PrecacheProgress {
     private addItem(key: string, label: string, totalBytes: number, downloaded: boolean): void {
         if (this.items.has(key)) return;
         this.items.set(key, { label, total: totalBytes, done: 0, finished: false, downloaded });
-        this.order.push(key);
+        this.activeOrder.push(key);
         this.itemTotal++;
         this.kick();
+    }
+
+    private removeActive(key: string): void {
+        const index = this.activeOrder.indexOf(key);
+        if (index !== -1) this.activeOrder.splice(index, 1);
     }
 
     private updateItem(key: string, done: number, total: number): void {
@@ -213,10 +227,6 @@ export class PrecacheProgress {
         this.tick = (this.tick + 1) % SPIN.length;
         const spin = SPIN[this.tick] ?? SPIN[0] ?? '';
 
-        const active  = this.order.filter(k => this.items.get(k)?.finished === false);
-        const finished = this.order.filter(k => this.items.get(k)?.finished === true);
-        const visible = [...active.slice(0, this.maxLines - 1), ...finished.slice(-1)];
-
         const elapsed = (Date.now() - this.startMs) / 1000;
         const elapsedStr = elapsed < 10 ? elapsed.toFixed(1) : String(Math.floor(elapsed));
 
@@ -234,20 +244,22 @@ export class PrecacheProgress {
 
         const lines = [`${spin} ${C.bold('Precaching')}: ${parts.join(', ')} ${C.dim(`${elapsedStr}s`)}`];
 
-        // Detail lines (big downloads)
-        for (const key of visible.slice(0, this.maxLines)) {
+        // Detail lines: keep render cost independent from total resolved count.
+        const activeLimit = this.lastFinished ? this.maxLines - 1 : this.maxLines;
+        for (let i = 0; i < this.activeOrder.length && i < activeLimit; i++) {
+            const key = this.activeOrder[i];
             const item = this.items.get(key);
             if (!item) continue;
             const lbl = truncate(item.label, termWidth - 30);
-            if (item.error) {
-                lines.push(`  ${C.red('✗')} ${lbl} ${C.red(item.error)}`);
-            } else if (item.finished) {
-                lines.push(`  ${C.green('✓')} ${lbl} ${item.total ? C.dim(fmtBytes(item.total)) : ''}`);
-            } else {
-                const bar = item.total ? renderBar(item.done, item.total, 12) : '';
-                const pct = item.total ? ` ${Math.floor(item.done / item.total * 100)}%` : '';
-                lines.push(`  ${C.cyan(spin)} ${lbl} ${C.green(bar)}${pct} ${C.dim(fmtBytes(item.done))}`);
-            }
+            const bar = item.total ? renderBar(item.done, item.total, 12) : '';
+            const pct = item.total ? ` ${Math.floor(item.done / item.total * 100)}%` : '';
+            lines.push(`  ${C.cyan(spin)} ${lbl} ${C.green(bar)}${pct} ${C.dim(fmtBytes(item.done))}`);
+        }
+        if (this.lastFinished && lines.length <= this.maxLines) {
+            const item = this.lastFinished;
+            const lbl = truncate(item.label, termWidth - 30);
+            if (item.error) lines.push(`  ${C.red('✗')} ${lbl} ${C.red(item.error)}`);
+            else lines.push(`  ${C.green('✓')} ${lbl} ${item.total ? C.dim(fmtBytes(item.total)) : ''}`);
         }
 
         if (this.drawn) this.clearLines(this.drawn);

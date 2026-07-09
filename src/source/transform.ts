@@ -86,6 +86,25 @@ export class Transformer {
         }
     }
 
+    transformCaptureBytes(bytes: Uint8Array, filename: string, lang?: string, mapKey?: string): { code: string; sourceMap?: string | object } | null {
+        const kind = sourceKind(filename, lang);
+        switch (kind) {
+            case KIND_TS:
+            case KIND_TSX:
+            case KIND_JSX:
+                if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) return null;
+                if (!this.oxc) return null;
+                const result = this.oxc.transpileBytes(bytes, filename, mapKey);
+                if (result !== null) {
+                    log.debug('transformer', () => `oxc bytes: ${filename}`);
+                    return this.sourceMaps ? result : { code: result.code };
+                }
+                return null;
+            default:
+                return null;
+        }
+    }
+
     /**
      * Prepare source for CommonJS execution.
      * This only strips TS/JSX syntax from files already classified as CJS;

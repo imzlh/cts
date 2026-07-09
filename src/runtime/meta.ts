@@ -61,6 +61,7 @@ export function fillMeta(
     meta.dirname  = dirname(info.localPath);
     meta.main     = info.specPath === resolver.entry;
     meta.use      = import.meta.use;
+    meta.register = import.meta.register;
 
     // import.meta.resolve — reuse cached closure per specPath.
     // Returns localPath (usable as file path), not specPath (which may be

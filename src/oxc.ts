@@ -1,8 +1,10 @@
+import type CModuleExternalOxc from '../../ext-oxc/native';
 import { log, errMsg } from './utils';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const smap = import.meta.use('sourcemap');
+const console = import.meta.use('console');
 
 // ── oxc native extension types ────────────────────────────────────────────────
 
@@ -10,7 +12,9 @@ export interface OxcModule {
     transpile(source: string, opts?: OxcOptions): { code: string; deps: string[]; sourceMap?: string };
     scanImports(source: string, opts?: OxcOptions): string[];
     transpileFast?: (source: string, kind: OxcKind, filename: string) => OxcTransformResult;
+    transpileBytes?: (source: Uint8Array, kind: OxcKind, filename: string) => OxcTransformResult;
     scanImportsFast?: (source: string, kind: OxcKind) => string[];
+    scanImportsBytes?: (source: Uint8Array, kind: OxcKind) => string[];
     version: string;
 }
 
@@ -37,6 +41,9 @@ const OXC_SCAN_JS_OPTIONS: OxcOptions = { kind: 'js' };
 const OXC_SCAN_JSX_OPTIONS: OxcOptions = { kind: 'jsx' };
 const OXC_SCAN_TS_OPTIONS: OxcOptions = { kind: 'ts' };
 const OXC_SCAN_TSX_OPTIONS: OxcOptions = { kind: 'tsx' };
+const REGISTER_SYMBOL = Symbol.for('cjs.internal.register');
+
+type NativeRegister = (name: string, path: string) => void;
 
 export function isOxcModule(value: unknown): value is OxcModule {
     return value !== null
@@ -52,7 +59,9 @@ export class OxcTranspiler {
     private mod: OxcModule;
     private transpileOptions: OxcOptions = { kind: 'js', filename: '' };
     private transpileFast: ((source: string, kind: OxcKind, filename: string) => OxcTransformResult) | null = null;
+    private transpileBytesFn: ((source: Uint8Array, kind: OxcKind, filename: string) => OxcTransformResult) | null = null;
     private scanImportsFast: ((source: string, kind: OxcKind) => string[]) | null = null;
+    private scanImportsBytesFn: ((source: Uint8Array, kind: OxcKind) => string[]) | null = null;
     private scanLogged = false;
 
     constructor(mod: OxcModule) {
@@ -61,9 +70,17 @@ export class OxcTranspiler {
         if (typeof transpileFast === 'function') {
             this.transpileFast = transpileFast;
         }
+        const transpileBytes = Reflect.get(mod, 'transpileBytes');
+        if (typeof transpileBytes === 'function') {
+            this.transpileBytesFn = transpileBytes;
+        }
         const scanImportsFast = Reflect.get(mod, 'scanImportsFast');
         if (typeof scanImportsFast === 'function') {
             this.scanImportsFast = scanImportsFast;
+        }
+        const scanImportsBytes = Reflect.get(mod, 'scanImportsBytes');
+        if (typeof scanImportsBytes === 'function') {
+            this.scanImportsBytesFn = scanImportsBytes;
         }
         log.debug('oxc', () => `loaded ${mod.version}`);
     }
@@ -109,6 +126,16 @@ export class OxcTranspiler {
         }
     }
 
+    transpileBytes(source: Uint8Array, filename: string, mapKey?: string): { code: string; sourceMap?: string } | null {
+        if (!this.transpileBytesFn) return null;
+        try {
+            return this.transpileBytesFn(source, kindFromFilename(filename), mapKey ?? filename);
+        } catch (e) {
+            log.debug('oxc', () => `transpileBytes failed for ${filename}: ${errMsg(e)}`);
+            return null;
+        }
+    }
+
     /** Extract import specifiers without full codegen. */
     scanImports(source: string, filename: string): string[] | null {
         try {
@@ -123,6 +150,21 @@ export class OxcTranspiler {
             return deps;
         } catch (e) {
             log.debug('oxc', () => `scanImports failed for ${filename}: ${errMsg(e)}`);
+            return null;
+        }
+    }
+
+    scanImportsBytes(source: Uint8Array, filename: string): string[] | null {
+        if (!this.scanImportsBytesFn) return null;
+        try {
+            const deps = this.scanImportsBytesFn(source, kindFromFilename(filename));
+            if (!this.scanLogged) {
+                this.scanLogged = true;
+                log.debug('oxc', () => `scan active: ${filename}`);
+            }
+            return deps;
+        } catch (e) {
+            log.debug('oxc', () => `scanImportsBytes failed for ${filename}: ${errMsg(e)}`);
             return null;
         }
     }
@@ -204,20 +246,24 @@ export function oxcExtPath(): string | null {
     }
 }
 
+let localOxc: OxcTranspiler | null = null;
 /** Try to load and register the oxc native extension.
  *  Returns an OxcTranspiler on success, null if not found or failed to load. */
 export function tryLoadOxc(): OxcTranspiler | null {
+    if (localOxc) return localOxc;
+
     const extPath = oxcExtPath();
     if (!extPath) return null;
 
     try {
         import.meta.register('oxc', extPath);
-        const oxcMod: unknown = import.meta.use('oxc');
+        const oxcMod: typeof CModuleExternalOxc = import.meta.use('oxc') as any;
         if (!isOxcModule(oxcMod)) {
             log.debug('oxc', () => `register succeeded but module API unexpected`);
             return null;
         }
-        return new OxcTranspiler(oxcMod);
+        localOxc = new OxcTranspiler(oxcMod);
+        return localOxc;
     } catch (e) {
         log.debug('oxc', () => `not available at ${extPath}: ${errMsg(e)}`);
         return null;

@@ -6,10 +6,10 @@ import { guessFileKind } from './base';
 import { expectFetch, StepType, type Flow, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname } from '../../utils/path';
 import { cacheFilename } from '../../utils/misc';
-declare const URL: typeof globalThis.URL;
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
 import { err, ErrorKind } from '../../errors';
+import { URL } from '../../utils/url';
 
 export class HttpHandler implements ProtocolHandler {
     readonly protocols = ['http', 'https'];

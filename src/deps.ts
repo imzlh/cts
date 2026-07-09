@@ -1,8 +1,8 @@
 import type { RuntimeConfig } from './types';
 import { ModuleResolver } from './resolve/index';
-import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName } from './utils';
+import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative } from './utils';
 import type { OxcTranspiler } from './oxc';
-import { extractImports, hasImportExportOrRequire, isScannablePath, isTsLikePath, isWasmPath } from './scan';
+import { extractImports, isScannablePath, isTsLikePath, isWasmPath } from './scan';
 
 const engine = import.meta.use('engine');
 const asyncfs = import.meta.use('asyncfs');
@@ -15,7 +15,6 @@ async function extractImportsFast(
     isTs: boolean,
     acc: OxcTranspiler | null,
 ): Promise<string[]> {
-    if (!hasImportExportOrRequire(source)) return [];
     if (acc) {
         try {
             const deps = acc.scanImports(source, filename);
@@ -53,6 +52,31 @@ function isEligibleParent(parent: string): boolean {
     return parent.startsWith('npm:') || parent.endsWith('/<cache>') || parent.endsWith('/<entry>');
 }
 
+function barePackageName(spec: string): string | null {
+    if (!spec ||
+        isRelative(spec) ||
+        spec.startsWith('/') ||
+        spec.startsWith('#') ||
+        /^[a-z][a-z0-9+\-.]*:/i.test(spec)) {
+        return null;
+    }
+    if (spec.startsWith('@')) {
+        const firstSlash = spec.indexOf('/');
+        if (firstSlash <= 1) return null;
+        const secondSlash = spec.indexOf('/', firstSlash + 1);
+        return secondSlash === -1 ? spec : spec.slice(0, secondSlash);
+    }
+    const slash = spec.indexOf('/');
+    return slash === -1 ? spec : spec.slice(0, slash);
+}
+
+function shouldEnqueueScannedImport(parentSpecPath: string, spec: string): boolean {
+    if (!parentSpecPath.startsWith('npm:')) return true;
+    const childPackage = barePackageName(spec);
+    if (!childPackage) return true;
+    return childPackage === npmPackageName(parentSpecPath);
+}
+
 export class DepScanner {
     private readonly seen = new Set<string>();
     private readonly errs: ScanResult['errors'] = [];
@@ -65,7 +89,7 @@ export class DepScanner {
         private readonly cfg: RuntimeConfig,
         private readonly prog: PrecacheProgress | null = null,
         private readonly oxc: OxcTranspiler | null = null,
-        private readonly parseImports: ((source: string, localPath: string) => Promise<string[]>) | null = null,
+        private readonly parseImports: ((localPath: string) => Promise<string[]>) | null = null,
     ) { }
 
     async scan(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
@@ -268,19 +292,20 @@ export class DepScanner {
         }
         if (!isScannablePath(localPath)) return [];
         try {
-            const bytes = await asyncfs.readFile(localPath);
-            const src = engine.decodeString(bytes);
-            if (!hasImportExportOrRequire(src)) return [];
             let imports: string[];
             if (this.parseImports) {
-                imports = await this.parseImports(src, localPath);
+                imports = await this.parseImports(localPath);
             } else {
+                const bytes = await asyncfs.readFile(localPath);
+                const src = engine.decodeString(bytes);
                 imports = await extractImportsFast(src, localPath, isTsLikePath(localPath), this.cfg.enableOxc !== false ? this.oxc : null);
             }
             const out: Array<{ spec: string; parent: string }> = [];
             for (let i = 0; i < imports.length; i++) {
                 const spec = imports[i];
-                if (spec !== undefined) out.push({ spec, parent: specPath });
+                if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec)) {
+                    out.push({ spec, parent: specPath });
+                }
             }
             return out;
         } catch { return []; }

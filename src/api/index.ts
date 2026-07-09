@@ -18,7 +18,7 @@ export { fatal, formatError, err, ErrorKind, TransformError } from '../errors';
 export {
     log, errMsg, uname, isWindows, stripJsonc,
     dirname, normalizePath, isAbsolute, joinPaths, cwd, toPosixPath,
-    resolvePath, isRelative, extname, canonicalizePath,
+    resolvePath, resolveFile, isRelative, extname, canonicalizePath,
 } from '../utils';
 export { createResourceManager, ResourceManager } from '../runtime/resources';
 export type {

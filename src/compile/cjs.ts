@@ -15,12 +15,12 @@ import { err, ErrorKind } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { guessFileKind } from '../resolve/protocols/base';
 import { createCtx, detectFormat, detectPackageJsonFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
+import { URL } from '../utils/url';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const napi = import.meta.use('nodeapi');
 const NativeFunction = globalThis.Function;
-declare const URL: typeof globalThis.URL;
 
 // ---------------------------------------------------------------------------
 // Types

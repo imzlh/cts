@@ -129,6 +129,15 @@ function lifecycleEnv(cwd: string): Record<string, string> {
     return env;
 }
 
+async function drainPipe(pipe: CModuleProcess.Pipe | null): Promise<void> {
+    if (!pipe) return;
+    const buf = new Uint8Array(64 * 1024);
+    for (;;) {
+        const n = await pipe.read(buf);
+        if (n === 0) return;
+    }
+}
+
 /** Nearest ancestor of `start` containing a project manifest, or undefined. */
 function findProjectRoot(start: string): string | undefined {
     let cur = toPosixPath(start);
@@ -336,8 +345,10 @@ export class TypeScriptRuntime {
                     (done, total) => prog?.setLinkProgress(done, total),
                 );
             } catch (e) {
+                prog?.clearForOutput();
                 log.warn('precache', () => `node_modules materialization failed: ${errMsg(e)}`);
             }
+            prog?.stop();
             log.debug('precache', () => 'materialize node_modules end');
         }
 
@@ -345,7 +356,7 @@ export class TypeScriptRuntime {
         if (!this.config.ignoreScripts) {
             log.debug('precache', () => 'lifecycle scripts begin');
             try {
-                const count = await this.runLifecycleScripts();
+                const count = await this.runLifecycleScripts(prog);
                 if (count > 0 && result.errors.length > 0) {
                     clearNegativeCache();
                     await this.retryScanErrors(result);
@@ -359,15 +370,29 @@ export class TypeScriptRuntime {
             log.debug('precache', () => 'lifecycle scripts end');
         }
 
-        for (const { spec, parent, error } of result.errors)
-            log.warn('deps', () => `"${spec}" from "${parent}": ${error}`);
+        let softNpmErrors = 0;
+        const fatalErrors: ScanResult['errors'] = [];
+        for (const item of result.errors) {
+            if (item.parent.startsWith('npm:')) {
+                softNpmErrors++;
+                log.debug('deps', () => `ignored npm-internal "${item.spec}" from "${item.parent}": ${item.error}`);
+            } else {
+                fatalErrors.push(item);
+                prog?.clearForOutput();
+                log.warn('deps', () => `"${item.spec}" from "${item.parent}": ${item.error}`);
+            }
+        }
+        if (softNpmErrors > 0) {
+            prog?.clearForOutput();
+            log.warn('deps', () => `${softNpmErrors} npm-internal dependency error(s) ignored during precache`);
+        }
         log.debug('precache', () => `scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
         this.resolver.rewriteLock();
-        if (result.errors.length > 0) {
+        if (fatalErrors.length > 0) {
             prog?.stop();
             this.resources.release();
             await parseDriver.terminate();
-            throw new Error(`Precache failed with ${result.errors.length} dependency error(s)`);
+            throw new Error(`Precache failed with ${fatalErrors.length} dependency error(s)`);
         }
 
         const scannableModules: Array<{ specPath: string; localPath: string }> = [];
@@ -436,7 +461,7 @@ export class TypeScriptRuntime {
         result.errors.splice(0, result.errors.length, ...remaining);
     }
 
-    private async runLifecycleScripts(): Promise<number> {
+    private async runLifecycleScripts(progress: PrecacheProgress | null = null): Promise<number> {
         const scripts = this.resolver.drainLifecycleScripts();
         if (!scripts.length) return 0;
         const isWin = isWindows;
@@ -445,6 +470,7 @@ export class TypeScriptRuntime {
         for (const { name, version, dir, lifecycle, script } of scripts) {
             log.debug('lifecycle', () => `${lifecycle} ${name}@${version}: ${script}`);
             if (!this.config.silent) {
+                progress?.clearForOutput();
                 console.log(`  ${lifecycle}: ${name}@${version}`);
             }
             let code: number;
@@ -452,13 +478,15 @@ export class TypeScriptRuntime {
                 code = await this.runLifecycleScript(script, dir, shell, shellArg);
             } catch (e) {
                 const message = `${lifecycle} ${name}@${version} failed: ${errMsg(e)}`;
+                progress?.clearForOutput();
                 log.warn('lifecycle', () => message);
-                throw new Error(message);
+                continue;
             }
             if (code !== 0) {
                 const message = `${lifecycle} ${name}@${version} exited with code ${code}`;
+                progress?.clearForOutput();
                 log.warn('lifecycle', () => message);
-                throw new Error(message);
+                continue;
             }
         }
         return scripts.length;
@@ -475,11 +503,14 @@ export class TypeScriptRuntime {
         const child = process.spawn(argv, {
             cwd,
             stdin: 'inherit',
-            stdout: 'inherit',
-            stderr: 'inherit',
+            stdout: 'pipe',
+            stderr: 'pipe',
             env: lifecycleEnv(cwd),
         });
+        const stdout = drainPipe(child.stdout);
+        const stderr = drainPipe(child.stderr);
         const info = await child.wait();
+        await Promise.allSettled([stdout, stderr]);
         return info.exit_status ?? 0;
     }
 
