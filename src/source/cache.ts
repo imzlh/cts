@@ -18,7 +18,8 @@ function removeCacheFiles(paths: { jsc: string; mt: string }): void {
 export function isRemote(specPath: string): boolean {
     return specPath.startsWith('http://') || specPath.startsWith('https://')
         || specPath.startsWith('jsr:') || specPath.startsWith('npm:')
-        || specPath.startsWith('node:');
+        || specPath.startsWith('node:') || specPath.startsWith('pack:')
+        || specPath.startsWith('ctsview:');
 }
 
 export class JscCache {
@@ -100,11 +101,25 @@ export class JscCache {
     }
 
     load(localPath: string, remote: boolean, cachedMtime?: number): CModuleEngine.Module | null {
+        return this.loadRaw(localPath, remote, cachedMtime) as CModuleEngine.Module | null;
+    }
+
+    /**
+     * Same lookup/freshness logic as `load()`, but for cached values that are
+     * not a `Module` — e.g. a CJS script compiled with `EVAL_COMPILE_ONLY`
+     * (see `CjsLoader`). Returns the raw `engine.deserialize()` result
+     * untyped; callers know what shape to expect from what they persisted.
+     */
+    loadCompiled(localPath: string, remote: boolean, cachedMtime?: number): unknown | null {
+        return this.loadRaw(localPath, remote, cachedMtime);
+    }
+
+    private loadRaw(localPath: string, remote: boolean, cachedMtime?: number): unknown | null {
         // L1: in-memory bytecode
         const bc = this.memory.get(localPath);
         if (bc) {
             try {
-                const mod = engine.deserialize(new Uint8Array(bc)) as CModuleEngine.Module;
+                const mod = engine.deserialize(new Uint8Array(bc));
                 this.memory.delete(localPath);
                 return mod;
             } catch (e) {
@@ -121,7 +136,7 @@ export class JscCache {
                 return null;
             }
             try {
-                return engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))) as CModuleEngine.Module;
+                return engine.deserialize(new Uint8Array(fs.readFile(paths.jsc)));
             } catch {
                 removeCacheFiles(paths);
                 return null;
@@ -144,10 +159,28 @@ export class JscCache {
         }
 
         try {
-            return engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))) as CModuleEngine.Module;
+            return engine.deserialize(new Uint8Array(fs.readFile(paths.jsc)));
         } catch {
             log.debug('jsc', () => `disk deserialize failed: ${paths.jsc}`);
             removeCacheFiles(paths);
+            return null;
+        }
+    }
+
+    /**
+     * Raw on-disk `.jsc` bytes for `localPath`, without ever calling
+     * `engine.deserialize()`. Used by `cno pack` to copy already-cached
+     * bytecode straight into a `.jspack` blob. Same freshness/lookup rules
+     * as `loadRaw()`; returns null on any cache miss (including L1 memory —
+     * pack only wants durable, already-persisted bytecode).
+     */
+    loadRawBytes(localPath: string, remote: boolean, cachedMtime?: number): ArrayBuffer | null {
+        const paths = remote ? this.remoteCachePaths(localPath) : this.localCachePath(localPath);
+        if (!paths) return null;
+        if (!this.hasFreshFile(paths, localPath, cachedMtime)) return null;
+        try {
+            return fs.readFile(paths.jsc);
+        } catch {
             return null;
         }
     }

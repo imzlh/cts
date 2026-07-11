@@ -1,6 +1,7 @@
-import type { RuntimeConfig } from './types';
+import type { RuntimeConfig, ModuleFormat } from './types';
 import { ModuleResolver } from './resolve/index';
 import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative } from './utils';
+import { isRemote } from './source/cache';
 import type { OxcTranspiler } from './oxc';
 import { extractImports, isScannablePath, isTsLikePath, isWasmPath } from './scan';
 
@@ -38,12 +39,23 @@ export interface ScanResult {
     visited: number;
     downloaded: number;
     errors: Array<{ spec: string; parent: string; error: string }>;
-    modules: Array<{ specPath: string; localPath: string }>;
+    modules: Array<{ specPath: string; localPath: string; format: ModuleFormat; remote: boolean }>;
     // Parent -> resolved-child edges, used to materialize a real node_modules
     // tree (node_modules mode). Only npm: children with an eligible parent
     // (an npm: package, or a synthetic project-root scan seed) are recorded —
     // see isEligibleParent().
     edges: Array<{ parentSpecPath: string; name: string; childSpecPath: string; childLocalPath: string }>;
+    /** Complete resolver edges for consumers that need an offline module graph. */
+    resolutions: Array<{ parentSpecPath: string; specifier: string; childSpecPath: string }>;
+}
+
+export interface DepScannerOptions {
+    /** Traverse cross-package npm imports and retain every resolved edge. */
+    fullGraph?: boolean;
+    /** Print the generic scan module-count summary. */
+    reportSummary?: boolean;
+    /** Resolve an edge but omit the matched module and its descendants. */
+    excludeSpecPath?: (specPath: string) => boolean;
 }
 
 /** Parents worth recording node_modules edges for: real npm packages, and the
@@ -70,7 +82,10 @@ function barePackageName(spec: string): string | null {
     return slash === -1 ? spec : spec.slice(0, slash);
 }
 
-function shouldEnqueueScannedImport(parentSpecPath: string, spec: string): boolean {
+function shouldEnqueueScannedImport(parentSpecPath: string, spec: string, fullGraph: boolean): boolean {
+    // Pack needs the complete transitive closure in the container; precache prunes
+    // cross-package npm imports (the npm tree is materialized/cached separately).
+    if (fullGraph) return true;
     if (!parentSpecPath.startsWith('npm:')) return true;
     const childPackage = barePackageName(spec);
     if (!childPackage) return true;
@@ -82,6 +97,7 @@ export class DepScanner {
     private readonly errs: ScanResult['errors'] = [];
     private readonly found: ScanResult['modules'] = [];
     private readonly edges: ScanResult['edges'] = [];
+    private readonly resolutions: ScanResult['resolutions'] = [];
     private downloaded = 0;
 
     constructor(
@@ -90,6 +106,7 @@ export class DepScanner {
         private readonly prog: PrecacheProgress | null = null,
         private readonly oxc: OxcTranspiler | null = null,
         private readonly parseImports: ((localPath: string) => Promise<string[]>) | null = null,
+        private readonly options: DepScannerOptions = {},
     ) { }
 
     async scan(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
@@ -104,7 +121,7 @@ export class DepScanner {
     async scanFromSpecifiers(specifiers: string[], parentDir: string): Promise<ScanResult> {
         this.init();
         if (!specifiers.length) {
-            return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [] };
+            return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [], resolutions: [] };
         }
         const parent = `${parentDir}/<cache>`;
         const seeds: Array<{ spec: string; parent: string }> = [];
@@ -139,6 +156,7 @@ export class DepScanner {
         this.errs.length = 0;
         this.found.length = 0;
         this.edges.length = 0;
+        this.resolutions.length = 0;
         this.downloaded = 0;
     }
 
@@ -174,7 +192,7 @@ export class DepScanner {
 
         // Guard: empty seed list — nothing to do
         if (pending === 0) {
-            return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [] };
+            return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [], resolutions: [] };
         }
 
         const CONCURRENCY = { low: 4, normal: 8, high: 16 }[getMemoryTier()] ?? 8;
@@ -203,6 +221,14 @@ export class DepScanner {
                     if (didDownload) this.downloaded++;
                     this.prog?.bumpResolved();
                     this.prog?.finishDownload(item.spec);
+                    if (this.options.fullGraph === true) {
+                        this.resolutions.push({
+                            parentSpecPath: item.parent,
+                            specifier: item.spec,
+                            childSpecPath: info.specPath,
+                        });
+                    }
+                    if (this.options.excludeSpecPath?.(info.specPath) === true) continue;
 
                     // Record the parent -> resolved-child edge unconditionally
                     // (even if this child was already visited via a different
@@ -227,7 +253,7 @@ export class DepScanner {
 
                     if (!this.seen.has(info.specPath)) {
                         this.seen.add(info.specPath);
-                        this.found.push({ specPath: info.specPath, localPath: info.localPath });
+                        this.found.push({ specPath: info.specPath, localPath: info.localPath, format: info.format, remote: isRemote(info.specPath) });
 
                         // parseOne self-gates on extension and tolerates a missing
                         // file (readFile failure → []), so no extra fs.exists stat.
@@ -255,11 +281,18 @@ export class DepScanner {
         // discovered by the active worker instead of making the scan serial.
         await Promise.all(Array.from({ length: CONCURRENCY }, () => rootedWorker()));
 
-        if (!this.cfg.silent) {
+        if (!this.cfg.silent && this.options.reportSummary !== false) {
             const e = this.errs.length ? `, ${this.errs.length} error(s)` : '';
             log.info(`✅ ${this.seen.size} modules${e}`);
         }
-        return { visited: this.seen.size, downloaded: this.downloaded, errors: [...this.errs], modules: this.found, edges: [...this.edges] };
+        return {
+            visited: this.seen.size,
+            downloaded: this.downloaded,
+            errors: [...this.errs],
+            modules: this.found,
+            edges: [...this.edges],
+            resolutions: [...this.resolutions],
+        };
     }
 
     // -------------------------------------------------------------------------
@@ -290,7 +323,7 @@ export class DepScanner {
                 return [];
             }
         }
-        if (!isScannablePath(localPath)) return [];
+        if (!isScannablePath(localPath) && !this.parseImports) return [];
         try {
             let imports: string[];
             if (this.parseImports) {
@@ -303,7 +336,7 @@ export class DepScanner {
             const out: Array<{ spec: string; parent: string }> = [];
             for (let i = 0; i < imports.length; i++) {
                 const spec = imports[i];
-                if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec)) {
+                if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec, this.options.fullGraph === true)) {
                     out.push({ spec, parent: specPath });
                 }
             }

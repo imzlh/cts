@@ -16,10 +16,17 @@ export interface ModuleInfo {
     fileKind:  FileKind;
     /** QuickJS-facing runtime identity when a request needs a non-canonical module view. */
     moduleId?: string;
+    /** Some source modules cannot safely round-trip through serialized bytecode. */
+    cacheBytecode?: boolean;
 }
 
 export function moduleRef(info: Pick<ModuleInfo, 'specPath' | 'moduleId'>): string {
     return info.moduleId ?? info.specPath;
+}
+
+/** Collision-free runtime identity for alternate text/bytes/json views. */
+export function moduleViewRef(specPath: string, fileKind: FileKind): string {
+    return `ctsview:${fileKind}/${encodeURIComponent(specPath)}`;
 }
 
 export interface LifecycleScriptEntry {

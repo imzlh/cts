@@ -163,6 +163,17 @@ export function resolvePath(...parts: string[]): string {
     return normalizePath(r);
 }
 
+/** POSIX-relative path from `base` to `target`, or null if `target` isn't under `base`. */
+export function relativePath(base: string, target: string): string | null {
+    let b = normalizePath(toPosixPath(base));
+    const t = normalizePath(toPosixPath(target));
+    if (b.endsWith('/')) b = b.slice(0, -1);
+    if (t === b) return '';
+    const prefix = b + '/';
+    if (!t.startsWith(prefix)) return null;
+    return t.slice(prefix.length);
+}
+
 export function isAbsolute(p: string): boolean {
     if (p.startsWith('/')) return true;
     if (uname.sysname.includes('Windows') && p.length >= 3 && p[1] === ':' && (p[2] === '/' || p[2] === '\\') && isAsciiAlpha(p.charCodeAt(0))) {

@@ -1,4 +1,4 @@
-import { moduleRef, type RuntimeConfig, type ModuleInfo, type NodeBuiltinResolver, type FileKind, type LifecycleScriptEntry } from '../types';
+import { moduleRef, moduleViewRef, type RuntimeConfig, type ModuleInfo, type NodeBuiltinResolver, type FileKind, type LifecycleScriptEntry } from '../types';
 import type { ProtocolHandler } from './protocols/base';
 import type { ProgressCallback } from '../flow';
 import { err, ErrorKind } from '../errors';
@@ -147,6 +147,11 @@ export class ModuleResolver {
         for (const p of h.protocols) this.handlers.set(p, h);
     }
 
+    /** Register a `pack:` handler for an active .jspack container run (see pack/reader.ts). */
+    registerPackHandler(h: ProtocolHandler): void {
+        this.reg(h);
+    }
+
     set entry(s: string) { this.mainEntry = s; }
     get entry(): string  { return this.mainEntry; }
 
@@ -225,6 +230,14 @@ export class ModuleResolver {
     private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
         if (isBuiltinSpecifier(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
+        // A packed module's bare imports were already resolved offline at
+        // pack time (see pack/writer.ts's edges table) — everything else
+        // (npm resolution, alias lookups) is meaningless without the real
+        // project directory a packed run doesn't have.
+        if (protoOf(parent) === 'pack') {
+            const handler = this.handlers.get('pack');
+            if (handler) return runAsync(handler.resolve(spec, parent, attr, onProgress));
+        }
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {
@@ -359,6 +372,7 @@ export class ModuleResolver {
     /** Clear runtime-only resolution caches while keeping persistent handler state intact. */
     clearRuntimeCaches(): void {
         this.runtimeModules.clear();
+        this.packParentsByLocalPath.clear();
         this.resolvedModules.clear();
         this.resolveCache.clear();
         this.sourceInfoCache.clear();
@@ -440,6 +454,10 @@ export class ModuleResolver {
     private resolveBare(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         if (spec.startsWith('@std/')) return this.dispatch(`jsr:${spec}`, parent, attr);
         if (isBuiltinSpecifier(spec)) return this.dispatch(`node:${spec}`, parent, attr);
+        if (protoOf(parent) === 'pack') {
+            const handler = this.handlers.get('pack');
+            if (handler) return runSync(handler.resolve(spec, parent, attr));
+        }
         const aliased = this.applyPathAlias(spec);
         if (aliased !== spec) {
             try {
@@ -626,6 +644,16 @@ export class ModuleResolver {
     private rememberRuntimeInfo(info: ModuleInfo): void {
         const ref = moduleRef(info);
         if (ref !== info.specPath) this.runtimeModules.set(ref, info);
+        if (protoOf(info.specPath) === 'pack') {
+            this.packParentsByLocalPath.set(normalizePath(info.localPath), info.specPath);
+        }
+    }
+
+    private readonly packParentsByLocalPath = new Map<string, string>();
+
+    /** Recover the synthetic parent id for a materialized file inside a pack. */
+    packParentRef(localPath: string): string | null {
+        return this.packParentsByLocalPath.get(normalizePath(localPath)) ?? null;
     }
 
     private toCanonicalInfo(info: ModuleInfo): ModuleInfo {
@@ -640,7 +668,7 @@ export class ModuleResolver {
         return {
             ...info,
             fileKind,
-            moduleId: `${info.specPath}#cts-view=${fileKind}`,
+            moduleId: moduleViewRef(info.specPath, fileKind),
         };
     }
 

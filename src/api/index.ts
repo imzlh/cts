@@ -13,11 +13,15 @@ export {
 } from '../parse';
 export { fatal, formatError, err, ErrorKind, TransformError } from '../errors';
 export {
-    log, errMsg, uname, isWindows, stripJsonc,
+    log, errMsg, fmtBytes, uname, isWindows, stripJsonc,
     dirname, normalizePath, isAbsolute, joinPaths, cwd, toPosixPath,
-    resolvePath, resolveFile, isRelative, extname, canonicalizePath,
+    resolvePath, resolveFile, isRelative, extname, canonicalizePath, basename,
 } from '../utils';
 export { createResourceManager, ResourceManager } from '../runtime/resources';
+export { writePack } from '../pack/writer';
+export type { WritePackOptions } from '../pack/writer';
+export { loadPack } from '../pack/reader';
+export type { PackManifest, PackModuleEntry } from '../pack/format';
 export type {
     ModuleInfo, ModuleFormat, FileKind,
     ConfigOptions, RuntimeConfig, PackageJson,

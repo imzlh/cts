@@ -134,7 +134,8 @@ export class EsmCompiler {
         const remote = isRemote(info.specPath);
         const needsTransform = !remote && isTransformSourcePath(info.localPath);
         const needsCompile  = !remote && !needsTransform && isCompiledSourcePath(info.localPath);
-        const cacheable = this.cfg.enableCache !== false && (remote || needsTransform || needsCompile);
+        const cacheable = info.cacheBytecode !== false && this.cfg.enableCache !== false &&
+            (remote || needsTransform || needsCompile);
 
         // L1: JSC bytecode cache (in-memory from precompile, or on-disk .jsc)
         if (cacheable) {

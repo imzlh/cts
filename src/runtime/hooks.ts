@@ -42,8 +42,9 @@ export function installEngineHooks(
     resolver: ModuleResolver,
     compiler: ModuleCompiler,
     callbacks: EngineHookCallbacks = {},
+    expectedReplacement = false,
 ): EngineHooks {
-    if (activeInstall) log.warn('runtime', () => 'engine.onModule re-installed — prior runtime hooks replaced');
+    if (activeInstall && !expectedReplacement) log.warn('runtime', () => 'engine.onModule re-installed — prior runtime hooks replaced');
     activeInstall = true;
 
     // Dedup: QuickJS does not cache dynamic import() results, so the

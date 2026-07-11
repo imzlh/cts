@@ -127,6 +127,16 @@ export class BinResolver {
         return `Package '${pkg.name ?? parsed.name}@${version}' declares a bin, but its target file is missing from the CTS cache.`;
     }
 
+    npmPackageSpecifier(name: string): string | null {
+        if (!name.startsWith('npm:') &&
+            (name.startsWith('/') || name.startsWith('.') || name.includes('/') || name.startsWith('-'))) {
+            return null;
+        }
+        const parsed = parseNpmExecSpec(name);
+        if (!parsed) return null;
+        return `npm:${parsed.name}@${parsed.version}`;
+    }
+
     private resolveLockBin(name: string): ResolvedBin | null {
         const lockBin = this.lockStore.getBin(name);
         return lockBin ? this.resolveEntry(lockBin.path) : null;

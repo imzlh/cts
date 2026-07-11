@@ -174,7 +174,7 @@ export class TypeScriptRuntime {
     readonly config: RuntimeConfig;
     readonly resources: ResourceManager;
     private readonly initHooks: Array<(specPath: string, info: ModuleInfo) => void> = [];
-    private readonly engineHooks: EngineHooks;
+    private engineHooks: EngineHooks;
     private readonly oxc: OxcTranspiler | null;
 
     /** Register an additional callback to fire after each module's init hook. */
@@ -200,8 +200,16 @@ export class TypeScriptRuntime {
         this.oxc = cfg.enableOxc === false ? null : tryLoadOxc();
         if (this.oxc) this.compiler.setOxc(this.oxc);
 
-        // Install engine hooks
-        this.engineHooks = installEngineHooks(this.resolver, this.compiler, {
+        this.engineHooks = this.installHooks();
+
+        this.hookEvents();
+
+        // Register handler cache cleanup
+        this.resources.register(() => this.resolver.clearHandlerCaches());
+    }
+
+    private installHooks(expectedReplacement = false): EngineHooks {
+        return installEngineHooks(this.resolver, this.compiler, {
             onInitHook: (specPath, info) => {
                 for (const fn of this.initHooks) {
                     try {
@@ -210,12 +218,23 @@ export class TypeScriptRuntime {
                 }
             },
             onSyntaxError: (e) => this.reportSyntax(e),
-        });
+        }, expectedReplacement);
+    }
 
-        this.hookEvents();
-
-        // Register handler cache cleanup
-        this.resources.register(() => this.resolver.clearHandlerCaches());
+    /**
+     * Swaps in a throwaway engine.onModule loader for the duration of `fn`,
+     * then restores the runtime's normal hooks — see pack/writer.ts.
+     */
+    async withStubModuleLoader<T>(
+        loader: { resolve(spec: string, parent: string, attr?: Record<string, unknown>): string; load(specPath: string): CModuleEngine.Module },
+        fn: () => Promise<T>,
+    ): Promise<T> {
+        engine.onModule({ resolve: loader.resolve, load: loader.load, init: () => {}, attrchk: () => {} });
+        try {
+            return await fn();
+        } finally {
+            this.engineHooks = this.installHooks(true);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -390,12 +409,18 @@ export class TypeScriptRuntime {
             throw new Error(`Precache failed with ${fatalErrors.length} dependency error(s)`);
         }
 
-        const scannableModules: Array<{ specPath: string; localPath: string }> = [];
-        const toCompile: Array<{ specPath: string; localPath: string }> = [];
+        const scannableModules: ScanResult['modules'] = [];
+        const toCompile: ScanResult['modules'] = [];
+        // CJS bytecode is always cached under the local (hashed) strategy,
+        // never next to the file — see CjsLoader's loadCjsCompiled/
+        // persistCjsCompiled in compile/bridge.ts, which has no specPath
+        // (only localPath) to derive true remote-ness from at read time.
+        const cacheRemote = (m: { format: ModuleFormat; specPath: string }) =>
+            m.format === 'cjs' ? false : isRemote(m.specPath);
         for (const m of result.modules) {
             if (!isPrecompilePath(m.localPath)) continue;
             scannableModules.push(m);
-            if (!this.compiler.esm.jsc.hasFresh(m.localPath, isRemote(m.specPath))) {
+            if (!this.compiler.esm.jsc.hasFresh(m.localPath, cacheRemote(m))) {
                 toCompile.push(m);
             }
         }
@@ -406,12 +431,15 @@ export class TypeScriptRuntime {
                 prog?.setCompileProgress(0, toCompile.length);
                 // Stream each bytecode straight to disk and drop it — never hold
                 // the whole graph's bytecode in memory (peak RSS bound).
+                const formatByLocalPath = new Map(toCompile.map(m => [m.localPath, m.format]));
                 let written = 0;
                 await parseDriver.compileModules(
                     toCompile,
                     (done, total) => prog?.setCompileProgress(done, total),
                     (localPath, bc, specPath) => {
-                        this.compiler.esm.jsc.persistBytecode(localPath, bc, isRemote(specPath));
+                        const format = formatByLocalPath.get(localPath);
+                        const remote = format === 'cjs' ? false : isRemote(specPath);
+                        this.compiler.esm.jsc.persistBytecode(localPath, bc, remote);
                         written++;
                     },
                 );
@@ -444,7 +472,7 @@ export class TypeScriptRuntime {
                 const info = await this.resolver.resolveAsync(item.spec, item.parent);
                 if (!known.has(info.specPath)) {
                     known.add(info.specPath);
-                    result.modules.push({ specPath: info.specPath, localPath: info.localPath });
+                    result.modules.push({ specPath: info.specPath, localPath: info.localPath, format: info.format, remote: isRemote(info.specPath) });
                 }
                 log.debug('deps', () => `retry ok "${item.spec}" from "${item.parent}"`);
             } catch (e) {

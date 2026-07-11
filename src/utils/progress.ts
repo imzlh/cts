@@ -97,9 +97,11 @@ export class PrecacheProgress {
     private startMs = Date.now();
 
     readonly maxLines: number;
+    private readonly title: string;
 
-    constructor(maxLines = 5) {
+    constructor(maxLines = 5, title = 'Precaching') {
         this.maxLines = maxLines;
+        this.title = title;
     }
 
     // ---- Scan phase ----
@@ -235,7 +237,7 @@ export class PrecacheProgress {
         if (this.speed > 1024)
             parts.push(C.dim(`${fmtBytes(this.speed)}/s`));
 
-        const lines = [`${spin} ${C.bold('Precaching')}: ${parts.join(', ')} ${C.dim(`${elapsedStr}s`)}`];
+        const lines = [`${spin} ${C.bold(this.title)}: ${parts.join(', ')} ${C.dim(`${elapsedStr}s`)}`];
 
         // Detail lines: keep render cost independent from total resolved count.
         const activeLimit = this.lastFinished ? this.maxLines - 1 : this.maxLines;

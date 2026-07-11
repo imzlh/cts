@@ -139,6 +139,18 @@ export function buildCjsDeps(
         prepareSource(code: string, filePath: string): string | null {
             return esm.transformer.transformForCjs(code, filePath);
         },
+
+        loadCjsCompiled(localPath: string): unknown | null {
+            return esm.jsc.loadCompiled(localPath, false);
+        },
+
+        persistCjsCompiled(localPath: string, bytes: ArrayBuffer): void {
+            esm.jsc.persistBytecode(localPath, bytes, false);
+        },
+
+        runtimeParent(localPath: string): string | null {
+            return resolver.packParentRef(localPath);
+        },
     };
 }
 

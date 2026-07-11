@@ -21,7 +21,9 @@ export function extractImports(source: string, isTs = true): string[] {
             if (!next) continue;
             if (next.type === tt.parenL) {
                 const specToken = tokens[i + 2];
-                if (specToken && specToken.type === tt.string) {
+                const afterSpec = tokens[i + 3];
+                if (specToken && specToken.type === tt.string &&
+                    afterSpec && (afterSpec.type === tt.parenR || afterSpec.type === tt.comma)) {
                     specs ??= new Set<string>();
                     specs.add(source.slice(specToken.start + 1, specToken.end - 1));
                 }
@@ -68,13 +70,28 @@ export function extractImports(source: string, isTs = true): string[] {
         if (tok.type === tt.name &&
             isRequireToken(source, tok.start, tok.end) &&
             parenToken && parenToken.type === tt.parenL &&
-            specToken && specToken.type === tt.string)
+            specToken && specToken.type === tt.string &&
+            tokens[i + 3]?.type === tt.parenR)
         {
             specs ??= new Set<string>();
             specs.add(source.slice(specToken.start + 1, specToken.end - 1));
         }
     }
     return specs ? [...specs] : [];
+}
+
+/** Bytecode serialization currently drops import attributes; keep affected
+ * modules on the source-compile path when loading a portable pack. */
+export function hasImportAttributes(source: string, isTs = true): boolean {
+    try {
+        const tokens = parse(source, true, isTs, false).tokens;
+        for (const tok of tokens) {
+            if (tok.type === tt._with || tok.contextualKeyword === ContextualKeyword._assert) return true;
+        }
+    } catch {
+        // The normal transform path will report the syntax error later.
+    }
+    return false;
 }
 
 type Tokens = ReturnType<typeof parse>['tokens'];

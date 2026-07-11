@@ -9,18 +9,18 @@ const worker = import.meta.use('worker');
 // ---------------------------------------------------------------------------
 
 export enum ErrorKind {
-    ModuleNotFound  = 'module-not-found',
-    SyntaxError     = 'syntax-error',
-    NetworkError    = 'network-error',
-    PermissionError = 'permission-error',
-    VersionNotFound = 'version-not-found',
-    LockFrozen      = 'lock-frozen',
-    TaskNotFound    = 'task-not-found',
-    TransformError  = 'transform-error',
-    ProtocolDisabled = 'protocol-disabled',
-    InvalidSpecifier = 'invalid-specifier',
-    FileNotFound    = 'file-not-found',
-    Generic         = 'generic',
+    ModuleNotFound  = 1,
+    SyntaxError     = 2,
+    NetworkError    = 3,
+    PermissionError = 4,
+    VersionNotFound = 5,
+    LockFrozen      = 6,
+    TaskNotFound    = 7,
+    TransformError  = 8,
+    ProtocolDisabled = 9,
+    InvalidSpecifier = 10,
+    FileNotFound    = 11,
+    Generic         = 12,
 }
 
 export class TransformError extends Error {
@@ -46,7 +46,7 @@ declare global {
 }
 
 function isErrorKind(value: unknown): value is ErrorKind {
-    return typeof value === 'string' && Object.values<string>(ErrorKind).includes(value);
+    return typeof value === 'number' && 0 <= value && value < ErrorKind.Generic;
 }
 
 function errorFromUnknown(value: unknown): Error {

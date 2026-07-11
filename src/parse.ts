@@ -2,6 +2,8 @@ import { Transformer, isPassthroughSource } from './source/transform';
 import { OxcTranspiler, isOxcModule, oxcExtPath, tryLoadOxc } from './oxc';
 import { extractImports, isTsLikePath } from './scan';
 import { errMsg, log, getMemoryTier, readText, type MemoryTier } from './utils';
+import { buildCjsWrapperSource } from './compile/cjs-wrap';
+import type { ModuleFormat } from './types';
 
 const { setTimeout, clearTimeout } = import.meta.use('timers');
 const os = import.meta.use('os');
@@ -20,6 +22,8 @@ interface WorkerTask {
     kind: 'transform' | 'scan';
     localPath: string;
     specPath?: string; // transform only: the module's runtime identity (see Transformer.transform's mapKey)
+    lang?: string;
+    useOxc?: boolean;
 }
 
 interface WorkerResult {
@@ -37,6 +41,30 @@ interface WorkerPolicy {
 
 interface ParseWorkerData {
     __cts_role?: unknown;
+    __cts_enable_oxc?: unknown;
+}
+
+// Compile transformed source to cacheable bytecode. CJS format is compiled
+// as a sloppy-mode (EVAL_GLOBAL) compile-only script wrapped in the same CJS
+// shape CjsLoader's fallback path builds — never as an engine.Module, since
+// module code is unconditionally strict per spec and would silently change
+// CJS semantics (implicit globals, non-strict `this`, etc). See
+// cjs-wrap.ts and engine.d.ts's EVAL_COMPILE_ONLY / evalCompiled().
+function compileForCache(code: string | Uint8Array, specPath: string, format: ModuleFormat | undefined): ArrayBuffer {
+    if (format === 'cjs') {
+        const src = typeof code === 'string' ? code : engine.decodeString(code);
+        const compiled = engine.eval(buildCjsWrapperSource(src), specPath,
+            engine.EVAL_GLOBAL | engine.EVAL_COMPILE_ONLY | engine.EVAL_NEW_BACKTRACE);
+        return engine.serialize(compiled).buffer;
+    }
+    const mod = new engine.Module(code, specPath);
+    return mod.dump();
+}
+
+function isTypeScriptLanguage(lang: string | undefined, localPath: string): boolean {
+    if (!lang) return isTsLikePath(localPath);
+    const normalized = (lang.startsWith('.') ? lang.slice(1) : lang).toLowerCase();
+    return normalized === 'ts' || normalized === 'tsx' || normalized === 'cts' || normalized === 'mts';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -51,7 +79,9 @@ function isWorkerTask(value: unknown): value is WorkerTask {
     return isRecord(value)
         && typeof value.id === 'number'
         && (value.kind === 'transform' || value.kind === 'scan')
-        && typeof value.localPath === 'string';
+        && typeof value.localPath === 'string'
+        && (value.lang === undefined || typeof value.lang === 'string')
+        && (value.useOxc === undefined || typeof value.useOxc === 'boolean');
 }
 
 function isWorkerResult(value: unknown): value is WorkerResult {
@@ -119,7 +149,7 @@ export async function runParseWorker(): Promise<void> {
     // registered here — this worker's JSContext is not where compiled
     // modules run, so a local smap.load() would be invisible to stack traces.
     const transformer = new Transformer({ sourceMaps: true });
-    const oxcTranspiler: OxcTranspiler | null = tryLoadOxc();
+    const oxcTranspiler: OxcTranspiler | null = wd.__cts_enable_oxc === false ? null : tryLoadOxc();
     if (oxcTranspiler) transformer.setOxc(oxcTranspiler);
     const postResult = (result: WorkerResult) => pipe.postMessage(result);
     const queue: WorkerTask[] = [];
@@ -137,7 +167,7 @@ export async function runParseWorker(): Promise<void> {
         if (task.kind === 'scan') {
             try {
                 let deps: string[] | null = null;
-                if (oxcTranspiler) {
+                if (oxcTranspiler && task.useOxc !== false) {
                     try {
                         deps = oxcTranspiler.scanImportsBytes(bytes, task.localPath);
                     } catch {}
@@ -145,14 +175,14 @@ export async function runParseWorker(): Promise<void> {
                 let source: string | null = null;
                 if (deps === null) {
                     source = engine.decodeString(bytes);
-                    if (oxcTranspiler) {
+                    if (oxcTranspiler && task.useOxc !== false) {
                         try {
                             deps = oxcTranspiler.scanImports(source, task.localPath);
                         } catch {}
                     }
                 }
                 if (deps === null) {
-                    deps = extractImports(source ?? engine.decodeString(bytes), isTsLikePath(task.localPath));
+                        deps = extractImports(source ?? engine.decodeString(bytes), isTypeScriptLanguage(task.lang, task.localPath));
                 }
                 postResult({ id: task.id, deps });
             } catch (e) {
@@ -162,10 +192,10 @@ export async function runParseWorker(): Promise<void> {
         }
 
         try {
-            let result = transformer.transformCaptureBytes(bytes, task.localPath, undefined, task.specPath);
+            let result = transformer.transformCaptureBytes(bytes, task.localPath, task.lang, task.specPath);
             if (result === null) {
                 const source = engine.decodeString(bytes);
-                result = transformer.transformCapture(source, task.localPath, undefined, task.specPath);
+                result = transformer.transformCapture(source, task.localPath, task.lang, task.specPath);
             }
             const { code, sourceMap } = result;
             postResult({
@@ -220,9 +250,10 @@ class TxWorker {
         idx: number,
         onResult: (r: WorkerResult) => void,
         onError: (workerIdx: number, error: unknown) => void,
+        enableOxc: boolean,
     ) {
         this.idx = idx;
-        this.w = new worker.Worker({ __cts_role: 'parse' });
+        this.w = new worker.Worker({ __cts_role: 'parse', __cts_enable_oxc: enableOxc });
         this.pipe = this.w.messagePipe;
         this.pipe.onmessage = (data: unknown) => {
             if (isWorkerResult(data)) {
@@ -276,12 +307,16 @@ export class ParseDriver {
     /** Scan tasks — dispatched first (lightweight, unblock BFS) */
     private scanQueue: WorkerTask[] = [];
     private scanCallbacks = new Map<number, (deps: string[]) => void>();
-    /** id → specPath for in-flight transform tasks (compiled+freed on arrival) */
-    private specMap = new Map<number, string>();
+    /** id → {specPath, format} for in-flight transform tasks (compiled+freed on arrival) */
+    private specMap = new Map<number, { specPath: string; format: ModuleFormat | undefined }>();
     /** localPath → bytecode, the only thing kept; sources/code are freed per task */
     private bytecodes = new Map<string, ArrayBuffer>();
     /** optional sink: when set, compiled bytecode is consumed and not retained */
     private onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void;
+    /** optional sink: called for a module that fails to compile (in addition to the
+     *  existing best-effort transformFail counting — callers that need completeness,
+     *  e.g. cno pack, pass this to surface the failure instead of silently dropping it). */
+    private onFailed?: (localPath: string, specPath: string, error: unknown) => void;
     private nextId = 0;
     private maxWorkers: number;
     private oxcPath: string | null;
@@ -290,7 +325,7 @@ export class ParseDriver {
     private taskTimers = new Map<number, ReturnType<typeof setTimeout>>();
     private workerTaskIds = new Map<number, Set<number>>();
     private taskInfo = new Map<number, { kind: WorkerTask['kind']; localPath: string; workerIdx: number }>();
-    private scanFallbacks = new Map<number, { localPath: string }>();
+    private scanFallbacks = new Map<number, { localPath: string; lang?: string; useOxc: boolean }>();
     private deadWorkers = new Set<number>();
     private settled = false;
     private closing = false;
@@ -327,6 +362,7 @@ export class ParseDriver {
                 this.workers.length,
                 (r) => this.onWorkerResult(r),
                 (workerIdx, error) => this.onWorkerError(workerIdx, error),
+                this.oxc !== null,
             );
             this.workers.push(w);
             live++;
@@ -339,14 +375,14 @@ export class ParseDriver {
      * Workers handle OXC (if available) with Sucrase fallback.
      * Can be called concurrently during BFS before compileModules() is invoked.
      */
-    async scanFile(localPath: string): Promise<string[]> {
+    async scanFile(localPath: string, lang?: string, useOxc = true): Promise<string[]> {
         if (this.closing) return [];
-        if (this.maxWorkers <= 0) return this.scanInlineFile(localPath);
+        if (this.maxWorkers <= 0) return this.scanInlineFile(localPath, lang, useOxc);
         this.ensureWorkers();
         const id = this.nextId++;
-        const task: WorkerTask = { id, kind: 'scan', localPath };
+        const task: WorkerTask = { id, kind: 'scan', localPath, lang, useOxc };
         return new Promise<string[]>(resolve => {
-            this.scanFallbacks.set(id, { localPath });
+            this.scanFallbacks.set(id, { localPath, lang, useOxc });
             this.scanQueue.push(task);
             const wrappedResolve = (deps: string[]) => {
                 this.scanFallbacks.delete(id);
@@ -358,17 +394,19 @@ export class ParseDriver {
     }
 
     async compileModules(
-        modules: Array<{ specPath: string; localPath: string }>,
+        modules: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }>,
         onProgress?: (done: number, total: number) => void,
         onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
+        onFailed?: (localPath: string, specPath: string, error: unknown) => void,
     ): Promise<Map<string, ArrayBuffer>> {
         if (this.closing) return new Map();
         if (!modules.length) return new Map();
         if (this.maxWorkers <= 0) {
-            return this.compileModulesInline(modules, onProgress, onCompiled);
+            return this.compileModulesInline(modules, onProgress, onCompiled, onFailed);
         }
 
         this.onCompiled = onCompiled;
+        this.onFailed = onFailed;
         this.bytecodes = new Map<string, ArrayBuffer>();
 
         log.debug('precompile', () => `queuing ${modules.length} modules`);
@@ -376,15 +414,15 @@ export class ParseDriver {
         // Tasks carry no source — it is read lazily at dispatch (and freed at
         // result) so we never hold the whole graph's sources at once.
         const tasks: WorkerTask[] = [];
-        const passthrough: Array<{ specPath: string; localPath: string }> = [];
+        const passthrough: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }> = [];
         for (const m of modules) {
-            if (isPassthroughSource(m.localPath)) {
+            if (isPassthroughSource(m.localPath) && !m.lang) {
                 passthrough.push(m);
                 continue;
             }
             const id = this.nextId++;
-            tasks.push({ id, kind: 'transform', localPath: m.localPath, specPath: m.specPath });
-            this.specMap.set(id, m.specPath);
+            tasks.push({ id, kind: 'transform', localPath: m.localPath, specPath: m.specPath, lang: m.lang });
+            this.specMap.set(id, { specPath: m.specPath, format: m.format });
         }
 
         this.taskTotal = modules.length;
@@ -415,25 +453,26 @@ export class ParseDriver {
         this.specMap.clear();
         this.pending.length = 0;
         this.onCompiled = undefined;
+        this.onFailed = undefined;
         return out;
     }
 
-    private scanInline(source: string, localPath: string): string[] {
+    private scanInline(source: string, localPath: string, lang?: string, useOxc = true): string[] {
         try {
-            if (this.oxc) {
+            if (this.oxc && useOxc) {
                 const deps = this.oxc.scanImports(source, localPath);
                 if (deps !== null) return deps;
             }
-            return extractImports(source, isTsLikePath(localPath));
+            return extractImports(source, isTypeScriptLanguage(lang, localPath));
         } catch (e) {
             log.debug('precompile', () => `inline scan fail: ${localPath}: ${errMsg(e)}`);
             return [];
         }
     }
 
-    private scanInlineFile(localPath: string): string[] {
+    private scanInlineFile(localPath: string, lang?: string, useOxc = true): string[] {
         try {
-            return this.scanInline(readText(localPath), localPath);
+            return this.scanInline(readText(localPath), localPath, lang, useOxc);
         } catch (e) {
             log.debug('precompile', () => `inline scan read fail: ${localPath}: ${errMsg(e)}`);
             return [];
@@ -450,17 +489,19 @@ export class ParseDriver {
     }
 
     async precompile(
-        modules: Array<{ specPath: string; localPath: string }>,
+        modules: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }>,
         onProgress?: (done: number, total: number) => void,
         onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
+        onFailed?: (localPath: string, specPath: string, error: unknown) => void,
     ): Promise<Map<string, ArrayBuffer>> {
-        return this.compileModules(modules, onProgress, onCompiled);
+        return this.compileModules(modules, onProgress, onCompiled, onFailed);
     }
 
     private async compileModulesInline(
-        modules: Array<{ specPath: string; localPath: string }>,
+        modules: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }>,
         onProgress?: (done: number, total: number) => void,
         onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
+        onFailed?: (localPath: string, specPath: string, error: unknown) => void,
     ): Promise<Map<string, ArrayBuffer>> {
         const bytecodes = new Map<string, ArrayBuffer>();
         let done = 0;
@@ -472,15 +513,15 @@ export class ParseDriver {
         for (const m of modules) {
             try {
                 const source = readText(m.localPath);
-                const code = transformer.transform(source, m.localPath, undefined, m.specPath);
-                const mod = new engine.Module(code, m.specPath);
-                const bc = mod.dump();
+                const code = transformer.transform(source, m.localPath, m.lang, m.specPath);
+                const bc = compileForCache(code, m.specPath, m.format);
                 if (onCompiled) onCompiled(m.localPath, bc, m.specPath);
                 else bytecodes.set(m.localPath, bc);
                 done++;
             } catch (e) {
                 fail++;
                 log.debug('precompile', () => `inline compile fail: ${m.localPath}: ${errMsg(e)}`);
+                onFailed?.(m.localPath, m.specPath, e);
             }
             onProgress?.(done + fail, total);
         }
@@ -508,9 +549,10 @@ export class ParseDriver {
 
         // Transform result: compile to bytecode now and free the shared view so
         // we never retain every transpiled source at once (peak RSS bound).
-        const specPath = this.specMap.get(r.id);
-        if (specPath) this.specMap.delete(r.id);
-        if (r.code && specPath) {
+        const entry = this.specMap.get(r.id);
+        if (entry) this.specMap.delete(r.id);
+        if (r.code && entry) {
+            const { specPath, format } = entry;
             try {
                 // Register under specPath — the identity the compiled Module()
                 // below actually runs as, not the worker's task.localPath.
@@ -520,18 +562,19 @@ export class ParseDriver {
                         else smap.load(specPath, r.sourceMap);
                     } catch (e) { log.debug('precompile', () => `smap relay: ${task.localPath}: ${errMsg(e)}`); }
                 }
-                const mod = new engine.Module(r.code, specPath);
-                const bc = mod.dump();
+                const bc = compileForCache(r.code, specPath, format);
                 // Sink consumes + drops it (precache → disk); else accumulate.
                 if (this.onCompiled) this.onCompiled(task.localPath, bc, specPath);
                 else this.bytecodes.set(task.localPath, bc);
             } catch (e) {
                 log.debug('precompile', () => `compile fail: ${task.localPath}: ${errMsg(e)}`);
+                this.onFailed?.(task.localPath, specPath, e);
             }
             this.transformDone++;
         } else {
             this.transformFail++;
             log.debug('precompile', () => `transform fail: ${task.localPath}: ${r.error}`);
+            this.onFailed?.(task.localPath, entry?.specPath ?? task.localPath, r.error);
         }
         r.code = undefined;
         r.sourceMap = undefined;
@@ -540,31 +583,31 @@ export class ParseDriver {
         if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
     }
 
-    private compilePassthrough(m: { specPath: string; localPath: string }): void {
+    private compilePassthrough(m: { specPath: string; localPath: string; format?: ModuleFormat; lang?: string }): void {
         try {
             const bytes = new Uint8Array(fs.readFile(m.localPath));
-            let mod: CModuleEngine.Module;
+            let bc: ArrayBuffer;
             if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
-                const code = this.getInlineTransformer().transform(engine.decodeString(bytes), m.localPath, undefined, m.specPath);
-                mod = new engine.Module(code, m.specPath);
+                const code = this.getInlineTransformer().transform(engine.decodeString(bytes), m.localPath, m.lang, m.specPath);
+                bc = compileForCache(code, m.specPath, m.format);
             } else {
                 try {
-                    mod = new engine.Module(bytes, m.specPath);
+                    bc = compileForCache(bytes, m.specPath, m.format);
                 } catch (e) {
                     try {
-                        mod = new engine.Module(engine.decodeString(bytes), m.specPath);
+                        bc = compileForCache(engine.decodeString(bytes), m.specPath, m.format);
                     } catch {
                         throw e;
                     }
                 }
             }
-            const bc = mod.dump();
             if (this.onCompiled) this.onCompiled(m.localPath, bc, m.specPath);
             else this.bytecodes.set(m.localPath, bc);
             this.transformDone++;
         } catch (e) {
             this.transformFail++;
             log.debug('precompile', () => `passthrough compile fail: ${m.localPath}: ${errMsg(e)}`);
+            this.onFailed?.(m.localPath, m.specPath, e);
         }
         this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
     }
@@ -618,8 +661,11 @@ export class ParseDriver {
                 while (this.pending.length > 0) {
                     const t = this.pending.shift();
                     if (!t) break;
+                    const specPath = this.specMap.get(t.id)?.specPath ?? t.localPath;
+                    this.specMap.delete(t.id);
                     this.transformFail++;
                     log.debug('precompile', () => `abandoned: ${t.localPath}`);
+                    this.onFailed?.(t.localPath, specPath, new Error('all parse workers stopped'));
                 }
             }
         }
@@ -724,9 +770,11 @@ export class ParseDriver {
             return;
         }
 
+        const specPath = this.specMap.get(taskId)?.specPath ?? task.localPath;
         this.specMap.delete(taskId);
         this.transformFail++;
         log.debug('precompile', () => `${reason}: ${task.localPath}`);
+        this.onFailed?.(task.localPath, specPath, new Error(reason));
         this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
         this.drain();
         if (this.taskTotal > 0 && this.transformDone + this.transformFail >= this.taskTotal) this.finish();
@@ -771,7 +819,7 @@ export class ParseDriver {
         if (!fallback) return [];
 
         log.debug('precompile', () => `${reason}, fallback inline: ${fallback.localPath}`);
-        return this.scanInlineFile(fallback.localPath);
+        return this.scanInlineFile(fallback.localPath, fallback.lang, fallback.useOxc);
     }
 
     async terminate(): Promise<void> {

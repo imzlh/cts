@@ -5,6 +5,7 @@ import { isBuiltinSpecifier } from '../resolve/builtins';
 import { guessFileKind } from '../resolve/protocols/base';
 import { createCtx, detectFormat, detectPackageJsonFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
 import { URL } from '../utils/url';
+import { buildCjsWrapperSource, cjsContextSlot, type CjsContext } from './cjs-wrap';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -41,6 +42,16 @@ export interface CjsDeps {
     resolveExternal(req: string, parent: string): ModuleInfo | null;
     /** Prepare source for CJS execution (e.g. strip TS/JSX syntax). */
     prepareSource?(code: string, filePath: string): string | null;
+    /**
+     * Look up cached compiled bytecode for a CJS file (a value from
+     * `engine.eval(..., EVAL_COMPILE_ONLY)`, see cjs-wrap.ts), if fresh.
+     * Returns null on a cache miss.
+     */
+    loadCjsCompiled?(localPath: string): unknown | null;
+    /** Persist freshly compiled CJS bytecode (already engine.serialize()'d). */
+    persistCjsCompiled?(localPath: string, bytes: ArrayBuffer): void;
+    /** Synthetic runtime parent for materialized container files, if any. */
+    runtimeParent?(localPath: string): string | null;
 }
 
 interface ResolvedCjsRequest {
@@ -52,7 +63,6 @@ interface ResolvedCjsRequest {
 // Performance: counter-based CJS context keys (no regex), dir-level path cache
 // ---------------------------------------------------------------------------
 
-let _ctxId = 0;
 const INTERNAL_ID = Symbol('cts.cjs.id');
 const INTERNAL_FILENAME = Symbol('cts.cjs.filename');
 
@@ -88,6 +98,17 @@ function splitBarePackageId(id: string): { name: string; subpath: string } | nul
         name,
         subpath: slash === -1 ? '.' : `./${id.slice(slash + 1)}`,
     };
+}
+
+/** True for a scheme-qualified id like "pack:///0.js" — mirrors resolve/index.ts's protoOf(). */
+function hasProtocolScheme(s: string): boolean {
+    const ci = s.indexOf(':');
+    if (ci < 2 || ci > 8) return false;
+    for (let i = 0; i < ci; i++) {
+        const c = s.charCodeAt(i);
+        if (c < 97 || c > 122) return false;
+    }
+    return true;
 }
 
 function toHostPath(path: string): string {
@@ -177,7 +198,7 @@ function normalizeExecError(error: unknown, filename: string): Error {
         e.kind = e instanceof SyntaxError ? ErrorKind.SyntaxError : ErrorKind.Generic;
     }
     if (e instanceof SyntaxError && !e.cause) {
-        e.cause = { source: { message: e.message }, path: filename };
+        e.cause = { source: e, path: filename };
     }
     return e;
 }
@@ -418,6 +439,33 @@ export class CjsLoader {
 
     private execJs(mod: CjsModule): void {
         const filename = getInternalFilename(mod);
+
+        // loadCjsCompiled() already treats a deserialize failure as a cache
+        // miss internally (JscCache.loadRaw clears the corrupt entry and
+        // returns null) — a non-null result here is structurally valid
+        // bytecode. Do NOT wrap runCompiled() in a fallback-to-fresh retry:
+        // a failure at this point is indistinguishable from a legitimate
+        // error thrown by the module's own top-level code, and retrying
+        // would re-run (and double) any side effects it already produced
+        // before throwing. ESM's cache-hit path (EsmCompiler.loadEsm) makes
+        // the same choice — a cache-hit failure just propagates normally.
+        const cached = this.deps.loadCjsCompiled?.(filename);
+        if (cached != null) {
+            log.debug('cjs', () => `bytecode cache hit: ${filename}`);
+            // Cache hit: no source text available to re-scan, so the dynamic-
+            // import-via-Function heuristic (hasDynamicImportFunctionSource)
+            // can't be recomputed here — patch defensively. The patch itself
+            // is a cheap globalThis.Function swap that only costs anything if
+            // the module actually calls `new Function(...)`, so this is safe
+            // and effectively free in the common case.
+            this.runCompiled(mod, cached, true);
+            return;
+        }
+
+        this.execJsFresh(mod, filename);
+    }
+
+    private execJsFresh(mod: CjsModule, filename: string): void {
         let src = engine.decodeString(fs.readFile(filename));
         // Transform TS/ESM source for CJS execution if a transformer is available
         if (this.deps.prepareSource) {
@@ -431,44 +479,66 @@ export class CjsLoader {
         if (src.startsWith('#!')) src = src.slice(src.indexOf('\n'));
 
         const filename = getInternalFilename(mod);
-        const key = `__cts${_ctxId++}`;
-        const ctx = {
+        const shouldPatchFunction = hasDynamicImportFunctionSource(src);
+
+        let compiled: unknown;
+        try {
+            compiled = engine.eval(buildCjsWrapperSource(src), filename,
+                engine.EVAL_GLOBAL | engine.EVAL_COMPILE_ONLY | engine.EVAL_NEW_BACKTRACE);
+        } catch (e) {
+            this.cache.delete(filename);
+            log.debug('cjs', () => `compile error: ${filename}`, e);
+            throw normalizeExecError(e, filename);
+        }
+
+        if (this.deps.persistCjsCompiled) {
+            try {
+                this.deps.persistCjsCompiled(filename, engine.serialize(compiled).buffer);
+            } catch (e) {
+                log.debug('cjs', () => `persist compiled failed: ${filename}`, e);
+            }
+        }
+
+        this.runCompiled(mod, compiled, shouldPatchFunction);
+    }
+
+    /**
+     * Run a value from `engine.eval(..., EVAL_COMPILE_ONLY)` (fresh compile
+     * or a cache hit) inside the CJS wrapper context. The five CJS locals are
+     * read from a single well-known global slot (see cjs-wrap.ts) instead of
+     * being closed over, so the same compiled bytecode is reusable across
+     * invocations — the slot is overwritten immediately before every call and
+     * its contents are captured synchronously by the wrapper's `.call(...)`
+     * before any user code (including a nested require()) can run.
+     */
+    private runCompiled(mod: CjsModule, compiled: unknown, needsFunctionPatch: boolean): void {
+        const filename = getInternalFilename(mod);
+        const ctx: CjsContext = {
             exports:    mod.exports,
             require:    mod.require,
             module:     mod,
             __filename: mod.filename,
             __dirname:  toHostPath(dirname(filename)),
         };
-        Reflect.set(globalThis, key, ctx);
+        Reflect.set(globalThis, cjsContextSlot(), ctx);
 
-        const shouldPatchFunction = hasDynamicImportFunctionSource(src);
         const previousFunction = globalThis.Function;
-        if (shouldPatchFunction) {
+        if (needsFunctionPatch) {
             Reflect.set(globalThis, 'Function', this.contextualFunction(filename));
         }
 
         try {
-            const k = JSON.stringify(key);
-            const wrapper =
-                `(function(exports,require,module,__filename,__dirname){${src}\n})` +
-                `.call(globalThis[${k}].exports,` +
-                `globalThis[${k}].exports,` +
-                `globalThis[${k}].require,` +
-                `globalThis[${k}].module,` +
-                `globalThis[${k}].__filename,` +
-                `globalThis[${k}].__dirname);`;
-            engine.eval(wrapper, filename,
-                engine.EVAL_NEW_BACKTRACE | engine.EVAL_GLOBAL);
+            engine.evalCompiled(compiled);
             mod.loaded = true;
         } catch (e) {
             this.cache.delete(filename);
             log.debug('cjs', () => `eval error: ${filename}`, e);
             throw normalizeExecError(e, filename);
         } finally {
-            if (shouldPatchFunction) {
+            if (needsFunctionPatch) {
                 Reflect.set(globalThis, 'Function', previousFunction);
             }
-            Reflect.deleteProperty(globalThis, key);
+            Reflect.deleteProperty(globalThis, cjsContextSlot());
         }
     }
 
@@ -666,6 +736,23 @@ export class CjsLoader {
     // -------------------------------------------------------------------------
 
     private resolveId(id: string, parentPath: string): ResolvedCjsRequest | null {
+        // A scheme-qualified parent (e.g. "pack:///0.js") has no real
+        // filesystem location to anchor relative/absolute require() against —
+        // route everything through the generic resolver, which dispatches by
+        // the parent's own scheme (see ModuleResolver.resolveRelative/
+        // resolveBare's pack: handling). Real CJS files (plain fs paths)
+        // keep the fast local-path-first behavior below unchanged.
+        const runtimeParent = hasProtocolScheme(parentPath)
+            ? parentPath
+            : this.deps.runtimeParent?.(parentPath) ?? null;
+        if (runtimeParent) {
+            try {
+                const ext = this.deps.resolveExternal(id, runtimeParent);
+                if (ext) return { info: ext, isCjs: ext.format === 'cjs' || ext.fileKind === 'json' };
+            } catch {}
+            return null;
+        }
+
         // CJS relative/absolute require() is anchored to the requiring file.
         // Try the local filesystem path before the generic resolver.
         if (isAbsolute(id)) return this.resolveLocalPath(id);
