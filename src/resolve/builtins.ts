@@ -1,5 +1,3 @@
-// builtins.ts — Node.js builtin module name detection (pure string check, no IO)
-
 export const BUILTINS = new Set([
     'assert','async_hooks','buffer','child_process','cluster','console','constants',
     'crypto','dgram','diagnostics_channel','dns','domain','events','fs','http','http2','https','inspector',

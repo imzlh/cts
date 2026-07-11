@@ -1,5 +1,3 @@
-// utils/io.ts — file I/O helpers with bounded LRU resolution cache
-
 import { dirname, joinPaths } from './path';
 import { LRU } from './lru';
 import { err, ErrorKind } from '../errors';

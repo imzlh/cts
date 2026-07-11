@@ -1,15 +1,3 @@
-// lock.ts - persistent resolution lock (SQLite3)
-//
-// Tables:
-//   modules: spec TEXT PK, local TEXT, format TEXT, kind TEXT
-//   sources: key TEXT PK (opaque resolver cache key), spec TEXT
-//   bins:    name TEXT PK, path TEXT, pkg TEXT
-//
-// Performance:
-//   - Every statement is prepared -> used -> finalized per call.
-//   - Writes are staged in memory, then flushed inside a short SQLite
-//     transaction on flush() / rewrite() / close().
-
 import type { ModuleInfo, ModuleFormat, FileKind } from './types';
 import { joinPaths, dirname, toPosixPath, ensureDir, errMsg, log, getMemoryTier } from './utils';
 

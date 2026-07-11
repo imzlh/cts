@@ -1,4 +1,3 @@
-// utils/index.ts — barrel re-export of all utils modules
 export * from './platform';
 export * from './path';
 export * from './io';

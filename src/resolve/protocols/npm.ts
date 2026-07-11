@@ -1,5 +1,3 @@
-// protocol/npm.ts - npm registry handler
-
 import type { RuntimeConfig, ModuleInfo, ModuleFormat, LifecycleScriptEntry } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
@@ -11,7 +9,7 @@ import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpa
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
-import { uname, isWindows } from '../../utils/index';
+import { uname, isWindows, getMemoryTier } from '../../utils/index';
 import { findLocalBin } from '../../utils/bin';
 import pkg from '../../../package.json';
 
@@ -928,7 +926,7 @@ export class NpmHandler implements ProtocolHandler {
                 throw err(ErrorKind.ModuleNotFound, `npm package not found in cache: "${name}", --cached-only is specified.`);
             }
             if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
-            yield* this.install(name, exactVer, pkgDir, onProgress);
+            yield* this.installOnce(name, exactVer, pkgDir, onProgress);
         } else {
             this.linkCacheAlias(name, pkgDir);
             yield* this.indexInstalledBins(name, exactVer, pkgDir);
@@ -1032,6 +1030,14 @@ export class NpmHandler implements ProtocolHandler {
         this.queueLifecycleScripts(name, ver, dir);
     }
 
+    private *installOnce(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
+        yield {
+            type: StepType.FLOW,
+            key: `npm-install:${name}@${ver}`,
+            flow: this.install(name, ver, dir, onProgress),
+        };
+    }
+
     private queueLifecycleScripts(name: string, ver: string, dir: string): void {
         if (!this.cfg.persistLock || this.cfg.ignoreScripts) return;
         const pkg = readPkg(dir);
@@ -1060,11 +1066,24 @@ export class NpmHandler implements ProtocolHandler {
         const depNames = recordKeysForLog(deps);
         if (!depNames) return;
         log.debug('npm', () => `deps for ${key}: ${depNames}`);
+        const flows: Flow<void>[] = [];
         for (const depName in deps) {
             const depRange = deps[depName]!;
-            const dep = yield* this.ensureInstalled(depName, depRange, `npm:${name}@${ver}`, onProgress);
-            this.linkDependency(dir, depName, dep.dir);
+            flows.push(this.installDependency(dir, name, ver, depName, depRange, onProgress));
         }
+        yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
+    }
+
+    private *installDependency(
+        parentDir: string,
+        parentName: string,
+        parentVer: string,
+        name: string,
+        range: string,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress);
+        this.linkDependency(parentDir, name, dep.dir);
     }
 
     /** Try to install each optionalDependency. Failures are non-fatal (platform mismatch, etc). */
@@ -1078,33 +1097,51 @@ export class NpmHandler implements ProtocolHandler {
         const osName = currentOs();
         const cpuName = currentCpu();
         const abiName = currentAbi();
+        const flows: Flow<void>[] = [];
         for (const depName in opts) {
             const depRange = opts[depName]!;
-            try {
-                const depMeta = yield* this.fetchMeta(depName, onProgress);
-                const exactVer = yield* this.resolveVersion(depName, depRange, onProgress);
-                const versionMeta = depMeta.versions[exactVer];
-                if (!versionMeta) continue;
-                if (!matchesConstraint(versionMeta.os, osName) || !matchesConstraint(versionMeta.cpu, cpuName)) {
-                    log.debug('npm', () => `optional dep skipped: ${depName}@${exactVer} (platform mismatch: ${osName}/${cpuName})`);
-                    continue;
-                }
-                if (!matchesAbiVariant(depName, abiName)) {
-                    log.debug('npm', () => `optional dep skipped: ${depName}@${exactVer} (abi mismatch: ${abiName || 'unknown'})`);
-                    continue;
-                }
-                const depDir = joinPaths(this.cacheDir, `${depName}@${exactVer}`);
-                const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(depDir, 'package.json') };
-                if (!exists) {
-                    if (!this.cfg.silent && !isatty) log.download(`${depName}@${exactVer} (optional)`);
-                    yield* this.install(depName, exactVer, depDir, onProgress);
-                    log.debug('npm', () => `optional dep installed: ${depName}@${exactVer}`);
-                }
-                this.linkDependency(dir, depName, depDir);
-            } catch (e) {
-                log.debug('npm', () => `optional dep skipped: ${depName} (${e instanceof Error ? e.message : String(e)})`);
-            }
+            flows.push(this.installOptionalDependency(dir, depName, depRange, osName, cpuName, abiName, onProgress));
         }
+        yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
+    }
+
+    private *installOptionalDependency(
+        parentDir: string,
+        name: string,
+        range: string,
+        osName: string,
+        cpuName: string,
+        abiName: string,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        try {
+            const meta = yield* this.fetchMeta(name, onProgress);
+            const ver = yield* this.resolveVersion(name, range, onProgress);
+            const versionMeta = meta.versions[ver];
+            if (!versionMeta) return;
+            if (!matchesConstraint(versionMeta.os, osName) || !matchesConstraint(versionMeta.cpu, cpuName)) {
+                log.debug('npm', () => `optional dep skipped: ${name}@${ver} (platform mismatch: ${osName}/${cpuName})`);
+                return;
+            }
+            if (!matchesAbiVariant(name, abiName)) {
+                log.debug('npm', () => `optional dep skipped: ${name}@${ver} (abi mismatch: ${abiName || 'unknown'})`);
+                return;
+            }
+            const depDir = joinPaths(this.cacheDir, `${name}@${ver}`);
+            const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(depDir, 'package.json') };
+            if (!exists) {
+                if (!this.cfg.silent && !isatty) log.download(`${name}@${ver} (optional)`);
+                yield* this.installOnce(name, ver, depDir, onProgress);
+                log.debug('npm', () => `optional dep installed: ${name}@${ver}`);
+            }
+            this.linkDependency(parentDir, name, depDir);
+        } catch (e) {
+            log.debug('npm', () => `optional dep skipped: ${name} (${e instanceof Error ? e.message : String(e)})`);
+        }
+    }
+
+    private packageInstallConcurrency(): number {
+        return { low: 2, normal: 4, high: 8 }[getMemoryTier()] ?? 4;
     }
 
     private linkDependency(parentDir: string, depName: string, depDir: string): void {

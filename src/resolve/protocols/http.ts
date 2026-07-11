@@ -1,5 +1,3 @@
-// protocol/http.ts - http/https handler
-
 import type { RuntimeConfig, ModuleInfo } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';

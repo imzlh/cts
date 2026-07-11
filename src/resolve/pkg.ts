@@ -1,5 +1,3 @@
-// pkg.ts — package.json utilities with bounded caches
-
 import type { FileKind, PackageJson, ModuleFormat } from '../types';
 import { dirname, extname, joinPaths, normalizePath, resolveFile, safeParse, LRU, log } from '../utils';
 import { err, ErrorKind } from '../errors';

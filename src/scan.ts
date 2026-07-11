@@ -1,7 +1,3 @@
-// scan.ts — import specifier extraction (sucrase token-based)
-// Lives here so parse workers can import it without pulling in the full
-// BFS scanner (resolver, progress, asyncfs, wasm, etc.).
-
 import { parse } from '../deps/sucrase/src/parser';
 import { IdentifierRole } from '../deps/sucrase/src/parser/tokenizer';
 import { TokenType as tt } from '../deps/sucrase/src/parser/tokenizer/types';

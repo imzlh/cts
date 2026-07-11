@@ -1,5 +1,3 @@
-// protocol/blob.ts - blob: object URL handler
-
 import type { RuntimeConfig, ModuleInfo, FileKind } from '../../types';
 import type { ProtocolHandler } from './base';
 import { StepType, type Flow } from '../../flow';

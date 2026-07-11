@@ -1,8 +1,6 @@
-// utils/path.ts — pure path utilities
-//
-// Convention: all public functions normalise backslashes to '/' internally.
-
 import { uname } from './index';
+
+// Convention: all public functions normalise backslashes to '/' internally.
 
 const os = import.meta.use('os');
 

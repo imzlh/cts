@@ -1,8 +1,3 @@
-// runtime/index.ts — TypeScriptRuntime (composition root)
-//
-// Owns the top-level object graph: resolver + compiler + resources.
-// Installs engine hooks, manages precache lifecycle, loads entry/polyfill.
-
 import { ModuleCompiler } from '../compile/index';
 import { createConfig } from '../config';
 import type { ScanResult } from '../deps';

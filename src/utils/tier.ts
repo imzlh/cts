@@ -1,9 +1,3 @@
-// utils/tier.ts — lightweight OS memory tier detection for cts
-//
-// Standalone copy of the tier thresholds from cno/src/utils/memory-tier.ts
-// because cts is a separate workspace package with no dependency on cno.
-// Only tier classification — no buffer limits (those live in cno).
-
 const os = import.meta.use('os');
 
 export type MemoryTier = 'low' | 'normal' | 'high';

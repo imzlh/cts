@@ -1,10 +1,3 @@
-// utils/lru.ts — bounded LRU cache (Map-based, O(1) get/set)
-//
-// Used by pkg.ts and io.ts to cap memory usage of module resolution caches.
-// JS Map preserves insertion order, so we use it as a queue:
-//   - on get: delete + re-insert to move to back (most-recently-used)
-//   - on set: evict front (least-recently-used) when over capacity
-
 export class LRU<K, V> {
     private readonly map: Map<K, V>;
 

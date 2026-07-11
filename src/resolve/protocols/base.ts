@@ -1,13 +1,3 @@
-// protocol/base.ts — ProtocolHandler interface
-//
-// Design principle:
-//   resolve()   → downloads/copies to cache, returns complete ModuleInfo
-//   localPath() → fast lookup for already-resolved specPaths (no I/O needed)
-//
-// The resolver.ts orchestrator calls resolve() once per specifier, caches the
-// returned ModuleInfo by specPath, then calls localPath() on subsequent load
-// requests.  Protocol handlers don't need to worry about the runtime cache.
-
 import type { ModuleInfo, FileKind } from '../../types';
 import type { Flow, ProgressCallback } from '../../flow';
 import { extname } from '../../utils';

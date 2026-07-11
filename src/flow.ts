@@ -21,6 +21,8 @@ export const enum StepType {
     FS_ENSURE_DIR,
     NET_FETCH,
     ARCHIVE_UNTAR_GZ,
+    FLOW,
+    FLOW_ALL,
 }
 
 export interface FsExistsStep {
@@ -68,6 +70,20 @@ export interface ArchiveUntarGzStep {
     data: Uint8Array | ArrayBuffer;
 }
 
+/** Run a nested flow. A key coalesces concurrent work such as package installs. */
+export interface FlowStep {
+    type: StepType.FLOW;
+    flow: Flow<void>;
+    key?: string;
+}
+
+/** Run independent flows with bounded concurrency. */
+export interface FlowAllStep {
+    type: StepType.FLOW_ALL;
+    flows: Flow<void>[];
+    concurrency: number;
+}
+
 export interface NetFetchResult {
     status: number;
     headers: Array<[string, string]>;
@@ -82,7 +98,9 @@ export type Step =
     | FsWriteBytesStep
     | FsEnsureDirStep
     | NetFetchStep
-    | ArchiveUntarGzStep;
+    | ArchiveUntarGzStep
+    | FlowStep
+    | FlowAllStep;
 
 export type StepResult = boolean | string | Uint8Array | ArrayBuffer | NetFetchResult | TarFile[] | undefined;
 export type Flow<T> = Generator<Step, T, StepResult>;
@@ -167,6 +185,7 @@ function toResult(response: CModuleCURL.Response): NetFetchResult {
 
 let asyncPool: CModuleCURL.ConnPool | null = null;
 let syncPool: CModuleCURL.ConnPool | null = null;
+const activeFlows = new Map<string, Promise<void>>();
 
 function getAsyncPool(): CModuleCURL.ConnPool {
     if (!asyncPool) {
@@ -249,6 +268,12 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => NetFetchResult):
             const files = unTarGz(step.data);
             log.debug('archive', () => `untar.gz done ${files.length} entries ${Date.now() - started}ms`);
             return files;
+        case StepType.FLOW:
+            runSync(step.flow);
+            return undefined;
+        case StepType.FLOW_ALL:
+            for (const flow of step.flows) runSync(flow);
+            return undefined;
     }
 }
 
@@ -322,7 +347,44 @@ async function executeAsync(step: Step): Promise<StepResult> {
             const files = unTarGz(step.data);
             log.debug('archive', () => `untar.gz done ${files.length} entries ${Date.now() - started}ms`);
             return files;
+        case StepType.FLOW:
+            await runNestedFlow(step);
+            return undefined;
+        case StepType.FLOW_ALL:
+            await runNestedFlows(step.flows, step.concurrency);
+            return undefined;
     }
+}
+
+async function runNestedFlow(step: FlowStep): Promise<void> {
+    if (!step.key) {
+        await runAsync(step.flow);
+        return;
+    }
+    let active = activeFlows.get(step.key);
+    if (!active) {
+        active = runAsync(step.flow);
+        activeFlows.set(step.key, active);
+        try {
+            await active;
+        } finally {
+            if (activeFlows.get(step.key) === active) activeFlows.delete(step.key);
+        }
+        return;
+    }
+    await active;
+}
+
+async function runNestedFlows(flows: Flow<void>[], concurrency: number): Promise<void> {
+    const count = Math.min(flows.length, Math.max(1, Math.floor(concurrency) || 1));
+    let next = 0;
+    const worker = async () => {
+        while (next < flows.length) {
+            const flow = flows[next++];
+            if (flow) await runAsync(flow);
+        }
+    };
+    await Promise.all(Array.from({ length: count }, () => worker()));
 }
 
 export function runSync<T>(flow: Flow<T>): T {

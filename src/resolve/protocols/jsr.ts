@@ -1,5 +1,3 @@
-// protocol/jsr.ts - JSR registry handler
-
 import type { RuntimeConfig, ModuleInfo, ParsedJsrSpec, JsrPackageMeta, JsrVersionMeta } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';

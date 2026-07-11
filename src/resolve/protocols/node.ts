@@ -1,5 +1,3 @@
-// protocol/node.ts - node: builtin module handler
-
 import type { RuntimeConfig, ModuleInfo, NodeBuiltinResolver } from '../../types';
 import type { ProtocolHandler } from './base';
 import { StepType, type Flow } from '../../flow';

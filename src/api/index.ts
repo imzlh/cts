@@ -1,6 +1,3 @@
-// api/index.ts — public API surface for external consumers (cno-cli, etc.)
-// Re-exports only; internal refactors behind this boundary don't break callers.
-
 export { createRuntime, TypeScriptRuntime } from '../runtime/index';
 export { createConfig, loadConfigFile, CLI_TPL } from '../config';
 export { Transformer } from '../source/transform';

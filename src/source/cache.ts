@@ -1,16 +1,3 @@
-// jsc.ts — JSC bytecode cache (compilation artifact management)
-//
-// Two-tier cache:
-//   L1  in-memory bytecode (from parse workers, same-process only)
-//   L2  on-disk .jsc files   (persisted, survives process restart)
-//
-// Remote modules (npm:, jsr:, http:, https:, node:) are cached next to their
-// local file (localPath + '.jsc') with an mtime sidecar.
-//
-// Local user files (.ts, .tsx, .jsx) are cached in {cacheDir}/local/
-// using a path-hash filename.  A .jsc.mt sidecar stores the source mtime;
-// on load, the cached bytecode is used only when the source hasn't changed.
-
 import { dirname, joinPaths, ensureDir, log } from '../utils';
 
 const fs = import.meta.use('fs');

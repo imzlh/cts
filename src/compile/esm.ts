@@ -1,15 +1,7 @@
-// compile/esm.ts — ESM compilation engine
-//
-// Responsibilities:
-//   - Compile ESM source via engine.Module
-//   - ESM module cache (esmCache) + circular dependency detection
-//   - specPath dedup (QuickJS does not cache dynamic import() results)
-//   - Load special types: binary, text
-
 import { moduleRef, type RuntimeConfig, type ModuleInfo } from '../types';
 import { Transformer } from '../source/transform';
 import { JscCache, isRemote } from '../source/cache';
-import { readText, log } from '../utils';
+import { readText, readBytes, log } from '../utils';
 import { err, ErrorKind } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 
@@ -94,18 +86,33 @@ export class EsmCompiler {
     // -------------------------------------------------------------------------
 
     /** Compile ESM source code, wrapping SyntaxError with file context. */
-    compileEsm(code: string, specPath: string, localPath: string): CModuleEngine.Module {
+    compileEsm(code: string | Uint8Array, specPath: string, localPath: string): CModuleEngine.Module {
         try {
             return new engine.Module(code, specPath);
         } catch (e) {
-            if (e instanceof SyntaxError) {
-                const ne = err(ErrorKind.SyntaxError,
-                    `Syntax error in ${localPath}: ${e.message}`, e);
-                ne.cause = { source: e, code, path: localPath };
-                throw ne;
+            // Raw passthrough bytes may be lossy/invalid UTF-8 that QuickJS's
+            // parser rejects outright — engine.decodeString() replaces bad
+            // sequences the same way readText() always did, so retry through
+            // the string before treating this as a genuine syntax error.
+            if (typeof code !== 'string' && e instanceof SyntaxError) {
+                try {
+                    return new engine.Module(engine.decodeString(code), specPath);
+                } catch (e2) {
+                    throw this.wrapSyntaxError(e2, code, localPath);
+                }
             }
-            throw e;
+            throw this.wrapSyntaxError(e, code, localPath);
         }
+    }
+
+    private wrapSyntaxError(e: unknown, code: string | Uint8Array, localPath: string): unknown {
+        if (!(e instanceof SyntaxError)) return e;
+        const ne = err(ErrorKind.SyntaxError, `Syntax error in ${localPath}: ${e.message}`, e);
+        // cause.code feeds the fail-<hash>.log code frame — decode bytes
+        // here (error path only) so reportSyntax() always sees a string.
+        const text = typeof code === 'string' ? code : engine.decodeString(code);
+        ne.cause = { source: e, code: text, path: localPath };
+        return ne;
     }
 
     private loadEsm(info: ModuleInfo, meta: Record<string, unknown>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
@@ -141,8 +148,8 @@ export class EsmCompiler {
 
         // L2: read + transform + compile on main thread
         this.esmLoading.add(cacheKey);
-        const text = readText(info.localPath);
-        const code = this.transformer.transform(text, info.localPath, metaLang(meta), moduleRef(info));
+        const bytes = readBytes(info.localPath);
+        const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleRef(info));
         let mod: CModuleEngine.Module;
         try {
             mod = this.compileEsm(code, moduleRef(info), info.localPath);

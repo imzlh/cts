@@ -1,12 +1,3 @@
-// compile/bridge.ts — CJS <-> ESM interop bridge
-//
-// Responsibilities:
-//   - bridgeCjsToEsm: wrap CJS exports as ESM Module (for ESM importing CJS)
-//   - loadEsmSync: synchronously load ESM for CJS require() (promiseResult semantics)
-//   - installGlobalRequire: install require() on globalThis
-//   - installInternalBridge: install CTS_INTERNAL symbol on globalThis
-//   - buildCjsDeps: construct the CjsDeps callback interface
-
 import type { ModuleInfo } from '../types';
 import type { CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';

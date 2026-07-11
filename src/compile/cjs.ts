@@ -1,14 +1,3 @@
-// compile/cjs.ts — CommonJS compilation engine
-//
-// Responsibilities:
-//   - CjsLoader: build, execute, cache CJS modules
-//   - mkRequire() factory
-//   - node_modules path traversal
-//
-// Does NOT contain:
-//   - BUILTINS (in resolve/builtins.ts)
-//   - CJS/ESM bridge (in compile/bridge.ts)
-
 import type { ModuleInfo } from '../types';
 import { dirname, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, hasLeadingSlashDrive, normalizePath } from '../utils';
 import { err, ErrorKind } from '../errors';

@@ -1,12 +1,5 @@
-// progress.ts — unified precache progress UI
-//
-// PrecacheProgress spans the entire precache lifecycle (scan + precompile).
-// DepScanner and ParseDriver call its methods; it owns all rendering.
-//
-// TTY:  live multi-line render with spinner, colors, speed
-// pipe: per-download 📦 lines (from handlers via !isatty)
-
 import { fmtBytes } from './misc';
+
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');

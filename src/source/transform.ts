@@ -1,9 +1,10 @@
-// transformer.ts — TS/JSX → JS via oxc (native, fast) or Sucrase (fallback)
-
 import { transformCnoCode } from '../../deps/sucrase/src/index';
 import { errMsg, log } from '../utils';
 import { err, ErrorKind, TransformError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
+
+const engine = import.meta.use('engine');
+const smap = import.meta.use('sourcemap');
 
 const KIND_OTHER = 0;
 const KIND_TS = 1;
@@ -43,7 +44,7 @@ export class Transformer {
             case KIND_TSX:
             case KIND_JSX: {
                 if (this.oxc) {
-                    const result = this.oxc.transpile(code, filename, mapKey);
+                    const result = this.oxc.transpile(code, filename, mapKey, oxcLang(kind));
                     if (result !== null) {
                         log.debug('transformer', () => `oxc: ${filename}`);
                         return result;
@@ -70,7 +71,7 @@ export class Transformer {
             case KIND_TSX:
             case KIND_JSX: {
                 if (this.oxc) {
-                    const result = this.oxc.transpileCapture(code, filename, mapKey);
+                    const result = this.oxc.transpileCapture(code, filename, mapKey, oxcLang(kind));
                     if (result !== null) {
                         log.debug('transformer', () => `oxc: ${filename}`);
                         return this.sourceMaps ? result : { code: result.code };
@@ -86,7 +87,7 @@ export class Transformer {
         }
     }
 
-    transformCaptureBytes(bytes: Uint8Array, filename: string, lang?: string, mapKey?: string): { code: string; sourceMap?: string | object } | null {
+    transformCaptureBytes(bytes: Uint8Array, filename: string, lang?: string, mapKey?: string): { code: string | Uint8Array; sourceMap?: string | Uint8Array | object } | null {
         const kind = sourceKind(filename, lang);
         switch (kind) {
             case KIND_TS:
@@ -94,7 +95,7 @@ export class Transformer {
             case KIND_JSX:
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) return null;
                 if (!this.oxc) return null;
-                const result = this.oxc.transpileBytes(bytes, filename, mapKey);
+                const result = this.oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
                 if (result !== null) {
                     log.debug('transformer', () => `oxc bytes: ${filename}`);
                     return this.sourceMaps ? result : { code: result.code };
@@ -102,6 +103,50 @@ export class Transformer {
                 return null;
             default:
                 return null;
+        }
+    }
+
+    /**
+     * Like transform(), but reads straight from file bytes and registers the
+     * sourcemap locally — for the main-thread loader, so a passthrough (or
+     * oxc-transpiled, via transpileSharedBytes) file never needs a JS string
+     * at all. Falls back to the string path for Sucrase and shebang stripping.
+     */
+    transformBytes(bytes: Uint8Array, filename: string, lang?: string, mapKey?: string): string | Uint8Array {
+        const kind = sourceKind(filename, lang);
+        switch (kind) {
+            case KIND_TS:
+            case KIND_TSX:
+            case KIND_JSX: {
+                if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
+                    return this.transform(engine.decodeString(bytes), filename, lang, mapKey);
+                }
+                if (this.oxc) {
+                    const result = this.oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
+                    if (result !== null) {
+                        log.debug('transformer', () => `oxc bytes: ${filename}`);
+                        if (this.sourceMaps && result.sourceMap) {
+                            this.registerSourceMap(mapKey ?? filename, result.sourceMap);
+                        }
+                        return result.code;
+                    }
+                    log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
+                }
+                return this.run(engine.decodeString(bytes), filename, kind !== KIND_JSX, kind !== KIND_TS, mapKey);
+            }
+            case KIND_JSON: return `export default ${engine.decodeString(bytes)};`;
+            default:
+                log.debug('transformer', () => `passthrough bytes: ${filename}`);
+                return bytes;
+        }
+    }
+
+    private registerSourceMap(name: string, sourceMap: string | Uint8Array): void {
+        try {
+            if (sourceMap instanceof Uint8Array) smap.loadJSONBytes(name, sourceMap);
+            else smap.loadJSON(name, sourceMap);
+        } catch (e) {
+            log.debug('transformer', () => `smap: ${name}: ${errMsg(e)}`);
         }
     }
 
@@ -186,6 +231,11 @@ export class Transformer {
     }
 }
 
+export function isPassthroughSource(filename: string): boolean {
+    const kind = sourceKind(filename);
+    return kind !== KIND_TS && kind !== KIND_TSX && kind !== KIND_JSX && kind !== KIND_JSON;
+}
+
 function sourceKind(filename: string, lang?: string): number {
     if (lang) {
         switch (lang) {
@@ -230,6 +280,15 @@ function sourceKind(filename: string, lang?: string): number {
         return KIND_JSON;
     }
     return KIND_OTHER;
+}
+
+function oxcLang(kind: number): string {
+    switch (kind) {
+        case KIND_TS: return 'ts';
+        case KIND_TSX: return 'tsx';
+        case KIND_JSX: return 'jsx';
+        default: return 'js';
+    }
 }
 
 function stripShebang(code: string): string {

@@ -1,17 +1,3 @@
-// resolve/linker.ts — materialize a real node_modules tree from scan edges
-//
-// cts resolves npm packages directly against a flat content-addressed store
-// (<cacheDir>/npm/<name>@<version>/) with no real node_modules ever written
-// to disk. Tools that do their own filesystem-based resolution (Vite, etc.)
-// need a real tree on disk — this builds one from DepScanner's resolved
-// edges. 'soft' only creates project top-level symlinks/junctions into the
-// flat store; 'hard' materializes the full nested tree with per-file hard
-// links, falling back to a copy only cross-volume.
-//
-// Regenerated on every `cno cache` run (last-writer-wins, no diffing against
-// a prior run) — the in-store node_modules is shared across all projects
-// using the same cache dir, which is an accepted, documented tradeoff.
-
 import type { ScanResult } from '../deps';
 import type { NodeModulesMode } from '../types';
 import { joinPaths, dirname, ensureDir, log, errMsg, npmNameVersion, isWindows, hardlinkOrCopyDirRecursiveSync } from '../utils';

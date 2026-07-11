@@ -1,5 +1,3 @@
-// config.ts — configuration loading
-
 import type { RuntimeConfig, ConfigOptions } from './types';
 import { dirname, joinPaths, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier } from './utils';
 import { err, ErrorKind } from './errors';
@@ -121,6 +119,7 @@ function envConfig(): Partial<ConfigOptions> {
     const E = 'CTS_';
     const v = (k: string) => env(E + k);
     const cacheDir = v('CACHE_DIR'); if (cacheDir) c.cacheDir = cacheDir;
+    const lockDir = v('LOCK_DIR'); if (lockDir) c.lockDir = lockDir;
     const dc  = bool(v('DISABLE_CACHE')); if (dc  !== undefined) c.enableCache = !dc;
     // OXC env vars
     const no  = bool(v('NO_OXC'));         if (no === true) c.enableOxc = false;
@@ -286,10 +285,10 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     const cli = parseArgs(os.args.slice(1), CLI_TPL);
     const cfg = { ...DEFAULTS, ...envConfig(), ...userConfig } as RuntimeConfig;
 
-    if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'] || env('CTS_CACHE_DIR') || '';
+    if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'];
     if (cli['polyfill'])      cfg.polyfill      = cli['polyfill'];
     if (cli['eval'] || cli['e']) cfg.eval        = cli['eval'] || cli['e'];
-    if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'] || env('CTS_LOCK_DIR') || '';
+    if (cli['lock-dir'])      cfg.lockDir       = cli['lock-dir'];
     if (cli['disable-cache']) cfg.enableCache  = false;
     if (cli['cached-only'])   cfg.cachedOnly   = true;
     if (cli['no-oxc']) cfg.enableOxc = false;

@@ -1,9 +1,3 @@
-// compile/index.ts — ModuleCompiler facade
-//
-// Orchestrates ESM, CJS, and WASM compilers.
-// Wires CjsLoader to ESM compiler via bridge.ts callbacks.
-// This is the single entry point for "compile source into Module".
-
 import { err, ErrorKind } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 import type { ModuleResolver } from '../resolve/index';

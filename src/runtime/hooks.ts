@@ -1,8 +1,3 @@
-// runtime/hooks.ts — Engine hooks (engine.onModule)
-//
-// C layer constraint: engine.onModule is REPLACEMENT (not append).
-// Only one set of hooks active per process — second runtime hijacks the first.
-
 import { moduleRef, type ModuleInfo } from '../types';
 import type { ModuleResolver } from '../resolve/index';
 import type { ModuleCompiler } from '../compile/index';

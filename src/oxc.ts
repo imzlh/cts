@@ -13,6 +13,7 @@ export interface OxcModule {
     scanImports(source: string, opts?: OxcOptions): string[];
     transpileFast?: (source: string, kind: OxcKind, filename: string) => OxcTransformResult;
     transpileBytes?: (source: Uint8Array, kind: OxcKind, filename: string) => OxcTransformResult;
+    transpileSharedBytes?: (source: Uint8Array, kind: OxcKind, filename: string) => OxcSharedBytesResult;
     scanImportsFast?: (source: string, kind: OxcKind) => string[];
     scanImportsBytes?: (source: Uint8Array, kind: OxcKind) => string[];
     version: string;
@@ -21,6 +22,11 @@ export interface OxcModule {
 interface OxcTransformResult {
     code: string;
     sourceMap?: string;
+}
+
+interface OxcSharedBytesResult {
+    code: Uint8Array;
+    sourceMap?: Uint8Array;
 }
 
 type OxcKind = 0 | 1 | 2 | 3;
@@ -60,6 +66,7 @@ export class OxcTranspiler {
     private transpileOptions: OxcOptions = { kind: 'js', filename: '' };
     private transpileFast: ((source: string, kind: OxcKind, filename: string) => OxcTransformResult) | null = null;
     private transpileBytesFn: ((source: Uint8Array, kind: OxcKind, filename: string) => OxcTransformResult) | null = null;
+    private transpileSharedBytesFn: ((source: Uint8Array, kind: OxcKind, filename: string) => OxcSharedBytesResult) | null = null;
     private scanImportsFast: ((source: string, kind: OxcKind) => string[]) | null = null;
     private scanImportsBytesFn: ((source: Uint8Array, kind: OxcKind) => string[]) | null = null;
     private scanLogged = false;
@@ -73,6 +80,10 @@ export class OxcTranspiler {
         const transpileBytes = Reflect.get(mod, 'transpileBytes');
         if (typeof transpileBytes === 'function') {
             this.transpileBytesFn = transpileBytes;
+        }
+        const transpileSharedBytes = Reflect.get(mod, 'transpileSharedBytes');
+        if (typeof transpileSharedBytes === 'function') {
+            this.transpileSharedBytesFn = transpileSharedBytes;
         }
         const scanImportsFast = Reflect.get(mod, 'scanImportsFast');
         if (typeof scanImportsFast === 'function') {
@@ -91,9 +102,9 @@ export class OxcTranspiler {
      *  the sourcemap registry key AND as the embedded `sources` entry, so a
      *  resolved stack frame shows that identity instead of the on-disk path
      *  `filename` (which may sit in a shared, unrelated cache directory). */
-    transpile(source: string, filename: string, mapKey?: string): string | null {
+    transpile(source: string, filename: string, mapKey?: string, lang?: string): string | null {
         try {
-            const kind = kindFromFilename(filename);
+            const kind = kindFromFilename(filename, lang);
             const name = mapKey ?? filename;
             const { code, sourceMap } = this.transpileFast
                 ? this.transpileFast(source, kind, name)
@@ -112,9 +123,9 @@ export class OxcTranspiler {
     /** Like transpile(), but returns the sourcemap instead of registering it
      *  locally — for callers (e.g. a worker) whose JSContext isn't the one
      *  that will actually run the compiled module and needs to register it. */
-    transpileCapture(source: string, filename: string, mapKey?: string): { code: string; sourceMap?: string } | null {
+    transpileCapture(source: string, filename: string, mapKey?: string, lang?: string): { code: string; sourceMap?: string } | null {
         try {
-            const kind = kindFromFilename(filename);
+            const kind = kindFromFilename(filename, lang);
             const name = mapKey ?? filename;
             const { code, sourceMap } = this.transpileFast
                 ? this.transpileFast(source, kind, name)
@@ -126,10 +137,14 @@ export class OxcTranspiler {
         }
     }
 
-    transpileBytes(source: Uint8Array, filename: string, mapKey?: string): { code: string; sourceMap?: string } | null {
-        if (!this.transpileBytesFn) return null;
+    transpileBytes(source: Uint8Array, filename: string, mapKey?: string, lang?: string): OxcTransformResult | OxcSharedBytesResult | null {
+        if (!this.transpileSharedBytesFn && !this.transpileBytesFn) return null;
         try {
-            return this.transpileBytesFn(source, kindFromFilename(filename), mapKey ?? filename);
+            const kind = kindFromFilename(filename, lang);
+            const name = mapKey ?? filename;
+            return this.transpileSharedBytesFn
+                ? this.transpileSharedBytesFn(source, kind, name)
+                : this.transpileBytesFn!(source, kind, name);
         } catch (e) {
             log.debug('oxc', () => `transpileBytes failed for ${filename}: ${errMsg(e)}`);
             return null;
@@ -177,7 +192,10 @@ export class OxcTranspiler {
     }
 }
 
-function kindFromFilename(filename: string): OxcKind {
+function kindFromFilename(filename: string, lang?: string): OxcKind {
+    if (lang === 'ts' || lang === 'mts' || lang === 'cts') return OXC_KIND_TS;
+    if (lang === 'tsx') return OXC_KIND_TSX;
+    if (lang === 'jsx') return OXC_KIND_JSX;
     const length = filename.length;
     if (length >= 3 &&
         filename.charCodeAt(length - 1) === 115 &&
@@ -225,13 +243,19 @@ function optionKindForKind(kind: OxcKind): OxcOptionKind {
  */
 export function oxcExtPath(): string | null {
     try {
-        const exeDir = os.exePath.replace(/[\\/][^\\/]+$/, '');
         const sep = os.platform === 'windows' ? '\\' : '/';
         const suffix = os.platform === 'windows' ? 'dll'
                      : os.platform === 'darwin'  ? 'dylib'
                      : 'so';
-        const extPath = `${exeDir}${sep}ext${sep}oxc.${suffix}`;
-        const candidates = [extPath];
+        const candidates: string[] = [];
+
+        // CTS_EXT_PATH (same env var bootstrap.ts's resolveExtDir() honors) wins.
+        let envDir: string | null = null;
+        try { envDir = os.getenv('CTS_EXT_PATH'); } catch {}
+        if (envDir) candidates.push(`${envDir.replace(/[\\/]+$/, '')}${sep}oxc.${suffix}`);
+
+        const exeDir = os.exePath.replace(/[\\/][^\\/]+$/, '');
+        candidates.push(`${exeDir}${sep}ext${sep}oxc.${suffix}`);
 
         for (const path of candidates) {
             try {

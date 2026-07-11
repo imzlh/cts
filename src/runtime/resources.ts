@@ -1,11 +1,3 @@
-// runtime/resources.ts — Central resource lifecycle manager
-//
-// Tracks resources opened during pre-cache and provides a single release()
-// call that must be invoked before user code runs.
-//
-// Design: instance-based (not singleton) so each TypeScriptRuntime
-// can have its own ResourceManager. Supports REPL creating multiple runtimes.
-
 import { clearResolveCache, clearNegativeCache, log } from '../utils';
 import { clearPkgCache } from '../resolve/pkg';
 import { clearDnsCache } from '@cnojs/http/dns-cache';

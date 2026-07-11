@@ -1,14 +1,3 @@
-// task.ts — `deno.json` task runner
-//
-// Supports:
-//   tasks: { "name": "command string" }
-//   tasks: { "name": { "command": "...", "dependencies": [...], "env": {...} } }
-//
-// `deno run [flags] <file>` in task commands is translated to a direct cts
-// re-invocation so the same cache/lock settings apply.  Package/bin commands
-// are resolved via BinResolver when possible; otherwise the platform shell
-// handles Deno-compatible task commands such as `echo` and redirection.
-
 import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows } from './utils';
 import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
@@ -90,7 +79,6 @@ export class BinResolver {
 
         if (opts?.global) {
             return this.resolveNpmSpecifierBin(`npm:${name}`)
-                ?? this.resolveLockBin(name)
                 ?? this.resolveCachedGlobalBin(name);
         }
 
@@ -107,6 +95,36 @@ export class BinResolver {
         if (cached) return this.resolveEntry(cached);
 
         return null;
+    }
+
+    explain(name: string): string | null {
+        const parsed = parseNpmExecSpec(name);
+        if (!parsed) return `Invalid npm executable specifier '${name}'.`;
+
+        const cacheDir = resolveCacheDir(this.cacheDir);
+        const installedDir = findCachedPackageDir(cacheDir, parsed.name, parsed.version);
+        if (!installedDir) {
+            return `Package '${parsed.name}@${parsed.version}' was not found in the CTS cache. ` +
+                `cno exec only uses '${cacheDir}/npm'.`;
+        }
+
+        const pkg = readPkgFresh(installedDir);
+        if (!pkg) return `Package '${parsed.name}' is cached, but its package.json could not be read.`;
+        const binMap = getBinMap(pkg);
+        const bins = Object.keys(binMap);
+        const version = String(pkg.version ?? parsed.version);
+        if (!bins.length) {
+            return `Package '${pkg.name ?? parsed.name}@${version}' has no executable entry. use cno run for a source file or add a bin entry.`;
+        }
+        if (parsed.binName && !binMap[parsed.binName]) {
+            return `Package '${pkg.name ?? parsed.name}@${version}' does not expose bin '${parsed.binName}'. ` +
+                `Available bins: ${bins.join(', ')}.`;
+        }
+        if (!parsed.binName && !defaultBinName(pkg.name ?? parsed.name, binMap)) {
+            return `Package '${pkg.name ?? parsed.name}@${version}' exposes multiple bins: ${bins.join(', ')}. ` +
+                'Specify one as npm:<package>/<bin>.';
+        }
+        return `Package '${pkg.name ?? parsed.name}@${version}' declares a bin, but its target file is missing from the CTS cache.`;
     }
 
     private resolveLockBin(name: string): ResolvedBin | null {
@@ -176,7 +194,7 @@ export class BinResolver {
         }
         if (!matches.length) return null;
         matches.sort((a, b) => compareVersions(a.version, b.version));
-        return this.resolveEntry(matches[matches.length - 1].path);
+        return this.resolveEntry(matches[matches.length - 1]!.path);
     }
 
     private collectCachedBinMatch(name: string, dir: string, matches: Array<{ version: string; path: string }>): void {

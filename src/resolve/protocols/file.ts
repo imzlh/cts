@@ -1,5 +1,3 @@
-// protocol/file.ts - file:// handler
-
 import type { ModuleInfo, RuntimeConfig } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';

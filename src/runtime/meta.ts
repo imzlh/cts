@@ -1,8 +1,3 @@
-// runtime/meta.ts — import.meta population
-//
-// Fills import.meta with url, filename, dirname, main, use, resolve
-// for each loaded module.
-
 import type { ModuleInfo } from '../types';
 import type { ModuleResolver } from '../resolve/index';
 import { dirname, isAbsolute, toPosixPath } from '../utils';

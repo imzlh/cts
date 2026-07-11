@@ -1,5 +1,3 @@
-// utils/bin.ts — shared node_modules/.bin resolution
-
 import { joinPaths, dirname, pathRoot, toPosixPath } from './path';
 import { isWindows } from './platform';
 

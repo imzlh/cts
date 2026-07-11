@@ -1,5 +1,3 @@
-// types.ts — shared types
-
 export type ModuleFormat = 'esm' | 'cjs';
 export type FileKind     = 'source' | 'json' | 'wasm' | 'binary' | 'text';
 export type LifecycleScriptName = 'install' | 'postinstall';

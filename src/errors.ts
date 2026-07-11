@@ -1,16 +1,3 @@
-// errors.ts — user-friendly error formatting and diagnostics
-//
-// Principles:
-//   - Show what went wrong, where, and what to try next
-//   - Never show an internal stack trace as the primary message
-//   - Colour is used where available (same TTY detection as progress.ts)
-//   - Actionable suggestions tailored to the error kind
-//
-// Error classification:
-//   Internal errors carry a `.kind` property (ErrorKind) set at the throw site.
-//   External errors (from user code, engines, or dependencies) have no `.kind`
-//   and fall back to message-based heuristics — but those are best-effort only.
-
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -77,15 +64,24 @@ function errorFromUnknown(value: unknown): Error {
     return new Error(String(value));
 }
 
-function syntaxCause(error: SyntaxError): { source?: SyntaxError; path?: string } | null {
+function syntaxCause(error: Error): { source?: Error; path?: string } | null {
     const cause = Reflect.get(error, 'cause');
     if (!cause || typeof cause !== 'object') return null;
     const source = Reflect.get(cause, 'source');
     const path = Reflect.get(cause, 'path');
     return {
-        source: source instanceof SyntaxError ? source : undefined,
+        source: source instanceof Error ? source : undefined,
         path: typeof path === 'string' ? path : undefined,
     };
+}
+
+/** QuickJS compile errors don't embed a location in .message — the engine
+ *  instead adds a synthetic "at <module-name>:<line>:<col>" frame at the top
+ *  of .stack (ahead of the real JS call frames), so grab the first one. */
+function locationFromStack(source: Error | undefined): { line: number; col: number } | null {
+    if (!source?.stack) return null;
+    const m = source.stack.match(/^\s*at\s+.*?:(\d+):(\d+)\s*$/m);
+    return m ? { line: +m[1]!, col: +m[2]! } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +135,7 @@ const C = {
     bold:   (s: string) => isTTY() ? `\x1b[1m${s}\x1b[0m`  : s,
     dim:    (s: string) => isTTY() ? `\x1b[2m${s}\x1b[0m`  : s,
     green:  (s: string) => isTTY() ? `\x1b[32m${s}\x1b[0m` : s,
+    invert: (s: string) => isTTY() ? `\x1b[7m${s}\x1b[0m`  : s,
 };
 
 // ---------------------------------------------------------------------------
@@ -216,21 +213,44 @@ function sourceContext(file: string, line: number, col: number): string {
     catch { return ''; }
 
     const lines = src.split(/\r?\n/);
+    // A trailing newline produces a final empty split element that isn't a
+    // real source line — drop it so we don't render a bogus blank "line N+1".
+    if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+
     const lo = Math.max(0, line - 2), hi = Math.min(lines.length, line + 1);
     const numW = String(hi + 1).length;
     const out: string[] = [''];
 
+    // Fixed gutter width before line content: "  " + num + " │ "
+    const gutter = numW + 5;
+    const tty = isTTY();
+
     for (let i = lo; i < hi; i++) {
-        const num    = String(i + 1).padStart(numW);
-        const isErr  = i === line - 1;
-        const prefix = isErr ? C.red('›') : ' ';
-        out.push(`  ${prefix} ${C.dim(num + ' │')} ${isErr ? C.bold(lines[i] ?? '') : (lines[i] ?? '')}`);
-        if (isErr && col > 0) {
-            const arrow = ' '.repeat(numW + 5 + col - 1) + C.red('^');
+        const isErr = i === line - 1;
+        const num   = String(i + 1).padStart(numW);
+        // Highlight the error line via a bold/red line number instead of a
+        // '›' marker glyph, which can misrender or misalign in some terminals.
+        const numOut = isErr ? C.bold(C.red(num)) : C.dim(num);
+        const raw = lines[i] ?? '';
+        out.push(`  ${numOut} │ ${isErr ? highlightAt(raw, col, tty) : raw}`);
+        // On a TTY, highlightAt already marks the offending character in
+        // place — a caret line is only needed as a plain-text fallback.
+        if (isErr && col > 0 && !tty) {
+            const arrow = ' '.repeat(gutter + col - 1) + C.red('^');
             out.push(arrow);
         }
     }
     return out.join('\n');
+}
+
+/** Bold the error line; on a TTY also reverse-video the single character at
+ *  `col` (1-indexed) so the offending token is visible without a separate
+ *  caret line below it. */
+function highlightAt(line: string, col: number, tty: boolean): string {
+    if (!tty || col <= 0) return C.bold(line);
+    const idx = col - 1;
+    if (idx >= line.length) return C.bold(line) + C.invert(' ');
+    return C.bold(line.slice(0, idx)) + C.invert(line[idx] ?? ' ') + C.bold(line.slice(idx + 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +276,7 @@ export function formatError(e: unknown, context?: string): string {
 
     // 1. Use .kind if available (set by internal throw sites via `err()`)
     // 2. Fall back to message heuristics for external errors
-    const kind = error.kind ?? classifyFallback(msg);
+    const kind = error.kind ?? ErrorKind.Generic;
     const hint = suggest(kind, msg);
 
     const lines: string[] = [];
@@ -271,16 +291,23 @@ export function formatError(e: unknown, context?: string): string {
         .replace(/\(see .*?\.log\)$/, '');
     lines.push(`  ${cleanMsg}`);
 
-    // Source context for syntax errors
-    if (error instanceof SyntaxError) {
+    // Source context for syntax/transform errors. `error` may be a plain
+    // Error carrying kind=SyntaxError (see compileEsm's err() wrapping) as
+    // well as an actual SyntaxError (from reportSyntax's rethrow) — both
+    // shapes stash { source, path } on .cause.
+    if (kind === ErrorKind.SyntaxError) {
         const cause = syntaxCause(error);
         if (cause?.path) {
             const locMatch = cause.source?.message?.match(/(\d+):(\d+)/);
-            const line = locMatch?.[1] ? +locMatch[1] : 0;
-            const col  = locMatch?.[2] ? +locMatch[2] : 0;
-            lines.push(C.dim(`  ${cause.path}${line ? `:${line}:${col}` : ''}`));
-            if (line) lines.push(sourceContext(cause.path, line, col));
+            const loc = locMatch?.[1]
+                ? { line: +locMatch[1], col: locMatch[2] ? +locMatch[2] : 0 }
+                : locationFromStack(cause.source);
+            lines.push(C.dim(`  ${cause.path}${loc ? `:${loc.line}:${loc.col}` : ''}`));
+            if (loc) lines.push(sourceContext(cause.path, loc.line, loc.col));
         }
+    } else if (error instanceof TransformError) {
+        lines.push(C.dim(`  ${error.fileName}:${error.line}:${error.column}`));
+        lines.push(sourceContext(error.fileName, error.line, error.column));
     }
 
     // Debug stack (only if DEBUG includes 'stack')
@@ -289,9 +316,13 @@ export function formatError(e: unknown, context?: string): string {
         for (const l of error.stack.split('\n').slice(1, 6))
             lines.push(C.dim(`  ${l.trim()}`));
     } else if (error.stack) {
-        const stackLines = error.stack.split('\n').filter(s => !s.includes('(native)'));
-        if (stackLines[0]) {
-            lines.push('    ' + C.dim(stackLines[0].trim().substring(3)));
+        // stack[0] is the "Name: message" header (already shown above via
+        // cleanMsg) — the first actual call site starts at index 1.
+        const frame = error.stack.split('\n').slice(1)
+            .map(l => l.trim())
+            .find(l => l && !l.includes('(native)'));
+        if (frame) {
+            lines.push('    ' + C.dim(frame.startsWith('at ') ? frame.slice(3) : frame));
         }
     }
 
@@ -299,48 +330,6 @@ export function formatError(e: unknown, context?: string): string {
     if (hint) lines.push('', `  ${C.yellow('→')} ${hint}`);
 
     return lines.join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// Fallback classifier — only used when .kind is absent (external errors)
-// ---------------------------------------------------------------------------
-
-function classifyFallback(msg: string): ErrorKind {
-    const m = msg.toLowerCase();
-
-    if (m.includes('syntax error') || m.includes('unexpected token') ||
-        m.includes('unexpected end') || m.includes('unterminated'))
-        return ErrorKind.SyntaxError;
-
-    if (m.includes('cannot find module') || m.includes('module not found'))
-        return ErrorKind.ModuleNotFound;
-
-    if (m.includes('cannot resolve'))
-        return ErrorKind.ModuleNotFound;
-
-    if (m.includes('file not found'))
-        return ErrorKind.FileNotFound;
-
-    if (m.includes('econnrefused') || m.includes('network') ||
-        m.includes('timeout') || m.includes('ssl') || m.includes('dns'))
-        return ErrorKind.NetworkError;
-
-    if (m.includes('http '))
-        return ErrorKind.NetworkError;
-
-    if (m.includes('eacces') || m.includes('eperm') || m.includes('permission'))
-        return ErrorKind.PermissionError;
-
-    if (m.includes('version') && (m.includes('not found') || m.includes('no matching')))
-        return ErrorKind.VersionNotFound;
-
-    if (/\bfrozen\b/.test(m) || /\block\b/.test(m))
-        return ErrorKind.LockFrozen;
-
-    if (m.includes('unknown task') || m.includes('task not found'))
-        return ErrorKind.TaskNotFound;
-
-    return ErrorKind.Generic;
 }
 
 function errorInfo(e: unknown): { name: string; message: string; stack?: string } {

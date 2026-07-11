@@ -1,11 +1,3 @@
-// compile/wasm.ts — WASM compilation engine
-//
-// Handles .wasm module loading with circular dependency support
-// (wasm-bindgen: JS glue imports from .wasm, .wasm imports table/memory from JS glue).
-// Unresolved imports throw LinkError (V8/Deno compatible behavior).
-// WASI imports (wasi_unstable / wasi_snapshot_preview1) are handled by
-// setWasiOptions and skipped during manual resolution.
-
 import type { ModuleInfo } from '../types';
 import { errMsg, log, assert } from '../utils';
 import { err, ErrorKind } from '../errors';

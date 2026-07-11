@@ -1,5 +1,3 @@
-// precompile.ts — compatibility shim for older imports
-
 export {
     ParseDriver,
     PrecompileDriver,

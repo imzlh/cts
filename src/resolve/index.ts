@@ -1,13 +1,3 @@
-// resolver.ts — ModuleResolver
-//
-// Three-level resolution cache:
-//   L1  lock.sources["mode\0spec\0parent"] → specPath    (skip dispatch entirely)
-//   L2  lock.modules[specPath]       → ModuleInfo  (skip protocol handler)
-//   L3  dispatch to protocol handler (download if needed)
-//
-// lock.modules IS the live in-process cache — no separate runCache needed.
-// lock.setModule() writes to both lock.modules and lock.dirtyModules.
-
 import { moduleRef, type RuntimeConfig, type ModuleInfo, type NodeBuiltinResolver, type FileKind, type LifecycleScriptEntry } from '../types';
 import type { ProtocolHandler } from './protocols/base';
 import type { ProgressCallback } from '../flow';

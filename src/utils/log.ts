@@ -1,18 +1,3 @@
-// utils/log.ts — structured debug logger
-//
-// Usage:
-//   import { log } from './utils/log';
-//   log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
-//   log.warn('npm', 'metadata cache expired for', name);
-//
-// Enable via environment variable:
-//   DEBUG=*              # all categories
-//   DEBUG=resolver,npm   # specific categories
-//   DEBUG=resolver,!lock # resolver but not lock
-//
-// Key design: the message lambda is ONLY called when the category is active.
-// This avoids string interpolation cost on every hot-path call.
-
 const os = import.meta.use('os');
 const console = import.meta.use('console');
 

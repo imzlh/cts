@@ -1,10 +1,3 @@
-// source/index.ts — Load layer: read files + TS/JSX to JS transform
-//
-// This layer is format-agnostic (no CJS/ESM awareness). It only:
-//   1. Reads source files (disk / network cache)
-//   2. Transforms (oxc native -> sucrase fallback -> passthrough)
-//   3. Returns clean JS source
-
 import type { ModuleInfo } from '../types';
 import { moduleRef } from '../types';
 import { readText, log } from '../utils';
