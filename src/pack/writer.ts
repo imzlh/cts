@@ -24,7 +24,7 @@ interface BlobChunk {
 interface BlobRange { offset: number; length: number }
 interface SourceSnapshot extends BlobRange {
     sourceOnly: boolean;
-    freshness: string;
+    digest: string;
 }
 
 class BlobBuilder {
@@ -62,9 +62,8 @@ function writeAll(fd: number, bytes: Uint8Array): void {
     }
 }
 
-function freshnessToken(path: string): string {
-    const stat = fs.stat(path);
-    return `${String(stat.mtim)}:${stat.size}`;
+function contentDigest(bytes: Uint8Array): string {
+    return crypto.hexEncode(crypto.sha256(bytes));
 }
 
 /** Same scheme-extraction rule as ModuleResolver's private protoOf() — 2-8
@@ -200,6 +199,7 @@ export async function writePack(
         // weight. Drop them here; edges pointing at them fall away with the target.
         const packableModules = scanResult.modules.filter(m => specScheme(m.specPath) !== 'node');
         const classified = classifyModules(packableModules, workspaceRoots);
+        classified.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
         const realToSynthetic = new Map<string, string>();
         for (const c of classified) realToSynthetic.set(c.m.specPath, c.id);
@@ -219,7 +219,8 @@ export async function writePack(
             const specs = importsByLocalPath.get(m.localPath);
             if (!specs || !specs.length) continue;
             const bucket: Record<string, string> = Object.create(null);
-            for (const spec of specs) {
+            const orderedSpecs = [...specs].sort();
+            for (const spec of orderedSpecs) {
                 const childSpecPath = resolvedEdges.get(`${m.specPath}\0${spec}`);
                 if (childSpecPath === undefined) {
                     throw err(ErrorKind.Generic, `pack: scan omitted edge "${spec}" from "${m.specPath}"`);
@@ -268,11 +269,7 @@ export async function writePack(
             }
             let snapshot = sourceSnapshots.get(m.localPath);
             if (!snapshot) {
-                const freshness = freshnessToken(m.localPath);
                 const source = new Uint8Array(fs.readFile(m.localPath));
-                if (freshnessToken(m.localPath) !== freshness) {
-                    throw err(ErrorKind.Generic, `pack: source changed while reading: ${m.localPath}`);
-                }
                 const range = blob.push(source);
                 snapshot = {
                     ...range,
@@ -282,7 +279,7 @@ export async function writePack(
                             ? isTypeScriptLang(options.entryLang)
                             : isTsLikePath(m.localPath),
                     ),
-                    freshness,
+                    digest: contentDigest(source),
                 };
                 sourceSnapshots.set(m.localPath, snapshot);
                 rawRanges.set(m.localPath, range);
@@ -301,6 +298,7 @@ export async function writePack(
         }
 
         const compileFailures: Array<{ localPath: string; specPath: string; error: unknown }> = [];
+        const compiled = new Map<string, Uint8Array>();
 
         if (sourceModules.length > 0) {
             // Throwaway placeholders so eager static-import resolution during
@@ -328,27 +326,11 @@ export async function writePack(
             }, () =>
                 // compileForCache reports both the real local path and synthetic id.
                 parseDriver.compileModules(sourceModules, (done, total) => prog?.setCompileProgress(done, total), (localPath, bc, syntheticSpecPath) => {
-                    const bytes = new Uint8Array(bc);
-                    const { offset, length } = blob.push(bytes);
-                    const format = moduleById.get(syntheticSpecPath)?.format ?? 'esm';
-                    const sourceRange = sourceRanges.get(syntheticSpecPath);
-                    if (!sourceRange) {
-                        compileFailures.push({ localPath, specPath: syntheticSpecPath, error: new Error('source bytes were not recorded') });
+                    if (compiled.has(syntheticSpecPath)) {
+                        compileFailures.push({ localPath, specPath: syntheticSpecPath, error: new Error('duplicate compiler output') });
                         return;
                     }
-                    modules[syntheticSpecPath] = {
-                        localPath: syntheticSpecPath,
-                        format,
-                        fileKind: 'source',
-                        offset,
-                        length,
-                        sourceOffset: sourceRange.offset,
-                        sourceLength: sourceRange.length,
-                        sourceOnly: sourceRange.sourceOnly,
-                        lang: moduleById.get(syntheticSpecPath)?.specPath === entryInfo.specPath
-                            ? options.entryLang
-                            : undefined,
-                    };
+                    compiled.set(syntheticSpecPath, new Uint8Array(bc));
                 }, (localPath, specPath, error) => {
                     compileFailures.push({ localPath, specPath, error });
                 }),
@@ -362,8 +344,31 @@ export async function writePack(
             throw err(ErrorKind.TransformError, `pack: ${compileFailures.length} source module(s) failed to compile:\n${lines}`);
         }
 
+        // Worker completion order is intentionally nondeterministic. Append
+        // bytecode in sorted module order so identical inputs produce a stable
+        // blob layout and manifest regardless of transform scheduling.
+        for (const sourceModule of sourceModules) {
+            const output = compiled.get(sourceModule.specPath);
+            const sourceRange = sourceRanges.get(sourceModule.specPath);
+            if (!output || !sourceRange) continue;
+            const { offset, length } = blob.push(output);
+            const source = moduleById.get(sourceModule.specPath);
+            modules[sourceModule.specPath] = {
+                localPath: sourceModule.specPath,
+                format: source?.format ?? 'esm',
+                fileKind: 'source',
+                offset,
+                length,
+                sourceOffset: sourceRange.offset,
+                sourceLength: sourceRange.length,
+                sourceOnly: sourceRange.sourceOnly,
+                lang: source?.specPath === entryInfo.specPath ? options.entryLang : undefined,
+            };
+        }
+
         for (const [localPath, snapshot] of sourceSnapshots) {
-            if (freshnessToken(localPath) !== snapshot.freshness) {
+            const current = new Uint8Array(fs.readFile(localPath));
+            if (contentDigest(current) !== snapshot.digest) {
                 throw err(ErrorKind.Generic, `pack: source changed while packing: ${localPath}`);
             }
         }
@@ -374,10 +379,20 @@ export async function writePack(
                 `pack: ${missing.length} module(s) produced no output:\n${missing.map(id => `  - ${id}`).join('\n')}`);
         }
 
+        // Stable key order for modules and edges so identical graphs encode
+        // byte-identical JSON regardless of Map/Object insertion quirks.
+        const orderedModules: Record<string, PackModuleEntry> = Object.create(null);
+        const orderedEdges: Record<string, Record<string, string>> = Object.create(null);
+        for (const { id } of classified) {
+            orderedModules[id] = modules[id]!;
+            const bucket = edges[id];
+            if (bucket) orderedEdges[id] = bucket;
+        }
+
         const manifest: PackManifest = {
             entry: entryId,
-            modules,
-            edges,
+            modules: orderedModules,
+            edges: orderedEdges,
             bytecodeVersion: engine.versions.quickjs,
         };
         writeAtomically(outPath, manifest, blob);
@@ -395,13 +410,19 @@ function writeAtomically(outPath: string, manifest: PackManifest, blob: BlobBuil
     let fd: number | null = null;
     try {
         const header = encodePackHeader(manifest, blob.byteLength);
-        fd = fs.open(tempPath, 'w');
+        fd = fs.open(tempPath, 'wx', 0o600);
         writeAll(fd, header);
         blob.writeTo(fd);
         fs.fsync(fd);
         fs.close(fd);
         fd = null;
-        fs.rename(tempPath, outPath);
+        // Linux rename replaces; Windows fails if dest exists — unlink then retry.
+        try {
+            fs.rename(tempPath, outPath);
+        } catch {
+            try { fs.unlink(outPath); } catch {}
+            fs.rename(tempPath, outPath);
+        }
     } finally {
         if (fd !== null) {
             try { fs.close(fd); } catch {}

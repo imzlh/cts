@@ -19,6 +19,7 @@ cts/
 │   ├── lock.ts              # LockStore class
 │   ├── scan.ts              # extractImports(), isTsLikePath(), isScannablePath(), isWasmPath()
 │   ├── parse.ts             # ParseDriver class, isParseWorker(), runParseWorker(), PrecompileDriver
+│   ├── pack/                # .jspack format, writer, validated extraction/reader
 │   ├── precompile.ts        # Shim — re-exports parse.ts symbols (delete when consumers migrate)
 │   ├── shell.ts             # parseShellCommand(), isShellOperator(), resolveWinBinEntry(), resolveUnixBinEntry()
 │   ├── task.ts              # TaskRunner, BinResolver, loadTasks()
@@ -51,7 +52,8 @@ cts/
 │   │       ├── http.ts      # http/https handler
 │   │       ├── jsr.ts       # JSR registry handler
 │   │       ├── npm.ts       # npm registry handler (largest)
-│   │       └── node.ts      # node: builtin handler
+│   │       ├── node.ts      # node: builtin handler
+│   │       └── pack.ts      # pack:/ctsview: manifest-only handler
 │   │
 │   ├── runtime/             # Composition root
 │   │   ├── index.ts         # TypeScriptRuntime class, createRuntime()
@@ -98,7 +100,8 @@ cts/
   TypeScriptRuntime
   ├── ModuleResolver ────── Protocol Handlers (npm, jsr, http, file, node, data, blob)
   │     ├── LockStore (SQLite) — 3-level cache: L1 specPath index, L2 modules, L3 protocol dispatch
-  │     └── DepScanner — concurrent BFS for dependency discovery
+  │     ├── DepScanner — concurrent BFS for dependency discovery
+  │     └── PackHandler — offline manifest edge lookup
   ├── ModuleCompiler
   │   ├── EsmCompiler ─── Transformer (oxc native → sucrase fallback) → JscCache
   │   ├── CjsLoader ───── bridgeCjsToEsm / installGlobalRequire
@@ -113,6 +116,8 @@ cts/
 **`cno cache <entry>`**: DepScanner parallel BFS → resolve each import → scan for deps → ParseDriver workers transform to bytecode → persist .jsc → flush lock. Optionally run lifecycle scripts and materialize node_modules.
 
 **`cno run <entry>`**: Create resolver + compiler → install engine.onModule hooks → QuickJS calls resolve/load/init per import → source transformed and compiled on demand.
+
+**`cno pack <entry>`**: DepScanner `fullGraph` → classify relocatable identities → compile under `pack:` ids → validate manifest/ranges → stream an atomic `.jspack`. Running it validates and extracts bundled bytes, registers `PackHandler`, then resolves only through recorded edges.
 
 ## Layer Responsibilities
 
@@ -132,6 +137,7 @@ Cross-cutting concerns shared by all layers. No dependencies on compile/resolve/
 | `task.ts` | `TaskRunner`, `BinResolver`, `loadTasks()` | Deno task runner, binary resolution |
 | `oxc.ts` | `OxcTranspiler`, `OxcModule`, `tryLoadOxc()`, `oxcExtPath()` | OXC native extension wrapper |
 | `deps.ts` | `DepScanner`, `ScanResult` | Concurrent BFS dependency discovery |
+| `pack/` | `writePack()`, `loadPack()`, `encodePack`/`decodePack`, format helpers | Portable container construction, validation, extraction |
 
 ### resolve/ — Specifier → Local Path
 Pure resolution logic. Given a specifier + referrer, produces a local file path or downloads the module.
@@ -153,6 +159,7 @@ Pure resolution logic. Given a specifier + referrer, produces a local file path 
 | `protocols/jsr.ts` | — | JSR registry handler |
 | `protocols/npm.ts` | — | npm registry handler (largest, handles tarballs + lifecycle) |
 | `protocols/node.ts` | — | `node:` builtin module handler |
+| `protocols/pack.ts` | `PackHandler` | Offline `pack:` and `ctsview:` lookup from a validated manifest |
 
 ### compile/ — Source → QuickJS Module
 Takes a resolved file path + source, produces a loaded QuickJS Module.
@@ -214,8 +221,32 @@ No circular deps. Used everywhere.
 - **Flow**: protocol handlers `yield Step`; `runSync`/`runAsync` drive them — no direct I/O inside handlers
 - **LRU**: instantiate with capacity, use `get`/`set` — no manual eviction
 - **Module identity**: use `moduleRef(info)` (returns `info.moduleId ?? info.specPath`) as the QuickJS module name, not `localPath`
+- **Pack isolation**: do not resolve a missing manifest edge against disk/network; incomplete scans and compiles are fatal
+- **Attribute views**: use `moduleViewRef()`; do not encode view state in a user query/hash suffix
+- **Bytecode safety**: propagate `cacheBytecode: false` for `sourceOnly` pack entries so warm caches cannot erase import attributes
+- **Pack writes**: validate first, stream to a same-directory temporary file, `fsync`, and atomically rename
+- **Pack extract integrity**: reuse only byte-identical files; heal with temp + `fsync` + rename (`.complete`/size alone is not integrity)
+- **Lock ownership**: pack may fill dependency caches but never persists `cts.lock` or runs lifecycle scripts
 - **Workers**: ParseDriver grows lazily; always `terminate()` when done
 - **Header comments**: removed — responsibilities documented here, not in-file
+
+## Pack Verification
+
+After changes under `pack/`, `deps.ts`, module identity, resolution, or bytecode
+caching, rebuild the embedded CLI and run at least:
+
+```bash
+cmake --build build -j2
+CTS_CACHE_DIR=/tmp/cno-pack-test build/stage/cno setup
+CTS_CACHE_DIR=/tmp/cno-pack-test build/stage/cno test tests/cts/pack-command.test.ts --concurrency=1
+CTS_CACHE_DIR=/tmp/cno-pack-test build/stage/cno test tests/cts/import-attributes-runtime.test.ts tests/cjs/require-esm-interop.test.ts --concurrency=1
+git diff --check
+git -C cts diff --check
+```
+
+The pack suite must exercise the same artifact more than once: the second run
+is what detects unsafe `sourceOnly` bytecode reuse and same-length extract-cache
+tampering on text/bytes/CJS attribute paths.
 
 ## External Dependencies
 

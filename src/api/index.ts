@@ -21,7 +21,14 @@ export { createResourceManager, ResourceManager } from '../runtime/resources';
 export { writePack } from '../pack/writer';
 export type { WritePackOptions } from '../pack/writer';
 export { loadPack } from '../pack/reader';
-export type { PackManifest, PackModuleEntry } from '../pack/format';
+export {
+    encodePack,
+    encodePackHeader,
+    decodePack,
+    readBlob,
+    readSourceBlob,
+} from '../pack/format';
+export type { PackManifest, PackModuleEntry, PackContainer } from '../pack/format';
 export type {
     ModuleInfo, ModuleFormat, FileKind,
     ConfigOptions, RuntimeConfig, PackageJson,

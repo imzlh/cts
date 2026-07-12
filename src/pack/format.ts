@@ -154,6 +154,10 @@ function validateManifest(value: unknown, blobLength: number): PackManifest {
         if (raw.fileKind === 'source' && !validRange(raw.sourceOffset, raw.sourceLength, blobLength)) {
             throw new Error(`Invalid .jspack file: source range is out of bounds for "${id}"`);
         }
+        if (raw.fileKind !== 'source' &&
+            (raw.sourceOffset !== undefined || raw.sourceLength !== undefined || raw.sourceOnly !== undefined || raw.lang !== undefined)) {
+            throw new Error(`Invalid .jspack file: non-source module has source metadata for "${id}"`);
+        }
         if (raw.sourceOnly !== undefined && typeof raw.sourceOnly !== 'boolean') {
             throw new Error(`Invalid .jspack file: invalid sourceOnly flag for "${id}"`);
         }
@@ -170,7 +174,8 @@ function validateManifest(value: unknown, blobLength: number): PackManifest {
             throw new Error(`Invalid .jspack file: invalid edge parent "${parent}"`);
         }
         for (const [specifier, target] of Object.entries(rawBucket)) {
-            if (!specifier || typeof target !== 'string' || !Object.prototype.hasOwnProperty.call(modules, target)) {
+            if (!specifier || specifier.includes('\0') || typeof target !== 'string' ||
+                !Object.prototype.hasOwnProperty.call(modules, target)) {
                 throw new Error(`Invalid .jspack file: invalid edge from "${parent}"`);
             }
         }
