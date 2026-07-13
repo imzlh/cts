@@ -175,7 +175,17 @@ export class TypeScriptRuntime {
     readonly resources: ResourceManager;
     private readonly initHooks: Array<(specPath: string, info: ModuleInfo) => void> = [];
     private engineHooks: EngineHooks;
-    private readonly oxc: OxcTranspiler | null;
+    private oxc: OxcTranspiler | null | undefined;
+
+    /** Native oxc accelerator when enableOxc and ext loaded; else null. */
+    getOxc(): OxcTranspiler | null {
+        if (this.oxc !== undefined) return this.oxc;
+        this.oxc = tryLoadOxc();
+        if (!this.oxc) {
+            log.debug('oxc', () => 'enableOxc but extension unavailable — scan/transform use Sucrase');
+        }
+        return this.oxc;
+    }
 
     /** Register an additional callback to fire after each module's init hook. */
     addInitHook(fn: (specPath: string, info: ModuleInfo) => void): void {
@@ -189,7 +199,7 @@ export class TypeScriptRuntime {
         // Lock location/mode: only `cno cache` persists to disk; run/eval/etc.
         // are read-only or in-memory, and never in the entry file's directory.
         if (cfg.disableLock) {
-            this.resolver = new ModuleResolver(cfg, undefined, true);
+            this.resolver = new ModuleResolver(cfg, cfg.cacheDir, true);
         } else {
             const lock = resolveLockTarget(cfg, entryDir);
             this.resolver = new ModuleResolver(cfg, lock.dir, lock.readOnly);
@@ -197,8 +207,8 @@ export class TypeScriptRuntime {
 
         this.compiler = new ModuleCompiler(this.resolver, cfg);
 
-        this.oxc = cfg.enableOxc === false ? null : tryLoadOxc();
-        if (this.oxc) this.compiler.setOxc(this.oxc);
+        this.oxc = cfg.enableOxc === false ? null : undefined;
+        this.compiler.setOxcLoader(() => this.getOxc());
 
         this.engineHooks = this.installHooks();
 
@@ -318,9 +328,12 @@ export class TypeScriptRuntime {
         projectDir: string,
     ): Promise<ScanResult> {
         const prog = this.config.silent ? null : new PrecacheProgress(6);
-        const parseDriver = new ParseDriver(this.oxc);
-        const scanner = new DepScanner(this.resolver, this.config, prog, this.oxc, parseDriver.scanFile.bind(parseDriver));
-        log.debug('precache', () => `pipeline: scan=${this.oxc ? 'oxc+fallback' : 'fallback-only'}, transform=${this.oxc ? 'oxc+sucrase fallback' : 'sucrase-only'}`);
+        // Import scan is main-thread oxc-first (ImportScanner inside DepScanner).
+        // Transform workers are only created for the compile phase below.
+        const oxc = this.getOxc();
+        const parseDriver = new ParseDriver(oxc);
+        const scanner = new DepScanner(this.resolver, this.config, prog, oxc);
+        log.debug('precache', () => `pipeline: scan=${oxc ? 'oxc' : 'sucrase'}, transform=${oxc ? 'oxc+workers' : 'sucrase+workers'}`);
 
         let result: ScanResult;
         try {
@@ -330,7 +343,7 @@ export class TypeScriptRuntime {
             log.debug('deps', () => `scan done in ${Date.now() - scanStarted}ms`);
         } catch (e) {
             try {
-                this.resolver.rewriteLock();
+                this.resolver.flushLock();
             } catch { }
             prog?.stop();
             this.resources.release();
@@ -359,8 +372,14 @@ export class TypeScriptRuntime {
                     (done, total) => prog?.setLinkProgress(done, total),
                 );
             } catch (e) {
+                // Fail closed: --npm-mode=soft|hard promised real node_modules.
+                // Swallowing here printed "✔ N modules cached" after zero links.
                 prog?.clearForOutput();
                 log.warn('precache', () => `node_modules materialization failed: ${errMsg(e)}`);
+                prog?.stop();
+                this.resources.release();
+                await parseDriver.terminate();
+                throw e instanceof Error ? e : new Error(errMsg(e));
             }
             prog?.stop();
             log.debug('precache', () => 'materialize node_modules end');
@@ -401,7 +420,7 @@ export class TypeScriptRuntime {
             log.warn('deps', () => `${softNpmErrors} npm-internal dependency error(s) ignored during precache`);
         }
         log.debug('precache', () => `scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
-        this.resolver.rewriteLock();
+        this.resolver.flushLock();
         if (fatalErrors.length > 0) {
             prog?.stop();
             this.resources.release();
@@ -426,13 +445,14 @@ export class TypeScriptRuntime {
         }
 
         if (toCompile.length > 0) {
+            log.debug('precache', () => `precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
+            prog?.setCompileProgress(0, toCompile.length);
+            // Stream each bytecode straight to disk and drop it — never hold
+            // the whole graph's bytecode in memory (peak RSS bound).
+            const formatByLocalPath = new Map(toCompile.map(m => [m.localPath, m.format]));
+            let written = 0;
+            let fail = 0;
             try {
-                log.debug('precache', () => `precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
-                prog?.setCompileProgress(0, toCompile.length);
-                // Stream each bytecode straight to disk and drop it — never hold
-                // the whole graph's bytecode in memory (peak RSS bound).
-                const formatByLocalPath = new Map(toCompile.map(m => [m.localPath, m.format]));
-                let written = 0;
                 await parseDriver.compileModules(
                     toCompile,
                     (done, total) => prog?.setCompileProgress(done, total),
@@ -442,10 +462,27 @@ export class TypeScriptRuntime {
                         this.compiler.esm.jsc.persistBytecode(localPath, bc, remote);
                         written++;
                     },
+                    (localPath, _specPath, error) => {
+                        fail++;
+                        log.debug('precompile', () => `skip ${localPath}: ${errMsg(error)}`);
+                    },
                 );
-                log.debug('precache', () => `precompile end: ${written}/${toCompile.length} bytecodes`);
             } catch (e) {
-                log.warn('precompile', () => `failed: ${errMsg(e)}`);
+                // Batch/driver failure is not "best effort cache warm" — surface it.
+                // Per-module failures still report via onFailed without throwing.
+                prog?.clearForOutput();
+                log.warn('precompile', () => `batch failed: ${errMsg(e)}`);
+                prog?.stop();
+                this.resources.release();
+                await parseDriver.terminate();
+                throw e instanceof Error ? e : new Error(errMsg(e));
+            }
+            log.debug('precache', () => `precompile end: ${written}/${toCompile.length} bytecodes` +
+                (fail ? `, ${fail} fail` : ''));
+            if (fail > 0) {
+                prog?.clearForOutput();
+                log.warn('precompile', () =>
+                    `${fail}/${toCompile.length} module(s) failed to precompile (source path still used on demand)`);
             }
         } else if (scannableModules.length > 0) {
             log.debug('precache', () => `precompile skipped: ${scannableModules.length} bytecodes fresh`);
@@ -503,13 +540,13 @@ export class TypeScriptRuntime {
                 const message = `${lifecycle} ${name}@${version} failed: ${errMsg(e)}`;
                 progress?.clearForOutput();
                 log.warn('lifecycle', () => message);
-                continue;
+                throw new Error(message);
             }
             if (code !== 0) {
                 const message = `${lifecycle} ${name}@${version} exited with code ${code}`;
                 progress?.clearForOutput();
                 log.warn('lifecycle', () => message);
-                continue;
+                throw new Error(message);
             }
         }
         return scripts.length;
@@ -523,18 +560,26 @@ export class TypeScriptRuntime {
     private async spawnLifecycleCommand(command: LifecycleCommand, cwd: string): Promise<number> {
         const argv = resolveLifecycleCommandArgv(command.argv, (name) => this.resolver.resolveBin(name, cwd));
         log.debug('lifecycle', () => `spawn: ${argv.join(' ')}`);
-        const child = process.spawn(argv, {
-            cwd,
-            stdin: 'inherit',
-            stdout: 'pipe',
-            stderr: 'pipe',
-            env: lifecycleEnv(cwd),
-        });
-        const stdout = drainPipe(child.stdout);
-        const stderr = drainPipe(child.stderr);
-        const info = await child.wait();
-        await Promise.allSettled([stdout, stderr]);
-        return info.exit_status ?? 0;
+        try {
+            const child = process.spawn(argv, {
+                cwd,
+                stdin: 'inherit',
+                stdout: 'pipe',
+                stderr: 'pipe',
+                env: lifecycleEnv(cwd),
+            });
+            const stdout = drainPipe(child.stdout);
+            const stderr = drainPipe(child.stderr);
+            const info = await child.wait();
+            await Promise.allSettled([stdout, stderr]);
+            return info.exit_status ?? 0;
+        } catch (e) {
+            // Shell-compatible: missing binary is exit 127 so `||` chains continue.
+            const code = (e as { code?: unknown; errno?: unknown })?.code
+                ?? (e as { errno?: unknown })?.errno;
+            if (code === 'ENOENT' || code === -2 || /ENOENT/i.test(errMsg(e))) return 127;
+            throw e;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -565,6 +610,8 @@ export class TypeScriptRuntime {
 
     async loadEntry(path: string, extra: Record<string, unknown> = {}, lang = 'ts'): Promise<CModuleEngine.Module> {
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
+        this.resolver.entry = info.specPath;
+        log.debug('runtime', () => `main: "${info.specPath}"`);
         const meta: Record<string, unknown> = { lang, ...extra };
         fillMeta(meta, info, this.resolver);
         meta.main = true;
@@ -575,6 +622,7 @@ export class TypeScriptRuntime {
         const info = this.resolver.resolve(path, `${os.cwd}/<entry>`);
         const meta: Record<string, unknown> = { lang, ...extra };
         fillMeta(meta, info, this.resolver);
+        meta.main = false;
         return this.compiler.load(info, meta);
     }
 
@@ -582,9 +630,10 @@ export class TypeScriptRuntime {
         code: string,
         path: string,
         extra: Record<string, unknown> = {},
-        opts: { lang?: string; format?: ModuleFormat; fileKind?: FileKind } = {},
+        opts: { lang?: string; format?: ModuleFormat; fileKind?: FileKind; main?: boolean } = {},
     ): CModuleEngine.Module {
-        this.resolver.entry = path;
+        const asMain = opts.main !== false;
+        if (asMain) this.resolver.entry = path;
         const info: ModuleInfo = {
             specPath: path,
             localPath: path,
@@ -593,7 +642,7 @@ export class TypeScriptRuntime {
         };
         const meta: Record<string, unknown> = { lang: opts.lang ?? 'ts', ...extra };
         fillMeta(meta, info, this.resolver);
-        meta.main = true;
+        meta.main = asMain;
         return this.compiler.loadSource(code, info, meta);
     }
 

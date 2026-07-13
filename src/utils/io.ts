@@ -1,13 +1,23 @@
 import { dirname, joinPaths } from './path';
 import { LRU } from './lru';
 import { err, ErrorKind } from '../errors';
+import { getMemoryFile } from './memfs';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
-export const readText  = (p: string) => engine.decodeString(fs.readFile(p));
+export const readText = (p: string) => {
+    const v = getMemoryFile(p);
+    if (v) return engine.decodeString(v);
+    return engine.decodeString(fs.readFile(p));
+};
 export const writeText = (p: string, s: string) => fs.writeFile(p, engine.encodeString(s));
-export const readBytes = (p: string) => new Uint8Array(fs.readFile(p));
+/** Prefer active VFS view (0-copy subarray); else fs. */
+export const readBytes = (p: string) => {
+    const v = getMemoryFile(p);
+    if (v) return v;
+    return new Uint8Array(fs.readFile(p));
+};
 
 function unlinkIfExists(path: string): void {
     try {

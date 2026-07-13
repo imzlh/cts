@@ -13,10 +13,8 @@ const FORMATS = new Set<ModuleFormat>(['esm', 'cjs']);
 const FILE_KINDS = new Set<FileKind>(['source', 'json', 'wasm', 'binary', 'text']);
 
 export interface PackModuleEntry {
-    /** Synthetic runtime id, directory-structure-preserving: "pack:/<rel>" for
-     *  workspace files, "pack:<scheme>/<rest>" for external modules — see
-     *  writer.ts. Doubles as the human-readable display path. The reader
-     *  rewrites entries to safe materialized paths — see reader.ts. */
+    /** Synthetic runtime id ("pack:/<rel>" or "pack:<scheme>/…"). Also the
+     *  PackBlobStore / loader key after install — not a host filesystem path. */
     localPath: string;
     format: ModuleFormat;
     fileKind: FileKind;
@@ -108,14 +106,16 @@ export function decodePack(bytes: Uint8Array): PackContainer {
 }
 
 export function readBlob(container: PackContainer, entry: PackModuleEntry): Uint8Array {
-    return checkedBlobSlice(container.blob, entry.offset, entry.length);
+    // Ranges were validated in decodePack; subarray is 0-copy.
+    return container.blob.subarray(entry.offset, entry.offset + entry.length);
 }
 
 export function readSourceBlob(container: PackContainer, entry: PackModuleEntry): Uint8Array {
     if (entry.sourceOffset === undefined || entry.sourceLength === undefined) {
         throw new Error('Invalid .jspack file: source module is missing fallback source bytes');
     }
-    return checkedBlobSlice(container.blob, entry.sourceOffset, entry.sourceLength);
+    // Same trust as readBlob — validateManifest already checked source ranges.
+    return container.blob.subarray(entry.sourceOffset, entry.sourceOffset + entry.sourceLength);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -161,6 +161,11 @@ function validateManifest(value: unknown, blobLength: number): PackManifest {
         if (raw.sourceOnly !== undefined && typeof raw.sourceOnly !== 'boolean') {
             throw new Error(`Invalid .jspack file: invalid sourceOnly flag for "${id}"`);
         }
+        // sourceOnly means "must recompile from fallback source" — the source
+        // range is mandatory (already checked for fileKind===source above).
+        if (raw.sourceOnly === true && raw.fileKind !== 'source') {
+            throw new Error(`Invalid .jspack file: sourceOnly requires fileKind source for "${id}"`);
+        }
         if (raw.lang !== undefined && (typeof raw.lang !== 'string' || !raw.lang)) {
             throw new Error(`Invalid .jspack file: invalid source language for "${id}"`);
         }
@@ -182,11 +187,4 @@ function validateManifest(value: unknown, blobLength: number): PackManifest {
     }
 
     return value as unknown as PackManifest;
-}
-
-function checkedBlobSlice(blob: Uint8Array, offset: number, length: number): Uint8Array {
-    if (!validRange(offset, length, blob.byteLength)) {
-        throw new Error('Invalid .jspack file: blob range is out of bounds');
-    }
-    return blob.subarray(offset, offset + length);
 }

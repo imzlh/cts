@@ -1,6 +1,6 @@
 import type { ScanResult } from '../deps';
 import type { NodeModulesMode } from '../types';
-import { joinPaths, dirname, ensureDir, log, errMsg, npmNameVersion, isWindows, hardlinkOrCopyDirRecursiveSync } from '../utils';
+import { joinPaths, dirname, ensureDir, errMsg, npmNameVersion, isWindows, hardlinkOrCopyDirRecursiveSync } from '../utils';
 
 const fs = import.meta.use('fs');
 const asyncfs = import.meta.use('asyncfs');
@@ -43,11 +43,25 @@ export async function materializeNodeModules(
     resetProjectRoots(projectDir, rootEdges);
 
     let linked = 0;
+    const failures: string[] = [];
     onLinked?.(linked, pending.length);
     for (const edge of pending) {
-        await linkEdge(edge, mode, storeRoot, projectDir);
+        try {
+            await linkEdge(edge, mode, storeRoot, projectDir);
+        } catch (e) {
+            // Collect all edge failures so one bad link doesn't hide the rest.
+            failures.push(errMsg(e));
+        }
         linked++;
         onLinked?.(linked, pending.length);
+    }
+
+    if (failures.length > 0) {
+        const head = failures.slice(0, 5).join('; ');
+        const more = failures.length > 5 ? ` (+${failures.length - 5} more)` : '';
+        throw new Error(
+            `node_modules materialization failed (${failures.length}/${pending.length} link(s)): ${head}${more}`,
+        );
     }
 
     writeProjectManifest(projectDir, edgeNames(rootEdges));
@@ -85,9 +99,15 @@ async function linkEdge(
     if (!targetDir || !cv) return;
     const linkSource = joinPaths(storeRoot, `${cv.name}@${cv.version}`);
     try {
+        // Soft mode uses symlink, which succeeds for a missing target and leaves
+        // a dangling link — treat absent store packages as hard failures.
+        if (!fs.exists(linkSource)) {
+            throw new Error(`store package missing: ${linkSource}`);
+        }
         await linkOne(linkSource, targetDir, mode);
     } catch (e) {
-        log.warn('linker', () => `failed to link ${edge.name} into ${targetDir}: ${errMsg(e)}`);
+        // Fail closed: missing store / EPERM / cross-device must not look like success.
+        throw new Error(`failed to link ${edge.name} into ${targetDir}: ${errMsg(e)}`, { cause: e });
     }
 }
 

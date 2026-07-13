@@ -3,29 +3,12 @@ import { ModuleResolver } from './resolve/index';
 import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative } from './utils';
 import { isRemote } from './source/cache';
 import type { OxcTranspiler } from './oxc';
-import { extractImports, isScannablePath, isTsLikePath, isWasmPath } from './scan';
+import { ImportScanner } from './import-scanner';
+import { isScannablePath, isWasmPath } from './scan';
 
-const engine = import.meta.use('engine');
 const asyncfs = import.meta.use('asyncfs');
 const wasm = import.meta.use('wasm');
 const os = import.meta.use('os');
-
-async function extractImportsFast(
-    source: string,
-    filename: string,
-    isTs: boolean,
-    acc: OxcTranspiler | null,
-): Promise<string[]> {
-    if (acc) {
-        try {
-            const deps = acc.scanImports(source, filename);
-            if (deps !== null) return deps;
-        } catch (e) {
-            log.debug('oxc', () => `scanImports failed for ${filename}: ${errMsg(e)}`);
-        }
-    }
-    return extractImports(source, isTs);
-}
 
 function isWasiModuleName(name: string): boolean {
     return name === 'wasi_unstable' || name === 'wasi_snapshot_preview1';
@@ -99,6 +82,8 @@ export class DepScanner {
     private readonly edges: ScanResult['edges'] = [];
     private readonly resolutions: ScanResult['resolutions'] = [];
     private downloaded = 0;
+    private readonly importScanner: ImportScanner;
+    private lastStallLogMs = 0;
 
     constructor(
         private readonly resolver: ModuleResolver,
@@ -107,7 +92,9 @@ export class DepScanner {
         private readonly oxc: OxcTranspiler | null = null,
         private readonly parseImports: ((localPath: string) => Promise<string[]>) | null = null,
         private readonly options: DepScannerOptions = {},
-    ) { }
+    ) {
+        this.importScanner = new ImportScanner(cfg.enableOxc !== false ? oxc : null);
+    }
 
     async scan(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
         this.init();
@@ -214,13 +201,13 @@ export class DepScanner {
                 const onProgress = baseProgress
                     ? (now: number, total: number) => { didDownload = true; baseProgress(now, total); }
                     : undefined;
+                const startedMs = Date.now();
+                this.prog?.startResolve(item.spec);
 
                 try {
-                    this.prog?.startResolve(item.spec);
                     const info = await this.resolver.resolveAsync(item.spec, item.parent, undefined, onProgress);
                     if (didDownload) this.downloaded++;
                     this.prog?.bumpResolved();
-                    this.prog?.finishDownload(item.spec);
                     if (this.options.fullGraph === true) {
                         this.resolutions.push({
                             parentSpecPath: item.parent,
@@ -262,9 +249,16 @@ export class DepScanner {
                     }
                 } catch (e) {
                     this.prog?.bumpResolved();
-                    this.prog?.finishDownload(item.spec, errMsg(e));
                     this.errs.push({ spec: item.spec, parent: item.parent, error: errMsg(e) });
                 } finally {
+                    // Always clear progress — resolve-only work never called
+                    // finishDownload and left the spinner stuck on one label.
+                    this.prog?.finishDownload(item.spec);
+                    const age = Date.now() - startedMs;
+                    if (age >= 5000) {
+                        log.debug('deps', () => `slow item ${age}ms: "${item.spec}" from "${item.parent}"`);
+                    }
+                    this.maybeLogStall(pending, queue.length);
                     pending--;
                     // Only wake waiters when all work is done (pending hits 0) so
                     // they can exit. While in-flight resolves are still pending,
@@ -325,14 +319,11 @@ export class DepScanner {
         }
         if (!isScannablePath(localPath) && !this.parseImports) return [];
         try {
-            let imports: string[];
-            if (this.parseImports) {
-                imports = await this.parseImports(localPath);
-            } else {
-                const bytes = await asyncfs.readFile(localPath);
-                const src = engine.decodeString(bytes);
-                imports = await extractImportsFast(src, localPath, isTsLikePath(localPath), this.cfg.enableOxc !== false ? this.oxc : null);
-            }
+            // Prefer caller-supplied scanner (pack records edges); else main-thread
+            // ImportScanner (oxc-first). Never route scan through transform workers.
+            const imports = this.parseImports
+                ? await this.parseImports(localPath)
+                : this.importScanner.scanFile(localPath);
             const out: Array<{ spec: string; parent: string }> = [];
             for (let i = 0; i < imports.length; i++) {
                 const spec = imports[i];
@@ -342,5 +333,14 @@ export class DepScanner {
             }
             return out;
         } catch { return []; }
+    }
+
+    /** DEBUG: if work stays in-flight a long time, log once per 10s (not a kill). */
+    private maybeLogStall(pending: number, queued: number): void {
+        const now = Date.now();
+        if (now - this.lastStallLogMs < 10_000) return;
+        if (pending <= 0) return;
+        this.lastStallLogMs = now;
+        log.debug('deps', () => `in-flight pending=${pending} queued=${queued} visited=${this.seen.size}`);
     }
 }

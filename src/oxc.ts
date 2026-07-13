@@ -239,7 +239,7 @@ function optionKindForKind(kind: OxcKind): OxcOptionKind {
 
 /**
  * Resolve path to the OXC native extension.
- * Returns null if not found.
+ * Mirrors bootstrap resolveExtDir: CTS_EXT_PATH, <exe>/ext, <exe>/lib/ext.
  */
 export function oxcExtPath(): string | null {
     try {
@@ -247,19 +247,21 @@ export function oxcExtPath(): string | null {
         const suffix = os.platform === 'windows' ? 'dll'
                      : os.platform === 'darwin'  ? 'dylib'
                      : 'so';
+        const file = `oxc.${suffix}`;
         const candidates: string[] = [];
 
         // CTS_EXT_PATH (same env var bootstrap.ts's resolveExtDir() honors) wins.
         let envDir: string | null = null;
         try { envDir = os.getenv('CTS_EXT_PATH'); } catch {}
-        if (envDir) candidates.push(`${envDir.replace(/[\\/]+$/, '')}${sep}oxc.${suffix}`);
+        if (envDir) candidates.push(`${envDir.replace(/[\\/]+$/, '')}${sep}${file}`);
 
         const exeDir = os.exePath.replace(/[\\/][^\\/]+$/, '');
-        candidates.push(`${exeDir}${sep}ext${sep}oxc.${suffix}`);
+        candidates.push(`${exeDir}${sep}ext${sep}${file}`);
+        candidates.push(`${exeDir}${sep}lib${sep}ext${sep}${file}`);
 
         for (const path of candidates) {
             try {
-                if (fs.stat?.(path)) return path;
+                if (fs.exists(path) && fs.stat(path).isFile) return path;
             } catch {}
         }
 
@@ -271,25 +273,55 @@ export function oxcExtPath(): string | null {
 }
 
 let localOxc: OxcTranspiler | null = null;
-/** Try to load and register the oxc native extension.
- *  Returns an OxcTranspiler on success, null if not found or failed to load. */
+
+function wrapOxc(mod: unknown): OxcTranspiler | null {
+    if (!isOxcModule(mod)) return null;
+    localOxc = new OxcTranspiler(mod);
+    return localOxc;
+}
+
+/** import.meta.use returns null (not throw) when the name is unknown. */
+function useRegisteredOxc(): OxcTranspiler | null {
+    try {
+        return wrapOxc(import.meta.use('oxc'));
+    } catch (e) {
+        log.debug('oxc', () => `use('oxc') failed: ${errMsg(e)}`);
+        return null;
+    }
+}
+
+function registerOxcPath(extPath: string): boolean {
+    try {
+        import.meta.register('oxc', extPath);
+        return true;
+    } catch (e) {
+        const msg = errMsg(e);
+        // Bootstrap / concurrent register is success for our purposes.
+        if (/already registered|built-in/i.test(msg)) return true;
+        log.debug('oxc', () => `register failed at ${extPath}: ${msg}`);
+        return false;
+    }
+}
+
+/** Try to load the oxc native extension (register if needed).
+ *  Returns an OxcTranspiler on success, null if not found or failed to load.
+ *
+ *  Order matters:
+ *  1. use() — cno bootstrap already put `oxc` in dyn_registry (or static)
+ *  2. register(path) then use() — standalone cts / missing bootstrap entry
+ *  Never treat "already registered" as unavailable (that forced Sucrase). */
 export function tryLoadOxc(): OxcTranspiler | null {
     if (localOxc) return localOxc;
 
+    const existing = useRegisteredOxc();
+    if (existing) return existing;
+
     const extPath = oxcExtPath();
     if (!extPath) return null;
+    if (!registerOxcPath(extPath)) return null;
 
-    try {
-        import.meta.register('oxc', extPath);
-        const oxcMod: typeof CModuleExternalOxc = import.meta.use('oxc') as any;
-        if (!isOxcModule(oxcMod)) {
-            log.debug('oxc', () => `register succeeded but module API unexpected`);
-            return null;
-        }
-        localOxc = new OxcTranspiler(oxcMod);
-        return localOxc;
-    } catch (e) {
-        log.debug('oxc', () => `not available at ${extPath}: ${errMsg(e)}`);
-        return null;
-    }
+    const loaded = useRegisteredOxc();
+    if (loaded) return loaded;
+    log.debug('oxc', () => `register path ok but module API unexpected at ${extPath}`);
+    return null;
 }

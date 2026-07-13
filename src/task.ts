@@ -17,6 +17,7 @@ const process = import.meta.use('process');
 
 type TaskDef = string | {
     command: string;
+    description?: string;
     dependencies?: string[];
     env?: Record<string, string>;
 };
@@ -769,20 +770,46 @@ export class TaskRunner {
             console.log('  \x1b[2mNo tasks defined in this config.\x1b[0m');
             return;
         }
-        const maxLen = names.reduce((m, n) => Math.max(m, n.length), 0);
+        // Deno-style: name, optional // description lines, then indented command.
+        console.log('Available tasks:');
         for (const name of names) {
             const def = this.tasks[name];
             if (!def) continue;
-            const cmd  = typeof def === 'string' ? def : def.command;
-            const deps = typeof def === 'string' ? [] : (def.dependencies ?? []);
-            const pad  = ' '.repeat(maxLen - name.length + 2);
-            const depStr = deps.length ? `  \x1b[2m← needs: ${deps.join(', ')}\x1b[0m` : '';
-            console.log(`  \x1b[36m${name}\x1b[0m${pad}\x1b[2m${cmd}\x1b[0m${depStr}`);
+            const cmd = typeof def === 'string' ? def : def.command;
+            const desc = typeof def === 'string' ? undefined : def.description;
+            console.log(`- ${name}`);
+            if (desc) {
+                for (const line of String(desc).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')) {
+                    if (line.length === 0) continue;
+                    console.log(`    // ${line}`);
+                }
+            }
+            console.log(`    ${cmd}`);
         }
     }
 
     has(name: string): boolean {
         return this.tasks[name] !== undefined;
+    }
+
+    /** Exact name or Deno-style task globs (`*` → `.*`, anchored). */
+    matchNames(pattern: string): string[] {
+        if (!pattern.includes('*')) {
+            return this.tasks[pattern] !== undefined ? [pattern] : [];
+        }
+        let escaped = '';
+        for (let i = 0; i < pattern.length; i++) {
+            const ch = pattern[i]!;
+            if (ch === '*') escaped += '.*';
+            else if (/[.+?^${}()|[\]\\]/.test(ch)) escaped += `\\${ch}`;
+            else escaped += ch;
+        }
+        const re = new RegExp(`^${escaped}$`);
+        const matched: string[] = [];
+        for (const name of Object.keys(this.tasks)) {
+            if (re.test(name)) matched.push(name);
+        }
+        return matched;
     }
 
     async run(name: string, extraArgs: string[] = [], includeLifecycle = true): Promise<number> {
@@ -858,6 +885,18 @@ export class TaskRunner {
         }
 
         return 0;
+    }
+
+    /** Ad-hoc shell for `cno task --eval <script>` (specs/task/eval). */
+    async runEval(script: string, extraArgs: string[] = []): Promise<number> {
+        if (!script || !String(script).trim()) {
+            console.error('error: [TASK] must be specified when using --eval');
+            return 1;
+        }
+        const inheritedInitCwd = os.environ().INIT_CWD;
+        const env = { INIT_CWD: inheritedInitCwd ?? this.initCwd };
+        console.log(`Task  ${script}`);
+        return execCommand(script, env, this.cwd, extraArgs, this.resolver, this.forwardedArgs);
     }
 }
 

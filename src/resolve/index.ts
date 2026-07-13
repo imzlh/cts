@@ -121,7 +121,7 @@ export class ModuleResolver {
         lockDir?: string,
         lockReadOnly = false,
     ) {
-        this.lock        = new LockStore(lockDir ?? os.cwd, lockReadOnly);
+        this.lock        = new LockStore(lockDir ?? os.cwd, lockReadOnly, cfg.disableLock === true);
         cfg.lockStore = this.lock;
         this.importIndex = cfg.importMap    ? buildImportMapIndex(cfg.importMap) : null;
         this.aliasIndex  = cfg.pathAliases  ? buildAliasIndex(cfg.pathAliases, cfg.baseUrl) : [];
@@ -176,6 +176,19 @@ export class ModuleResolver {
         parent = this.normalizeParentRef(parent);
         const requestSpec = spec;
         if (spec.includes('\\') || spec[1] === ':') spec = canonicalizePath(spec);
+
+        // A pack manifest is the complete authority for imports made by a
+        // packed parent. Resolve the original source specifier before import
+        // maps, lock entries, or protocol handlers can redirect it outside.
+        if (protoOf(parent) === 'pack') {
+            const packedSpec = spec.startsWith('node:') || isBuiltinSpecifier(spec)
+                ? (spec.startsWith('node:') ? spec : `node:${spec}`)
+                : null;
+            const info = packedSpec
+                ? await this.dispatchAsync(packedSpec, parent, attr, onProgress)
+                : await runAsync(this.packHandler().resolve(spec, parent, attr, onProgress));
+            return this.publishResolved(requestSpec, spec, parent, info, attr);
+        }
 
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
@@ -269,6 +282,19 @@ export class ModuleResolver {
         // Must happen before import map lookup, protoOf check, and dispatch.
         spec = canonicalizePath(spec);
 
+        // Preserve the exact specifier recorded in manifest.edges. Applying
+        // an import map first can turn a bare edge into npm:/jsr: and escape
+        // to the live dependency cache instead of the packed child.
+        if (protoOf(parent) === 'pack') {
+            const packedSpec = spec.startsWith('node:') || isBuiltinSpecifier(spec)
+                ? (spec.startsWith('node:') ? spec : `node:${spec}`)
+                : null;
+            const info = packedSpec
+                ? this.dispatch(packedSpec, parent, attr)
+                : runSync(this.packHandler().resolve(spec, parent, attr));
+            return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
+        }
+
         // Fast path: exact (spec, parent) seen before — skip import map + L1/L2/dispatch
         if (!attr) {
             const cacheKey = `${spec}\0${parent}`;
@@ -345,6 +371,13 @@ export class ModuleResolver {
         const proto = protoOf(specPath);
         const h = this.handlers.get(proto);
         if (h) {
+            // Pack/ctsview (and future handlers) may carry fileKind/cacheBytecode
+            // that cannot be recovered from the materialized path alone.
+            const fromHandler = h.getModuleInfo?.(specPath);
+            if (fromHandler) {
+                this.rememberRuntimeInfo(fromHandler);
+                return fromHandler;
+            }
             const lp = h.localPath(specPath);
             return {
                 specPath,
@@ -356,8 +389,7 @@ export class ModuleResolver {
         return { specPath, localPath: specPath, format: 'esm', fileKind: 'source' };
     }
 
-    flushLock():   void { this.lock.flush(); }
-    rewriteLock(): void { this.lock.rewrite(); }
+    flushLock(): void { this.lock.flush(); }
     get lockSize(): number { return this.lock.size; }
     get lockDirty(): number { return this.lock.dirtyCount; }
     get lockPath(): string { return this.lock.path; }
@@ -407,6 +439,12 @@ export class ModuleResolver {
         if (isRelative(spec)) return this.resolveRelative(spec, parent, attr);
         if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
         return this.resolveBare(spec, parent, attr);
+    }
+
+    private packHandler(): ProtocolHandler {
+        const handler = this.handlers.get('pack');
+        if (handler) return handler;
+        throw err(ErrorKind.ProtocolDisabled, 'No handler for protocol "pack:"');
     }
 
     private resolveRelative(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
@@ -551,10 +589,8 @@ export class ModuleResolver {
             this.resolvedModules.set(canonical.specPath, canonical);
             if (cacheLockEntry && opts?.persistModule) this.lock.setModule(canonical);
             if (cacheLockEntry && opts?.persistSource) this.lock.setSourceByKey(sourceKey, canonical.specPath);
-            if (!this.mainEntry) {
-                this.mainEntry = canonical.specPath;
-                log.debug('resolver', () => `main: "${canonical.specPath}"`);
-            }
+            // mainEntry is set only by loadEntry / loadSourceEntry(main), not first resolve —
+            // so `cno test` modules keep import.meta.main === false (Deno semantics).
         }
 
         if (opts?.rememberExact && !attr) {
@@ -665,10 +701,13 @@ export class ModuleResolver {
     private materializeRuntimeInfo(info: ModuleInfo, attr?: Record<string, unknown>): ModuleInfo {
         const fileKind = applyAttrType(info.fileKind, attr);
         if (fileKind === info.fileKind) return info;
+        // Attribute views share the base file's localPath. JscCache is keyed by
+        // that path, so a text/bytes/json view must never load source bytecode.
         return {
             ...info,
             fileKind,
             moduleId: moduleViewRef(info.specPath, fileKind),
+            cacheBytecode: false,
         };
     }
 

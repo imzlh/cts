@@ -67,6 +67,8 @@ interface DownloadItem {
     finished: boolean;
     downloaded: boolean;
     error?: string;
+    /** Wall-clock start for stall visibility (resolve/scan may never download). */
+    startedMs: number;
 }
 
 export class PrecacheProgress {
@@ -93,6 +95,7 @@ export class PrecacheProgress {
     // Render
     private tick  = 0;
     private timer: ReturnType<typeof setInterval> | null = null;
+    private stopped = false;
     private drawn = 0;
     private startMs = Date.now();
 
@@ -162,7 +165,10 @@ export class PrecacheProgress {
     // ---- Lifecycle ----
 
     stop(): void {
-        if (this.timer) {
+        // stop() is terminal. Late producer callbacks during shutdown must not
+        // recreate the interval and keep the process event loop alive.
+        this.stopped = true;
+        if (this.timer !== null) {
             clearInterval(this.timer);
             this.timer = null;
         }
@@ -178,7 +184,8 @@ export class PrecacheProgress {
     // ---- Internals ----
 
     private kick(): void {
-        if (isatty && !this.timer) {
+        if (this.stopped) return;
+        if (isatty && this.timer === null) {
             this.timer = setInterval(() => this.render(), 200);
             this.render();
         }
@@ -186,7 +193,14 @@ export class PrecacheProgress {
 
     private addItem(key: string, label: string, totalBytes: number, downloaded: boolean): void {
         if (this.items.has(key)) return;
-        this.items.set(key, { label, total: totalBytes, done: 0, finished: false, downloaded });
+        this.items.set(key, {
+            label,
+            total: totalBytes,
+            done: 0,
+            finished: false,
+            downloaded,
+            startedMs: Date.now(),
+        });
         this.activeOrder.push(key);
         this.itemTotal++;
         this.kick();
@@ -239,16 +253,25 @@ export class PrecacheProgress {
 
         const lines = [`${spin} ${C.bold(this.title)}: ${parts.join(', ')} ${C.dim(`${elapsedStr}s`)}`];
 
-        // Detail lines: keep render cost independent from total resolved count.
-        const activeLimit = this.lastFinished ? this.maxLines - 1 : this.maxLines;
-        for (let i = 0; i < this.activeOrder.length && i < activeLimit; i++) {
-            const key = this.activeOrder[i];
+        // Oldest in-flight first so a stuck resolve is always visible (not buried).
+        const now = Date.now();
+        const active: Array<{ key: string; item: DownloadItem; age: number }> = [];
+        for (const key of this.activeOrder) {
             const item = this.items.get(key);
-            if (!item) continue;
-            const lbl = truncate(item.label, termWidth - 30);
+            if (!item || item.finished) continue;
+            active.push({ key, item, age: now - item.startedMs });
+        }
+        active.sort((a, b) => b.age - a.age);
+
+        const activeLimit = this.lastFinished ? this.maxLines - 1 : this.maxLines;
+        for (let i = 0; i < active.length && i < activeLimit; i++) {
+            const { item, age } = active[i]!;
+            const ageStr = age >= 2000 ? C.yellow(` ${Math.floor(age / 1000)}s`) : '';
+            const lbl = truncate(item.label, termWidth - 36);
             const bar = item.total ? renderBar(item.done, item.total, 12) : '';
             const pct = item.total ? ` ${Math.floor(item.done / item.total * 100)}%` : '';
-            lines.push(`  ${C.cyan(spin)} ${lbl} ${C.green(bar)}${pct} ${C.dim(fmtBytes(item.done))}`);
+            const size = item.downloaded ? ` ${C.dim(fmtBytes(item.done))}` : '';
+            lines.push(`  ${C.cyan(spin)} ${lbl}${ageStr} ${C.green(bar)}${pct}${size}`);
         }
         if (this.lastFinished && lines.length <= this.maxLines) {
             const item = this.lastFinished;

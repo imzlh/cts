@@ -1,5 +1,7 @@
 export * from './platform';
 export * from './path';
+export * from './memfs';
+export type { VirtualFileStore } from './memfs';
 export * from './io';
 export * from './misc';
 export * from './bin';

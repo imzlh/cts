@@ -2,6 +2,7 @@ import type { ModuleInfo } from '../types';
 import type { CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
+import { isResolutionMiss } from '../errors';
 import { BUILTINS } from '../resolve/builtins';
 import { errMsg, log } from '../utils';
 
@@ -133,7 +134,12 @@ export function buildCjsDeps(
         resolveExternal(req: string, parent: string): ModuleInfo | null {
             try {
                 return resolver.resolve(req, parent, { cjs: true });
-            } catch { return null; }
+            } catch (e) {
+                // Only true misses fall through to CJS local FS; policy/network
+                // errors must surface (was: catch { return null } → wrong MODULE_NOT_FOUND).
+                if (isResolutionMiss(e)) return null;
+                throw e;
+            }
         },
 
         prepareSource(code: string, filePath: string): string | null {

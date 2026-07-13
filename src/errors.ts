@@ -121,6 +121,19 @@ export function err(kind: ErrorKind, msg: string, source?: unknown): Error {
     return e;
 }
 
+/**
+ * True when a resolver failure means "not found here" and CJS require may
+ * continue with node_modules / local FS fallback. Non-miss kinds (protocol
+ * disabled, network, frozen lock, invalid specifier, …) must rethrow so they
+ * are not masked as MODULE_NOT_FOUND.
+ */
+export function isResolutionMiss(e: unknown): boolean {
+    if (!(e instanceof Error)) return false;
+    if (e.kind === ErrorKind.ModuleNotFound || e.kind === ErrorKind.FileNotFound) return true;
+    const code = Reflect.get(e, 'code');
+    return code === 'MODULE_NOT_FOUND' || code === 'ENOENT';
+}
+
 // ---------------------------------------------------------------------------
 // Terminal colour helpers (graceful degradation)
 // ---------------------------------------------------------------------------

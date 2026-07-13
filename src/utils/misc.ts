@@ -1,4 +1,4 @@
-import { extname } from './index';
+import { extname } from './path';
 import { err, ErrorKind } from '../errors';
 import { URL } from './url';
 

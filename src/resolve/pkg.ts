@@ -1,6 +1,7 @@
 import type { FileKind, PackageJson, ModuleFormat } from '../types';
 import { dirname, extname, joinPaths, normalizePath, resolveFile, safeParse, LRU, log } from '../utils';
 import { err, ErrorKind } from '../errors';
+import { hasTopLevelEsmSyntax } from '../scan';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -75,7 +76,15 @@ export function getBinMap(pkg: PackageJson): Record<string, string> {
 export function detectFormat(localPath: string): ModuleFormat {
     const hit = formatCache.get(localPath);
     if (hit) return hit;
-    const result = _detectFormat(localPath);
+    let result = _detectFormat(localPath);
+    // CJS package `.js` with static import/export is still ESM (Deno dual detect).
+    if (result === 'cjs' && localPath.endsWith('.js')) {
+        try {
+            if (hasTopLevelEsmSyntax(engine.decodeString(fs.readFile(localPath)), false)) {
+                result = 'esm';
+            }
+        } catch { /* keep cjs */ }
+    }
     formatCache.set(localPath, result);
     return result;
 }
@@ -371,6 +380,23 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
     const exported = resolveExports(ctx, norm);
     if (exported) return exported;
     const base = joinPaths(ctx.pkgDir, norm.slice(2));
+    // ESM package subpaths stay strict: no directory index.js fallback.
+    if (!ctx.forceCjs) {
+        try {
+            // File only — do not treat a directory as resolvable via index.js.
+            if (fs.stat(base).isFile) {
+                if (!extname(base)) return { path: base, format: 'cjs', fileKind: 'source' };
+                return { path: base, format: detectFormat(base) };
+            }
+        } catch {}
+        for (const ext of PACKAGE_SUBPATH_EXTS) {
+            try {
+                const withExt = base + ext;
+                if (fs.stat(withExt).isFile) return { path: withExt, format: detectFormat(withExt) };
+            } catch {}
+        }
+        return null;
+    }
     try {
         const path = resolvePackageSubpath(base);
         if (!extname(path)) return { path, format: 'cjs', fileKind: 'source' };

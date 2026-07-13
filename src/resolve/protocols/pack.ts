@@ -4,8 +4,8 @@ import type { Flow } from '../../flow';
 import type { PackManifest, PackModuleEntry } from '../../pack/format';
 import { err, ErrorKind } from '../../errors';
 
-// Resolves modules inside an active .jspack container: pure manifest lookups,
-// no I/O — bytecode delivery is pre-seeded into JscCache's L1, see reader.ts.
+// Manifest-only resolve for an installed PackSession.
+// Payload: PackBlobStore via readBytes; bytecode: store.bytecode on demand.
 export class PackHandler implements ProtocolHandler {
     readonly protocols = ['pack', 'ctsview'];
 
@@ -19,8 +19,9 @@ export class PackHandler implements ProtocolHandler {
         const view = this.viewInfo(spec);
         if (view) return view;
 
-        const bucket = Object.prototype.hasOwnProperty.call(this.manifest.edges, parent)
-            ? this.manifest.edges[parent]
+        const edges = this.manifest.edges;
+        const bucket = Object.prototype.hasOwnProperty.call(edges, parent)
+            ? edges[parent]
             : undefined;
         const childSpecPath = bucket && Object.prototype.hasOwnProperty.call(bucket, spec)
             ? bucket[spec]
@@ -36,11 +37,16 @@ export class PackHandler implements ProtocolHandler {
     }
 
     localPath(specPath: string): string {
-        const entry = this.ownModule(specPath);
-        if (entry) return entry.localPath;
-        const view = this.viewInfo(specPath);
-        if (view) return view.localPath;
+        const info = this.getModuleInfo(specPath);
+        if (info) return info.localPath;
         throw err(ErrorKind.ModuleNotFound, `Pack manifest is missing module "${specPath}"`);
+    }
+
+    /** Recover full ModuleInfo for load/init hooks (fileKind + sourceOnly flags). */
+    getModuleInfo(specPath: string): ModuleInfo | null {
+        const direct = this.ownModule(specPath);
+        if (direct) return this.toInfo(specPath, direct);
+        return this.viewInfo(specPath);
     }
 
     private toInfo(specPath: string, entry: PackModuleEntry): ModuleInfo {
@@ -49,7 +55,8 @@ export class PackHandler implements ProtocolHandler {
             localPath: entry.localPath,
             format: entry.format,
             fileKind: entry.fileKind,
-            cacheBytecode: entry.sourceOnly ? false : undefined,
+            // Serialized bytecode drops import-attribute semantics; never cache.
+            cacheBytecode: entry.sourceOnly || entry.fileKind !== 'source' ? false : undefined,
         };
     }
 
@@ -72,7 +79,9 @@ export class PackHandler implements ProtocolHandler {
             localPath: entry.localPath,
             format: entry.format,
             fileKind,
-            cacheBytecode: entry.sourceOnly ? false : undefined,
+            // Views share the base VFS path — never use source bytecode.
+            cacheBytecode: false,
+            moduleId: specPath,
         };
     }
 

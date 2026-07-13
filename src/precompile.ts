@@ -1,8 +1,7 @@
+/** @deprecated Import from `./parse` — kept as a thin re-export for old paths. */
 export {
     ParseDriver,
-    PrecompileDriver,
+    parseTaskTimeoutMs,
     isParseWorker,
-    isCompilerWorker,
     runParseWorker,
-    runCompilerWorker,
 } from './parse';

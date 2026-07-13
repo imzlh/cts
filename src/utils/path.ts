@@ -1,4 +1,4 @@
-import { uname } from './index';
+import { uname } from './platform';
 
 // Convention: all public functions normalise backslashes to '/' internally.
 

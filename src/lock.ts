@@ -53,21 +53,25 @@ export class LockStore {
     /** On-disk path of the lock (may not exist yet when in-memory/read-only). */
     get path(): string { return this.dbPath; }
     /** True when this store persists writes to disk. */
-    get writable(): boolean { return !this.readOnly; }
+    get writable(): boolean { return !this.readOnly && !this.disabled; }
+    /** False for --no-lock / packed runtimes: no SQLite handle is opened. */
+    get enabled(): boolean { return !this.disabled; }
 
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
     private loadFailed = false;
     private recoveredInvalidLock = false;
     private readonly dbPath: string;
     private readonly readOnly: boolean;
+    private readonly disabled: boolean;
 
     private readonly pendingModules = new Map<string, ModuleInfo>();
     private readonly pendingSources = new Map<string, string>();
     private readonly pendingBins = new Map<string, { path: string; pkg: string }>();
     private readonly pendingRemovedBinPkgs = new Set<string>();
 
-    constructor(lockDir: string, readOnly: boolean) {
+    constructor(lockDir: string, readOnly: boolean, disabled = false) {
         this.readOnly = readOnly;
+        this.disabled = disabled;
         const dir = toPosixPath(lockDir);
         this.dbPath = joinPaths(dir, DB_FILENAME);
     }
@@ -103,6 +107,7 @@ export class LockStore {
     }
 
     load(): void {
+        if (this.disabled) return;
         if (this.db || this.loadFailed) return;
 
         if (!this.readOnly) {
@@ -174,6 +179,7 @@ export class LockStore {
     }
 
     private getDb(): CModuleSQLite3.Sqlite3Handle | null {
+        if (this.disabled) return null;
         if (!this.db) this.load();
         return this.db;
     }
@@ -312,11 +318,8 @@ export class LockStore {
         }
     }
 
+    /** Persist pending modules/sources/bins. No-op when read-only or empty. */
     flush(): void {
-        this.applyPendingWrites();
-    }
-
-    rewrite(): void {
         this.applyPendingWrites();
     }
 

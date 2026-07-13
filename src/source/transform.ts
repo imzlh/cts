@@ -24,6 +24,8 @@ export class Transformer {
     private readonly jsxPragma: string;
     private readonly jsxFragmentPragma: string;
     private oxc: OxcTranspiler | null = null;
+    private oxcLoader: (() => OxcTranspiler | null) | null = null;
+    private oxcLoaded = false;
 
     constructor(options: TransformerOptions = {}) {
         this.sourceMaps = options.sourceMaps ?? true;
@@ -34,6 +36,20 @@ export class Transformer {
     /** Install the native oxc transpiler. When set, it takes priority over Sucrase. */
     setOxc(oxc: OxcTranspiler): void {
         this.oxc = oxc;
+        this.oxcLoaded = true;
+    }
+
+    /** Defer native extension loading until a TS/TSX/JSX transform misses bytecode. */
+    setOxcLoader(loader: () => OxcTranspiler | null): void {
+        this.oxcLoader = loader;
+    }
+
+    private getOxc(): OxcTranspiler | null {
+        if (!this.oxcLoaded) {
+            this.oxcLoaded = true;
+            this.oxc = this.oxcLoader?.() ?? null;
+        }
+        return this.oxc;
     }
 
     transform(code: string, filename: string, lang?: string, mapKey?: string): string {
@@ -43,8 +59,9 @@ export class Transformer {
             case KIND_TS:
             case KIND_TSX:
             case KIND_JSX: {
-                if (this.oxc) {
-                    const result = this.oxc.transpile(code, filename, mapKey, oxcLang(kind));
+                const oxc = this.getOxc();
+                if (oxc) {
+                    const result = oxc.transpile(code, filename, mapKey, oxcLang(kind));
                     if (result !== null) {
                         log.debug('transformer', () => `oxc: ${filename}`);
                         return result;
@@ -70,8 +87,9 @@ export class Transformer {
             case KIND_TS:
             case KIND_TSX:
             case KIND_JSX: {
-                if (this.oxc) {
-                    const result = this.oxc.transpileCapture(code, filename, mapKey, oxcLang(kind));
+                const oxc = this.getOxc();
+                if (oxc) {
+                    const result = oxc.transpileCapture(code, filename, mapKey, oxcLang(kind));
                     if (result !== null) {
                         log.debug('transformer', () => `oxc: ${filename}`);
                         return this.sourceMaps ? result : { code: result.code };
@@ -94,8 +112,9 @@ export class Transformer {
             case KIND_TSX:
             case KIND_JSX:
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) return null;
-                if (!this.oxc) return null;
-                const result = this.oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
+                const oxc = this.getOxc();
+                if (!oxc) return null;
+                const result = oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
                 if (result !== null) {
                     log.debug('transformer', () => `oxc bytes: ${filename}`);
                     return this.sourceMaps ? result : { code: result.code };
@@ -121,8 +140,9 @@ export class Transformer {
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
                     return this.transform(engine.decodeString(bytes), filename, lang, mapKey);
                 }
-                if (this.oxc) {
-                    const result = this.oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
+                const oxc = this.getOxc();
+                if (oxc) {
+                    const result = oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
                     if (result !== null) {
                         log.debug('transformer', () => `oxc bytes: ${filename}`);
                         if (this.sourceMaps && result.sourceMap) {

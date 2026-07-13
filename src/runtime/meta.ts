@@ -31,14 +31,16 @@ function isWindowsDrivePath(path: string): boolean {
 }
 
 function toImportMetaUrl(info: ModuleInfo): string {
-    if (isAbsolute(info.specPath) || isAbsolute(info.localPath)) {
-        return toFileUrl(info.localPath);
-    }
+    // Protocol specs (pack:, npm:, http:, …) keep their identity as URL.
+    // Avoid isAbsolute on "pack:/x" which looks absolute after the scheme.
     if (info.specPath.includes('://') || isProtocolSpec(info.specPath)) {
         if (info.specPath.startsWith('npm:') || info.specPath.startsWith('jsr:')) {
             return toFileUrl(info.localPath);
         }
         return info.specPath;
+    }
+    if (isAbsolute(info.specPath) || isAbsolute(info.localPath)) {
+        return toFileUrl(info.localPath);
     }
     return info.specPath;
 }

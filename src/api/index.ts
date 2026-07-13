@@ -5,13 +5,12 @@ export { loadTasks, BinResolver } from '../task';
 export { LockStore } from '../lock';
 export {
     ParseDriver,
-    PrecompileDriver,
+    parseTaskTimeoutMs,
     isParseWorker,
-    isCompilerWorker,
     runParseWorker,
-    runCompilerWorker,
 } from '../parse';
-export { fatal, formatError, err, ErrorKind, TransformError } from '../errors';
+export { ImportScanner } from '../import-scanner';
+export { fatal, formatError, err, ErrorKind, TransformError, isResolutionMiss } from '../errors';
 export {
     log, errMsg, fmtBytes, uname, isWindows, stripJsonc,
     dirname, normalizePath, isAbsolute, joinPaths, cwd, toPosixPath,
@@ -20,7 +19,8 @@ export {
 export { createResourceManager, ResourceManager } from '../runtime/resources';
 export { writePack } from '../pack/writer';
 export type { WritePackOptions } from '../pack/writer';
-export { loadPack } from '../pack/reader';
+export { loadPack, PackSession, PackBlobStore } from '../pack/reader';
+export type { LoadedPack, PackLoadStats } from '../pack/reader';
 export {
     encodePack,
     encodePackHeader,
@@ -29,6 +29,14 @@ export {
     readSourceBlob,
 } from '../pack/format';
 export type { PackManifest, PackModuleEntry, PackContainer } from '../pack/format';
+// Integrity primitives used by pack write and unit tests (full-byte verify).
+export { bytesEqual, hasExpectedContent, safeExtractBaseName } from '../pack/integrity';
+export {
+    MemoryFileStore, setActiveFileStore, getActiveFileStore, hasActiveFileStore,
+    hasMemoryFile, getMemoryFile, getMemoryBytecode,
+} from '../utils';
+export type { VirtualFileStore } from '../utils';
+export { isFileBackedPath } from '../source/cache';
 export type {
     ModuleInfo, ModuleFormat, FileKind,
     ConfigOptions, RuntimeConfig, PackageJson,

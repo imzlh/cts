@@ -212,6 +212,35 @@ export function resolveWinBinEntry(cmdPath: string): string | null {
     }
 }
 
+// npm wrappers are tiny; native bins (e.g. opencode.exe ELF ~180MB) must not
+// be fully read — that hung `cno exec` for tens of seconds decoding garbage.
+const BIN_HEAD_BYTES = 8192;
+
+function readTextHead(path: string, max = BIN_HEAD_BYTES): string | null {
+    let fd: number | undefined;
+    try {
+        fd = fs.open(path, 'r');
+        const buf = new Uint8Array(max);
+        const n = fs.read(fd, buf);
+        if (n <= 0) return '';
+        // ELF / PE — native binary, not a shell/JS wrapper.
+        if (n >= 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46) {
+            return null;
+        }
+        if (n >= 2 && buf[0] === 0x4d && buf[1] === 0x5a) return null;
+        for (let i = 0; i < Math.min(n, 512); i++) {
+            if (buf[i] === 0) return null;
+        }
+        return engine.decodeString(buf.buffer.slice(0, n));
+    } catch {
+        return null;
+    } finally {
+        if (fd !== undefined) {
+            try { fs.close(fd); } catch { /* ignore */ }
+        }
+    }
+}
+
 /**
  * Parse a Unix npm shell wrapper and return the absolute path to the JS file.
  * If the script itself has a Node.js shebang, return the script path as-is.
@@ -223,7 +252,8 @@ export function resolveWinBinEntry(cmdPath: string): string | null {
  */
 export function resolveUnixBinEntry(shPath: string): string | null {
     try {
-        const content = engine.decodeString(fs.readFile(shPath));
+        const content = readTextHead(shPath);
+        if (content == null) return null;
         const lines = content.split('\n');
         const first = lines[0] || '';
         if (first.startsWith('#!')) {

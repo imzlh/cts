@@ -1,17 +1,17 @@
 import { moduleRef, type RuntimeConfig, type ModuleInfo } from '../types';
 import { Transformer } from '../source/transform';
-import { JscCache, isRemote } from '../source/cache';
+import { JscCache, isRemote, isFileBackedPath } from '../source/cache';
 import { readText, readBytes, log } from '../utils';
 import { err, ErrorKind } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 
-const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
 function metaLang(meta: Record<string, unknown>): string | undefined {
     return typeof meta.lang === 'string' ? meta.lang : undefined;
 }
 
+/** .ts / .mts / .tsx / .jsx — extension only (works for pack:/name.ts keys). */
 function isTransformSourcePath(path: string): boolean {
     const length = path.length;
     if (length < 3) return false;
@@ -26,6 +26,7 @@ function isTransformSourcePath(path: string): boolean {
     return (mid === 116 || mid === 106) && path.charCodeAt(length - 4) === 46;
 }
 
+/** .js / .mjs — extension only. */
 function isCompiledSourcePath(path: string): boolean {
     const length = path.length;
     if (length < 3 || path.charCodeAt(length - 1) !== 115 || path.charCodeAt(length - 2) !== 106) {
@@ -54,13 +55,17 @@ export class EsmCompiler {
         this.transformer.setOxc(oxc);
     }
 
+    setOxcLoader(loader: () => OxcTranspiler | null): void {
+        this.transformer.setOxcLoader(loader);
+    }
+
     // -------------------------------------------------------------------------
     // Public: load a module from its ModuleInfo (format-agnostic dispatch)
     // -------------------------------------------------------------------------
 
     load(info: ModuleInfo, meta: Record<string, unknown> = {}, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
-        log.debug('loader', () => `load ${info.specPath} kind=${info.fileKind} format=${info.format}`);
-        log.debug('loader', () => `alias: ${info.specPath} -> ${info.localPath}`);
+        log.debug('loader', () =>
+            `load ${info.specPath} → ${info.localPath} kind=${info.fileKind} format=${info.format}`);
         switch (info.fileKind) {
             case 'binary': return this.loadBytes(info);
             case 'text':   return this.loadText(info);
@@ -132,14 +137,22 @@ export class EsmCompiler {
         }
 
         const remote = isRemote(info.specPath);
-        const needsTransform = !remote && isTransformSourcePath(info.localPath);
-        const needsCompile  = !remote && !needsTransform && isCompiledSourcePath(info.localPath);
-        const cacheable = info.cacheBytecode !== false && this.cfg.enableCache !== false &&
-            (remote || needsTransform || needsCompile);
+        const fileBacked = isFileBackedPath(info.localPath);
+        // Extension policy (works for pack:/name.ts keys, not only host paths).
+        const needsTransform = isTransformSourcePath(info.localPath);
+        const needsCompile = !needsTransform && isCompiledSourcePath(info.localPath);
+        // cacheBytecode === false: sourceOnly / attribute views — never L1/L2.
+        // L1: remote, pack-seeded (isRemote), or local transform/compile candidates.
+        // L2 disk: only when fileBacked (isFileBackedPath / JscCache).
+        const allowCache = info.cacheBytecode !== false && this.cfg.enableCache !== false;
+        const tryBytecode = allowCache && (remote || needsTransform || needsCompile);
 
-        // L1: JSC bytecode cache (in-memory from precompile, or on-disk .jsc)
-        if (cacheable) {
-            const cached = this.jsc.load(info.localPath, remote, resolveMtime?.(info.localPath));
+        if (tryBytecode) {
+            const cached = this.jsc.load(
+                info.localPath,
+                remote && fileBacked,
+                fileBacked ? resolveMtime?.(info.localPath) : undefined,
+            );
             if (cached) {
                 Object.assign(cached.meta, meta);
                 this.esmCache.set(cacheKey, cached);
@@ -147,7 +160,7 @@ export class EsmCompiler {
             }
         }
 
-        // L2: read + transform + compile on main thread
+        // VFS (pack) or fs → transform → compile
         this.esmLoading.add(cacheKey);
         const bytes = readBytes(info.localPath);
         const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleRef(info));
@@ -168,13 +181,11 @@ export class EsmCompiler {
             for (const key of Object.keys(ns)) {
                 this.exportPlaceholderBinding(cached, key, ns[key]);
             }
-            // if no default defined, try to export full namespace
-            // if (!('default' in ns)) cached.export('default', Object(ns));
             log.debug('loader', () => `populated ESM placeholder: ${info.specPath} (${Object.keys(ns).length} exports)`);
             return cached;
         }
 
-        if (cacheable) {
+        if (tryBytecode && fileBacked) {
             if (remote) this.jsc.persist(info.localPath, mod);
             else        this.jsc.persistLocal(info.localPath, mod);
         }
@@ -212,7 +223,8 @@ export class EsmCompiler {
 
     private loadBytes(info: ModuleInfo): CModuleEngine.Module {
         const mod = engine.Module.create(moduleRef(info));
-        mod.export('default', new Uint8Array(fs.readFile(info.localPath)));
+        // Copy: callers may mutate the default export buffer.
+        mod.export('default', readBytes(info.localPath).slice());
         return mod;
     }
 

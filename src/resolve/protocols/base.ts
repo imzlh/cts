@@ -1,6 +1,6 @@
 import type { ModuleInfo, FileKind } from '../../types';
 import type { Flow, ProgressCallback } from '../../flow';
-import { extname } from '../../utils';
+import { extname } from '../../utils/path';
 
 export type { ModuleInfo };
 
@@ -8,6 +8,8 @@ export interface ProtocolHandler {
     readonly protocols: string[];
     resolve(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Flow<ModuleInfo>;
     localPath(specPath: string): string;
+    /** Full ModuleInfo when localPath alone cannot recover format/kind/flags (pack views). */
+    getModuleInfo?(specPath: string): ModuleInfo | null;
     clearCache?(): void;
 }
 

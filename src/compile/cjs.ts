@@ -1,9 +1,9 @@
 import type { ModuleInfo } from '../types';
-import { dirname, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, hasLeadingSlashDrive, normalizePath } from '../utils';
+import { dirname, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, hasLeadingSlashDrive, normalizePath, readText } from '../utils';
 import { err, ErrorKind } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { guessFileKind } from '../resolve/protocols/base';
-import { createCtx, detectFormat, detectPackageJsonFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
+import { createCtx, detectFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
 import { URL } from '../utils/url';
 import { buildCjsWrapperSource, cjsContextSlot, type CjsContext } from './cjs-wrap';
 
@@ -146,6 +146,12 @@ const _dirPaths = new Map<string, string[]>(); // dir → node_modules search li
 export function buildPaths(dir: string): string[] {
     const hit = _dirPaths.get(dir);
     if (hit) return hit;
+    // Synthetic pack:/ctsview: parents have no host node_modules walk.
+    if (dir.startsWith('pack:') || dir.startsWith('ctsview:')) {
+        const empty: string[] = [];
+        _dirPaths.set(dir, empty);
+        return empty;
+    }
     const out: string[] = [];
     let d = dir;
     while (d !== '/') {
@@ -429,7 +435,7 @@ export class CjsLoader {
     private execJson(mod: CjsModule): void {
         const filename = getInternalFilename(mod);
         try {
-            mod.exports = safeParse(engine.decodeString(fs.readFile(filename)));
+            mod.exports = safeParse(readText(filename));
             mod.loaded  = true;
         } catch (e) {
             this.cache.delete(filename);
@@ -466,7 +472,7 @@ export class CjsLoader {
     }
 
     private execJsFresh(mod: CjsModule, filename: string): void {
-        let src = engine.decodeString(fs.readFile(filename));
+        let src = readText(filename);
         // Transform TS/ESM source for CJS execution if a transformer is available
         if (this.deps.prepareSource) {
             const transformed = this.deps.prepareSource(src, filename);
@@ -746,10 +752,9 @@ export class CjsLoader {
             ? parentPath
             : this.deps.runtimeParent?.(parentPath) ?? null;
         if (runtimeParent) {
-            try {
-                const ext = this.deps.resolveExternal(id, runtimeParent);
-                if (ext) return { info: ext, isCjs: ext.format === 'cjs' || ext.fileKind === 'json' };
-            } catch {}
+            // resolveExternal rethrows non-miss; do not wrap in empty catch.
+            const ext = this.deps.resolveExternal(id, runtimeParent);
+            if (ext) return { info: ext, isCjs: ext.format === 'cjs' || ext.fileKind === 'json' };
             return null;
         }
 
@@ -759,16 +764,15 @@ export class CjsLoader {
         if (isRelative(id)) return this.resolveLocalPath(joinPaths(dirname(parentPath), id));
         if (id === '.') return this.resolveLocalPath(dirname(parentPath));
 
-        // External resolver first (covers npm, jsr, http, aliases, import map)
-        try {
-            const ext = this.deps.resolveExternal(id, parentPath);
-            if (ext) {
-                return {
-                    info: ext,
-                    isCjs: ext.format === 'cjs' || ext.fileKind === 'json',
-                };
-            }
-        } catch {}
+        // External resolver first (covers npm, jsr, http, aliases, import map).
+        // Non-miss errors (ProtocolDisabled, Network, …) propagate from resolveExternal.
+        const ext = this.deps.resolveExternal(id, parentPath);
+        if (ext) {
+            return {
+                info: ext,
+                isCjs: ext.format === 'cjs' || ext.fileKind === 'json',
+            };
+        }
 
         // Local filesystem fallback for contexts that bypass the resolver, such as
         // internal createRequire() consumers operating directly on filenames.
@@ -801,11 +805,9 @@ export class CjsLoader {
     private resolveLocalPath(candidate: string): ResolvedCjsRequest | null {
         try {
             const path = normalizePath(resolveFile(normalizePath(candidate)));
-            // .node/.json always load through the CJS path below; for .js/.mjs/.cjs
-            // honor the nearest package.json "type" field like the external resolver
-            // does, otherwise an ESM file reached via a bare relative require() would
-            // be fed straight into the CJS eval and crash on `export`/`import` syntax.
-            const format = extname(path) === '.node' ? 'cjs' : detectPackageJsonFormat(path) ?? detectFormat(path);
+            // .node always CJS; .js uses detectFormat (package type + ESM-syntax promote)
+            // so require() of dual ESM-in-.js packages reaches loadEsmSync instead of CJS eval.
+            const format = extname(path) === '.node' ? 'cjs' : detectFormat(path);
             const fileKind = guessFileKind(path);
             return this.infoFromLocalPath(path, format, fileKind);
         } catch {

@@ -80,16 +80,179 @@ export function extractImports(source: string, isTs = true): string[] {
     return specs ? [...specs] : [];
 }
 
-/** Bytecode serialization currently drops import attributes; keep affected
- * modules on the source-compile path when loading a portable pack. */
-export function hasImportAttributes(source: string, isTs = true): boolean {
-    try {
-        const tokens = parse(source, true, isTs, false).tokens;
-        for (const tok of tokens) {
-            if (tok.type === tt._with || tok.contextualKeyword === ContextualKeyword._assert) return true;
+/**
+ * Bytecode serialization currently drops import attributes; keep affected
+ * modules on the source-compile path when loading a portable pack.
+ *
+ * Must NOT full-parse TypeScript (Sucrase isTs=true is multi-second on large
+ * files). Linear scan is enough: prefer false positive → sourceOnly over a
+ * false negative that would ship broken attribute-less bytecode.
+ * `isTs` kept for call-site compatibility; ignored on purpose.
+ */
+export function hasImportAttributes(source: string, _isTs = true): boolean {
+    const n = source.length;
+    let i = 0;
+    while (i < n) {
+        const c = source.charCodeAt(i);
+        // Skip // and /* */ comments so "with" inside them is ignored.
+        if (c === 47 && i + 1 < n) {
+            const n1 = source.charCodeAt(i + 1);
+            if (n1 === 47) {
+                i += 2;
+                while (i < n && source.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (n1 === 42) {
+                i += 2;
+                while (i + 1 < n && !(source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
         }
-    } catch {
-        // The normal transform path will report the syntax error later.
+        // Skip string / template literals.
+        if (c === 34 || c === 39 || c === 96) {
+            const q = c;
+            i++;
+            while (i < n) {
+                const ch = source.charCodeAt(i);
+                if (ch === 92) { i += 2; continue; }
+                if (ch === q) { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        // import / export … with {  |  assert {
+        if ((c === 105 || c === 101) && isWordAt(source, i, c === 105 ? 'import' : 'export')) {
+            const kwLen = c === 105 ? 6 : 6;
+            if (!isIdentBoundary(source, i + kwLen)) { i++; continue; }
+            const end = Math.min(n, i + 4000);
+            let j = i + kwLen;
+            let depth = 0;
+            while (j < end) {
+                const cj = source.charCodeAt(j);
+                if (cj === 34 || cj === 39 || cj === 96) {
+                    const q = cj;
+                    j++;
+                    while (j < end) {
+                        const ch = source.charCodeAt(j);
+                        if (ch === 92) { j += 2; continue; }
+                        if (ch === q) { j++; break; }
+                        j++;
+                    }
+                    // After a string in an import/export, accept with/assert {
+                    while (j < end && isWs(source.charCodeAt(j))) j++;
+                    if (isWordAt(source, j, 'with') || isWordAt(source, j, 'assert')) {
+                        let k = j + (source.charCodeAt(j) === 119 ? 4 : 6);
+                        while (k < end && isWs(source.charCodeAt(k))) k++;
+                        if (k < end && source.charCodeAt(k) === 123) return true;
+                    }
+                    continue;
+                }
+                if (cj === 123) depth++;
+                else if (cj === 125) depth = Math.max(0, depth - 1);
+                else if (cj === 59 && depth === 0) break;
+                j++;
+            }
+            i = j;
+            continue;
+        }
+        i++;
+    }
+    return false;
+}
+
+function isWs(c: number): boolean {
+    return c === 32 || c === 9 || c === 10 || c === 13;
+}
+
+function isIdentBoundary(source: string, idx: number): boolean {
+    if (idx >= source.length) return true;
+    const c = source.charCodeAt(idx);
+    return !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 36 || c === 95);
+}
+
+function isWordAt(source: string, idx: number, word: string): boolean {
+    if (idx + word.length > source.length) return false;
+    if (idx > 0 && !isIdentBoundary(source, idx - 1) && !isWs(source.charCodeAt(idx - 1))) {
+        // previous char must not be identifier-continue (start of keyword)
+        const p = source.charCodeAt(idx - 1);
+        if ((p >= 65 && p <= 90) || (p >= 97 && p <= 122) || (p >= 48 && p <= 57) || p === 36 || p === 95) {
+            return false;
+        }
+    }
+    for (let k = 0; k < word.length; k++) {
+        if (source.charCodeAt(idx + k) !== word.charCodeAt(k)) return false;
+    }
+    return isIdentBoundary(source, idx + word.length);
+}
+
+/**
+ * True when source has top-level `import`/`export` ESM syntax (not `import()`).
+ * Used to promote package `"type":"commonjs"` / untyped `.js` files that are
+ * actually ESM (Deno `detect_es_module_defined_as_cjs` / package_json_type).
+ *
+ * Linear scan only — full Sucrase parse was multi-second on large dual packages
+ * and ran on every detectFormat / ModuleCompiler.load for `.js` under CJS pkgs.
+ * `isTs` kept for call-site compatibility; ignored (JS dual-detect only).
+ */
+export function hasTopLevelEsmSyntax(source: string, _isTs = false): boolean {
+    const n = source.length;
+    let i = 0;
+    let brace = 0;
+    let paren = 0;
+    let bracket = 0;
+    while (i < n) {
+        const c = source.charCodeAt(i);
+        // // and /* */ comments
+        if (c === 47 && i + 1 < n) {
+            const n1 = source.charCodeAt(i + 1);
+            if (n1 === 47) {
+                i += 2;
+                while (i < n && source.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (n1 === 42) {
+                i += 2;
+                while (i + 1 < n && !(source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+        }
+        // strings / templates (no full template nesting; good enough for dual detect)
+        if (c === 34 || c === 39 || c === 96) {
+            const q = c;
+            i++;
+            while (i < n) {
+                const ch = source.charCodeAt(i);
+                if (ch === 92) { i += 2; continue; }
+                if (ch === q) { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        if (c === 123) { brace++; i++; continue; }
+        if (c === 125) { brace = Math.max(0, brace - 1); i++; continue; }
+        if (c === 40) { paren++; i++; continue; }
+        if (c === 41) { paren = Math.max(0, paren - 1); i++; continue; }
+        if (c === 91) { bracket++; i++; continue; }
+        if (c === 93) { bracket = Math.max(0, bracket - 1); i++; continue; }
+        // Only top-level statements count as ESM markers.
+        if (brace === 0 && paren === 0 && bracket === 0) {
+            if (c === 101 && isWordAt(source, i, 'export')) {
+                return true;
+            }
+            if (c === 105 && isWordAt(source, i, 'import')) {
+                let j = i + 6;
+                while (j < n && isWs(source.charCodeAt(j))) j++;
+                // dynamic import(...) is valid in CJS
+                if (j < n && source.charCodeAt(j) === 40) {
+                    i = j;
+                    continue;
+                }
+                return true;
+            }
+        }
+        i++;
     }
     return false;
 }
@@ -196,9 +359,11 @@ function findFromString(
     tokens: Tokens,
     start: number,
 ): number {
-    const limit = Math.min(start + 80, tokens.length);
+    // No fixed token window: real packages (e.g. multiaddr registry.js) import
+    // 40+ named bindings in one statement (~85 tokens). A short cap silently
+    // drops the edge and pack later fails with "no static edge".
     let braceDepth = 0;
-    for (let i = start; i < limit; i++) {
+    for (let i = start; i < tokens.length; i++) {
         const t = tokens[i];
         if (!t) continue;
         if (t.type === tt.braceL) {

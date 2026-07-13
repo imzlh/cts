@@ -55,7 +55,11 @@ export function installEngineHooks(
         resolve(spec: string, parent: string, attr?: Record<string, unknown>): string {
             try {
                 const info = resolver.resolve(spec, parent, attr);
-                compiler.preRegister(info.localPath, parentLocal(parent));
+                // CJS circular stubs only — ESM/pack preRegister is pure waste
+                // (buildPaths walks synthetic pack: keys toward root).
+                if (info.format === 'cjs' && info.fileKind === 'source') {
+                    compiler.preRegister(info.localPath, parentLocal(parent));
+                }
                 return moduleRef(info);
             } catch (e) {
                 throw err(ErrorKind.ModuleNotFound,
@@ -67,12 +71,12 @@ export function installEngineHooks(
             log.debug('runtime', () => `load hook: ${specPath}`);
             const info = resolver.getInfo(specPath);
             const key = moduleKey(info);
-            const meta: Record<string, unknown> = {};
-            fillMeta(meta, info, resolver);
-
+            // Dedup before fillMeta — dynamic import() may re-enter often.
             const dedup = loadedModules.get(key);
             if (dedup) return dedup;
 
+            const meta: Record<string, unknown> = {};
+            fillMeta(meta, info, resolver);
             try {
                 const mod = compiler.load(info, meta);
                 loadedModules.set(key, mod);

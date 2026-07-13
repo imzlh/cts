@@ -1,4 +1,5 @@
 import { dirname, joinPaths, ensureDir, log } from '../utils';
+import { getMemoryBytecode, hasActiveFileStore, hasMemoryFile } from '../utils/memfs';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -22,7 +23,19 @@ export function isRemote(specPath: string): boolean {
         || specPath.startsWith('ctsview:');
 }
 
+/**
+ * Disk L2 / mtime freshness only for real filesystem paths.
+ * Pack / VFS keys are never file-backed.
+ */
+export function isFileBackedPath(localPath: string): boolean {
+    if (localPath.startsWith('pack:') || localPath.startsWith('ctsview:')) return false;
+    // Skip VFS has() when no overlay is installed (common disk-only runs).
+    if (hasActiveFileStore() && hasMemoryFile(localPath)) return false;
+    return true;
+}
+
 export class JscCache {
+    /** Optional owned L1 buffers (precompile); pack uses VFS bytecode() instead. */
     private readonly memory = new Map<string, ArrayBuffer>();
     private readonly localDir: string | null;
 
@@ -35,7 +48,7 @@ export class JscCache {
     // -------------------------------------------------------------------------
 
     private localCachePath(localPath: string): { jsc: string; mt: string } | null {
-        if (!this.localDir) return null;
+        if (!this.localDir || !isFileBackedPath(localPath)) return null;
         const hash = crypto.hexEncode(crypto.md5(engine.encodeString(localPath)));
         const dir = joinPaths(this.localDir, hash.slice(0, 2));
         const base = joinPaths(dir, hash);
@@ -46,7 +59,8 @@ export class JscCache {
     // Load: L1 (memory) → L2 (disk .jsc) → null
     // -------------------------------------------------------------------------
 
-    private remoteCachePaths(localPath: string): { jsc: string; mt: string } {
+    private remoteCachePaths(localPath: string): { jsc: string; mt: string } | null {
+        if (!isFileBackedPath(localPath)) return null;
         const jsc = localPath + '.jsc';
         return { jsc, mt: jsc + '.mt' };
     }
@@ -115,22 +129,34 @@ export class JscCache {
     }
 
     private loadRaw(localPath: string, remote: boolean, cachedMtime?: number): unknown | null {
-        // L1: in-memory bytecode
+        // L1a: owned buffers (precompile one-shot)
         const bc = this.memory.get(localPath);
         if (bc) {
             try {
                 const mod = engine.deserialize(new Uint8Array(bc));
                 this.memory.delete(localPath);
                 return mod;
-            } catch (e) {
+            } catch {
                 log.debug('jsc', () => `memory deserialize failed: ${localPath}`);
                 this.memory.delete(localPath);
             }
         }
 
-        // L2: on-disk
+        // L1b: active VFS bytecode() — 0-copy view, deserialize on demand
+        const view = getMemoryBytecode(localPath);
+        if (view) {
+            try {
+                return engine.deserialize(view);
+            } catch {
+                log.debug('jsc', () => `vfs bytecode deserialize failed: ${localPath}`);
+                // Fall through: source recompile (ABI mismatch / corrupt blob).
+            }
+        }
+
+        // L2: on-disk only for real filesystem paths
         if (remote) {
             const paths = this.remoteCachePaths(localPath);
+            if (!paths) return null;
             if (!this.isFreshMtime(localPath, paths.mt, cachedMtime)) {
                 removeCacheFiles(paths);
                 return null;
@@ -143,7 +169,6 @@ export class JscCache {
             }
         }
 
-        // Local: .jsc in cacheDir, mtime-validated
         const paths = this.localCachePath(localPath);
         if (!paths) return null;
 
@@ -192,41 +217,29 @@ export class JscCache {
      */
     hasFresh(localPath: string, remote: boolean, cachedMtime?: number): boolean {
         if (remote) {
-            return this.hasFreshFile(this.remoteCachePaths(localPath), localPath, cachedMtime);
+            const paths = this.remoteCachePaths(localPath);
+            return paths ? this.hasFreshFile(paths, localPath, cachedMtime) : false;
         }
-
         const paths = this.localCachePath(localPath);
         if (!paths) return false;
         return this.hasFreshFile(paths, localPath, cachedMtime);
     }
 
-    /**
-     * Clear all in-memory bytecode (for memory cleanup)
-     */
     clearMemory(): void {
         this.memory.clear();
     }
-
-    // -------------------------------------------------------------------------
-    // Store bytecode in memory (called by the parse driver)
-    // -------------------------------------------------------------------------
 
     setMemory(localPath: string, bc: ArrayBuffer): void {
         this.memory.set(localPath, bc);
     }
 
-    // -------------------------------------------------------------------------
-    // Persist bytecode straight to disk without keeping it in memory.
-    // Used by precache: remote → next to file, local → cacheDir + mtime sidecar.
-    // -------------------------------------------------------------------------
-
     persistBytecode(localPath: string, bc: ArrayBuffer, remote: boolean): void {
         if (remote) {
             const paths = this.remoteCachePaths(localPath);
+            if (!paths) return;
             try {
                 this.writeCacheFile(paths, localPath, bc);
-            }
-            catch (e) { log.warn('jsc', `persist failed: ${paths.jsc}`, e); }
+            } catch (e) { log.warn('jsc', `persist failed: ${paths.jsc}`, e); }
             return;
         }
         const paths = this.localCachePath(localPath);
@@ -236,14 +249,11 @@ export class JscCache {
         } catch (e) { log.warn('jsc', `persistBytecode failed: ${paths.jsc}`, e); }
     }
 
-    // -------------------------------------------------------------------------
-    // Persist in-memory bytecode to .jsc file (called after precompile)
-    // -------------------------------------------------------------------------
-
     persistMemory(localPath: string): void {
         const bc = this.memory.get(localPath);
         if (!bc) return;
         const paths = this.remoteCachePaths(localPath);
+        if (!paths) return;
         try {
             this.writeCacheFile(paths, localPath, bc);
         } catch (e) {
@@ -251,22 +261,15 @@ export class JscCache {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Persist remote module bytecode (next to local file)
-    // -------------------------------------------------------------------------
-
     persist(localPath: string, mod: CModuleEngine.Module): void {
         const paths = this.remoteCachePaths(localPath);
+        if (!paths) return;
         try {
             this.writeCacheFile(paths, localPath, mod.dump());
         } catch (e) {
             log.warn('jsc', `persist failed: ${paths.jsc}`, e);
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Persist local file bytecode to cacheDir with mtime sidecar
-    // -------------------------------------------------------------------------
 
     persistLocal(localPath: string, mod: CModuleEngine.Module): void {
         const paths = this.localCachePath(localPath);
@@ -278,10 +281,6 @@ export class JscCache {
             log.warn('jsc', `persistLocal failed: ${paths.jsc}`, e);
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Clear local bytecode cache (full wipe of {cacheDir}/local/)
-    // -------------------------------------------------------------------------
 
     clearLocal(): void {
         if (!this.localDir || !fs.exists(this.localDir)) return;

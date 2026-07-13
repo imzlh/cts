@@ -1,8 +1,7 @@
 import type { ModuleInfo } from '../types';
-import { errMsg, log, assert } from '../utils';
+import { errMsg, log, assert, readBytes } from '../utils';
 import { err, ErrorKind } from '../errors';
 
-const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const wasm = import.meta.use('wasm');
 
@@ -186,7 +185,7 @@ export function buildWasmModule(
 ): { mod: CModuleEngine.Module; instance: CModuleWASM.Instance } | null {
     if (!wasm) return null;
 
-    const raw = fs.readFile(info.localPath);
+    const raw = readBytes(info.localPath);
     const wmod = wasm.parseModule(raw);
 
     const imports = wasm.moduleImports(wmod);

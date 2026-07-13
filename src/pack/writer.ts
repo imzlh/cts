@@ -1,20 +1,20 @@
 import type { TypeScriptRuntime } from '../runtime/index';
-import { moduleViewRef, type ModuleFormat } from '../types';
+import type { ModuleFormat } from '../types';
 import { ParseDriver } from '../parse';
 import { DepScanner } from '../deps';
+import { ImportScanner } from '../import-scanner';
 import { guessFileKind } from '../resolve/protocols/base';
 import { hasImportAttributes, isScannablePath, isTsLikePath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
-import { relativePath, dirname, basename, ensureDir, PrecacheProgress } from '../utils';
+import { relativePath, dirname, basename, ensureDir, PrecacheProgress, log } from '../utils';
 import { err, ErrorKind } from '../errors';
-import { tryLoadOxc } from '../oxc';
 import { encodePackHeader, type PackManifest, type PackModuleEntry } from './format';
+import { writeAll, writeAtomicallyStreamed } from './integrity';
+import { attributeViewId, specScheme } from './identity';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
-const os = import.meta.use('os');
 const crypto = import.meta.use('crypto');
-let tempFileId = 0;
 
 interface BlobChunk {
     bytes: Uint8Array;
@@ -53,31 +53,8 @@ class BlobBuilder {
     }
 }
 
-function writeAll(fd: number, bytes: Uint8Array): void {
-    let offset = 0;
-    while (offset < bytes.byteLength) {
-        const written = fs.write(fd, bytes.subarray(offset));
-        if (written <= 0) throw new Error('Failed to make progress while writing pack output');
-        offset += written;
-    }
-}
-
 function contentDigest(bytes: Uint8Array): string {
     return crypto.hexEncode(crypto.sha256(bytes));
-}
-
-/** Same scheme-extraction rule as ModuleResolver's private protoOf() — 2-8
- *  lowercase-alpha chars before the first ':'. Local/Windows-drive specPaths
- *  never match (drive letters are single-char and upper-cased by canonicalizePath). */
-function specScheme(specPath: string): string | null {
-    const ci = specPath.indexOf(':');
-    if (ci < 2 || ci > 8) return null;
-    const scheme = specPath.slice(0, ci);
-    for (let i = 0; i < scheme.length; i++) {
-        const c = scheme.charCodeAt(i);
-        if (c < 97 || c > 122) return null;
-    }
-    return scheme;
 }
 
 function externalLocalId(m: ScanModule): string {
@@ -90,12 +67,6 @@ function localSpecifierSuffix(m: ScanModule): string {
     if (!m.specPath.startsWith(m.localPath)) return '';
     const suffix = m.specPath.slice(m.localPath.length);
     return suffix.startsWith('?') || suffix.startsWith('#') ? suffix : '';
-}
-
-function attributeViewId(id: string, baseKind: ReturnType<typeof guessFileKind>, attr?: Record<string, unknown>): string {
-    const type = attr?.type;
-    const view = type === 'text' ? 'text' : type === 'bytes' ? 'binary' : type === 'json' ? 'json' : baseKind;
-    return view === baseKind ? id : moduleViewRef(id, view);
 }
 
 function isTypeScriptLang(lang: string): boolean {
@@ -162,17 +133,23 @@ export async function writePack(
     outPath: string,
     options: WritePackOptions = {},
 ): Promise<PackManifest> {
-    const oxc = runtime.config.enableOxc === false ? null : tryLoadOxc();
-    const parseDriver = new ParseDriver(oxc);
+    // Reuse the runtime's oxc (createRuntime already tried tryLoadOxc).
+    const oxc = runtime.getOxc();
+    // Pack compiles bytecode on the main thread anyway, and only a minority of
+    // modules need TS transformation. Inline OXC is faster here and avoids a
+    // native worker-pipe failure leaving the final transform replies stranded.
+    const importScanner = new ImportScanner(oxc);
+    const parseDriver = new ParseDriver(oxc, 0);
     const prog = runtime.config.silent ? null : new PrecacheProgress(5, 'Packing');
     const importsByLocalPath = new Map<string, string[]>();
+    log.debug('pack', () => `pipeline: scan=${oxc ? 'oxc' : 'sucrase'} transform=${oxc ? 'oxc+inline' : 'sucrase+inline'}`);
 
     try {
         const entryInfo = runtime.resolver.resolve(entrySpecifier, `${projectDir}/<pack>`);
         const recordingParseImports = async (localPath: string): Promise<string[]> => {
             const lang = localPath === entryInfo.localPath ? options.entryLang : undefined;
             const deps = isScannablePath(localPath) || lang
-                ? await parseDriver.scanFile(localPath, lang, false)
+                ? importScanner.scanFile(localPath, lang)
                 : [];
             importsByLocalPath.set(localPath, deps);
             return deps;
@@ -347,10 +324,22 @@ export async function writePack(
         // Worker completion order is intentionally nondeterministic. Append
         // bytecode in sorted module order so identical inputs produce a stable
         // blob layout and manifest regardless of transform scheduling.
+        // Fail closed: every source module must have both compiled output and
+        // a source snapshot — never silently skip and hope the missing check
+        // is the only guard (and never fall back to host paths at run time).
         for (const sourceModule of sourceModules) {
             const output = compiled.get(sourceModule.specPath);
             const sourceRange = sourceRanges.get(sourceModule.specPath);
-            if (!output || !sourceRange) continue;
+            if (!output || !sourceRange) {
+                if (!compileFailures.some(f => f.specPath === sourceModule.specPath)) {
+                    compileFailures.push({
+                        localPath: sourceModule.localPath,
+                        specPath: sourceModule.specPath,
+                        error: new Error(!output ? 'compiler produced no bytecode' : 'source snapshot missing'),
+                    });
+                }
+                continue;
+            }
             const { offset, length } = blob.push(output);
             const source = moduleById.get(sourceModule.specPath);
             modules[sourceModule.specPath] = {
@@ -361,9 +350,18 @@ export async function writePack(
                 length,
                 sourceOffset: sourceRange.offset,
                 sourceLength: sourceRange.length,
-                sourceOnly: sourceRange.sourceOnly,
+                // Explicit false omitted to keep manifests small; true is required
+                // so loaders disable bytecode that would drop import attributes.
+                sourceOnly: sourceRange.sourceOnly || undefined,
                 lang: source?.specPath === entryInfo.specPath ? options.entryLang : undefined,
             };
+        }
+
+        if (compileFailures.length > 0) {
+            const lines = compileFailures
+                .map(f => `  - ${f.localPath}: ${f.error instanceof Error ? f.error.message : String(f.error)}`)
+                .join('\n');
+            throw err(ErrorKind.TransformError, `pack: ${compileFailures.length} source module(s) failed to compile:\n${lines}`);
         }
 
         for (const [localPath, snapshot] of sourceSnapshots) {
@@ -398,35 +396,21 @@ export async function writePack(
         writeAtomically(outPath, manifest, blob);
         return manifest;
     } finally {
-        prog?.stop();
-        await parseDriver.terminate();
+        // Shut down the progress producer before closing its UI. The progress
+        // object also rejects late callbacks, but this ordering keeps cleanup
+        // correct for any future ParseDriver shutdown reporting.
+        try {
+            await parseDriver.terminate();
+        } finally {
+            prog?.stop();
+        }
     }
 }
 
 function writeAtomically(outPath: string, manifest: PackManifest, blob: BlobBuilder): void {
-    ensureDir(dirname(outPath));
-    const pid = typeof os.pid === 'number' || typeof os.pid === 'string' ? String(os.pid) : 'runtime';
-    const tempPath = `${outPath}.tmp-${pid}-${Date.now()}-${tempFileId++}`;
-    let fd: number | null = null;
-    try {
-        const header = encodePackHeader(manifest, blob.byteLength);
-        fd = fs.open(tempPath, 'wx', 0o600);
+    const header = encodePackHeader(manifest, blob.byteLength);
+    writeAtomicallyStreamed(outPath, (fd) => {
         writeAll(fd, header);
         blob.writeTo(fd);
-        fs.fsync(fd);
-        fs.close(fd);
-        fd = null;
-        // Linux rename replaces; Windows fails if dest exists — unlink then retry.
-        try {
-            fs.rename(tempPath, outPath);
-        } catch {
-            try { fs.unlink(outPath); } catch {}
-            fs.rename(tempPath, outPath);
-        }
-    } finally {
-        if (fd !== null) {
-            try { fs.close(fd); } catch {}
-        }
-        try { fs.unlink(tempPath); } catch {}
-    }
+    }, ensureDir);
 }
