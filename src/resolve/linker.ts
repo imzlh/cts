@@ -1,6 +1,7 @@
 import type { ScanResult } from '../deps';
 import type { NodeModulesMode } from '../types';
-import { joinPaths, dirname, ensureDir, errMsg, npmNameVersion, isWindows, hardlinkOrCopyDirRecursiveSync } from '../utils';
+import { joinPaths, dirname, ensureDir, errMsg, npmNameVersion, isWindows, hardlinkOrCopyDirRecursiveSync, readText, safeParse } from '../utils';
+import { getBinMap } from './pkg';
 
 const fs = import.meta.use('fs');
 const asyncfs = import.meta.use('asyncfs');
@@ -20,6 +21,19 @@ function safeRmdir(path: string): void {
     } catch {}
 }
 
+/**
+ * Materialize a real node_modules tree from the scan graph.
+ *
+ * soft — symlink project roots + nested store edges.
+ * hard — hard-link (or copy) the same edges.
+ *
+ * Neither mode wipes store package node_modules: NpmHandler install already
+ * linked package.json dependencies/peers there. Materialize only ensures scan
+ * edges and project roots exist. Node resolves from realpath of soft links, so
+ * nested edges must land under the store package itself.
+ *
+ * Peers that never appear in the import graph are install-time only.
+ */
 export async function materializeNodeModules(
     edges: ScanResult['edges'],
     mode: Exclude<NodeModulesMode, 'normal'>,
@@ -30,16 +44,15 @@ export async function materializeNodeModules(
     const storeRoot = joinPaths(cacheDir, 'npm');
     const { internalEdges, rootEdges } = partitionEdges(edges);
     const pending: ScanResult['edges'] = [];
-    if (mode !== 'soft') {
-        for (const edge of sortInternalEdges(internalEdges)) {
-            if (canLinkEdge(edge, storeRoot, projectDir)) pending.push(edge);
-        }
+    for (const edge of sortInternalEdges(internalEdges)) {
+        if (canLinkEdge(edge, storeRoot, projectDir)) pending.push(edge);
     }
     for (const edge of rootEdges) {
         if (canLinkEdge(edge, storeRoot, projectDir)) pending.push(edge);
     }
 
-    if (mode !== 'soft') resetStorePackages(edges, storeRoot);
+    // Only project-level roots are pruned against the previous manifest.
+    // Store package node_modules is owned by install (deps + peers).
     resetProjectRoots(projectDir, rootEdges);
 
     let linked = 0;
@@ -64,7 +77,51 @@ export async function materializeNodeModules(
         );
     }
 
+    // Project .bin is not part of the scan graph (bin maps live in package.json).
+    materializeProjectBins(rootEdges, storeRoot, projectDir);
+
     writeProjectManifest(projectDir, edgeNames(rootEdges));
+}
+
+/** Symlink each root package's bin entries into <project>/node_modules/.bin. */
+function materializeProjectBins(
+    rootEdges: ScanResult['edges'],
+    storeRoot: string,
+    projectDir: string,
+): void {
+    const binDir = joinPaths(projectDir, 'node_modules', '.bin');
+    for (const edge of rootEdges) {
+        const cv = npmNameVersion(edge.childSpecPath);
+        if (!cv) continue;
+        const pkgDir = joinPaths(storeRoot, `${cv.name}@${cv.version}`);
+        const pkg = readPkgJson(pkgDir);
+        if (!pkg) continue;
+        const binMap = getBinMap(pkg);
+        for (const binName in binMap) {
+            const rel = binMap[binName];
+            if (!rel) continue;
+            const source = joinPaths(pkgDir, rel);
+            const target = joinPaths(binDir, binName);
+            try {
+                if (!fs.exists(source)) continue;
+                if (fs.exists(target)) continue;
+                ensureDir(binDir);
+                fs.symlink(source, target);
+                try { fs.chmod(source, 0o755); } catch {}
+            } catch {
+                // Best-effort: missing bin must not fail the whole materialize.
+            }
+        }
+    }
+}
+
+function readPkgJson(dir: string): { bin?: unknown; name?: string } | null {
+    try {
+        const raw = readText(joinPaths(dir, 'package.json'));
+        return safeParse(raw);
+    } catch {
+        return null;
+    }
 }
 
 function edgeNames(edges: ScanResult['edges']): string[] {
@@ -82,9 +139,7 @@ function resolveTargetDir(edge: ScanResult['edges'][number], storeRoot: string, 
         if (pv.name === edge.name) return null;
         return joinPaths(storeRoot, `${pv.name}@${pv.version}`, 'node_modules', edge.name);
     }
-    // Synthetic project-root marker (`${dir}/<cache>` or `${dir}/<entry>`,
-    // see DepScanner.isEligibleParent) — link into the project's own
-    // top-level node_modules.
+    // Project-root scan seed — link into project node_modules.
     return joinPaths(projectDir, 'node_modules', edge.name);
 }
 
@@ -194,17 +249,6 @@ function sortInternalEdges(edges: ScanResult['edges']): ScanResult['edges'] {
         if (a.name !== b.name) return a.name < b.name ? -1 : 1;
         return 0;
     });
-}
-
-function resetStorePackages(edges: ScanResult['edges'], storeRoot: string): void {
-    const packages = new Set<string>();
-    for (const edge of edges) {
-        const cv = npmNameVersion(edge.childSpecPath);
-        if (cv) packages.add(joinPaths(storeRoot, `${cv.name}@${cv.version}`, 'node_modules'));
-        const pv = npmNameVersion(edge.parentSpecPath);
-        if (pv) packages.add(joinPaths(storeRoot, `${pv.name}@${pv.version}`, 'node_modules'));
-    }
-    for (const dir of packages) removeIfExists(dir);
 }
 
 function resetProjectRoots(projectDir: string, rootEdges: ScanResult['edges']): void {

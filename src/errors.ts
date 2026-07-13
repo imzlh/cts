@@ -4,9 +4,7 @@ const engine = import.meta.use('engine');
 const console = import.meta.use('console');
 const worker = import.meta.use('worker');
 
-// ---------------------------------------------------------------------------
 // ErrorKind — the single source of truth for error categories
-// ---------------------------------------------------------------------------
 
 export enum ErrorKind {
     ModuleNotFound  = 1,
@@ -75,24 +73,16 @@ function syntaxCause(error: Error): { source?: Error; path?: string } | null {
     };
 }
 
-/** QuickJS compile errors don't embed a location in .message — the engine
- *  instead adds a synthetic "at <module-name>:<line>:<col>" frame at the top
- *  of .stack (ahead of the real JS call frames), so grab the first one. */
+/** Location from first "at <module>:<line>:<col>" frame in .stack. */
 function locationFromStack(source: Error | undefined): { line: number; col: number } | null {
     if (!source?.stack) return null;
     const m = source.stack.match(/^\s*at\s+.*?:(\d+):(\d+)\s*$/m);
     return m ? { line: +m[1]!, col: +m[2]! } : null;
 }
 
-// ---------------------------------------------------------------------------
 // Helper: create an Error with .kind attached
-// ---------------------------------------------------------------------------
 
-/**
- * Create an Error with a .kind field.
- * Use this instead of `new Error(...)` at internal throw sites so that
- * formatError can display the correct category without guessing.
- */
+/** Error with .kind for formatError. */
 export function err(kind: ErrorKind, msg: string, source?: unknown): Error {
     const e = new Error(msg);
     e.kind = kind;
@@ -121,12 +111,7 @@ export function err(kind: ErrorKind, msg: string, source?: unknown): Error {
     return e;
 }
 
-/**
- * True when a resolver failure means "not found here" and CJS require may
- * continue with node_modules / local FS fallback. Non-miss kinds (protocol
- * disabled, network, frozen lock, invalid specifier, …) must rethrow so they
- * are not masked as MODULE_NOT_FOUND.
- */
+/** Resolution miss (continue CJS walk). Non-miss kinds must rethrow. */
 export function isResolutionMiss(e: unknown): boolean {
     if (!(e instanceof Error)) return false;
     if (e.kind === ErrorKind.ModuleNotFound || e.kind === ErrorKind.FileNotFound) return true;
@@ -134,9 +119,7 @@ export function isResolutionMiss(e: unknown): boolean {
     return code === 'MODULE_NOT_FOUND' || code === 'ENOENT';
 }
 
-// ---------------------------------------------------------------------------
 // Terminal colour helpers (graceful degradation)
-// ---------------------------------------------------------------------------
 
 const _isTTY: boolean = os.guessHandle(os.STDERR_FILENO) == 'tty';
 function isTTY(): boolean { return _isTTY; }
@@ -150,10 +133,6 @@ const C = {
     green:  (s: string) => isTTY() ? `\x1b[32m${s}\x1b[0m` : s,
     invert: (s: string) => isTTY() ? `\x1b[7m${s}\x1b[0m`  : s,
 };
-
-// ---------------------------------------------------------------------------
-// Labels and suggestions
-// ---------------------------------------------------------------------------
 
 function label(kind: ErrorKind): string {
     switch (kind) {
@@ -216,9 +195,7 @@ function suggest(kind: ErrorKind, msg: string): string {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Source context — show lines around the error location
-// ---------------------------------------------------------------------------
 
 function sourceContext(file: string, line: number, col: number): string {
     let src: string;
@@ -256,19 +233,13 @@ function sourceContext(file: string, line: number, col: number): string {
     return out.join('\n');
 }
 
-/** Bold the error line; on a TTY also reverse-video the single character at
- *  `col` (1-indexed) so the offending token is visible without a separate
- *  caret line below it. */
+/** Bold error line; on TTY reverse-video the char at col. */
 function highlightAt(line: string, col: number, tty: boolean): string {
     if (!tty || col <= 0) return C.bold(line);
     const idx = col - 1;
     if (idx >= line.length) return C.bold(line) + C.invert(' ');
     return C.bold(line.slice(0, idx)) + C.invert(line[idx] ?? ' ') + C.bold(line.slice(idx + 1));
 }
-
-// ---------------------------------------------------------------------------
-// Main formatting function
-// ---------------------------------------------------------------------------
 
 function readDebugEnv(): string {
     try {
@@ -304,10 +275,7 @@ export function formatError(e: unknown, context?: string): string {
         .replace(/\(see .*?\.log\)$/, '');
     lines.push(`  ${cleanMsg}`);
 
-    // Source context for syntax/transform errors. `error` may be a plain
-    // Error carrying kind=SyntaxError (see compileEsm's err() wrapping) as
-    // well as an actual SyntaxError (from reportSyntax's rethrow) — both
-    // shapes stash { source, path } on .cause.
+    // Syntax/transform: .cause may hold { source, path } (plain Error or SyntaxError).
     if (kind === ErrorKind.SyntaxError) {
         const cause = syntaxCause(error);
         if (cause?.path) {
@@ -356,9 +324,7 @@ function errorInfo(e: unknown): { name: string; message: string; stack?: string 
     return { name: 'Error', message: String(e) };
 }
 
-// ---------------------------------------------------------------------------
 // Fatal error — print and exit
-// ---------------------------------------------------------------------------
 
 export function fatal(e: unknown, context?: string): never {
     const workerData = worker.workerData;

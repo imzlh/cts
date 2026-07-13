@@ -4,7 +4,7 @@ import { ParseDriver } from '../parse';
 import { DepScanner } from '../deps';
 import { ImportScanner } from '../import-scanner';
 import { guessFileKind } from '../resolve/protocols/base';
-import { hasImportAttributes, isScannablePath, isTsLikePath } from '../scan';
+import { hasImportAttributes, isScannablePath, isTsLikePath, isWasmPath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { relativePath, dirname, basename, ensureDir, PrecacheProgress, log } from '../utils';
 import { err, ErrorKind } from '../errors';
@@ -86,10 +86,7 @@ export interface WritePackOptions {
     entryLang?: string;
 }
 
-/** Assign every scanned module a stable, directory-structure-preserving id:
- *  - workspace files: "pack:/<relative-path>"
- *  - everything else: "pack:<scheme>/<rest>" derived from its own specPath scheme,
- *    or "pack:local/<hash>/<basename>" for a local file outside workspace roots. */
+/** Stable pack id: pack:/rel, pack:<scheme>/…, or pack:local/<hash>/base. */
 function classifyModules(modules: ScanModule[], workspaceRoots: string[]): ClassifiedModule[] {
     const syntheticToReal = new Map<string, string>();
     const out: ClassifiedModule[] = [];
@@ -122,10 +119,7 @@ function classifyModules(modules: ScanModule[], workspaceRoots: string[]): Class
     return out;
 }
 
-// Packs entry + its static dep graph into a portable .jspack container, keyed
-// by synthetic, directory-structure-preserving "pack:/..." / "pack:<scheme>/..." ids
-// instead of pack-time absolute paths. External (non-workspace) dependencies must
-// be resolvable at pack time; all source modules are compiled under their synthetic ids.
+// Entry + static graph → .jspack under synthetic pack: ids (externals must resolve at pack time).
 export async function writePack(
     runtime: TypeScriptRuntime,
     entrySpecifier: string,
@@ -135,26 +129,23 @@ export async function writePack(
 ): Promise<PackManifest> {
     // Reuse the runtime's oxc (createRuntime already tried tryLoadOxc).
     const oxc = runtime.getOxc();
-    // Pack compiles bytecode on the main thread anyway, and only a minority of
-    // modules need TS transformation. Inline OXC is faster here and avoids a
-    // native worker-pipe failure leaving the final transform replies stranded.
+    // Inline OXC: pack compiles on main thread; avoids stranded worker replies.
     const importScanner = new ImportScanner(oxc);
     const parseDriver = new ParseDriver(oxc, 0);
     const prog = runtime.config.silent ? null : new PrecacheProgress(5, 'Packing');
-    const importsByLocalPath = new Map<string, string[]>();
     log.debug('pack', () => `pipeline: scan=${oxc ? 'oxc' : 'sucrase'} transform=${oxc ? 'oxc+inline' : 'sucrase+inline'}`);
 
     try {
         const entryInfo = runtime.resolver.resolve(entrySpecifier, `${projectDir}/<pack>`);
-        const recordingParseImports = async (localPath: string): Promise<string[]> => {
+        // Offline edges come only from scanResult.resolutions (JS/TS + WASM).
+        const parseImports = async (localPath: string): Promise<string[]> => {
             const lang = localPath === entryInfo.localPath ? options.entryLang : undefined;
-            const deps = isScannablePath(localPath) || lang
-                ? importScanner.scanFile(localPath, lang)
-                : [];
-            importsByLocalPath.set(localPath, deps);
-            return deps;
+            if (isScannablePath(localPath) || isWasmPath(localPath) || lang) {
+                return importScanner.scanFile(localPath, lang);
+            }
+            return [];
         };
-        const scanner = new DepScanner(runtime.resolver, runtime.config, prog, oxc, recordingParseImports, {
+        const scanner = new DepScanner(runtime.resolver, runtime.config, prog, oxc, parseImports, {
             fullGraph: true,
             reportSummary: false,
             excludeSpecPath: specPath => specPath.startsWith('node:'),
@@ -171,9 +162,7 @@ export async function writePack(
 
         const entryDir = dirname(entryInfo.localPath);
         const workspaceRoots = entryDir === projectDir ? [projectDir] : [projectDir, entryDir];
-        // Node builtins are runtime-provided — at run time `node:`/builtin specifiers
-        // dispatch natively before the pack handler, so packing their polyfills is dead
-        // weight. Drop them here; edges pointing at them fall away with the target.
+        // Drop node builtins (runtime-provided; packing polyfills is dead weight).
         const packableModules = scanResult.modules.filter(m => specScheme(m.specPath) !== 'node');
         const classified = classifyModules(packableModules, workspaceRoots);
         classified.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -184,32 +173,37 @@ export async function writePack(
         const entryId = realToSynthetic.get(entryInfo.specPath);
         if (!entryId) throw new Error(`Pack entry "${entryInfo.specPath}" was not found by the scan`);
 
-        const resolvedEdges = new Map<string, string>();
-        for (const edge of scanResult.resolutions) {
-            resolvedEdges.set(`${edge.parentSpecPath}\0${edge.specifier}`, edge.childSpecPath);
-        }
-
-        // Offline (parent, raw specifier) -> child synthetic id, using the exact
-        // results produced by the dependency scan instead of lock-store side effects.
+        // Edges = scan resolutions only; never re-parse (would drop non-source).
         const edges: Record<string, Record<string, string>> = Object.create(null);
-        for (const { m, id: parentId } of classified) {
-            const specs = importsByLocalPath.get(m.localPath);
-            if (!specs || !specs.length) continue;
-            const bucket: Record<string, string> = Object.create(null);
-            const orderedSpecs = [...specs].sort();
-            for (const spec of orderedSpecs) {
-                const childSpecPath = resolvedEdges.get(`${m.specPath}\0${spec}`);
-                if (childSpecPath === undefined) {
-                    throw err(ErrorKind.Generic, `pack: scan omitted edge "${spec}" from "${m.specPath}"`);
-                }
-                const childId = realToSynthetic.get(childSpecPath);
-                if (childId) bucket[spec] = childId;
-                else if (!childSpecPath.startsWith('node:')) {
-                    throw err(ErrorKind.Generic,
-                        `pack: resolved edge target was not included: "${spec}" from "${m.specPath}" -> "${childSpecPath}"`);
-                }
+        for (const edge of scanResult.resolutions) {
+            // Synthetic BFS parents are not packed modules.
+            if (edge.parentSpecPath.endsWith('/<cache>') ||
+                edge.parentSpecPath.endsWith('/<pack>') ||
+                edge.parentSpecPath.endsWith('/<entry>')) {
+                continue;
             }
-            if (Object.keys(bucket).length > 0) edges[parentId] = bucket;
+            const parentId = realToSynthetic.get(edge.parentSpecPath);
+            if (!parentId) continue;
+            const childId = realToSynthetic.get(edge.childSpecPath);
+            if (childId) {
+                let bucket = edges[parentId];
+                if (!bucket) {
+                    bucket = Object.create(null);
+                    edges[parentId] = bucket;
+                }
+                bucket[edge.specifier] = childId;
+            } else if (!edge.childSpecPath.startsWith('node:')) {
+                throw err(ErrorKind.Generic,
+                    `pack: resolved edge target was not included: "${edge.specifier}" from "${edge.parentSpecPath}" -> "${edge.childSpecPath}"`);
+            }
+        }
+        // Stable specifier order inside each parent bucket.
+        for (const parentId of Object.keys(edges)) {
+            const bucket = edges[parentId]!;
+            const keys = Object.keys(bucket).sort();
+            const ordered: Record<string, string> = Object.create(null);
+            for (const k of keys) ordered[k] = bucket[k]!;
+            edges[parentId] = ordered;
         }
 
         const moduleById = new Map(classified.map(c => [c.id, c.m] as const));
@@ -262,10 +256,7 @@ export async function writePack(
                 rawRanges.set(m.localPath, range);
             }
             sourceRanges.set(id, snapshot);
-            // Compile every source module (workspace + external deps) from source under
-            // its synthetic id. Reusing cached .jsc is not portable: bytecode bakes in the
-            // original "npm:"/"file:" identity, so at run time its imports would resolve
-            // against that identity's parent and escape the container to the live cache.
+            // Compile under pack: ids; host .jsc is not portable (bakes npm:/file: identity).
             sourceModules.push({
                 specPath: id,
                 localPath: m.localPath,
@@ -321,12 +312,7 @@ export async function writePack(
             throw err(ErrorKind.TransformError, `pack: ${compileFailures.length} source module(s) failed to compile:\n${lines}`);
         }
 
-        // Worker completion order is intentionally nondeterministic. Append
-        // bytecode in sorted module order so identical inputs produce a stable
-        // blob layout and manifest regardless of transform scheduling.
-        // Fail closed: every source module must have both compiled output and
-        // a source snapshot — never silently skip and hope the missing check
-        // is the only guard (and never fall back to host paths at run time).
+        // Sorted append for stable layout; fail if any source lacks compile+snapshot.
         for (const sourceModule of sourceModules) {
             const output = compiled.get(sourceModule.specPath);
             const sourceRange = sourceRanges.get(sourceModule.specPath);
@@ -396,9 +382,7 @@ export async function writePack(
         writeAtomically(outPath, manifest, blob);
         return manifest;
     } finally {
-        // Shut down the progress producer before closing its UI. The progress
-        // object also rejects late callbacks, but this ordering keeps cleanup
-        // correct for any future ParseDriver shutdown reporting.
+        // Stop progress producer before closing UI.
         try {
             await parseDriver.terminate();
         } finally {

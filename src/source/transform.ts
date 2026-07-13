@@ -77,9 +77,7 @@ export class Transformer {
         }
     }
 
-    /** Like transform(), but returns the sourcemap instead of registering it
-     *  locally — for a caller whose JSContext (e.g. a worker) isn't the one
-     *  that will run the compiled module. See Transformer.transform(). */
+    /** Like transform(); return sourcemap for remote JSContext. */
     transformCapture(code: string, filename: string, lang?: string, mapKey?: string): { code: string; sourceMap?: string | object } {
         code = stripShebang(code);
         const kind = sourceKind(filename, lang);
@@ -125,12 +123,7 @@ export class Transformer {
         }
     }
 
-    /**
-     * Like transform(), but reads straight from file bytes and registers the
-     * sourcemap locally — for the main-thread loader, so a passthrough (or
-     * oxc-transpiled, via transpileSharedBytes) file never needs a JS string
-     * at all. Falls back to the string path for Sucrase and shebang stripping.
-     */
+    /** transform from file bytes; prefer no JS string. Sucrase/shebang fall back. */
     transformBytes(bytes: Uint8Array, filename: string, lang?: string, mapKey?: string): string | Uint8Array {
         const kind = sourceKind(filename, lang);
         switch (kind) {
@@ -170,11 +163,7 @@ export class Transformer {
         }
     }
 
-    /**
-     * Prepare source for CommonJS execution.
-     * This only strips TS/JSX syntax from files already classified as CJS;
-     * it does not rewrite ESM import/export semantics.
-     */
+    /** Strip TS/JSX for CJS; does not rewrite ESM import/export. */
     transformForCjs(code: string, filename: string, lang?: string): string {
         code = stripShebang(code);
         switch (sourceKind(filename, lang)) {

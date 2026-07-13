@@ -4,11 +4,25 @@ import { dirname, isAbsolute, toPosixPath } from '../utils';
 
 const importMetaResolveCache = new Map<string, (s: string, p?: string, a?: Record<string, unknown>) => string>();
 
+// Encode # etc. in file URLs (es5-ext uses a real "#" directory).
+function encodeFileUrlPath(path: string): string {
+    let out = '';
+    for (let i = 0; i < path.length; i++) {
+        const c = path.charCodeAt(i);
+        if (c === 35 /*#*/ || c === 63 /*?*/ || c === 37 /*%*/ || c === 32 /* */) {
+            out += `%${c.toString(16).toUpperCase().padStart(2, '0')}`;
+        } else {
+            out += path[i];
+        }
+    }
+    return out;
+}
+
 function toFileUrl(path: string): string {
     const normalized = toPosixPath(path);
-    if (isWindowsDrivePath(normalized)) return `file:///${normalized}`;
-    if (normalized.startsWith('//')) return `file:${normalized}`;
-    return normalized.startsWith('/') ? `file://${normalized}` : normalized;
+    if (isWindowsDrivePath(normalized)) return `file:///${encodeFileUrlPath(normalized)}`;
+    if (normalized.startsWith('//')) return `file:${encodeFileUrlPath(normalized)}`;
+    return normalized.startsWith('/') ? `file://${encodeFileUrlPath(normalized)}` : normalized;
 }
 
 function isAsciiAlpha(c: number): boolean {
@@ -45,9 +59,7 @@ function toImportMetaUrl(info: ModuleInfo): string {
     return info.specPath;
 }
 
-/**
- * Fill an import.meta object with standard properties.
- */
+/** Fill import.meta with standard properties. */
 export function fillMeta(
     meta: Record<string, unknown>,
     info: ModuleInfo,
@@ -60,9 +72,7 @@ export function fillMeta(
     meta.use      = import.meta.use;
     meta.register = import.meta.register;
 
-    // import.meta.resolve — reuse cached closure per specPath.
-    // Returns localPath (usable as file path), not specPath (which may be
-    // a protocol specifier like npm:vite@8.1.0/... that is not a valid file path).
+    // import.meta.resolve → localPath (not npm:/jsr: specPath); cache per specPath.
     let fn = importMetaResolveCache.get(info.specPath);
     if (!fn) {
         const self = info.specPath;

@@ -12,9 +12,7 @@ const smap = import.meta.use('sourcemap');
 const asyncfs = import.meta.use('asyncfs');
 const fs = import.meta.use('fs');
 
-// ---------------------------------------------------------------------------
 // Worker protocol — transform only (import scan is ImportScanner on main)
-// ---------------------------------------------------------------------------
 
 interface WorkerTask {
     id: number;
@@ -42,12 +40,7 @@ interface ParseWorkerData {
     __cts_enable_oxc?: unknown;
 }
 
-// Compile transformed source to cacheable bytecode. CJS format is compiled
-// as a sloppy-mode (EVAL_GLOBAL) compile-only script wrapped in the same CJS
-// shape CjsLoader's fallback path builds — never as an engine.Module, since
-// module code is unconditionally strict per spec and would silently change
-// CJS semantics (implicit globals, non-strict `this`, etc). See
-// cjs-wrap.ts and engine.d.ts's EVAL_COMPILE_ONLY / evalCompiled().
+// Bytecode: CJS via cjs-wrap; ESM via Module.dump() under stub onModule (no dep cascade).
 function compileForCache(code: string | Uint8Array, specPath: string, format: ModuleFormat | undefined): ArrayBuffer {
     if (format === 'cjs') {
         const src = typeof code === 'string' ? code : engine.decodeString(code);
@@ -128,10 +121,6 @@ function resolveWorkerPolicy(): WorkerPolicy {
     return { maxWorkers: workersForTier(tier), source: `memory-tier=${tier}` };
 }
 
-// ---------------------------------------------------------------------------
-// In-worker: transform only
-// ---------------------------------------------------------------------------
-
 export function isParseWorker(): boolean {
     const role = parseWorkerData().__cts_role;
     return worker.isWorker && (role === 'parse' || role === 'compiler');
@@ -141,9 +130,7 @@ export async function runParseWorker(): Promise<void> {
     const pipe = worker.pipe;
     if (!pipe) throw new Error('Parse worker pipe is not available');
     const wd = parseWorkerData();
-    // Sourcemaps are captured and relayed to the main thread instead of
-    // registered here — this worker's JSContext is not where compiled
-    // modules run, so a local smap.load() would be invisible to stack traces.
+    // Relay sourcemaps to main; worker JSContext is not where modules run.
     const transformer = new Transformer({ sourceMaps: true });
     const oxcTranspiler: OxcTranspiler | null = wd.__cts_enable_oxc === false ? null : tryLoadOxc();
     if (oxcTranspiler) transformer.setOxc(oxcTranspiler);
@@ -205,10 +192,6 @@ export async function runParseWorker(): Promise<void> {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Worker pool
-// ---------------------------------------------------------------------------
-
 class TxWorker {
     readonly w: CModuleWorker.Worker;
     readonly pipe: CModuleWorker.MessagePipe;
@@ -265,9 +248,7 @@ class TxWorker {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ParseDriver — transform / precompile only
-// ---------------------------------------------------------------------------
 
 export class ParseDriver {
     private workers: TxWorker[] = [];

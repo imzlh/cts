@@ -30,11 +30,7 @@ export function toPosixPath(p: string): string {
     return normalizeSlashes(p);
 }
 
-/**
- * Canonicalise a path/specifier so a case-insensitive Windows volume cannot
- * split cache keys: backslashes → '/', and a leading drive letter is upper-cased
- * ("c:/x" and "C:/x" are the same file). No-op for paths without a drive prefix.
- */
+/** Posix-ish path + upper drive letter so Windows case doesn't split cache keys. */
 export function canonicalizePath(p: string): string {
     p = normalizeSlashes(p);
     if (p.length >= 2 && p[1] === ':') {
@@ -50,11 +46,7 @@ export function cwd(): string {
     return toPosixPath(String(os.cwd));
 }
 
-/**
- * Return the filesystem root for the given path.
- *   POSIX      → '/'
- *   Windows    → 'C:/' (or 'D:/' etc.)
- */
+/** FS root: '/' or 'C:/'. */
 export function pathRoot(p: string): string {
     const s = toPosixPath(p);
     if (s.length >= 3 && s[1] === ':' && s[2] === '/' && isAsciiAlpha(s.charCodeAt(0))) {
@@ -182,9 +174,7 @@ export function isAbsolute(p: string): boolean {
     return false;
 }
 
-/** Check if a specifier is a relative import (./ or ../, with either separator).
- *  Also matches the bare tokens "." and ".." — e.g. require("..") for a
- *  directory-parent import — which have no trailing separator to prefix-match. */
+/** Relative import: ./ ../ . or .. (either separator). */
 export function isRelative(s: string): boolean {
     return s === '.' || s === '..' ||
         s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');

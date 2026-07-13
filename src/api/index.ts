@@ -29,6 +29,8 @@ export {
     readSourceBlob,
 } from '../pack/format';
 export type { PackManifest, PackModuleEntry, PackContainer } from '../pack/format';
+export { sizeBucketForModule, summarizePackSizes } from '../pack/size';
+export type { PackSizeRow, PackSizeSummary } from '../pack/size';
 // Integrity primitives used by pack write and unit tests (full-byte verify).
 export { bytesEqual, hasExpectedContent, safeExtractBaseName } from '../pack/integrity';
 export {

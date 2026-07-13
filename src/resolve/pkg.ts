@@ -6,13 +6,7 @@ import { hasTopLevelEsmSyntax } from '../scan';
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
-// ---------------------------------------------------------------------------
-// Cache capacities — tuned to typical project sizes without excess
-// ---------------------------------------------------------------------------
-//  pkgCache:      one entry per node_modules package → 512 covers very large projects
-//  formatCache:   one per source file → 2048 is generous
-//  formatDirCache:one per directory → 512 fine
-//  exportsCache:  one per (pkgDir × subpath × cjs) triple → 1024
+// pkg 512 / format 2048 / formatDir 512 / exports 1024
 
 const _NO_PKG = Symbol('no.pkg');
 const pkgCache      = new LRU<string, { pkg: PackageJson | typeof _NO_PKG; at: number }>(512);
@@ -57,21 +51,19 @@ export function clearPkgCache(): void {
     exportsCache.clear();
 }
 
-// ---------------------------------------------------------------------------
-// Bin field normalization
-// ---------------------------------------------------------------------------
-
+/** npm: string `bin` → command is unscoped leaf (`@babel/parser` → `parser`). */
 export function normalizeBinField(pkgName: string, bin: string | Record<string, string>): Record<string, string> {
-    return typeof bin === 'string' ? { [pkgName]: bin } : bin;
+    if (typeof bin !== 'string') return bin;
+    const slash = pkgName.lastIndexOf('/');
+    const cmd = slash === -1 ? pkgName : pkgName.slice(slash + 1);
+    return { [cmd || pkgName]: bin };
 }
 
 export function getBinMap(pkg: PackageJson): Record<string, string> {
     return pkg.bin ? normalizeBinField(pkg.name || '', pkg.bin) : {};
 }
 
-// ---------------------------------------------------------------------------
 // Format detection — two-level bounded cache
-// ---------------------------------------------------------------------------
 
 export function detectFormat(localPath: string): ModuleFormat {
     const hit = formatCache.get(localPath);
@@ -145,10 +137,6 @@ function _detectFormat(localPath: string): ModuleFormat {
     return 'esm';
 }
 
-// ---------------------------------------------------------------------------
-// Resolution context
-// ---------------------------------------------------------------------------
-
 export interface ResolveCtx { pkgDir: string; pkg: PackageJson; forceCjs?: boolean; conditions?: string[] }
 
 export interface ResolvedPath {
@@ -162,9 +150,7 @@ export function createCtx(dir: string, opts: { forceCjs?: boolean; conditions?: 
     return pkg ? { pkgDir: dir, pkg, ...opts } : null;
 }
 
-// ---------------------------------------------------------------------------
 // Exports resolution — bounded cache
-// ---------------------------------------------------------------------------
 
 function exportsKey(ctx: ResolveCtx, sub: string): string {
     return `${ctx.pkgDir}\0${sub}\0${ctx.forceCjs ? '1' : '0'}\0${ctx.conditions?.join('\0') ?? ''}`;
@@ -186,9 +172,7 @@ export function isPackageSubpathBlockedByExports(ctx: ResolveCtx, sub: string): 
     return resolveExports(ctx, norm) === null;
 }
 
-// True when "." resolves under neither ESM nor CJS conditions — a declaration-only
-// package (e.g. modern @types/react, exports-mapped to "types" conditions only)
-// rather than a real package whose exports just don't match the requested format.
+// "." unresolvable under import/require → declaration-only package (e.g. @types/*).
 export function isRootExportRuntimeless(ctx: ResolveCtx): boolean {
     return resolveExports({ ...ctx, forceCjs: true }, '.') === null
         && resolveExports({ ...ctx, forceCjs: false }, '.') === null;
@@ -218,9 +202,7 @@ export function packageImportNotDefinedError(spec: string, pkgDir: string, paren
 }
 
 function conds(ctx: ResolveCtx): string[] {
-    // Prefer explicit import/require branches, then Node runtime branches,
-    // then default. Keeping import/require first avoids switching packages
-    // that already publish a format-specific runtime entry.
+    // Conditions: import|require first, then node, then default.
     return ctx.forceCjs
         ? ['require', ...(ctx.conditions ?? []), 'node', 'default']
         : ['import', ...(ctx.conditions ?? []), 'node', 'default'];
@@ -231,13 +213,7 @@ function preferredFormatForPath(ctx: ResolveCtx, path: string, preferred?: Modul
     if (ext === '.cjs' || ext === '.cts' || ext === '.node') return 'cjs';
     if (ext === '.mjs' || ext === '.mts') return 'esm';
     if (preferred) return preferred;
-    // The exports map landed on an ambiguous condition (e.g. a bare "default"
-    // with no "import"/"require" branch). Some packages (vue, @vue/runtime-*)
-    // point "exports" at the very same file their "module" field names — the
-    // conventional (bundler-only) signal for "this is the package's ESM
-    // build" — without ever setting "type": "module", since they expect a
-    // bundler's own content-sniffing rather than Node's type/extension rules.
-    // Same package, same file: honor that signal instead of guessing 'cjs'.
+    // Ambiguous exports target same as "module" field → treat as ESM.
     if (ctx.pkg.module && resolvePath(ctx, ctx.pkg.module) === path) return 'esm';
     return detectPackageJsonFormat(path) ?? detectFormat(path);
 }
@@ -374,16 +350,27 @@ export function resolveMain(ctx: ResolveCtx): ResolvedPath | null {
     return null;
 }
 
+/** Nested folder package.json (e.g. constants/package.json → main). */
+function resolveNestedPackageDir(ctx: ResolveCtx, dir: string): ResolvedPath | null {
+    try {
+        if (!fs.stat(dir).isDirectory) return null;
+    } catch {
+        return null;
+    }
+    const nested = createCtx(dir, { forceCjs: ctx.forceCjs, conditions: ctx.conditions });
+    return nested ? resolveMain(nested) : null;
+}
+
 export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | null {
     if (!sub || sub === '.' || sub === './') return resolveMain(ctx);
     const norm = sub.startsWith('./') ? sub : `./${sub}`;
     const exported = resolveExports(ctx, norm);
     if (exported) return exported;
     const base = joinPaths(ctx.pkgDir, norm.slice(2));
-    // ESM package subpaths stay strict: no directory index.js fallback.
+    // ESM without exports uses legacy FS rules: file, ext, nested package.json.
+    // Directory index.js only for CJS (Node ESM is stricter on bare dirs).
     if (!ctx.forceCjs) {
         try {
-            // File only — do not treat a directory as resolvable via index.js.
             if (fs.stat(base).isFile) {
                 if (!extname(base)) return { path: base, format: 'cjs', fileKind: 'source' };
                 return { path: base, format: detectFormat(base) };
@@ -394,6 +381,11 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
                 const withExt = base + ext;
                 if (fs.stat(withExt).isFile) return { path: withExt, format: detectFormat(withExt) };
             } catch {}
+        }
+        // react-remove-scroll-bar/constants etc. — folder package, no exports field
+        if (!ctx.pkg.exports) {
+            const nested = resolveNestedPackageDir(ctx, base);
+            if (nested) return nested;
         }
         return null;
     }

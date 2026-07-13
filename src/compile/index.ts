@@ -80,10 +80,6 @@ export class ModuleCompiler {
         this.esm.setOxcLoader(loader);
     }
 
-    // -------------------------------------------------------------------------
-    // Public API: load a module from its ModuleInfo
-    // -------------------------------------------------------------------------
-
     load(info: ModuleInfo, meta: Record<string, unknown> = {}): CModuleEngine.Module {
         if (isTypeDecl(info.localPath)) {
             throw err(ErrorKind.FileNotFound,
@@ -143,10 +139,6 @@ export class ModuleCompiler {
     requireInternal(id: string, parentPath?: string): unknown {
         return this.cjs.mkRequire(parentPath ?? `${this.resolver.entry}/../<internal>`)(id);
     }
-
-    // -------------------------------------------------------------------------
-    // Cache management
-    // -------------------------------------------------------------------------
 
     clearLoadedModules(): void {
         this.esm.clearLoadedModules();

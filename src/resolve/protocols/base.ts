@@ -13,10 +13,6 @@ export interface ProtocolHandler {
     clearCache?(): void;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers shared by all protocol handlers
-// ---------------------------------------------------------------------------
-
 const TEXT_EXTS = new Set(['.ts', '.tsx', '.cts', '.mts', '.js', '.jsx', '.mjs', '.cjs', '.json', '.jsonc']);
 
 export function guessFileKind(localPath: string): FileKind {
@@ -28,10 +24,7 @@ export function guessFileKind(localPath: string): FileKind {
     return 'binary';
 }
 
-/**
- * Override fileKind based on import attribute `type`.
- * Supports `import ... with { type: 'text' | 'bytes' | 'json' }`.
- */
+/** fileKind from import attribute type: text | bytes | json. */
 export function applyAttrType(kind: FileKind, attr?: Record<string, unknown>): FileKind {
     const t = attr?.type;
     if (t === 'text') return 'text';

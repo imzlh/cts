@@ -59,9 +59,7 @@ export class EsmCompiler {
         this.transformer.setOxcLoader(loader);
     }
 
-    // -------------------------------------------------------------------------
     // Public: load a module from its ModuleInfo (format-agnostic dispatch)
-    // -------------------------------------------------------------------------
 
     load(info: ModuleInfo, meta: Record<string, unknown> = {}, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
         log.debug('loader', () =>
@@ -86,19 +84,12 @@ export class EsmCompiler {
         this.esmCache.set(this.cacheKey(info), mod);
     }
 
-    // -------------------------------------------------------------------------
-    // ESM loading
-    // -------------------------------------------------------------------------
-
     /** Compile ESM source code, wrapping SyntaxError with file context. */
     compileEsm(code: string | Uint8Array, specPath: string, localPath: string): CModuleEngine.Module {
         try {
             return new engine.Module(code, specPath);
         } catch (e) {
-            // Raw passthrough bytes may be lossy/invalid UTF-8 that QuickJS's
-            // parser rejects outright — engine.decodeString() replaces bad
-            // sequences the same way readText() always did, so retry through
-            // the string before treating this as a genuine syntax error.
+            // Invalid UTF-8 bytes: retry via decodeString before real syntax error.
             if (typeof code !== 'string' && e instanceof SyntaxError) {
                 try {
                     return new engine.Module(engine.decodeString(code), specPath);
@@ -141,9 +132,7 @@ export class EsmCompiler {
         // Extension policy (works for pack:/name.ts keys, not only host paths).
         const needsTransform = isTransformSourcePath(info.localPath);
         const needsCompile = !needsTransform && isCompiledSourcePath(info.localPath);
-        // cacheBytecode === false: sourceOnly / attribute views — never L1/L2.
-        // L1: remote, pack-seeded (isRemote), or local transform/compile candidates.
-        // L2 disk: only when fileBacked (isFileBackedPath / JscCache).
+        // sourceOnly: no cache. L1 if remote/pack/local candidate; L2 only if file-backed.
         const allowCache = info.cacheBytecode !== false && this.cfg.enableCache !== false;
         const tryBytecode = allowCache && (remote || needsTransform || needsCompile);
 
@@ -217,10 +206,6 @@ export class EsmCompiler {
         return mod;
     }
 
-    // -------------------------------------------------------------------------
-    // Special file types
-    // -------------------------------------------------------------------------
-
     private loadBytes(info: ModuleInfo): CModuleEngine.Module {
         const mod = engine.Module.create(moduleRef(info));
         // Copy: callers may mutate the default export buffer.
@@ -239,10 +224,6 @@ export class EsmCompiler {
         mod.export('default', code);
         return mod;
     }
-
-    // -------------------------------------------------------------------------
-    // Cache management
-    // -------------------------------------------------------------------------
 
     clearLoadedModules(): void {
         this.esmCache.clear();

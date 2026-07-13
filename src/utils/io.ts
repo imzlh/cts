@@ -36,12 +36,7 @@ export function ensureDir(dir: string): void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// resolveFile — LRU(2048) positive cache
-//
-// Inner loop tries each candidate with a single try/stat — no separate exists().
-// Directories trigger a recursive index lookup.
-// ---------------------------------------------------------------------------
+// resolveFile — LRU(2048); try/stat candidates; dirs recurse index.
 
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.node', '.wasm'];
 const cache = new LRU<string, string>(2048);
@@ -108,13 +103,7 @@ function _resolve(base: string, exts: string[]): string {
 
 export function clearResolveCache(): void { cache.clear(); negCache.clear(); }
 
-// ---------------------------------------------------------------------------
-// hardlinkOrCopyDirRecursiveSync — used by node_modules 'hard' mode.
-// Hard-links each file when possible (same-volume, zero-copy, mirrors pnpm's
-// store-linking); falls back to a real copy only when hard-linking fails
-// (typically cross-volume EXDEV). Symlinks in the source are preserved as
-// symlinks rather than dereferenced or hard-linked.
-// ---------------------------------------------------------------------------
+// hardlinkOrCopyDirRecursiveSync — hard mode: hardlink files, copy on EXDEV; keep symlinks.
 
 export function hardlinkOrCopyDirRecursiveSync(src: string, dest: string): void {
     ensureDir(dest);

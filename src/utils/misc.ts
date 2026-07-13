@@ -5,19 +5,13 @@ import { URL } from './url';
 const crypto = import.meta.use('crypto');
 const zlib = import.meta.use('zlib');
 
-// ---------------------------------------------------------------------------
-// Misc
-// ---------------------------------------------------------------------------
-
 export const errMsg = (e: unknown) => e instanceof Error ? e.message : String(e);
 export function assert(c: unknown, msg?: string): asserts c {
     if (!c) throw err(ErrorKind.Generic, msg ?? 'Assertion failed');
 }
 
-// ---------------------------------------------------------------------------
 // Hash — FNV-1a 32-bit (using regular JS numbers, much faster than BigInt)
 // Returns 8-char hex string.
-// ---------------------------------------------------------------------------
 
 export function hashString(s: string): string {
     let h = 0x811c9dc5;   // FNV offset basis (32-bit)
@@ -49,10 +43,6 @@ export function fmtBytes(n: number): string {
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
     return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
-
-// ---------------------------------------------------------------------------
-// Semver
-// ---------------------------------------------------------------------------
 
 function pad(v: string): [number, number, number, string] {
     const nums: [number, number, number] = [0, 0, 0];
@@ -346,11 +336,7 @@ export function matchLatestRecordVersion(vs: Record<string, unknown>, r: string)
     return latest;
 }
 
-// ---------------------------------------------------------------------------
-// npm specPath parsing — "npm:name@version[/subpath]" -> parts.
-// Operates on the already-resolved, canonical specPath (not the raw request
-// specifier, which may be a range/alias/bare-name and is messy to parse).
-// ---------------------------------------------------------------------------
+// Parse canonical npm:name@version[/sub] (not raw range/alias specs).
 
 export function npmNameVersion(specPath: string): { name: string; version: string } | null {
     if (!specPath.startsWith('npm:')) return null;
@@ -368,9 +354,7 @@ export function npmPackageName(specPath: string): string | null {
     return npmNameVersion(specPath)?.name ?? null;
 }
 
-// ---------------------------------------------------------------------------
 // tar.gz extraction
-// ---------------------------------------------------------------------------
 
 export interface TarFile {
     path: string;
@@ -387,6 +371,37 @@ const TAR_ENTRY_TYPES: Record<string, TarFile['type']> = {
     '2': 'link',
 };
 
+/** ustar prefix (345..500) + name when magic is ustar; name alone is ≤100 bytes. */
+function tarHeaderPath(bytes: Uint8Array, pos: number, name: string): string {
+    const magic = String.fromCharCode(...bytes.subarray(pos + 257, pos + 263));
+    if (magic !== 'ustar\0' && magic !== 'ustar ') return name;
+    const prefixSlice = bytes.subarray(pos + 345, pos + 500);
+    const n = prefixSlice.indexOf(0);
+    const prefix = String.fromCharCode(...(n === -1 ? prefixSlice : prefixSlice.subarray(0, n)));
+    if (!prefix) return name;
+    return name ? `${prefix}/${name}` : prefix;
+}
+
+/** Parse pax `key=value\n` records; only `path` is required for long names. */
+function parsePaxPath(content: Uint8Array): string | null {
+    let i = 0;
+    while (i < content.length) {
+        let j = i;
+        while (j < content.length && content[j]! >= 0x30 && content[j]! <= 0x39) j++;
+        if (j === i || content[j] !== 0x20) break;
+        const recLen = parseInt(String.fromCharCode(...content.subarray(i, j)), 10);
+        if (!(recLen > 0) || i + recLen > content.length) break;
+        const rec = String.fromCharCode(...content.subarray(j + 1, i + recLen));
+        const eq = rec.indexOf('=');
+        if (eq > 0 && rec.slice(0, eq) === 'path') {
+            const v = rec.slice(eq + 1);
+            return v.endsWith('\n') ? v.slice(0, -1) : v;
+        }
+        i += recLen;
+    }
+    return null;
+}
+
 export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
     const bytes = new Uint8Array(zlib.gunzip(data));
     const str = (off: number, len: number) => {
@@ -394,8 +409,7 @@ export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
         const slice = bytes.subarray(off, off + len);
         const n = slice.indexOf(0);
         const relevant = n === -1 ? slice : slice.subarray(0, n);
-        // Bulk convert via spread — safe because tar header fields are ≤ 100 bytes
-        // (well below the ~65536 arg limit of Function.prototype.apply)
+        // Bulk convert via spread — safe because tar header fields are ≤ 155 bytes
         return String.fromCharCode(...relevant);
     };
     const oct = (off: number, len: number) => {
@@ -410,24 +424,49 @@ export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
     };
     const B = 512, files: TarFile[] = [];
     let pos = 0;
+    let nextPath: string | null = null; // GNU 'L' / pax 'x' override for following entry
     while (pos < bytes.length) {
         if (zero(pos) && (pos + B >= bytes.length || zero(pos + B))) break;
-        const name = str(pos, 100), mode = oct(pos + 100, 8), size = oct(pos + 124, 12), flag = str(pos + 156, 1);
-        if (!name || size < 0) {
+        const rawName = str(pos, 100);
+        const mode = oct(pos + 100, 8);
+        const size = oct(pos + 124, 12);
+        const flag = str(pos + 156, 1) || '0';
+        if (size < 0) {
             pos += B;
             continue;
         }
+        const hdr = pos;
         const start = pos + B;
-        files.push({ path: name, content: bytes.slice(start, start + size), size, mode,
-            type: TAR_ENTRY_TYPES[flag] ?? 'other' });
+        const content = bytes.slice(start, start + size);
         pos = start + Math.ceil(size / B) * B;
+
+        // GNU long name / pax path apply to the next real entry only.
+        if (flag === 'L') {
+            const n = content.indexOf(0);
+            nextPath = String.fromCharCode(...(n === -1 ? content : content.subarray(0, n)));
+            continue;
+        }
+        if (flag === 'x' || flag === 'g') {
+            if (flag === 'x') {
+                const p = parsePaxPath(content);
+                if (p) nextPath = p;
+            }
+            continue;
+        }
+
+        const name = nextPath ?? tarHeaderPath(bytes, hdr, rawName);
+        nextPath = null;
+        if (!name) continue;
+        files.push({
+            path: name,
+            content,
+            size,
+            mode,
+            type: TAR_ENTRY_TYPES[flag] ?? 'other',
+        });
     }
     return files;
 }
-
-// ---------------------------------------------------------------------------
-// JSONC
-// ---------------------------------------------------------------------------
 
 export function stripJsonc(src: string): string {
     let out = '', inStr = false, quote = '', esc = false, block = false, line = false;
@@ -498,10 +537,6 @@ export function safeParse<T = unknown>(json: string): T {
         throw err(ErrorKind.SyntaxError, msg);
     }
 }
-
-// ---------------------------------------------------------------------------
-// CLI arg parsing
-// ---------------------------------------------------------------------------
 
 type ArgType = 'string' | 'boolean' | 'number';
 type ArgTemplate = Record<string, ArgType>;

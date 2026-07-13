@@ -22,11 +22,7 @@ export interface PackLoadStats {
     totalMs: number;
 }
 
-/**
- * Lazy 0-copy views into one mapped .jspack.
- * has/get/bytecode only subarray — no per-module copies.
- * Lifetime: container.blob (and thus all views) share the mapped ArrayBuffer.
- */
+/** Lazy 0-copy subarrays of one mapped .jspack blob. */
 export class PackBlobStore implements VirtualFileStore {
     private readonly container: PackContainer;
     private readonly abiOk: boolean;
@@ -49,10 +45,7 @@ export class PackBlobStore implements VirtualFileStore {
             : readBlob(this.container, entry);
     }
 
-    /**
-     * ABI-matching non-sourceOnly bytecode (0-copy).
-     * Absent → loaders recompile from get() source.
-     */
+    /** 0-copy bytecode if ABI matches and not sourceOnly; else recompile. */
     bytecode(path: string): Uint8Array | undefined {
         const entry = this.entry(path);
         if (!entry || entry.fileKind !== 'source' || entry.sourceOnly || !this.abiOk) {
@@ -68,12 +61,7 @@ export class PackBlobStore implements VirtualFileStore {
     }
 }
 
-/**
- * Mapped .jspack lifetime:
- *   open()    — 1× readFile + decode (range-validated). No per-module work.
- *   install() — process-wide PackBlobStore + pack: handler.
- * First load: JscCache → store.bytecode() → deserialize(view), else get() source.
- */
+/** open: map+decode; install: PackBlobStore + pack: handler. Load: jsc → blob → source. */
 export class PackSession {
     readonly manifest: PackManifest;
     readonly store: PackBlobStore;

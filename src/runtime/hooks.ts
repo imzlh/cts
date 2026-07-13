@@ -34,10 +34,7 @@ function hasSyntaxSourceCause(error: SyntaxError): boolean {
     return !!cause && typeof cause === 'object' && Reflect.get(cause, 'source') instanceof SyntaxError;
 }
 
-/**
- * Install engine.onModule hooks that wire resolve -> load -> init.
- * Warns on re-install because C layer replaces (not appends) the prior hooks.
- */
+/** Install onModule hooks (C layer replaces; re-install warns). */
 export function installEngineHooks(
     resolver: ModuleResolver,
     compiler: ModuleCompiler,

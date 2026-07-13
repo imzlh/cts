@@ -1,7 +1,4 @@
-/**
- * Process-scoped virtual file overlay.
- * Pack installs PackBlobStore (lazy 0-copy subarrays of one mapped buffer).
- */
+/** Process-scoped VFS overlay (pack: lazy 0-copy blob views). */
 
 /** Overlay for synthetic localPaths. get/bytecode should prefer 0-copy views. */
 export interface VirtualFileStore {

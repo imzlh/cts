@@ -6,27 +6,22 @@ import type { OxcTranspiler } from './oxc';
 import { ImportScanner } from './import-scanner';
 import { isScannablePath, isWasmPath } from './scan';
 
-const asyncfs = import.meta.use('asyncfs');
-const wasm = import.meta.use('wasm');
 const os = import.meta.use('os');
+const { setTimeout } = import.meta.use('timers');
 
-function isWasiModuleName(name: string): boolean {
-    return name === 'wasi_unstable' || name === 'wasi_snapshot_preview1';
+/** Yield so libuv timers (progress UI) can run during long sync parse stretches. */
+function yieldEventLoop(): Promise<void> {
+    return new Promise(resolve => { setTimeout(resolve, 0); });
 }
 
-// ---------------------------------------------------------------------------
 // Parallel BFS — full scan, no lock deps shortcut
-// ---------------------------------------------------------------------------
 
 export interface ScanResult {
     visited: number;
     downloaded: number;
     errors: Array<{ spec: string; parent: string; error: string }>;
     modules: Array<{ specPath: string; localPath: string; format: ModuleFormat; remote: boolean }>;
-    // Parent -> resolved-child edges, used to materialize a real node_modules
-    // tree (node_modules mode). Only npm: children with an eligible parent
-    // (an npm: package, or a synthetic project-root scan seed) are recorded —
-    // see isEligibleParent().
+    // node_modules edges (npm: child + eligible parent); see isEligibleParent().
     edges: Array<{ parentSpecPath: string; name: string; childSpecPath: string; childLocalPath: string }>;
     /** Complete resolver edges for consumers that need an offline module graph. */
     resolutions: Array<{ parentSpecPath: string; specifier: string; childSpecPath: string }>;
@@ -102,9 +97,7 @@ export class DepScanner {
         return this.queueLoopInternal([{ spec: entrySpecPath, parent: `${os.cwd}/<entry>` }]);
     }
 
-    /**
-     * BFS from an explicit set of specifiers (no entry file needed).
-     */
+    /** BFS from an explicit specifier set (no entry file). */
     async scanFromSpecifiers(specifiers: string[], parentDir: string): Promise<ScanResult> {
         this.init();
         if (!specifiers.length) {
@@ -118,12 +111,7 @@ export class DepScanner {
         return this.queueLoopInternal(seeds);
     }
 
-    /**
-     * BFS from the entry file's import graph *and* an explicit specifier set
-     * in one pass. Used by `cno cache <entry>` to also pull in package.json
-     * devDependencies (e.g. dev-tool bins) that aren't reachable from the
-     * entry's static imports but that `cno task` will need to resolve later.
-     */
+    /** BFS entry graph + extra specs (e.g. devDeps for `cno cache`). */
     async scanEntryAndSpecifiers(entrySpecPath: string, entryLocalPath: string, specifiers: string[], parentDir: string): Promise<ScanResult> {
         this.init();
         const seeds: Array<{ spec: string; parent: string }> = [
@@ -134,10 +122,6 @@ export class DepScanner {
         return this.queueLoopInternal(seeds);
     }
 
-    // -------------------------------------------------------------------------
-    // Shared internals
-    // -------------------------------------------------------------------------
-
     private init(): void {
         this.seen.clear();
         this.errs.length = 0;
@@ -147,11 +131,7 @@ export class DepScanner {
         this.downloaded = 0;
     }
 
-    /**
-     * Concurrent queue: keep the full curl connection pool busy.
-     * Each worker pulls one specifier, resolves it, enqueues its children.
-     * No waiting for a whole batch to finish.
-     */
+    /** Concurrent BFS: pull/resolve/enqueue without batch barriers. */
     private async queueLoopInternal(
         seeds: Array<{ spec: string; parent: string }>,
     ): Promise<ScanResult> {
@@ -217,22 +197,11 @@ export class DepScanner {
                     }
                     if (this.options.excludeSpecPath?.(info.specPath) === true) continue;
 
-                    // Record the parent -> resolved-child edge unconditionally
-                    // (even if this child was already visited via a different
-                    // parent) — each parent needs its own node_modules/<name>
-                    // link, even though the child itself is only downloaded
-                    // and scanned once. Gate on the *resolved* specPath being
-                    // npm: (info.specPath, not the raw request item.spec,
-                    // which may be a range/alias/bare-name) and on the parent
-                    // being eligible (an npm: package or a synthetic
-                    // project-root scan seed).
+                    // Always record edge (per-parent node_modules link). Use resolved npm: path.
                     if (info.specPath.startsWith('npm:') && isEligibleParent(item.parent)) {
                         const name = npmPackageName(info.specPath);
                         const parentName = item.parent.startsWith('npm:') ? npmPackageName(item.parent) : null;
-                        // Skip package self-references like `axios` importing
-                        // `axios/...` from within axios itself. Materializing
-                        // those into `<pkg>/node_modules/<pkg>` causes an
-                        // infinite self-link chain in soft mode.
+                        // Skip self-deps (pkg → pkg/...) — soft mode would self-link forever.
                         if (name && name !== parentName) {
                             this.edges.push({ parentSpecPath: item.parent, name, childSpecPath: info.specPath, childLocalPath: info.localPath });
                         }
@@ -246,6 +215,9 @@ export class DepScanner {
                         // file (readFile failure → []), so no extra fs.exists stat.
                         const children = await this.parseOne(info.specPath, info.localPath);
                         for (const child of children) enqueue(child.spec, info.specPath);
+                        // Sync parse of large graphs starves the progress timer;
+                        // yield so UI (and other timers) can paint.
+                        if ((this.seen.size & 31) === 0) await yieldEventLoop();
                     }
                 } catch (e) {
                     this.prog?.bumpResolved();
@@ -260,19 +232,13 @@ export class DepScanner {
                     }
                     this.maybeLogStall(pending, queue.length);
                     pending--;
-                    // Only wake waiters when all work is done (pending hits 0) so
-                    // they can exit. While in-flight resolves are still pending,
-                    // idle workers should keep sleeping — re-checking queue state
-                    // every time another resolve finishes just burns CPU in a
-                    // busy-loop without making progress.
+                    // Wake only when pending===0; otherwise idle workers busy-loop.
                     if (pending === 0) wake();
                 }
             }
         };
 
-        // Start the full worker pool. The initial queue is often just the
-        // entry module; workers that find an empty queue will wait for imports
-        // discovered by the active worker instead of making the scan serial.
+        // Full pool from the start; empty workers wait for newly enqueued imports.
         await Promise.all(Array.from({ length: CONCURRENCY }, () => rootedWorker()));
 
         if (!this.cfg.silent && this.options.reportSummary !== false) {
@@ -289,50 +255,34 @@ export class DepScanner {
         };
     }
 
-    // -------------------------------------------------------------------------
     // Read + parse a single file, return its import specifiers
-    // -------------------------------------------------------------------------
 
     private async parseOne(
         specPath: string,
         localPath: string,
     ): Promise<Array<{ spec: string; parent: string }>> {
-        if (isWasmPath(localPath)) {
-            if (!wasm) return [];
-            try {
-                const bytes = await asyncfs.readFile(localPath);
-                const wmod = wasm.parseModule(new Uint8Array(bytes));
-                const seen = new Set<string>();
-                for (const imp of wasm.moduleImports(wmod)) {
-                    if (isWasiModuleName(imp.module)) continue;
-                    if (imp.module === 'env') continue;
-                    if (seen.has(imp.module)) continue;
-                    seen.add(imp.module);
-                }
-                const imports: Array<{ spec: string; parent: string }> = [];
-                for (const spec of seen) imports.push({ spec, parent: specPath });
-                return imports;
-            } catch (e) {
-                log.debug('deps', () => `wasm scan failed for ${localPath}: ${errMsg(e)}`);
+        try {
+            // All file kinds via ImportScanner — do not special-case wasm here.
+            let imports: string[];
+            if (this.parseImports) {
+                imports = await this.parseImports(localPath);
+            } else if (isWasmPath(localPath) || isScannablePath(localPath)) {
+                imports = this.importScanner.scanFile(localPath);
+            } else {
                 return [];
             }
-        }
-        if (!isScannablePath(localPath) && !this.parseImports) return [];
-        try {
-            // Prefer caller-supplied scanner (pack records edges); else main-thread
-            // ImportScanner (oxc-first). Never route scan through transform workers.
-            const imports = this.parseImports
-                ? await this.parseImports(localPath)
-                : this.importScanner.scanFile(localPath);
             const out: Array<{ spec: string; parent: string }> = [];
+            const fullGraph = this.options.fullGraph === true;
             for (let i = 0; i < imports.length; i++) {
                 const spec = imports[i];
-                if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec, this.options.fullGraph === true)) {
+                if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec, fullGraph)) {
                     out.push({ spec, parent: specPath });
                 }
             }
             return out;
-        } catch { return []; }
+        } catch {
+            return [];
+        }
     }
 
     /** DEBUG: if work stays in-flight a long time, log once per 10s (not a kill). */

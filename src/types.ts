@@ -2,11 +2,7 @@ export type ModuleFormat = 'esm' | 'cjs';
 export type FileKind     = 'source' | 'json' | 'wasm' | 'binary' | 'text';
 export type LifecycleScriptName = 'install' | 'postinstall';
 
-// 'normal': no node_modules generated (default).
-// 'soft': project top-level directory symlinks/junctions into the flat npm store.
-// 'hard': full nested node_modules materialization using per-file hard links,
-//         falling back to a copy only when the store and project are on
-//         different volumes.
+// normal: flat store only; soft: dir symlinks/junctions; hard: hardlink (copy cross-volume).
 export type NodeModulesMode = 'normal' | 'soft' | 'hard';
 
 export interface ModuleInfo {
@@ -36,10 +32,6 @@ export interface LifecycleScriptEntry {
     lifecycle: LifecycleScriptName;
     script:    string;
 }
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 
 export interface ConfigOptions {
     cacheDir?:      string;
@@ -100,9 +92,7 @@ export interface RuntimeConfig extends ConfigOptions {
     _cli?:          import('./utils/misc').ParsedArgs;
 }
 
-// ---------------------------------------------------------------------------
 // Package.json
-// ---------------------------------------------------------------------------
 
 export interface PackageJson {
     name?:         string;
@@ -121,10 +111,6 @@ export interface PackageJson {
     cpu?:          string[];
     scripts?:      Record<string, string>;
 }
-
-// ---------------------------------------------------------------------------
-// JSR registry
-// ---------------------------------------------------------------------------
 
 export interface JsrPackageMeta {
     versions: Record<string, { yanked?: boolean }>;

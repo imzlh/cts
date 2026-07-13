@@ -12,10 +12,6 @@ const engine = import.meta.use('engine');
 const napi = import.meta.use('nodeapi');
 const NativeFunction = globalThis.Function;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 export interface CjsModule {
     id: string; filename: string; loaded: boolean; exports: unknown;
     require: CjsRequireFn; children: CjsModule[]; parent: CjsModule | null; paths: string[];
@@ -31,10 +27,7 @@ export interface CjsRequireFn {
 export interface CjsDeps {
     /** Resolve a node builtin to its concrete module info. */
     resolveBuiltin(name: string, parent: string): ModuleInfo;
-    /**
-     * Load an ESM module synchronously (for CJS->ESM interop).
-     * Must call engine.promiseResult internally; returns the namespace.
-     */
+    /** Sync ESM load for require(); returns namespace via promiseResult. */
     loadEsmSync(info: ModuleInfo): Record<string, unknown>;
     /** Load a wasm module synchronously for CJS require(.wasm). */
     loadWasmSync?(info: ModuleInfo): Record<string, unknown>;
@@ -42,11 +35,7 @@ export interface CjsDeps {
     resolveExternal(req: string, parent: string): ModuleInfo | null;
     /** Prepare source for CJS execution (e.g. strip TS/JSX syntax). */
     prepareSource?(code: string, filePath: string): string | null;
-    /**
-     * Look up cached compiled bytecode for a CJS file (a value from
-     * `engine.eval(..., EVAL_COMPILE_ONLY)`, see cjs-wrap.ts), if fresh.
-     * Returns null on a cache miss.
-     */
+    /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. */
     loadCjsCompiled?(localPath: string): unknown | null;
     /** Persist freshly compiled CJS bytecode (already engine.serialize()'d). */
     persistCjsCompiled?(localPath: string, bytes: ArrayBuffer): void;
@@ -59,9 +48,7 @@ interface ResolvedCjsRequest {
     isCjs: boolean;
 }
 
-// ---------------------------------------------------------------------------
 // Performance: counter-based CJS context keys (no regex), dir-level path cache
-// ---------------------------------------------------------------------------
 
 const INTERNAL_ID = Symbol('cts.cjs.id');
 const INTERNAL_FILENAME = Symbol('cts.cjs.filename');
@@ -284,18 +271,12 @@ function stringifyFunctionParams(args: unknown[]): string[] {
     return params;
 }
 
-// ---------------------------------------------------------------------------
-// CjsLoader
-// ---------------------------------------------------------------------------
-
 export class CjsLoader {
     // filename → module (includes in-progress modules for circular dep detection)
     readonly cache        = new Map<string, CjsModule>();
     private readonly builtinCache = new Map<string, CjsModule>();
     private mainModule: CjsModule | null = null;
-    // Bracket-indexable view of `cache` for the public require.cache surface —
-    // Node's Module._cache/require.cache is a plain object (`cache[path]`),
-    // but the internal map stays a real Map for get/set/delete performance.
+    // require.cache is a plain object; internal store stays a Map.
     private readonly cacheView: Record<string, CjsModule> = new Proxy(Object.create(null), {
         has: (_t, key) => typeof key === 'string' && this.cache.has(key),
         get: (_t, key) => typeof key === 'string' ? this.cache.get(key) : undefined,
@@ -309,10 +290,6 @@ export class CjsLoader {
     });
 
     constructor(private readonly deps: CjsDeps) {}
-
-    // -------------------------------------------------------------------------
-    // Public API
-    // -------------------------------------------------------------------------
 
     loadAndGet(filename: string, parentPath?: string, isMain = false): CjsModule {
         filename = normalizePath(filename);
@@ -359,10 +336,6 @@ export class CjsLoader {
         this.cache.set(filename, this.make(filename, parent));
     }
 
-    // -------------------------------------------------------------------------
-    // Module construction
-    // -------------------------------------------------------------------------
-
     private make(filename: string, parent: CjsModule | null): CjsModule {
         filename = normalizePath(filename);
         const dir  = dirname(filename);
@@ -400,10 +373,6 @@ export class CjsLoader {
         this.mainModule = mod;
         mod.require.main = mod;
     }
-
-    // -------------------------------------------------------------------------
-    // Module execution
-    // -------------------------------------------------------------------------
 
     private exec(mod: CjsModule): void {
         const ext = extname(getInternalFilename(mod));
@@ -446,24 +415,12 @@ export class CjsLoader {
     private execJs(mod: CjsModule): void {
         const filename = getInternalFilename(mod);
 
-        // loadCjsCompiled() already treats a deserialize failure as a cache
-        // miss internally (JscCache.loadRaw clears the corrupt entry and
-        // returns null) — a non-null result here is structurally valid
-        // bytecode. Do NOT wrap runCompiled() in a fallback-to-fresh retry:
-        // a failure at this point is indistinguishable from a legitimate
-        // error thrown by the module's own top-level code, and retrying
-        // would re-run (and double) any side effects it already produced
-        // before throwing. ESM's cache-hit path (EsmCompiler.loadEsm) makes
-        // the same choice — a cache-hit failure just propagates normally.
+        // Non-null = valid bytecode. Do not retry on run failure: may be
+        // user code, and retry would double side effects (same as ESM path).
         const cached = this.deps.loadCjsCompiled?.(filename);
         if (cached != null) {
             log.debug('cjs', () => `bytecode cache hit: ${filename}`);
-            // Cache hit: no source text available to re-scan, so the dynamic-
-            // import-via-Function heuristic (hasDynamicImportFunctionSource)
-            // can't be recomputed here — patch defensively. The patch itself
-            // is a cheap globalThis.Function swap that only costs anything if
-            // the module actually calls `new Function(...)`, so this is safe
-            // and effectively free in the common case.
+            // No source on cache hit — patch Function for dynamic import defensively.
             this.runCompiled(mod, cached, true);
             return;
         }
@@ -508,15 +465,7 @@ export class CjsLoader {
         this.runCompiled(mod, compiled, shouldPatchFunction);
     }
 
-    /**
-     * Run a value from `engine.eval(..., EVAL_COMPILE_ONLY)` (fresh compile
-     * or a cache hit) inside the CJS wrapper context. The five CJS locals are
-     * read from a single well-known global slot (see cjs-wrap.ts) instead of
-     * being closed over, so the same compiled bytecode is reusable across
-     * invocations — the slot is overwritten immediately before every call and
-     * its contents are captured synchronously by the wrapper's `.call(...)`
-     * before any user code (including a nested require()) can run.
-     */
+    /** Run EVAL_COMPILE_ONLY value with CJS locals in the global ctx slot. */
     private runCompiled(mod: CjsModule, compiled: unknown, needsFunctionPatch: boolean): void {
         const filename = getInternalFilename(mod);
         const ctx: CjsContext = {
@@ -581,9 +530,7 @@ export class CjsLoader {
         return contextual;
     }
 
-    // -------------------------------------------------------------------------
     // require() factory
-    // -------------------------------------------------------------------------
 
     public mkRequire(parentPath: string, parentMod: CjsModule | null = null): CjsRequireFn {
         const self = this;
@@ -641,17 +588,7 @@ export class CjsLoader {
         return this.loadResolvedCjs(path, parentMod).exports;
     }
 
-    // -------------------------------------------------------------------------
-    // CJS → ESM interop
-    // -------------------------------------------------------------------------
-
-    /**
-     * CJS → ESM interop: synchronously load an ESM module.
-     * Uses deps.loadEsmSync which handles promiseResult semantics.
-     * Cached in the same map (keyed by localPath) as plain CJS modules so
-     * repeated require() calls return the same object AND the module shows
-     * up in require.cache, matching Node 22+ require(esm) semantics.
-     */
+    /** require(esm): loadEsmSync + same cache as CJS (Node 22+ semantics). */
     private requireEsm(info: ModuleInfo, parentPath: string): unknown {
         const path = info.localPath;
         const hit = this.cache.get(path);
@@ -678,11 +615,7 @@ export class CjsLoader {
         return mod.exports;
     }
 
-    /**
-     * Load a node builtin module (e.g. 'fs', 'path').
-     * Delegates to deps for resolution + ESM loading,
-     * then applies ns.default logic (same as requireEsm).
-     */
+    /** Builtin via deps; ns.default same as requireEsm. */
     private loadBuiltin(name: string, parent: string): CjsModule {
         const hit = this.builtinCache.get(name);
         if (hit) return hit;
@@ -737,17 +670,8 @@ export class CjsLoader {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Module resolution
-    // -------------------------------------------------------------------------
-
     private resolveId(id: string, parentPath: string): ResolvedCjsRequest | null {
-        // A scheme-qualified parent (e.g. "pack:///0.js") has no real
-        // filesystem location to anchor relative/absolute require() against —
-        // route everything through the generic resolver, which dispatches by
-        // the parent's own scheme (see ModuleResolver.resolveRelative/
-        // resolveBare's pack: handling). Real CJS files (plain fs paths)
-        // keep the fast local-path-first behavior below unchanged.
+        // pack:/ctsview: parents have no FS base — full resolver; plain paths stay local-first.
         const runtimeParent = hasProtocolScheme(parentPath)
             ? parentPath
             : this.deps.runtimeParent?.(parentPath) ?? null;

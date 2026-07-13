@@ -1,14 +1,9 @@
 import { fmtBytes } from './misc';
 
-
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
 const { setInterval, clearInterval } = import.meta.use('timers');
-
-// ---------------------------------------------------------------------------
-// Colors
-// ---------------------------------------------------------------------------
 
 const C = {
     dim:    (s: string) => isatty ? `\x1b[2m${s}\x1b[0m`  : s,
@@ -19,10 +14,6 @@ const C = {
     red:    (s: string) => isatty ? `\x1b[31m${s}\x1b[0m` : s,
     blue:   (s: string) => isatty ? `\x1b[34m${s}\x1b[0m` : s,
 };
-
-// ---------------------------------------------------------------------------
-// TTY
-// ---------------------------------------------------------------------------
 
 function getEnv(name: string): string | null {
     try {
@@ -48,15 +39,9 @@ function write(s: string): void {
     fs.write(os.STDOUT_FILENO, engine.encodeString(s));
 }
 
-// ---------------------------------------------------------------------------
-// Spinner
-// ---------------------------------------------------------------------------
-
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-// ---------------------------------------------------------------------------
 // PrecacheProgress — one object for the entire precache lifecycle
-// ---------------------------------------------------------------------------
 
 const BIG_THRESHOLD = 100 * 1024;
 
@@ -87,17 +72,17 @@ export class PrecacheProgress {
     private itemDone = 0;
     private itemTotal = 0;
 
-    // Speed estimation
     private lastBytes    = 0;
     private lastBytesMs  = Date.now();
     private speed        = 0;
 
-    // Render
     private tick  = 0;
     private timer: ReturnType<typeof setInterval> | null = null;
     private stopped = false;
     private drawn = 0;
     private startMs = Date.now();
+    /** Last paint wall time — producer path paints when the interval is starved. */
+    private lastPaintMs = 0;
 
     readonly maxLines: number;
     private readonly title: string;
@@ -164,16 +149,21 @@ export class PrecacheProgress {
 
     // ---- Lifecycle ----
 
-    stop(): void {
-        // stop() is terminal. Late producer callbacks during shutdown must not
-        // recreate the interval and keep the process event loop alive.
-        this.stopped = true;
+    /** Pause spinner; later phases may repaint. */
+    pause(): void {
         if (this.timer !== null) {
             clearInterval(this.timer);
             this.timer = null;
         }
         if (isatty && this.drawn) this.clearLines(this.drawn);
         this.drawn = 0;
+        this.lastPaintMs = 0;
+    }
+
+    /** Terminal shutdown: no further paints; late callbacks are ignored. */
+    stop(): void {
+        this.stopped = true;
+        this.pause();
     }
 
     clearForOutput(): void {
@@ -184,9 +174,13 @@ export class PrecacheProgress {
     // ---- Internals ----
 
     private kick(): void {
-        if (this.stopped) return;
-        if (isatty && this.timer === null) {
+        if (this.stopped || !isatty) return;
+        // Interval for idle gaps + producer-path paint (~200ms; timers starve on sync).
+        if (this.timer === null) {
             this.timer = setInterval(() => this.render(), 200);
+        }
+        const now = Date.now();
+        if (this.lastPaintMs === 0 || now - this.lastPaintMs >= 200) {
             this.render();
         }
     }
@@ -232,14 +226,14 @@ export class PrecacheProgress {
     }
 
     private render(): void {
-        if (!isatty) return;
+        if (!isatty || this.stopped) return;
+        this.lastPaintMs = Date.now();
         this.tick = (this.tick + 1) % SPIN.length;
         const spin = SPIN[this.tick] ?? SPIN[0] ?? '';
 
-        const elapsed = (Date.now() - this.startMs) / 1000;
+        const elapsed = (this.lastPaintMs - this.startMs) / 1000;
         const elapsedStr = elapsed < 10 ? elapsed.toFixed(1) : String(Math.floor(elapsed));
 
-        // Summary line
         const parts: string[] = [];
         parts.push(`${C.cyan('resolved')} ${C.bold(String(this.resolved))}`);
         if (this.downloaded > 0)
@@ -285,10 +279,6 @@ export class PrecacheProgress {
         this.drawn = lines.length;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function renderBar(done: number, total: number, width: number): string {
     const filled = Math.floor(Math.min(1, done / total) * width);

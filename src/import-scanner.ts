@@ -1,13 +1,7 @@
-/**
- * Import graph extraction — oxc-first, main-thread by default.
- *
- * Scan is tokenize/native-parse only (~ms with oxc). Spawning the transform
- * worker pool for scan was the wrong tradeoff: IPC + worker boot dominated,
- * and coupling scan to transform timeouts created the old 10s-kill heritage.
- * Workers are only used when oxc is unavailable and the caller opts in.
- */
+/** Import specs: oxc-first on main thread; workers only if oxc missing + opted in. */
 import type { OxcTranspiler } from './oxc';
-import { extractImports, isTsLikePath } from './scan';
+import { extractImports, isTsLikePath, isWasmPath } from './scan';
+import { scanWasmImportModules } from './wasm-imports';
 import { errMsg, log, readText } from './utils';
 
 const engine = import.meta.use('engine');
@@ -36,6 +30,9 @@ export class ImportScanner {
     }
 
     scanBytes(bytes: Uint8Array, localPath: string, lang?: string): string[] {
+        // WASM: import section module names are static deps (same as JS import specs).
+        if (isWasmPath(localPath)) return scanWasmImportModules(bytes);
+
         if (this.oxc) {
             try {
                 const deps = this.oxc.scanImportsBytes(bytes, localPath);

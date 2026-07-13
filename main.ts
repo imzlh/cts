@@ -177,8 +177,7 @@ function collectSpecifiers(dir: string): Set<string> {
         // Don't break — also check package.json
     }
 
-    // package.json runtime dependencies. Dev dependencies can pull in very
-    // large toolchains (typescript/esbuild) and make no-arg cache impractical.
+    // package.json runtime deps only (devDeps can dominate no-arg cache).
     const pkgP = joinPaths(dir, 'package.json');
     if (fs.exists(pkgP)) {
         let pkg: Record<string, any> | null = null;

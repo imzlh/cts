@@ -1,7 +1,4 @@
-/**
- * Write integrity helpers for .jspack (writer) and general full-byte checks.
- * Runtime pack load is memory-only — these are not used for pack-extract.
- */
+/** Atomic write helpers for .jspack (runtime pack is memory-only). */
 
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');
@@ -40,10 +37,7 @@ function tempBeside(path: string): string {
     return `${path}.tmp-${pid}-${Date.now()}-${tempSeq++}`;
 }
 
-/**
- * Write bytes via exclusive temp file, fsync, then rename into place.
- * On Windows rename-over-existing fails: accept healthy dest, else unlink+retry.
- */
+/** temp + fsync + rename; Windows: keep healthy dest or unlink+retry. */
 export function writeAtomically(path: string, bytes: Uint8Array, ensureParent: (dir: string) => void): void {
     const slash = path.lastIndexOf('/');
     if (slash > 0) ensureParent(path.slice(0, slash));

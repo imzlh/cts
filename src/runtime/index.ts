@@ -97,6 +97,16 @@ function lifecyclePathValue(cwd: string, existing: string, sep: string): string 
 function isPrecompilePath(filename: string): boolean {
     const length = filename.length;
     if (length < 3) return false;
+    // Native addons / non-JS: never bytecode-compile (.node already fails the
+    // extension checks below; keep the guard explicit for clarity).
+    if (length >= 5 &&
+        filename.charCodeAt(length - 5) === 46 &&
+        filename.charCodeAt(length - 4) === 110 &&
+        filename.charCodeAt(length - 3) === 111 &&
+        filename.charCodeAt(length - 2) === 100 &&
+        filename.charCodeAt(length - 1) === 101) {
+        return false;
+    }
     const last = filename.charCodeAt(length - 1);
     if (last === 115) {
         const prev = filename.charCodeAt(length - 2);
@@ -114,6 +124,28 @@ function isPrecompilePath(filename: string): boolean {
     const third = filename.charCodeAt(length - 3);
     return (third === 116 || third === 106) &&
         filename.charCodeAt(length - 4) === 46;
+}
+
+/** Empty modules for every import edge during precache bytecode compile. */
+function precompileStubLoader(): {
+    resolve(spec: string, parent: string, attr?: Record<string, unknown>): string;
+    load(specPath: string): CModuleEngine.Module;
+} {
+    const stubs = new Map<string, CModuleEngine.Module>();
+    return {
+        resolve(spec: string, parent: string) {
+            // Unique id per edge so QuickJS can link without real files.
+            return `cts-precompile-stub:${parent}\0${spec}`;
+        },
+        load(specPath: string) {
+            let mod = stubs.get(specPath);
+            if (!mod) {
+                mod = engine.Module.create(specPath);
+                stubs.set(specPath, mod);
+            }
+            return mod;
+        },
+    };
 }
 
 function lifecycleEnv(cwd: string): Record<string, string> {
@@ -148,15 +180,7 @@ function findProjectRoot(start: string): string | undefined {
     }
 }
 
-/**
- * Decide where cts.lock lives and whether we may write it. The lock is a
- * resolution cache, not something to scatter next to every script:
- *   - --lock-dir           → that dir (writable only when persisting)
- *   - cno cache (persist)  → project root, else the global cache dir
- *   - run/eval/repl/test   → read-only; reuse a project lock if present,
- *                            else the global cache dir (open if there, else
- *                            purely in-memory). Never writes to disk.
- */
+/** Lock location/mode: lock-dir | cache→project | run→read-only (never scatter). */
 function resolveLockTarget(cfg: RuntimeConfig, entryDir?: string): { dir: string; readOnly: boolean } {
     const persist = cfg.persistLock === true;
     if (cfg.lockDir) return { dir: cfg.lockDir, readOnly: !persist };
@@ -231,10 +255,7 @@ export class TypeScriptRuntime {
         }, expectedReplacement);
     }
 
-    /**
-     * Swaps in a throwaway engine.onModule loader for the duration of `fn`,
-     * then restores the runtime's normal hooks — see pack/writer.ts.
-     */
+    /** Run fn under stub onModule, then restore (pack/writer). */
     async withStubModuleLoader<T>(
         loader: { resolve(spec: string, parent: string, attr?: Record<string, unknown>): string; load(specPath: string): CModuleEngine.Module },
         fn: () => Promise<T>,
@@ -247,9 +268,7 @@ export class TypeScriptRuntime {
         }
     }
 
-    // -------------------------------------------------------------------------
     // Event hooks (unhandled rejections, job exceptions)
-    // -------------------------------------------------------------------------
 
     private hookEvents(): void {
         const trace = new Set<unknown>();
@@ -301,9 +320,7 @@ export class TypeScriptRuntime {
         });
     }
 
-    // -------------------------------------------------------------------------
     // Pre-cache: async parallel BFS, then full resource cleanup
-    // -------------------------------------------------------------------------
 
     async precache(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
         return this.runPrecache((scanner) =>
@@ -351,14 +368,8 @@ export class TypeScriptRuntime {
             throw e;
         }
 
-        // The scan-phase spinner has nothing left to show once resolution
-        // finishes, and its 200ms redraw loop would otherwise clobber the
-        // scan-error lines below and deferred lifecycle scripts' own
-        // console/child output (both print while the old timer was ticking).
-        // Stopping here — not just at the very end — lets that output print
-        // cleanly, and setCompileProgress() below restarts a fresh spinner
-        // for precompile instead of redrawing stale scan-phase numbers.
-        prog?.stop();
+        // pause not stop — precompile must be able to restart the spinner.
+        prog?.pause();
 
         if (this.config.nodeModulesMode !== 'normal') {
             const nodeModulesMode = this.config.nodeModulesMode;
@@ -381,7 +392,7 @@ export class TypeScriptRuntime {
                 await parseDriver.terminate();
                 throw e instanceof Error ? e : new Error(errMsg(e));
             }
-            prog?.stop();
+            prog?.pause();
             log.debug('precache', () => 'materialize node_modules end');
         }
 
@@ -400,6 +411,7 @@ export class TypeScriptRuntime {
                 await parseDriver.terminate();
                 throw e;
             }
+            prog?.pause();
             log.debug('precache', () => 'lifecycle scripts end');
         }
 
@@ -430,10 +442,7 @@ export class TypeScriptRuntime {
 
         const scannableModules: ScanResult['modules'] = [];
         const toCompile: ScanResult['modules'] = [];
-        // CJS bytecode is always cached under the local (hashed) strategy,
-        // never next to the file — see CjsLoader's loadCjsCompiled/
-        // persistCjsCompiled in compile/bridge.ts, which has no specPath
-        // (only localPath) to derive true remote-ness from at read time.
+        // CJS bytecode always uses local hashed cache (no specPath at load).
         const cacheRemote = (m: { format: ModuleFormat; specPath: string }) =>
             m.format === 'cjs' ? false : isRemote(m.specPath);
         for (const m of result.modules) {
@@ -453,19 +462,22 @@ export class TypeScriptRuntime {
             let written = 0;
             let fail = 0;
             try {
-                await parseDriver.compileModules(
-                    toCompile,
-                    (done, total) => prog?.setCompileProgress(done, total),
-                    (localPath, bc, specPath) => {
-                        const format = formatByLocalPath.get(localPath);
-                        const remote = format === 'cjs' ? false : isRemote(specPath);
-                        this.compiler.esm.jsc.persistBytecode(localPath, bc, remote);
-                        written++;
-                    },
-                    (localPath, _specPath, error) => {
-                        fail++;
-                        log.debug('precompile', () => `skip ${localPath}: ${errMsg(error)}`);
-                    },
+                // Stub deps during precache compile so missing edges don't cascade.
+                await this.withStubModuleLoader(precompileStubLoader(), () =>
+                    parseDriver.compileModules(
+                        toCompile,
+                        (done, total) => prog?.setCompileProgress(done, total),
+                        (localPath, bc, specPath) => {
+                            const format = formatByLocalPath.get(localPath);
+                            const remote = format === 'cjs' ? false : isRemote(specPath);
+                            this.compiler.esm.jsc.persistBytecode(localPath, bc, remote);
+                            written++;
+                        },
+                        (localPath, _specPath, error) => {
+                            fail++;
+                            log.debug('precompile', () => `skip ${localPath}: ${errMsg(error)}`);
+                        },
+                    ),
                 );
             } catch (e) {
                 // Batch/driver failure is not "best effort cache warm" — surface it.
@@ -582,9 +594,7 @@ export class TypeScriptRuntime {
         }
     }
 
-    // -------------------------------------------------------------------------
     // Polyfill + entry
-    // -------------------------------------------------------------------------
 
     async loadPolyfill(path: string): Promise<void> {
         const localPath = this.resolvePolyfillPath(path);

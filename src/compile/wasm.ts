@@ -9,9 +9,7 @@ const RE_INT_LITERAL = /^-?\d+n?$/;
 type WasmImportExports = Record<string, unknown>;
 type WasmImportFunction = (...args: CModuleWASM.WasmValue[]) => CModuleWASM.WasmValue | void;
 
-// ---------------------------------------------------------------------------
 // Error classes — V8/Deno WebAssembly API compatibility
-// ---------------------------------------------------------------------------
 
 export class CompileError extends Error {
     constructor(message: string) { super(message); this.name = 'CompileError'; }
@@ -23,9 +21,7 @@ export class RuntimeError extends Error {
     constructor(message: string) { super(message); this.name = 'RuntimeError'; }
 }
 
-// ---------------------------------------------------------------------------
 // Built-in "env" module + WASI module names
-// ---------------------------------------------------------------------------
 
 const ENV_MODULE: Record<string, (...args: number[]) => number> = {
     floor: Math.floor, ceil: Math.ceil, trunc: Math.trunc, round: Math.round,
@@ -42,10 +38,6 @@ const WASI_MODULES = new Set(['wasi_unstable', 'wasi_snapshot_preview1']);
 
 // Heuristic match for "the env module": env, ./env.js, env.js
 const RE_ENV_MODULE = /^(?:\.\/)?env(?:\.js)?$/;
-
-// ---------------------------------------------------------------------------
-// Import resolver
-// ---------------------------------------------------------------------------
 
 export interface WasmImportSource {
     require(spec: string, parentPath: string): WasmImportExports | null;
@@ -175,10 +167,6 @@ function resolveGlobalImport(
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// WASM module builder
-// ---------------------------------------------------------------------------
-
 export function buildWasmModule(
     info: ModuleInfo,
     importSource: WasmImportSource,
@@ -238,7 +226,6 @@ export function buildWasmModule(
     wasm.setWasiOptions(wmod, [], null, null);
     const inst = wasm.buildInstance(wmod);
 
-    // Build ESM module with V8/Deno-compatible export wrappers
     const exp = wasm.moduleExports(wmod);
     const mod = engine.Module.create(info.specPath);
     const ns: Record<string, unknown> = {};
@@ -343,9 +330,7 @@ function toWasmValue(v: unknown): CModuleWASM.WasmValue {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
 // WasmCompiler — cache + circular dependency handling
-// ---------------------------------------------------------------------------
 
 type LoadFn = (info: ModuleInfo, meta: Record<string, unknown>) => CModuleEngine.Module;
 type ResolveFn = (spec: string, parent: string) => ModuleInfo;

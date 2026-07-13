@@ -7,10 +7,7 @@ export interface LoadedPack {
     session: PackSession;
 }
 
-/**
- * Map a .jspack into the runtime: 1× read, decode, install lazy 0-copy store.
- * No pack-extract, no eager seed, no bytecode copies.
- */
+/** Map .jspack: one read, decode, lazy 0-copy store. */
 export function loadPack(jspackPath: string, resolver: ModuleResolver): LoadedPack {
     const session = PackSession.open(jspackPath);
     session.install(resolver);

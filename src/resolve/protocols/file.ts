@@ -21,11 +21,17 @@ export class FileHandler implements ProtocolHandler {
     localPath(specPath: string): string { return this.strip(specPath); }
 
     private strip(url: string): string {
-        let p = url.startsWith('file://') ? decodeURIComponent(url.slice(7)) : url;
-        const query = p.indexOf('?');
-        const hash = p.indexOf('#');
-        const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
-        if (cut !== -1) p = p.slice(0, cut);
+        // Decode %23 after URL path; literal # in abs paths is a segment (es5-ext).
+        let p: string;
+        if (url.startsWith('file://')) {
+            const raw = url.slice(7);
+            const query = raw.indexOf('?');
+            const hash = raw.indexOf('#');
+            const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
+            p = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
+        } else {
+            p = url;
+        }
         if (p.startsWith('/') && isWindows && p.length > 2 && p[2] === ':')
             p = p.slice(1);
         return normalizePath(p);

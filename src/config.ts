@@ -7,9 +7,7 @@ const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
 
-// ---------------------------------------------------------------------------
 // Defaults (only truly required fields)
-// ---------------------------------------------------------------------------
 
 const DEFAULTS = {
     enableHttp:  true,
@@ -17,7 +15,8 @@ const DEFAULTS = {
     enableNode:  true,
     silent:      false,
     jsrCacheTTL: 7 * 24 * 60 * 60 * 1000,
-    requestTimeout: 30000,
+    // Large registry tarballs (multi-MB) often need >30s on slow links.
+    requestTimeout: 120000,
     enableCache: true,
     cachedOnly: false,
     enableOxc: true,
@@ -27,9 +26,7 @@ const DEFAULTS = {
     cacheDir:    '',
 } as const;
 
-// ---------------------------------------------------------------------------
 // Tier-based runtime defaults (applied when no explicit CLI/env override)
-// ---------------------------------------------------------------------------
 
 const TIER_MEM_LIMIT: Record<string, number> = {
     low:    32 * 1024 * 1024,  // 32 MB
@@ -46,9 +43,7 @@ const TIER_STACK_SIZE: Record<string, number> = {
 const DEFAULT_MEM_LIMIT = TIER_MEM_LIMIT.normal;
 const DEFAULT_STACK_SIZE = TIER_STACK_SIZE.normal;
 
-// ---------------------------------------------------------------------------
 // Memory size parser  "256MB" → bytes
-// ---------------------------------------------------------------------------
 
 export function parseSize(s: string | undefined): number | undefined {
     if (!s) return undefined;
@@ -59,10 +54,6 @@ export function parseSize(s: string | undefined): number | undefined {
     const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024**2, GB: 1024**3, TB: 1024**4 };
     return Math.floor(parseFloat(value) * (units[(m[2] ?? 'B').toUpperCase()] ?? 1));
 }
-
-// ---------------------------------------------------------------------------
-// Environment
-// ---------------------------------------------------------------------------
 
 function env(k: string): string | null {
     try {
@@ -187,10 +178,6 @@ function isJscArtifact(path: string): boolean {
     return path.endsWith('.jsc') || path.endsWith('.jsc.mt');
 }
 
-// ---------------------------------------------------------------------------
-// Cache directory
-// ---------------------------------------------------------------------------
-
 function clearJsc(dir: string): void {
     // Delete bytecode artifacts in a background timer so we don't block startup.
     timers.setTimeout(() => {
@@ -248,9 +235,7 @@ function verifyCacheDir(dir: string): void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // CLI template — all flags declared here
-// ---------------------------------------------------------------------------
 
 const CLI_TPL = {
     'cache-dir':      'string',
@@ -328,9 +313,7 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     return cfg;
 }
 
-// ---------------------------------------------------------------------------
 // loadConfigFile — reads tsconfig / deno.json / package.json
-// ---------------------------------------------------------------------------
 
 export function loadConfigFile(dir: string): Partial<ConfigOptions> {
     const cfg: Partial<ConfigOptions> = {};

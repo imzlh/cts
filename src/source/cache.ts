@@ -23,10 +23,7 @@ export function isRemote(specPath: string): boolean {
         || specPath.startsWith('ctsview:');
 }
 
-/**
- * Disk L2 / mtime freshness only for real filesystem paths.
- * Pack / VFS keys are never file-backed.
- */
+/** True only for real FS paths (not pack:/ctsview:). */
 export function isFileBackedPath(localPath: string): boolean {
     if (localPath.startsWith('pack:') || localPath.startsWith('ctsview:')) return false;
     // Skip VFS has() when no overlay is installed (common disk-only runs).
@@ -43,9 +40,7 @@ export class JscCache {
         this.localDir = cacheDir ? joinPaths(cacheDir, 'local') : null;
     }
 
-    // -------------------------------------------------------------------------
     // Local cache path: {cacheDir}/local/{hash[0:2]}/{hash}.jsc
-    // -------------------------------------------------------------------------
 
     private localCachePath(localPath: string): { jsc: string; mt: string } | null {
         if (!this.localDir || !isFileBackedPath(localPath)) return null;
@@ -55,9 +50,7 @@ export class JscCache {
         return { jsc: base + '.jsc', mt: base + '.jsc.mt' };
     }
 
-    // -------------------------------------------------------------------------
     // Load: L1 (memory) → L2 (disk .jsc) → null
-    // -------------------------------------------------------------------------
 
     private remoteCachePaths(localPath: string): { jsc: string; mt: string } | null {
         if (!isFileBackedPath(localPath)) return null;
@@ -118,12 +111,7 @@ export class JscCache {
         return this.loadRaw(localPath, remote, cachedMtime) as CModuleEngine.Module | null;
     }
 
-    /**
-     * Same lookup/freshness logic as `load()`, but for cached values that are
-     * not a `Module` — e.g. a CJS script compiled with `EVAL_COMPILE_ONLY`
-     * (see `CjsLoader`). Returns the raw `engine.deserialize()` result
-     * untyped; callers know what shape to expect from what they persisted.
-     */
+    /** load() for non-Module values (e.g. EVAL_COMPILE_ONLY); raw deserialize. */
     loadCompiled(localPath: string, remote: boolean, cachedMtime?: number): unknown | null {
         return this.loadRaw(localPath, remote, cachedMtime);
     }
@@ -192,13 +180,7 @@ export class JscCache {
         }
     }
 
-    /**
-     * Raw on-disk `.jsc` bytes for `localPath`, without ever calling
-     * `engine.deserialize()`. Used by `cno pack` to copy already-cached
-     * bytecode straight into a `.jspack` blob. Same freshness/lookup rules
-     * as `loadRaw()`; returns null on any cache miss (including L1 memory —
-     * pack only wants durable, already-persisted bytecode).
-     */
+    /** On-disk .jsc bytes only (no deserialize); for pack. Null if not durable. */
     loadRawBytes(localPath: string, remote: boolean, cachedMtime?: number): ArrayBuffer | null {
         const paths = remote ? this.remoteCachePaths(localPath) : this.localCachePath(localPath);
         if (!paths) return null;
@@ -210,11 +192,7 @@ export class JscCache {
         }
     }
 
-    /**
-     * Fast freshness check used by precache before scheduling precompile work.
-     * This avoids deserializing bytecode just to decide whether the file should
-     * be regenerated.
-     */
+    /** Freshness without deserializing (precache gate). */
     hasFresh(localPath: string, remote: boolean, cachedMtime?: number): boolean {
         if (remote) {
             const paths = this.remoteCachePaths(localPath);

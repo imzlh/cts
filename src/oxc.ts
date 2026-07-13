@@ -96,12 +96,7 @@ export class OxcTranspiler {
         log.debug('oxc', () => `loaded ${mod.version}`);
     }
 
-    /** Transpile TS/TSX/JS/JSX to JS. Returns null if the extension errors.
-     *  `mapKey` is the module's runtime identity (e.g. specPath) — the same
-     *  name passed to `new engine.Module(code, mapKey)`. It is used both as
-     *  the sourcemap registry key AND as the embedded `sources` entry, so a
-     *  resolved stack frame shows that identity instead of the on-disk path
-     *  `filename` (which may sit in a shared, unrelated cache directory). */
+    /** Transpile to JS. mapKey = runtime id (sourcemap + Module name), not disk path. */
     transpile(source: string, filename: string, mapKey?: string, lang?: string): string | null {
         try {
             const kind = kindFromFilename(filename, lang);
@@ -120,9 +115,7 @@ export class OxcTranspiler {
         }
     }
 
-    /** Like transpile(), but returns the sourcemap instead of registering it
-     *  locally — for callers (e.g. a worker) whose JSContext isn't the one
-     *  that will actually run the compiled module and needs to register it. */
+    /** Like transpile(); return sourcemap for remote JSContext to register. */
     transpileCapture(source: string, filename: string, mapKey?: string, lang?: string): { code: string; sourceMap?: string } | null {
         try {
             const kind = kindFromFilename(filename, lang);
@@ -237,10 +230,7 @@ function optionKindForKind(kind: OxcKind): OxcOptionKind {
     }
 }
 
-/**
- * Resolve path to the OXC native extension.
- * Mirrors bootstrap resolveExtDir: CTS_EXT_PATH, <exe>/ext, <exe>/lib/ext.
- */
+/** OXC ext path: CTS_EXT_PATH, <exe>/ext, <exe>/lib/ext. */
 export function oxcExtPath(): string | null {
     try {
         const sep = os.platform === 'windows' ? '\\' : '/';
@@ -303,13 +293,7 @@ function registerOxcPath(extPath: string): boolean {
     }
 }
 
-/** Try to load the oxc native extension (register if needed).
- *  Returns an OxcTranspiler on success, null if not found or failed to load.
- *
- *  Order matters:
- *  1. use() — cno bootstrap already put `oxc` in dyn_registry (or static)
- *  2. register(path) then use() — standalone cts / missing bootstrap entry
- *  Never treat "already registered" as unavailable (that forced Sucrase). */
+/** Load oxc: use() first, else register(path)+use(). "Already registered" is success. */
 export function tryLoadOxc(): OxcTranspiler | null {
     if (localOxc) return localOxc;
 

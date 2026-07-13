@@ -34,9 +34,7 @@ export function extractImports(source: string, isTs = true): string[] {
                 specs.add(source.slice(next.start + 1, next.end - 1));
                 continue;
             }
-            // `import type { X }` / `import type * as X` / `import type X` — type-only, skip.
-            // Exception: `import type from '...'` where "from" follows directly — that's a
-            // value default import with the binding named "type".
+            // type-only import; `import type from '…'` is a value binding named type.
             if (next.type === tt.name && next.contextualKeyword === ContextualKeyword._type) {
                 const afterType = tokens[i + 2];
                 if (!afterType || afterType.contextualKeyword !== ContextualKeyword._from) continue;
@@ -80,15 +78,7 @@ export function extractImports(source: string, isTs = true): string[] {
     return specs ? [...specs] : [];
 }
 
-/**
- * Bytecode serialization currently drops import attributes; keep affected
- * modules on the source-compile path when loading a portable pack.
- *
- * Must NOT full-parse TypeScript (Sucrase isTs=true is multi-second on large
- * files). Linear scan is enough: prefer false positive → sourceOnly over a
- * false negative that would ship broken attribute-less bytecode.
- * `isTs` kept for call-site compatibility; ignored on purpose.
- */
+/** Import attrs present? Linear scan only (no full TS parse). Prefer false+ for pack. */
 export function hasImportAttributes(source: string, _isTs = true): boolean {
     const n = source.length;
     let i = 0;
@@ -186,15 +176,7 @@ function isWordAt(source: string, idx: number, word: string): boolean {
     return isIdentBoundary(source, idx + word.length);
 }
 
-/**
- * True when source has top-level `import`/`export` ESM syntax (not `import()`).
- * Used to promote package `"type":"commonjs"` / untyped `.js` files that are
- * actually ESM (Deno `detect_es_module_defined_as_cjs` / package_json_type).
- *
- * Linear scan only — full Sucrase parse was multi-second on large dual packages
- * and ran on every detectFormat / ModuleCompiler.load for `.js` under CJS pkgs.
- * `isTs` kept for call-site compatibility; ignored (JS dual-detect only).
- */
+/** Top-level import/export (not import())? Linear scan; isTs unused. */
 export function hasTopLevelEsmSyntax(source: string, _isTs = false): boolean {
     const n = source.length;
     let i = 0;
@@ -359,9 +341,7 @@ function findFromString(
     tokens: Tokens,
     start: number,
 ): number {
-    // No fixed token window: real packages (e.g. multiaddr registry.js) import
-    // 40+ named bindings in one statement (~85 tokens). A short cap silently
-    // drops the edge and pack later fails with "no static edge".
+    // No token cap on named imports — short windows drop edges (pack fails later).
     let braceDepth = 0;
     for (let i = start; i < tokens.length; i++) {
         const t = tokens[i];

@@ -7,10 +7,7 @@ export { Transformer } from './transform';
 export { JscCache, isRemote } from './cache';
 export type { TransformerOptions } from './transform';
 
-/**
- * Read and transform source code.
- * Applies oxc/sucrase for .ts/.tsx/.jsx; passes through .js/.json as-is.
- */
+/** Read + transform (.ts/.tsx/.jsx); .js/.json passthrough. */
 export function readSource(info: ModuleInfo, transformer: Transformer, lang?: string): string {
     const raw = readText(info.localPath);
     const code = transformer.transform(raw, info.localPath, lang, moduleRef(info));
@@ -20,9 +17,7 @@ export function readSource(info: ModuleInfo, transformer: Transformer, lang?: st
     return code;
 }
 
-/**
- * Prepare source for CJS execution (strip TS/JSX syntax only, keep import/export intact).
- */
+/** Strip TS/JSX for CJS; keep import/export intact. */
 export function readSourceForCjs(info: ModuleInfo, transformer: Transformer, lang?: string): string {
     const raw = readText(info.localPath);
     return transformer.transformForCjs(raw, info.localPath, lang);

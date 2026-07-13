@@ -29,14 +29,9 @@ function buildCjsEsmWrapper(specPath: string, exports: Record<string, unknown>):
     return new engine.Module(code, specPath);
 }
 
-// ---------------------------------------------------------------------------
 // ESM -> CJS bridge: wrap CJS exports as an ESM Module
-// ---------------------------------------------------------------------------
 
-/**
- * Create an ESM Module from CJS module.exports.
- * Handles __esModule flag (Babel/tsc transpiled modules).
- */
+/** ESM Module from CJS exports; honors __esModule. */
 export function bridgeCjsToEsm(
     specPath: string,
     meta: Record<string, unknown>,
@@ -74,21 +69,9 @@ export function bridgeCjsToEsm(
     return mod;
 }
 
-// ---------------------------------------------------------------------------
 // CJS -> ESM bridge: synchronously load ESM via promiseResult
-// ---------------------------------------------------------------------------
 
-/**
- * Load an ESM module synchronously for CJS require() interop.
- *
- * promiseResult semantics:
- *   1. Throws  -> module evaluation failed (SyntaxError, etc.) -> propagate as require error
- *   2. Returns null -> module has top-level await, cannot load synchronously
- *   3. Returns truthy -> module loaded successfully -> safe to read namespace
- *
- * After success, iterates namespace keys with try/catch to guard against
- * getters that may throw (async leftover side-effects).
- */
+/** Sync ESM for require(): throw → error; null → TLA (reject); else namespace. */
 export function loadEsmSync(
     info: ModuleInfo,
     esm: EsmCompiler,
@@ -107,14 +90,9 @@ export function loadEsmSync(
     return mod.namespace;
 }
 
-// ---------------------------------------------------------------------------
 // CjsDeps factory: wire CjsLoader to resolver + ESM compiler
-// ---------------------------------------------------------------------------
 
-/**
- * Build the CjsDeps callback interface that CjsLoader uses
- * to interact with the resolver and ESM compiler.
- */
+/** Wire CjsLoader to resolver + ESM compiler. */
 export function buildCjsDeps(
     resolver: ModuleResolver,
     esm: EsmCompiler,
@@ -160,9 +138,7 @@ export function buildCjsDeps(
     };
 }
 
-// ---------------------------------------------------------------------------
 // Global require + CTS_INTERNAL installation
-// ---------------------------------------------------------------------------
 
 /** Normalize path traversal (../..) in npm spec paths. */
 function normalizeNpmSpec(spec: string): string {
@@ -190,10 +166,7 @@ function normalizeNpmSpec(spec: string): string {
     return normalized.length > 0 ? `npm:${pkg}/${normalized.join('/')}` : `npm:${pkg}`;
 }
 
-/**
- * Install globalThis.require as a lazy getter that delegates to CjsLoader.
- * Warns on re-install (second runtime in same process hijacks the first).
- */
+/** Lazy globalThis.require; re-install warns (one runtime per process). */
 export function installGlobalRequire(
     mkRequire: (parentPath: string) => (id: string) => unknown,
     getEntry: () => string,
@@ -229,10 +202,7 @@ export function installGlobalRequire(
     }
 }
 
-/**
- * Install globalThis[CTS_INTERNAL] bridge.
- * Re-install overwrites the prior object's fields (with per-field error logging).
- */
+/** Install/overwrite globalThis[CTS_INTERNAL] bridge fields. */
 export function installInternalBridge(
     mkRequire: (parentPath: string) => CjsRequireFn,
     preloadModule: (id: string, parentPath: string) => unknown,

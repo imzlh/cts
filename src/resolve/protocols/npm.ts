@@ -119,9 +119,15 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
             name = `${scope}/${rest.slice(0, at)}`;
             const after = rest.slice(at + 1);
             if (!after) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (empty version): ${raw}`);
-            const sl3 = after.indexOf('/');
-            ver = sl3 === -1 ? after : after.slice(0, sl3);
-            sub = sl3 === -1 ? '' : after.slice(sl3 + 1);
+            // http(s) tarball URLs contain '/' — do not treat path as subpath.
+            if (isTarballUrl(after)) {
+                ver = after;
+                sub = '';
+            } else {
+                const sl3 = after.indexOf('/');
+                ver = sl3 === -1 ? after : after.slice(0, sl3);
+                sub = sl3 === -1 ? '' : after.slice(sl3 + 1);
+            }
         } else if (sl2 !== -1) {
             name = `${scope}/${rest.slice(0, sl2)}`; sub = rest.slice(sl2 + 1);
         } else { name = `${scope}/${rest}`; }
@@ -132,9 +138,14 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
             name = rest.slice(0, at);
             const after = rest.slice(at + 1);
             if (!after) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (empty version): ${raw}`);
-            const sl2 = after.indexOf('/');
-            ver = sl2 === -1 ? after : after.slice(0, sl2);
-            sub = sl2 === -1 ? '' : after.slice(sl2 + 1);
+            if (isTarballUrl(after)) {
+                ver = after;
+                sub = '';
+            } else {
+                const sl2 = after.indexOf('/');
+                ver = sl2 === -1 ? after : after.slice(0, sl2);
+                sub = sl2 === -1 ? '' : after.slice(sl2 + 1);
+            }
         } else if (sl !== -1) {
             name = rest.slice(0, sl);
             sub = rest.slice(sl + 1);
@@ -291,10 +302,61 @@ function canUseLocalPackageForRange(range: string): boolean {
     return !range || range === 'latest' || range === '*';
 }
 
+/** package.json dep values like https://cdn…/pkg-1.0.0.tgz (npm/yarn/pnpm). */
+function isTarballUrl(range: string): boolean {
+    if (!(range.startsWith('https://') || range.startsWith('http://'))) return false;
+    const path = range.split(/[?#]/, 1)[0]!.toLowerCase();
+    return path.endsWith('.tgz')
+        || path.endsWith('.tar.gz')
+        || path.endsWith('.tar')
+        || path.endsWith('.tar.bz2');
+}
+
+/** Best-effort version from URL filename: …/xlsx-0.20.3.tgz → 0.20.3 */
+function versionHintFromTarballUrl(url: string): string | null {
+    const path = url.split(/[?#]/, 1)[0]!;
+    const slash = path.lastIndexOf('/');
+    const base = slash === -1 ? path : path.slice(slash + 1);
+    // name-1.2.3.tgz / name-1.2.3-beta.1.tar.gz
+    const m = base.match(/-(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)\.(?:tgz|tar\.gz|tar|tar\.bz2)$/i);
+    return m?.[1] ?? null;
+}
+
 function localPackageMatchesRange(version: string | undefined, range: string): boolean {
     if (!version) return canUseLocalPackageForRange(range);
     if (canUseLocalPackageForRange(range)) return true;
+    // URL ranges pin a dist, not a semver — never treat a local copy as a match.
+    if (isTarballUrl(range)) return false;
     return version === range || matchLatestVersion([version], range) === version;
+}
+
+function packageJsonVersionFromTar(files: TarFile[]): string | null {
+    for (const f of files) {
+        if (f.type !== 'file') continue;
+        const p = f.path.replace(/\\/g, '/');
+        // package/package.json or bare package.json
+        if (p === 'package.json' || p.endsWith('/package.json')) {
+            // Prefer the shallowest package.json (npm pack root).
+            if (p !== 'package.json' && p.split('/').length > 2) continue;
+            try {
+                const text = engine.decodeString(f.content);
+                const pkg = safeParse<{ version?: string }>(text);
+                if (pkg?.version && typeof pkg.version === 'string') return pkg.version;
+            } catch {}
+        }
+    }
+    // Second pass: any package.json
+    for (const f of files) {
+        if (f.type !== 'file') continue;
+        const p = f.path.replace(/\\/g, '/');
+        if (!p.endsWith('package.json')) continue;
+        try {
+            const text = engine.decodeString(f.content);
+            const pkg = safeParse<{ version?: string }>(text);
+            if (pkg?.version && typeof pkg.version === 'string') return pkg.version;
+        } catch {}
+    }
+    return null;
 }
 
 function startsWithVersionish(value: string): boolean {
@@ -345,6 +407,8 @@ export class NpmHandler implements ProtocolHandler {
     private readonly specFormat = new Map<string, ModuleFormat>();
     private readonly specLocalPath = new Map<string, string>();
     private readonly dependenciesChecked = new Set<string>();
+    /** name@version already had bins/optional/lifecycle prepared this process. */
+    private readonly packagesPrepared = new Set<string>();
     private readonly pendingLifecycle: LifecycleScriptEntry[] = [];
     private readonly queuedLifecycle = new Set<string>();
 
@@ -360,6 +424,7 @@ export class NpmHandler implements ProtocolHandler {
         this.specFormat.clear();
         this.specLocalPath.clear();
         this.dependenciesChecked.clear();
+        this.packagesPrepared.clear();
         this.npmCfg = null;
     }
 
@@ -440,10 +505,7 @@ export class NpmHandler implements ProtocolHandler {
         return this.toLocalModuleInfo(pkg.name, pkg.version ?? '0.0.0', pkgDir, normalized, format);
     }
 
-    /**
-     * Resolve a binary name to its absolute path.
-     * Priority: local node_modules/.bin > lock bin index.
-     */
+    /** Bin path: node_modules/.bin then lock index. */
     resolveBin(name: string, cwd: string): string | null {
         if (name.startsWith('/') || name.startsWith('.') || name.includes('/')) return null;
 
@@ -492,10 +554,7 @@ export class NpmHandler implements ProtocolHandler {
         const ctx = createCtx(pkg.dir, this.ctxOptions(forceCjs));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
 
-        /* When the parent is the package root (no subpath), relative imports
-         * must resolve from pkg.dir — NOT from the directory of the main entry
-         * file.  Otherwise `./dist/foo.cjs` in a package whose main is already
-         * `./dist/foo.cjs` would double the `dist/` prefix. */
+        /* Root parent: resolve relative from pkg.dir, not main entry dir. */
         let baseDir: string;
         if (!subpath || subpath === '.' || subpath === './') {
             baseDir = pkg.dir;
@@ -538,10 +597,7 @@ export class NpmHandler implements ProtocolHandler {
         }
         const resolved = blockedByExports ? null : resolveSubpath(ctx, subpath);
         if (!resolved) {
-            // Root entry (subpath === '') with no main/exports: the package has been
-            // installed but exposes no runtime entry (e.g. @types/* declaration packages).
-            // Return package.json as a no-content leaf so precache can record it without
-            // failing — dep scanner skips .json files when looking for further imports.
+            // No main/exports: leaf package.json so precache records @types/* without fail.
             if (!subpath) {
                 const pkgJson = joinPaths(dir, 'package.json');
                 log.debug('npm', () => `${name}@${ver}: no entry point, using package.json as install marker`);
@@ -779,9 +835,7 @@ export class NpmHandler implements ProtocolHandler {
             if (!base) return;
             const normBase = normalizePath(base);
             const real = this.realPath(base);
-            // For pnpm-linked package entries (for example .pnpm/node_modules/foo),
-            // prefer the real package directory first so package-private deps win
-            // over the hoisted virtual .pnpm/node_modules layer.
+            // Prefer real package dir over hoisted .pnpm/node_modules.
             if (real && real !== normBase) {
                 this.pushNodeModulesSearchDirs(real, search, seen);
             }
@@ -876,21 +930,18 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private *ensureInstalled(name: string, version: string, parent?: string, onProgress?: ProgressCallback): Flow<{ dir: string; resolvedVer: string }> {
+        // Direct tarball URL (e.g. sheetjs CDN) — skip registry meta entirely.
+        if (isTarballUrl(version)) {
+            return yield* this.ensureInstalledFromTarballUrl(name, version, onProgress);
+        }
         const origin = this.parentOrigin(parent);
         const locked = this.lockedVersionForRange(name, version);
         if (locked) {
             const lockedDir = joinPaths(this.cacheDir, `${name}@${locked}`);
-            // Check package.json, not just the directory — a directory can exist
-            // but be incomplete (interrupted extraction, crash mid-install), and
-            // a bare FS_EXISTS on the dir would wrongly treat that as "installed"
-            // forever, since nothing else ever re-triggers install() afterward.
+            // Need package.json; bare dir may be a partial extract (never re-installed).
             const lockedExists = yield { type: StepType.FS_EXISTS, path: joinPaths(lockedDir, 'package.json') };
             if (lockedExists) {
-                this.linkCacheAlias(name, lockedDir);
-                yield* this.indexInstalledBins(name, locked, lockedDir);
-                yield* this.installDependencies(name, locked, lockedDir, onProgress);
-                yield* this.installOptionalDeps(lockedDir, onProgress);
-                this.queueLifecycleScripts(name, locked, lockedDir);
+                yield* this.prepareInstalledPackage(name, locked, lockedDir, onProgress);
                 return { dir: lockedDir, resolvedVer: locked };
             }
         }
@@ -905,11 +956,7 @@ export class NpmHandler implements ProtocolHandler {
             const exactDir = joinPaths(this.cacheDir, `${name}@${version}`);
             const exactExists = yield { type: StepType.FS_EXISTS, path: joinPaths(exactDir, 'package.json') };
             if (exactExists) {
-                this.linkCacheAlias(name, exactDir);
-                yield* this.indexInstalledBins(name, version, exactDir);
-                yield* this.installDependencies(name, version, exactDir, onProgress);
-                yield* this.installOptionalDeps(exactDir, onProgress);
-                this.queueLifecycleScripts(name, version, exactDir);
+                yield* this.prepareInstalledPackage(name, version, exactDir, onProgress);
                 return { dir: exactDir, resolvedVer: version };
             }
             const local = this.findLocal(name, parent);
@@ -928,13 +975,121 @@ export class NpmHandler implements ProtocolHandler {
             if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
             yield* this.installOnce(name, exactVer, pkgDir, onProgress);
         } else {
-            this.linkCacheAlias(name, pkgDir);
-            yield* this.indexInstalledBins(name, exactVer, pkgDir);
-            yield* this.installDependencies(name, exactVer, pkgDir, onProgress);
-            yield* this.installOptionalDeps(pkgDir, onProgress);
-            this.queueLifecycleScripts(name, exactVer, pkgDir);
+            yield* this.prepareInstalledPackage(name, exactVer, pkgDir, onProgress);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
+    }
+
+    /** Install/resolve a package pinned to an http(s) .tgz URL in package.json. */
+    private *ensureInstalledFromTarballUrl(
+        name: string,
+        url: string,
+        onProgress?: ProgressCallback,
+    ): Flow<{ dir: string; resolvedVer: string }> {
+        const cacheKey = `${name}@${url}`;
+        const hit = (ver: string): Flow<{ dir: string; resolvedVer: string } | null> => {
+            return (function* (self: NpmHandler) {
+                const dir = joinPaths(self.cacheDir, `${name}@${ver}`);
+                const ok = yield { type: StepType.FS_EXISTS, path: joinPaths(dir, 'package.json') };
+                if (!ok) return null;
+                yield* self.prepareInstalledPackage(name, ver, dir, onProgress);
+                self.verCache.set(cacheKey, ver);
+                return { dir, resolvedVer: ver };
+            })(this);
+        };
+        const cachedVer = this.verCache.get(cacheKey);
+        if (cachedVer) {
+            const ready = yield* hit(cachedVer);
+            if (ready) return ready;
+        }
+        // Skip re-download when URL embeds a version and that store dir exists.
+        const hinted = versionHintFromTarballUrl(url);
+        if (hinted) {
+            const ready = yield* hit(hinted);
+            if (ready) return ready;
+        }
+        if (this.cfg.cachedOnly) {
+            throw err(ErrorKind.ModuleNotFound, `npm package not found in cache: "${name}" (${url}), --cached-only is specified.`);
+        }
+        if (!this.cfg.silent && !isatty) log.download(`${name} <- ${url}`);
+        const result = yield* this.installFromTarballUrlOnce(name, url, onProgress);
+        this.verCache.set(cacheKey, result.resolvedVer);
+        return result;
+    }
+
+    private *installFromTarballUrlOnce(
+        name: string,
+        url: string,
+        onProgress?: ProgressCallback,
+    ): Flow<{ dir: string; resolvedVer: string }> {
+        const cacheKey = `${name}@${url}`;
+        // FLOW is void-only and key-deduped: write result into verCache so concurrent
+        // waiters can read it after the shared flow settles.
+        yield {
+            type: StepType.FLOW,
+            key: `npm-tarball:${cacheKey}`,
+            flow: this.installFromTarballUrl(name, url, cacheKey, onProgress),
+        };
+        const ver = this.verCache.get(cacheKey);
+        if (!ver) throw err(ErrorKind.Generic, `Failed to install ${name} from ${url}`);
+        return { dir: joinPaths(this.cacheDir, `${name}@${ver}`), resolvedVer: ver };
+    }
+
+    private *installFromTarballUrl(
+        name: string,
+        url: string,
+        cacheKey: string,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        log.debug('npm', () => `fetch tarball URL ${name} <- ${url}`);
+        const fetchStarted = Date.now();
+        const { body } = expectFetch(yield {
+            type: StepType.NET_FETCH,
+            url,
+            timeout: this.cfg.requestTimeout,
+            onProgress,
+        });
+        log.debug('npm', () => `fetched tarball URL ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - fetchStarted}ms`);
+        const files = expectTarFiles(yield { type: StepType.ARCHIVE_UNTAR_GZ, data: body });
+        const ver = packageJsonVersionFromTar(files) ?? '0.0.0';
+        this.verCache.set(cacheKey, ver);
+        const pkgDir = joinPaths(this.cacheDir, `${name}@${ver}`);
+        const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(pkgDir, 'package.json') };
+        if (!exists) {
+            yield { type: StepType.FS_ENSURE_DIR, path: pkgDir };
+            log.debug('npm', () => `write ${name}@${ver} (url) -> ${pkgDir}`);
+            yield* this.writeArchive(pkgDir, files);
+            clearNegativeCache();
+            yield* this.indexInstalledBins(name, ver, pkgDir);
+            yield* this.installDependencies(name, ver, pkgDir, onProgress);
+            yield* this.installPeerDeps(pkgDir, name, ver, onProgress);
+            yield* this.installOptionalDeps(pkgDir, onProgress);
+            this.queueLifecycleScripts(name, ver, pkgDir);
+            this.packagesPrepared.add(`${name}@${ver}`);
+            this.linkCacheAlias(name, pkgDir);
+        } else {
+            yield* this.prepareInstalledPackage(name, ver, pkgDir, onProgress);
+        }
+    }
+
+    /** Once per installed package: alias, bins, deps, optionals, lifecycle. */
+    private *prepareInstalledPackage(
+        name: string,
+        ver: string,
+        dir: string,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        const key = `${name}@${ver}`;
+        if (this.packagesPrepared.has(key)) return;
+        this.packagesPrepared.add(key);
+        this.linkCacheAlias(name, dir);
+        yield* this.indexInstalledBins(name, ver, dir);
+        yield* this.installDependencies(name, ver, dir, onProgress);
+        yield* this.installPeerDeps(dir, name, ver, onProgress);
+        yield* this.installOptionalDeps(dir, onProgress);
+        // No hoist/inject: soft+realpath cannot safely mirror npm hoisting (CPU
+        // blow-up). Vite/tools that need a real tree use --npm-mode=hard.
+        this.queueLifecycleScripts(name, ver, dir);
     }
 
     private *resolveVersion(name: string, range: string, onProgress?: ProgressCallback): Flow<string> {
@@ -1019,15 +1174,14 @@ export class NpmHandler implements ProtocolHandler {
         yield* this.writeArchive(dir, files);
         log.debug('npm', () => `wrote ${name}@${ver} in ${Date.now() - writeStarted}ms`);
         this.linkCacheAlias(name, dir);
-        // A concurrent worker resolving a sibling file mid-extraction (before this
-        // writeArchive call finished) may have permanently marked it as missing in
-        // the resolver's negative file-existence cache. Clear it now that this
-        // package is fully on disk so those siblings get a fair re-check.
+        // Clear negative exists cache poisoned by mid-extract sibling resolves.
         clearNegativeCache();
         yield* this.indexInstalledBins(name, ver, dir);
         yield* this.installDependencies(name, ver, dir, onProgress);
+        yield* this.installPeerDeps(dir, name, ver, onProgress);
         yield* this.installOptionalDeps(dir, onProgress);
         this.queueLifecycleScripts(name, ver, dir);
+        this.packagesPrepared.add(`${name}@${ver}`);
     }
 
     private *installOnce(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
@@ -1053,8 +1207,9 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private *installDependencies(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
-        if (!this.cfg.persistLock) return;
-
+        // Always link deps into the store package. Flat store + realpath require a
+        // complete package-local node_modules; gating on persistLock left packages
+        // extracted by `cno run` permanently incomplete.
         const key = `${name}@${ver}`;
         if (this.dependenciesChecked.has(key)) return;
         this.dependenciesChecked.add(key);
@@ -1084,6 +1239,84 @@ export class NpmHandler implements ProtocolHandler {
     ): Flow<void> {
         const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress);
         this.linkDependency(parentDir, name, dep.dir);
+    }
+
+    /**
+     * peerDependencies are not on the static import graph. Flat store packages
+     * resolve via realpath, so peers must be linked under the package that
+     * declared them (same as dependencies). Optional peers never fail install.
+     */
+    private *installPeerDeps(
+        dir: string,
+        parentName: string,
+        parentVer: string,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        const pkg = readPkg(dir);
+        const peers = pkg?.peerDependencies;
+        if (!peers) return;
+        const meta = (pkg as { peerDependenciesMeta?: Record<string, { optional?: boolean }> })
+            ?.peerDependenciesMeta;
+        const peerNames = recordKeysForLog(peers);
+        if (!peerNames) return;
+        log.debug('npm', () => `peers for ${parentName}@${parentVer}: ${peerNames}`);
+        const flows: Flow<void>[] = [];
+        for (const peerName in peers) {
+            const range = peers[peerName]!;
+            const optional = meta?.[peerName]?.optional === true;
+            flows.push(this.installPeerDependency(
+                dir, parentName, parentVer, peerName, range, optional, onProgress,
+            ));
+        }
+        yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
+    }
+
+    private *installPeerDependency(
+        parentDir: string,
+        parentName: string,
+        parentVer: string,
+        name: string,
+        range: string,
+        optional: boolean,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        // Optional peers: only link if already in the store — never fetch new trees.
+        if (optional) {
+            const local = this.findLocal(name, `npm:${parentName}@${parentVer}`)
+                ?? this.findCachedPackageMatching(name, range);
+            if (local) this.linkDependency(parentDir, name, local);
+            return;
+        }
+        try {
+            const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress);
+            this.linkDependency(parentDir, name, dep.dir);
+        } catch (e) {
+            // Unmet required peers are warnings in npm; do not fail the install tree.
+            log.debug('npm', () => `peer skipped: ${name} (${e instanceof Error ? e.message : String(e)})`);
+            const local = this.findCachedPackageMatching(name, range);
+            if (local) this.linkDependency(parentDir, name, local);
+        }
+    }
+
+    /** Prefer an already-extracted store package that satisfies `range`. */
+    private findCachedPackageMatching(name: string, range: string): string | null {
+        const locked = this.lockedVersionForRange(name, range);
+        if (locked) {
+            const dir = joinPaths(this.cacheDir, `${name}@${locked}`);
+            if (fs.exists(joinPaths(dir, 'package.json'))) return dir;
+        }
+        if (isExactSemver(range)) {
+            const dir = joinPaths(this.cacheDir, `${name}@${range}`);
+            if (fs.exists(joinPaths(dir, 'package.json'))) return dir;
+        }
+        const alias = joinPaths(this.cacheDir, name);
+        try {
+            if (fs.exists(joinPaths(alias, 'package.json'))) {
+                const pkg = readPkg(alias);
+                if (localPackageMatchesRange(pkg?.version, range)) return fs.realpath(alias);
+            }
+        } catch {}
+        return null;
     }
 
     /** Try to install each optionalDependency. Failures are non-fatal (platform mismatch, etc). */
@@ -1212,12 +1445,7 @@ export class NpmHandler implements ProtocolHandler {
         }
     }
 
-    // package.json is written last, once every other file has landed on disk —
-    // ensureInstalled() treats "package.json exists" as "fully installed", and
-    // concurrent scan workers race to check immediately after it becomes true.
-    // Writing it eagerly (in tarball order) lets a worker see "installed" while
-    // sibling files (e.g. a relative-import target) are still mid-extraction,
-    // which permanently poisons the resolver's negative file-existence cache.
+    // package.json last: earlier = false "installed" + poisoned negative cache.
     private *writeArchive(dir: string, files: TarFile[]): Flow<void> {
         const archiveRoot = this.detectArchiveRoot(files);
         const seen = new Set<string>();

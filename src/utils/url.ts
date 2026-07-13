@@ -15,7 +15,6 @@ const percentEncode = (str: string, encodeSet: RegExp): string => {
     });
 };
 
-
 const percentDecode = (str: string): string => {
     return str.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => {
         return String.fromCharCode(parseInt(hex, 16));
@@ -49,9 +48,7 @@ function requireArguments(name: string, actual: number, required: number): void 
 }
 
 const normalizeWindowsPath = (path: string): string => {
-    // C:\aaa\bbb -> C:/aaa/bbb
-    // /C:\aaa -> C:/aaa
-    // /C:/aaa -> C:/aaa
+    // Normalize Windows paths to C:/…
 
     path = path.replace(/\\/g, '/');
 
@@ -67,9 +64,6 @@ const normalizeWindowsPath = (path: string): string => {
 
     return path;
 };
-
-
-// ==================== URLSearchParams ====================
 
 class URLSearchParams {
     #params: Array<[string, string]> = [];
@@ -255,7 +249,6 @@ class URLSearchParams {
         }
     }
 
-
     [Symbol.iterator](): IterableIterator<[string, string]> {
         return this.entries();
     }
@@ -276,7 +269,7 @@ class URLSearchParams {
     _getParams(): Array<[string, string]> {
         return [...this.#params];
     }
-    
+
     get [Symbol.toStringTag]() {
         return 'URLSearchParams';
     }
@@ -333,7 +326,6 @@ export class URL {
     #parse(input: string, base?: string | URL): void {
         input = String(input).trim();
 
-        // Standard URL parsing
         const baseUrl = base ? (typeof base === 'string' ? new URL(base) : base as URL) : null;
 
         // Handle special formats (only when there is no base URL)
@@ -349,14 +341,12 @@ export class URL {
             }
         }
 
-        // Extract fragment
         const fragmentIndex = input.indexOf('#');
         if (fragmentIndex !== -1) {
             this.#fragment = input.slice(fragmentIndex + 1);
             input = input.slice(0, fragmentIndex);
         }
 
-        // Extract query
         const queryIndex = input.indexOf('?');
         if (queryIndex !== -1) {
             this.#hasQuery = true;
@@ -364,7 +354,6 @@ export class URL {
             input = input.slice(0, queryIndex);
         }
 
-        // Parse scheme
         const schemeMatch = input.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
         if (schemeMatch) {
             this.#scheme = schemeMatch[1]!.toLowerCase();
@@ -378,7 +367,6 @@ export class URL {
             throw new TypeError('Invalid URL: no scheme');
         }
 
-        // Special scheme handling
         const isSpecial = this.#scheme in SPECIAL_SCHEMES;
 
         // Parse authority
@@ -522,8 +510,6 @@ export class URL {
             this.#path.push('');
         }
     }
-
-    // ==================== Getters ====================
 
     get href(): string {
         return this.toString();
@@ -714,8 +700,6 @@ export class URL {
             FRAGMENT_ENCODE_SET
         );
     }
-
-    // ==================== Methods ====================
 
     toString(): string {
         let result = this.#scheme + ':';

@@ -19,10 +19,8 @@ import { guessFileKind, applyAttrType } from './protocols/base';
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 
-// ---------------------------------------------------------------------------
 // protoOf — extract protocol prefix without regex
 // Returns '' for relative/absolute paths, 'http' for 'http://...', etc.
-// ---------------------------------------------------------------------------
 
 function protoOf(s: string): string {
     const ci = s.indexOf(':');
@@ -36,7 +34,44 @@ function protoOf(s: string): string {
     return proto;
 }
 
+/** Skip empty-prefix aliases when spec is already a real absolute/drive path. */
+function isRealAbsolutePath(spec: string): boolean {
+    if (!spec) return false;
+    if (spec.length >= 3) {
+        const c0 = spec.charCodeAt(0);
+        const alpha = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122);
+        if (alpha && spec.charCodeAt(1) === 58 /* : */) {
+            const sep = spec.charCodeAt(2);
+            if (sep === 47 || sep === 92) return true;
+        }
+    }
+    if (spec.charCodeAt(0) !== 47 /* / */) return false;
+    try {
+        return fs.exists(spec);
+    } catch {
+        return false;
+    }
+}
+
+function isFilesystemLocalPath(spec: string): boolean {
+    if (!spec) return false;
+    if (spec.charCodeAt(0) === 47 /* / */) return true;
+    // Windows drive: C:\ or C:/
+    if (spec.length >= 3) {
+        const c0 = spec.charCodeAt(0);
+        const alpha = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122);
+        if (alpha && spec.charCodeAt(1) === 58 /* : */) {
+            const sep = spec.charCodeAt(2);
+            if (sep === 47 || sep === 92) return true;
+        }
+    }
+    return false;
+}
+
+// Strip URL query/fragment only. Absolute filesystem paths may contain a
+// real directory named "#" (es5-ext); never treat that as a fragment.
 function splitLocalSpecifier(spec: string): { path: string; suffix: string } {
+    if (isFilesystemLocalPath(spec)) return { path: spec, suffix: '' };
     const query = spec.indexOf('?');
     const hash = spec.indexOf('#');
     const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
@@ -44,10 +79,6 @@ function splitLocalSpecifier(spec: string): { path: string; suffix: string } {
         ? { path: spec, suffix: '' }
         : { path: spec.slice(0, cut), suffix: spec.slice(cut) };
 }
-
-// ---------------------------------------------------------------------------
-// Precomputed index structures
-// ---------------------------------------------------------------------------
 
 interface ImportMapIndex {
     exact:    Map<string, string>;
@@ -92,10 +123,6 @@ function buildAliasIndex(aliases: Record<string, string[]>, baseUrl?: string): P
     }
     return entries;
 }
-
-// ---------------------------------------------------------------------------
-// ModuleResolver
-// ---------------------------------------------------------------------------
 
 export class ModuleResolver {
     private readonly handlers    = new Map<string, ProtocolHandler>();
@@ -165,10 +192,8 @@ export class ModuleResolver {
         return moduleRef(info);
     }
 
-    // -------------------------------------------------------------------------
     // Async resolution — used by DepScanner during precache for parallel downloads
     // Falls back to sync resolve when no async handler available (file, data, node).
-    // -------------------------------------------------------------------------
 
     async resolveAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
@@ -177,9 +202,7 @@ export class ModuleResolver {
         const requestSpec = spec;
         if (spec.includes('\\') || spec[1] === ':') spec = canonicalizePath(spec);
 
-        // A pack manifest is the complete authority for imports made by a
-        // packed parent. Resolve the original source specifier before import
-        // maps, lock entries, or protocol handlers can redirect it outside.
+        // pack: parent — resolve original specifier before maps/lock redirect out.
         if (protoOf(parent) === 'pack') {
             const packedSpec = spec.startsWith('node:') || isBuiltinSpecifier(spec)
                 ? (spec.startsWith('node:') ? spec : `node:${spec}`)
@@ -195,7 +218,6 @@ export class ModuleResolver {
         const sourceHit = this.sourceInfoCache.get(sourceKey);
         if (sourceHit) return sourceHit;
 
-        // L1
         const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
@@ -209,7 +231,6 @@ export class ModuleResolver {
             return this.publishResolved(requestSpec, mapped, parent, localPreferred, attr, { persistModule: true, persistSource: true });
         }
 
-        // L2
         const proto = protoOf(mapped);
         if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
@@ -243,10 +264,7 @@ export class ModuleResolver {
     private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
         if (isBuiltinSpecifier(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
-        // A packed module's bare imports were already resolved offline at
-        // pack time (see pack/writer.ts's edges table) — everything else
-        // (npm resolution, alias lookups) is meaningless without the real
-        // project directory a packed run doesn't have.
+        // pack: bare imports are offline edges only (no project dir at run).
         if (protoOf(parent) === 'pack') {
             const handler = this.handlers.get('pack');
             if (handler) return runAsync(handler.resolve(spec, parent, attr, onProgress));
@@ -268,23 +286,17 @@ export class ModuleResolver {
         throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
 
-    // -------------------------------------------------------------------------
     // Main resolution — three-level cache
-    // -------------------------------------------------------------------------
 
     resolve(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
         parent = this.normalizeParentRef(parent);
         const requestSpec = spec;
-        // Normalize Windows backslashes to forward slashes and upper-case the
-        // drive letter so a case-insensitive volume can't split cache keys.
-        // Must happen before import map lookup, protoOf check, and dispatch.
+        // Canonical path before maps/dispatch (drive case + backslashes).
         spec = canonicalizePath(spec);
 
-        // Preserve the exact specifier recorded in manifest.edges. Applying
-        // an import map first can turn a bare edge into npm:/jsr: and escape
-        // to the live dependency cache instead of the packed child.
+        // Keep manifest edge specs; import maps can escape pack to live cache.
         if (protoOf(parent) === 'pack') {
             const packedSpec = spec.startsWith('node:') || isBuiltinSpecifier(spec)
                 ? (spec.startsWith('node:') ? spec : `node:${spec}`)
@@ -424,10 +436,6 @@ export class ModuleResolver {
         return null;
     }
 
-    // -------------------------------------------------------------------------
-    // Dispatch
-    // -------------------------------------------------------------------------
-
     private dispatch(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         const proto = protoOf(spec);
         if (proto) {
@@ -454,8 +462,17 @@ export class ModuleResolver {
             const handler = this.handlers.get(pp);
             if (handler) return runSync(handler.resolve(spec, parent, attr));
         }
-        let base = parent.startsWith('file://') ? parent.slice(7) : parent;
-        base = splitLocalSpecifier(base).path;
+        let base = parent;
+        if (parent.startsWith('file://')) {
+            const raw = parent.slice(7);
+            const query = raw.indexOf('?');
+            // Only a real URL fragment after an encoded path — %23 is a path char.
+            const hash = raw.indexOf('#');
+            const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
+            base = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
+        } else {
+            base = splitLocalSpecifier(base).path;
+        }
         // file:///C:/... → /C:/... → strip leading / before drive letter
         if (hasLeadingSlashDrive(base)) base = base.slice(1);
         // Ensure base is an absolute path for correct relative resolution
@@ -511,9 +528,7 @@ export class ModuleResolver {
         throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
 
-    // -------------------------------------------------------------------------
     // Import map — precomputed O(1) exact + O(k) prefix
-    // -------------------------------------------------------------------------
 
     private applyImportMap(spec: string): string {
         const idx = this.importIndex;
@@ -536,8 +551,12 @@ export class ModuleResolver {
     private applyPathAlias(spec: string): string {
         for (const e of this.aliasIndex) {
             if (e.wildcard) {
-                if (spec === e.prefix || spec.startsWith(e.prefix + '/'))
+                if (spec === e.prefix || spec.startsWith(e.prefix + '/')) {
+                    // Empty prefix ("/*" → "./public/*") also matches real OS
+                    // paths. Keep on-disk absolutes; remap short /asset imports.
+                    if (e.prefix === '' && isRealAbsolutePath(spec)) return spec;
                     return e.target + spec.slice(e.prefix.length);
+                }
             } else if (spec === e.prefix) {
                 return e.target;
             }
@@ -578,9 +597,7 @@ export class ModuleResolver {
         const canonical = this.toCanonicalInfo(info);
         const resolved = this.materializeRuntimeInfo(canonical, attr);
 
-        // Parent-scoped CJS resolves may intentionally choose different
-        // package conditions/format than canonical ESM module identity.
-        // Keep those results in the mode-aware source cache only.
+        // CJS condition/format may differ from ESM identity — mode-aware cache only.
         this.sourceInfoCache.set(sourceKey, resolved);
         this.rememberRuntimeInfo(resolved);
 

@@ -119,7 +119,7 @@ cts/
 
 **`cno run <entry>`**: Create resolver + compiler → install engine.onModule hooks → QuickJS calls resolve/load/init per import → source transformed and compiled on demand (no DepScanner unless `--precache`).
 
-**`cno pack <entry>`**: DepScanner `fullGraph` + ImportScanner → classify relocatable identities → compile under `pack:` ids → validate manifest/ranges → stream an atomic `.jspack`. Running it validates and extracts bundled bytes, registers `PackHandler`, then resolves only through recorded edges.
+**`cno pack <entry>`**: DepScanner `fullGraph` + ImportScanner (JS/TS + WASM import modules) → classify relocatable identities → build offline `edges` from scan `resolutions` only → compile under `pack:` ids → validate manifest/ranges → stream an atomic `.jspack`. Running it maps the container, registers `PackHandler`, then resolves only through recorded edges.
 
 ## Layer Responsibilities
 

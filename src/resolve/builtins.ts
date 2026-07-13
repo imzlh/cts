@@ -7,10 +7,7 @@ export const BUILTINS = new Set([
     'wasi','worker_threads','zlib',
 ]);
 
-// Node only recognizes a fixed allowlist of dual-mode "module/subpath" builtins.
-// Anything else with a slash (e.g. "string_decoder/", "fs/utils") is NOT a builtin —
-// old npm packages append a trailing slash specifically to bypass the core module
-// and force resolution to the userland node_modules package of the same name.
+// Only fixed dual builtins; "fs/utils" or "string_decoder/" are userland (slash bypass).
 const BUILTIN_SUBPATHS = new Set([
     'fs/promises', 'dns/promises', 'stream/promises', 'stream/web', 'stream/consumers',
     'timers/promises', 'readline/promises', 'util/types',

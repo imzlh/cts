@@ -28,9 +28,7 @@ export class ResourceManager {
     get released(): boolean { return this.done; }
 }
 
-/**
- * Create a ResourceManager with standard pre-cache cleanups registered.
- */
+/** ResourceManager with standard pre-cache cleanups. */
 export function createResourceManager(): ResourceManager {
     const mgr = new ResourceManager();
 
@@ -54,7 +52,5 @@ export function createResourceManager(): ResourceManager {
     return mgr;
 }
 
-// Module-level singleton for process-level cleanup (used by src/main.ts).
-// Each TypeScriptRuntime creates its own instance; this one is for
-// process exit cleanup when no runtime reference is available.
+// Process-exit cleanup singleton when no TypeScriptRuntime is held.
 export const resources = createResourceManager();

@@ -11,9 +11,7 @@ const console = import.meta.use('console');
 const fs = import.meta.use('fs');
 const process = import.meta.use('process');
 
-// ---------------------------------------------------------------------------
 // deno.json task schema
-// ---------------------------------------------------------------------------
 
 type TaskDef = string | {
     command: string;
@@ -35,9 +33,7 @@ interface LoadTasksOptions {
     initCwd?: string;
 }
 
-// ---------------------------------------------------------------------------
 // Bin resolver — resolves command names to executable paths
-// ---------------------------------------------------------------------------
 
 export interface ResolvedBin {
     /** Absolute path to the JS entry file (runnable by cts directly) */
@@ -59,20 +55,7 @@ export class BinResolver {
         this.cacheDir = opts.cacheDir;
     }
 
-    /**
-     * Resolve a binary name to a runnable JS entry path.
-     * Priority: local node_modules/.bin > lock bin index.
-     * Returns null if name looks like a path or flag, or if the binary cannot be found.
-     *
-     * When possible, parses .cmd/.bat/shell wrappers to extract the real JS
-     * entry so it can be run directly by the cts runtime.
-     *
-     * `opts.global` (used by `cno exec`) skips all cwd-scoped lookups (local
-     * node_modules/.bin, this project's lock bin index, this project's
-     * package.json deps) and resolves purely against the shared `~/.cts/npm`
-     * cache, the same as an explicit `npm:<name>` spec — pnpm-dlx/pnpx style,
-     * independent of which directory you run it from.
-     */
+    /** Bin → JS entry; opts.global uses only ~/.cts/npm (no cwd). */
     resolve(name: string, cwd: string, opts?: { global?: boolean }): ResolvedBin | null {
         if (name.startsWith('npm:')) return this.resolveNpmSpecifierBin(name);
         if (name.startsWith('/') || name.startsWith('.') || name.includes('/')) return null;
@@ -217,20 +200,21 @@ export class BinResolver {
         if (fs.exists(absPath)) matches.push({ version: String(pkg.version ?? '0.0.0'), path: absPath });
     }
 
-    /**
-     * Given a bin path (from node_modules/.bin or lock), try to extract the
-     * real JS entry file from wrapper scripts.  Falls back to running the
-     * bin through cmd.exe / sh if the wrapper can't be parsed.
-     */
+    /** Unwrap .cmd/sh bin to JS entry; else run via shell. */
     private resolveEntry(binPath: string): ResolvedBin {
-        const normPath = toPosixPath(binPath);
-        const isNodeModulesBin = normPath.includes('/node_modules/.bin/');
+        // Symlinked bins (soft store / node_modules/.bin → ~/.cts/npm/…) must
+        // resolve relative requires against the real package dir, not the link.
+        let realBin = toPosixPath(binPath);
+        try {
+            if (fs.exists(binPath)) realBin = toPosixPath(fs.realpath(binPath));
+        } catch { /* keep original */ }
+        const isNodeModulesBin = toPosixPath(binPath).includes('/node_modules/.bin/');
 
         if (isNodeModulesBin) {
             if (this.isWin) {
                 // Find the .cmd/.bat file
                 let cmdPath: string | null = null;
-                if (normPath.toLowerCase().endsWith('.cmd') || normPath.toLowerCase().endsWith('.bat')) {
+                if (realBin.toLowerCase().endsWith('.cmd') || realBin.toLowerCase().endsWith('.bat')) {
                     cmdPath = binPath;
                 } else {
                     for (const ext of WIN_BIN_EXTS) {
@@ -240,18 +224,22 @@ export class BinResolver {
                 }
                 if (cmdPath) {
                     const entry = resolveWinBinEntry(cmdPath);
-                    if (entry) return { entry, binPath: cmdPath, fallback: false, reason: 'win-cmd-entry' };
+                    if (entry) return { entry: realpathQuiet(entry), binPath: cmdPath, fallback: false, reason: 'win-cmd-entry' };
                     // Can't parse the .cmd — fall back to cmd.exe
                     return { entry: cmdPath, binPath: cmdPath, fallback: true, reason: 'unparsed-win-cmd' };
                 }
                 // No .cmd/.bat found for this node_modules/.bin entry —
                 // the extensionless file might be a raw JS script with a shebang
                 const entry = resolveUnixBinEntry(binPath);
-                if (entry) return { entry, binPath, fallback: false, reason: 'win-posix-shim-entry' };
+                if (entry) return { entry: realpathQuiet(entry), binPath, fallback: false, reason: 'win-posix-shim-entry' };
             } else {
                 // Unix: parse shebang / wrapper for real JS entry
                 const entry = resolveUnixBinEntry(binPath);
-                if (entry) return { entry, binPath, fallback: false, reason: 'unix-shim-entry' };
+                if (entry) return { entry: realpathQuiet(entry), binPath, fallback: false, reason: 'unix-shim-entry' };
+                // Direct symlink to package bin (no wrapper text) — use realpath.
+                if (realBin.toLowerCase().endsWith('.js') || realBin.toLowerCase().endsWith('.mjs') || realBin.toLowerCase().endsWith('.cjs')) {
+                    return { entry: realBin, binPath, fallback: false, reason: 'unix-symlink-js' };
+                }
                 // Wrapper couldn't be parsed — mark as fallback
                 return { entry: binPath, binPath, fallback: true, reason: 'unparsed-unix-shim' };
             }
@@ -259,17 +247,24 @@ export class BinResolver {
 
         // Lock/cache bin path (not in node_modules/.bin) — try to resolve JS entry
         // from the path itself (it might be a direct JS file or node shebang).
-        if (normPath.toLowerCase().endsWith('.js') || normPath.toLowerCase().endsWith('.mjs') || normPath.toLowerCase().endsWith('.cjs')) {
-            return { entry: binPath, binPath, fallback: false, reason: 'direct-js' };
+        if (realBin.toLowerCase().endsWith('.js') || realBin.toLowerCase().endsWith('.mjs') || realBin.toLowerCase().endsWith('.cjs')) {
+            return { entry: realBin, binPath, fallback: false, reason: 'direct-js' };
         }
         if (!this.isWin) {
             const entry = resolveUnixBinEntry(binPath);
-            if (entry) return { entry, binPath, fallback: false, reason: 'direct-node-shebang' };
+            if (entry) return { entry: realpathQuiet(entry), binPath, fallback: false, reason: 'direct-node-shebang' };
         }
 
         // Unknown — run as-is, likely will fallback to cmd.exe or chmod
-        return { entry: binPath, binPath, fallback: true, reason: 'unknown-non-js' };
+        return { entry: realBin, binPath, fallback: true, reason: 'unknown-non-js' };
     }
+}
+
+function realpathQuiet(path: string): string {
+    try {
+        if (fs.exists(path)) return toPosixPath(fs.realpath(path));
+    } catch { /* keep original */ }
+    return toPosixPath(path);
 }
 
 function env(k: string): string | null {
@@ -428,10 +423,7 @@ function findCachedBinInDeps(
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// Deno flag stripping
 // All deno-specific flags that have no cts equivalent are dropped.
-// ---------------------------------------------------------------------------
 
 // Flags that consume the next token as a value
 const DENO_VALUE_FLAGS = new Set([
@@ -455,10 +447,7 @@ const DENO_BOOL_FLAGS = new Set([
     '--frozen',
 ]);
 
-/**
- * Given the tokens after `deno run`, return [entryFile, ...args]
- * with all deno-specific flags stripped.
- */
+/** After `deno run`: [entry, ...args] with deno flags stripped. */
 function stripDenoRunFlags(tokens: string[]): string[] {
     const out: string[] = [];
     let i = 0;
@@ -490,15 +479,7 @@ function stripDenoRunFlags(tokens: string[]): string[] {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Environment variable expansion
-// ---------------------------------------------------------------------------
-
-/**
- * Expand $VAR and ${VAR} in a string using the given env.
- * $$ is escaped as a literal $ (shell convention).
- * $ followed by non-identifier characters (e.g. $/foo) is left as-is.
- */
+/** Expand $VAR / ${VAR}; $$ → $; bare $ left as-is. */
 function expandVars(s: string, env: Record<string, string>): string {
     return s.replace(/\$(\$|\{(\w+)\}|(\w+))/g, (_, esc, braced, bare) => {
         if (esc === '$') return '$';
@@ -551,9 +532,20 @@ function shellEnv(env: Record<string, string>, cwd: string): Record<string, stri
         }
     }
     const sep = isWindows ? ';' : ':';
-    const localBin = joinPaths(cwd, 'node_modules', '.bin');
+    // Walk up like npm: every ancestor node_modules/.bin for monorepos / nested tasks.
+    let pathPrefix = '';
+    let dir = toPosixPath(cwd);
+    const root = pathRoot(dir);
+    while (true) {
+        const bin = joinPaths(dir, 'node_modules', '.bin');
+        pathPrefix = pathPrefix ? `${pathPrefix}${sep}${bin}` : bin;
+        if (dir === root) break;
+        const up = dirname(dir);
+        if (up === dir) break;
+        dir = up;
+    }
     const current = merged[pathKey] ?? '';
-    return { ...env, PWD: cwd, [pathKey]: current ? `${localBin}${sep}${current}` : localBin };
+    return { ...env, PWD: cwd, [pathKey]: current ? `${pathPrefix}${sep}${current}` : pathPrefix };
 }
 
 function shellArgv(script: string): string[] {
@@ -574,17 +566,7 @@ function segmentCommand(bin: string, args: string[]): string {
     return `${quoteShellArg(bin)} ${joinQuotedArgs(args)}`;
 }
 
-// ---------------------------------------------------------------------------
-// Command parsing and execution
-// ---------------------------------------------------------------------------
-
-/**
- * Execute a command string.
- * - `deno run [flags] <file> [args]` → re-invoke cts
- * - `deno task <name>` → re-invoke cts task
- * - Shell-only syntax → run through the platform shell
- * - Plain commands → resolve each segment via BinResolver, fail if not found
- */
+/** Run command string: deno run/task → cts; shell ops → shell; else BinResolver. */
 async function execCommand(
     cmd: string,
     env: Record<string, string>,
@@ -626,7 +608,6 @@ async function execCommand(
             return execTask([...seg.args.slice(1), ...extraArgs], env, cwd, forwardedArgs);
         }
 
-        // Try resolve as bin
         const resolved = resolver.resolve(seg.bin, cwd);
         if (resolved) {
             return execBinary(resolved, allArgs, env, cwd);
@@ -635,11 +616,7 @@ async function execCommand(
         return rawExec(shellArgv(shellCommand(expanded, extraArgs)), shellEnv(env, cwd), cwd);
     }
 
-    // Multi-segment pipeline: op is on the segment BEFORE the operator.
-    // seg.op === '&&': run next only if this succeeds; bail on failure
-    // seg.op === '||': run next only if this fails; skip next on success
-    // seg.op === ';':  always run next regardless of exit code
-    // seg.op === undefined: last segment; unsupported shell ops handled above
+    // Pipeline: && / || / ; on previous segment (unsupported ops already rejected).
     let prevCode = 0;
     for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
@@ -707,7 +684,9 @@ function chmodExecutableQuietly(path: string): void {
 }
 
 async function execBinary(resolved: ResolvedBin, args: string[], env: Record<string, string>, cwd: string): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
+    // Nested tools (npm-run-all → vue-tsc) resolve via PATH; keep .bin first.
+    const pathEnv = shellEnv(env, cwd);
+    const mergedEnv = { ...os.environ(), ...pathEnv, PWD: cwd };
     const isWin = isWindows;
 
     log.debug('task', () => `exec bin: entry=${resolved.entry} binPath=${resolved.binPath} fallback=${resolved.fallback} reason=${resolved.reason ?? ''}`);
@@ -740,10 +719,6 @@ async function rawExec(argv: string[], env: Record<string, string>, cwd: string)
         return 1;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Task graph
-// ---------------------------------------------------------------------------
 
 export class TaskRunner {
     private readonly tasks: Record<string, TaskDef>;
@@ -899,10 +874,6 @@ export class TaskRunner {
         return execCommand(script, env, this.cwd, extraArgs, this.resolver, this.forwardedArgs);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 function taskRunnerForConfig(
     configPath: string,

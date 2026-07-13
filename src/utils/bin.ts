@@ -6,12 +6,7 @@ const fs = import.meta.use('fs');
 /** Windows wrapper extensions, checked in preference order. */
 export const WIN_BIN_EXTS = ['.cmd', '.CMD', '.bat', '.BAT'];
 
-/**
- * Walk up from `cwd` looking for `node_modules/.bin/<name>`.
- * On Windows, also checks `.cmd` / `.BAT` wrappers (preferred over bare shims).
- *
- * Returns the first match found, or null.
- */
+/** Walk up for node_modules/.bin/<name> (.cmd/.BAT preferred on Windows). */
 export function findLocalBin(name: string, cwd: string): string | null {
     let dir = toPosixPath(cwd);
     const root = pathRoot(dir);

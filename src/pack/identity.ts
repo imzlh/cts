@@ -1,7 +1,4 @@
-/**
- * Synthetic pack module identities (relocatable pack:/… and attribute views).
- * Kept separate from writer orchestration for review and unit testing.
- */
+/** Synthetic pack:/… and attribute-view identities. */
 
 import { moduleViewRef, type FileKind } from '../types';
 import { guessFileKind } from '../resolve/protocols/base';
