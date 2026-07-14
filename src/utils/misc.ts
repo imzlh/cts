@@ -23,14 +23,16 @@ export function hashString(s: string): string {
     return h.toString(16).padStart(8, '0');
 }
 
-/** Build a stable cache filename from a URL, preserving path structure and extension. */
+/** Build a stable cache filename from a URL; ext from path, hash includes query. */
 export function cacheFilename(url: string): string {
     try {
         const u = new URL(url);
-        let pathname = u.pathname;
-        const dirHash = hashString(pathname).slice(0, 8);
+        const pathname = u.pathname;
+        // Query/hash change content identity (CDN ?v=); path alone collides.
+        const key = pathname + (u.search || '') + (u.hash || '');
+        const dirHash = hashString(key).slice(0, 8);
         const name = extname(pathname) || '.js';
-        return `${dirHash}${name}`
+        return `${dirHash}${name}`;
     } catch {
         return hashString(url);
     }
@@ -159,6 +161,34 @@ function comparatorRange(r: string): [string, string] | null {
     return [op, r.slice(start)];
 }
 
+function numericRangeParts(r: string): number {
+    let parts = 0;
+    let hasDigit = false;
+    for (let i = 0; i < r.length; i++) {
+        const c = r.charCodeAt(i);
+        if (c >= 48 && c <= 57) {
+            hasDigit = true;
+            continue;
+        }
+        if (c === 46 && hasDigit) {
+            parts++;
+            hasDigit = false;
+            continue;
+        }
+        break;
+    }
+    return parts + (hasDigit ? 1 : 0);
+}
+
+function caretUpperBound(r: string): string {
+    const [major, minor, patch] = pad(r);
+    if (major > 0) return `${major + 1}.0.0`;
+    const parts = numericRangeParts(r);
+    if (parts < 2) return '1.0.0';
+    if (minor > 0 || parts < 3) return `0.${minor + 1}.0`;
+    return `0.0.${patch + 1}`;
+}
+
 export function compareVersions(a: string, b: string): number {
     const [a0, a1, a2, ap] = pad(a), [b0, b1, b2, bp] = pad(b);
     const d = a0 - b0 || a1 - b1 || a2 - b2;
@@ -187,10 +217,8 @@ function satisfies(ver: string, range: string, includePrerelease = rangeHasPrere
     if (isOneOrTwoPartNumericRange(r)) r += '.x';
     if (isExactVersionRange(r)) return compareVersions(ver, r) === 0;
     if (r.startsWith('^')) {
-        const [M, m, p] = pad(r.slice(1));
-        const lo = `${M}.${m}.${p}`;
-        const hi = M > 0 ? `${M + 1}.0.0` : `0.${m + 1}.0`;
-        return compareVersions(ver, r.slice(1)) >= 0 && compareVersions(ver, hi) < 0;
+        const base = r.slice(1);
+        return compareVersions(ver, base) >= 0 && compareVersions(ver, caretUpperBound(base)) < 0;
     }
     if (r.startsWith('~')) {
         const [M, m, p] = pad(r.slice(1));

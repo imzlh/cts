@@ -57,6 +57,7 @@ export class Transformer {
         const kind = sourceKind(filename, lang);
         switch (kind) {
             case KIND_TS:
+            case KIND_CTS:
             case KIND_TSX:
             case KIND_JSX: {
                 const oxc = this.getOxc();
@@ -68,7 +69,14 @@ export class Transformer {
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
-                return this.run(code, filename, kind !== KIND_JSX, kind !== KIND_TS, mapKey);
+                // .cts keeps TS strip + unused imports (CJS require/exports intact).
+                return this.run(
+                    code, filename,
+                    kind !== KIND_JSX,
+                    kind === KIND_TSX || kind === KIND_JSX,
+                    mapKey,
+                    kind === KIND_CTS,
+                );
             }
             case KIND_JSON: return `export default ${code};`;
             default:
@@ -83,6 +91,7 @@ export class Transformer {
         const kind = sourceKind(filename, lang);
         switch (kind) {
             case KIND_TS:
+            case KIND_CTS:
             case KIND_TSX:
             case KIND_JSX: {
                 const oxc = this.getOxc();
@@ -94,7 +103,12 @@ export class Transformer {
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
-                return this.runCapture(code, filename, kind !== KIND_JSX, kind !== KIND_TS, mapKey);
+                return this.runCapture(
+                    code, filename,
+                    kind !== KIND_JSX,
+                    kind === KIND_TSX || kind === KIND_JSX,
+                    mapKey,
+                );
             }
             case KIND_JSON: return { code: `export default ${code};` };
             default:
@@ -107,6 +121,7 @@ export class Transformer {
         const kind = sourceKind(filename, lang);
         switch (kind) {
             case KIND_TS:
+            case KIND_CTS:
             case KIND_TSX:
             case KIND_JSX:
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) return null;
@@ -128,6 +143,7 @@ export class Transformer {
         const kind = sourceKind(filename, lang);
         switch (kind) {
             case KIND_TS:
+            case KIND_CTS:
             case KIND_TSX:
             case KIND_JSX: {
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
@@ -145,7 +161,13 @@ export class Transformer {
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
-                return this.run(engine.decodeString(bytes), filename, kind !== KIND_JSX, kind !== KIND_TS, mapKey);
+                return this.run(
+                    engine.decodeString(bytes), filename,
+                    kind !== KIND_JSX,
+                    kind === KIND_TSX || kind === KIND_JSX,
+                    mapKey,
+                    kind === KIND_CTS,
+                );
             }
             case KIND_JSON: return `export default ${engine.decodeString(bytes)};`;
             default:
@@ -242,13 +264,16 @@ export class Transformer {
 
 export function isPassthroughSource(filename: string): boolean {
     const kind = sourceKind(filename);
-    return kind !== KIND_TS && kind !== KIND_TSX && kind !== KIND_JSX && kind !== KIND_JSON;
+    // .cts needs TS strip (transformForCjs / transform); not plain JS passthrough.
+    return kind !== KIND_TS && kind !== KIND_CTS && kind !== KIND_TSX
+        && kind !== KIND_JSX && kind !== KIND_JSON;
 }
 
 function sourceKind(filename: string, lang?: string): number {
     if (lang) {
         switch (lang) {
-            case 'ts': return KIND_TS;
+            case 'ts':
+            case 'mts': return KIND_TS;
             case 'tsx': return KIND_TSX;
             case 'jsx': return KIND_JSX;
             case 'cts': return KIND_CTS;
@@ -293,7 +318,8 @@ function sourceKind(filename: string, lang?: string): number {
 
 function oxcLang(kind: number): string {
     switch (kind) {
-        case KIND_TS: return 'ts';
+        case KIND_TS:
+        case KIND_CTS: return 'ts';
         case KIND_TSX: return 'tsx';
         case KIND_JSX: return 'jsx';
         default: return 'js';

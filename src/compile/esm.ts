@@ -11,13 +11,19 @@ function metaLang(meta: Record<string, unknown>): string | undefined {
     return typeof meta.lang === 'string' ? meta.lang : undefined;
 }
 
-/** .ts / .mts / .tsx / .jsx — extension only (works for pack:/name.ts keys). */
+/** .ts / .mts / .cts / .tsx / .jsx — extension only (works for pack:/name.ts keys). */
 function isTransformSourcePath(path: string): boolean {
     const length = path.length;
     if (length < 3) return false;
     const last = path.charCodeAt(length - 1);
     if (last === 115) {
-        return path.charCodeAt(length - 2) === 116 && path.charCodeAt(length - 3) === 46;
+        if (path.charCodeAt(length - 2) !== 116) return false;
+        const third = path.charCodeAt(length - 3);
+        if (third === 46) return true;
+        // .mts / .cts
+        return length >= 4 &&
+            (third === 109 || third === 99) &&
+            path.charCodeAt(length - 4) === 46;
     }
     if (last !== 120 || length < 4) return false;
     const prev = path.charCodeAt(length - 2);

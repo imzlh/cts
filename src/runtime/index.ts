@@ -8,12 +8,18 @@ import { ParseDriver } from '../parse';
 import { ModuleResolver } from '../resolve/index';
 import { LockStore } from '../lock';
 import { materializeNodeModules } from '../resolve/linker';
-import { guessFileKind } from '../resolve/protocols/base';
+import { guessFileKind, isTypeDecl } from '../resolve/protocols/base';
 import { isRemote } from '../source/cache';
 import type { FileKind, ModuleFormat, ModuleInfo, NodeBuiltinResolver, RuntimeConfig } from '../types';
-import { PrecacheProgress, clearNegativeCache, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
+import { PrecacheProgress, clearNegativeCache, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, npmNameVersion, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
 import { installEngineHooks, type EngineHooks } from './hooks';
-import { planLifecycleScript, resolveLifecycleCommandArgv, runLifecyclePlan, type LifecycleCommand } from './lifecycle';
+import {
+    planLifecycleScript,
+    resolveLifecycleCommandArgv,
+    runLifecyclePlan,
+    type LifecycleCommand,
+    type LifecycleSession,
+} from './lifecycle';
 import { fillMeta } from './meta';
 import { ResourceManager, createResourceManager } from './resources';
 
@@ -79,8 +85,30 @@ function envPathKey(env: Record<string, string>): string {
     return 'Path';
 }
 
-function lifecyclePathValue(cwd: string, existing: string, sep: string): string {
+/** Dir with `node` → os.exePath so shell/nested spawns find a Node-compatible binary. */
+let lifecycleNodeShimDir: string | null = null;
+
+function ensureLifecycleNodeShim(exePath: string): string | null {
+    if (lifecycleNodeShimDir) return lifecycleNodeShimDir;
+    try {
+        const dir = joinPaths(toPosixPath(os.tmpDir), `cno-lc-node-${os.pid}`);
+        ensureDir(dir);
+        const name = isWindows ? 'node.exe' : 'node';
+        const link = joinPaths(dir, name);
+        try { fs.unlink(link); } catch { /* fresh or missing */ }
+        if (isWindows) fs.symlink(exePath, link, 'file');
+        else fs.symlink(exePath, link);
+        lifecycleNodeShimDir = dir;
+        return dir;
+    } catch (e) {
+        log.warn('lifecycle', () => `node PATH shim failed: ${errMsg(e)}`);
+        return null;
+    }
+}
+
+function lifecyclePathValue(cwd: string, existing: string, sep: string, nodeShimDir?: string | null): string {
     let value = '';
+    if (nodeShimDir) value = nodeShimDir;
     let dir = toPosixPath(cwd);
     const root = pathRoot(dir);
     while (true) {
@@ -107,10 +135,20 @@ function isPrecompilePath(filename: string): boolean {
         filename.charCodeAt(length - 1) === 101) {
         return false;
     }
+    // Type declarations are not runtime modules.
+    if (isTypeDecl(filename)) return false;
     const last = filename.charCodeAt(length - 1);
     if (last === 115) {
         const prev = filename.charCodeAt(length - 2);
-        if (prev === 116) return filename.charCodeAt(length - 3) === 46;
+        // .ts / .mts / .cts
+        if (prev === 116) {
+            const third = filename.charCodeAt(length - 3);
+            if (third === 46) return true;
+            return length >= 4 &&
+                (third === 109 || third === 99) &&
+                filename.charCodeAt(length - 4) === 46;
+        }
+        // .js / .mjs / .cjs
         if (prev !== 106) return false;
         const third = filename.charCodeAt(length - 3);
         return third === 46 ||
@@ -148,21 +186,76 @@ function precompileStubLoader(): {
     };
 }
 
-function lifecycleEnv(cwd: string): Record<string, string> {
-    const env = os.environ();
+/**
+ * Env for one spawn: session map is the full env after export/unset (clone of process
+ * env at script start). Without session, inherit process env. Then PATH shim.
+ */
+function lifecycleEnv(cwd: string, exePath: string, sessionEnv?: Record<string, string>): Record<string, string> {
+    // Session is authoritative so `unset` deletions stick; do not re-merge os.environ().
+    const env: Record<string, string> = sessionEnv
+        ? Object.assign(Object.create(null), sessionEnv)
+        : os.environ();
     const key = envPathKey(env);
     const sep = isWindows ? ';' : ':';
-    env[key] = lifecyclePathValue(cwd, env[key] ?? '', sep);
+    const shim = ensureLifecycleNodeShim(exePath);
+    env[key] = lifecyclePathValue(cwd, env[key] ?? '', sep, shim);
+    env['npm_node_execpath'] = env['npm_node_execpath'] ?? exePath;
+    env['npm_execpath'] = env['npm_execpath'] ?? exePath;
     return env;
 }
 
-async function drainPipe(pipe: CModuleProcess.Pipe | null): Promise<void> {
-    if (!pipe) return;
+/** Clone process env into a mutable session map for export/unset during one script. */
+function newLifecycleSession(cwd: string): LifecycleSession {
+    const env = os.environ();
+    const copy: Record<string, string> = Object.create(null);
+    for (const k in env) copy[k] = env[k]!;
+    return { cwd: toPosixPath(cwd), env: copy };
+}
+
+const LIFECYCLE_STDERR_CAP = 8 * 1024;
+
+async function drainPipe(pipe: CModuleProcess.Pipe | null, capture = false): Promise<string> {
+    if (!pipe) return '';
     const buf = new Uint8Array(64 * 1024);
+    if (!capture) {
+        for (;;) {
+            const n = await pipe.read(buf);
+            if (n === 0) return '';
+        }
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
     for (;;) {
         const n = await pipe.read(buf);
-        if (n === 0) return;
+        if (n === 0) break;
+        if (total < LIFECYCLE_STDERR_CAP) {
+            const take = Math.min(n, LIFECYCLE_STDERR_CAP - total);
+            chunks.push(buf.slice(0, take));
+            total += take;
+        }
     }
+    if (!chunks.length) return '';
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+        out.set(c, off);
+        off += c.length;
+    }
+    try {
+        return engine.decodeString(out).replace(/\s+$/, '');
+    } catch {
+        return '';
+    }
+}
+
+function formatLifecycleDiag(argv: string[], code: number, stderr: string): string {
+    const cmd = argv.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ');
+    let msg = `command: ${cmd} (exit ${code})`;
+    if (stderr) {
+        const tail = stderr.length > 2000 ? `…${stderr.slice(-2000)}` : stderr;
+        msg += `\n${tail}`;
+    }
+    return msg;
 }
 
 /** Nearest ancestor of `start` containing a project manifest, or undefined. */
@@ -345,12 +438,20 @@ export class TypeScriptRuntime {
         projectDir: string,
     ): Promise<ScanResult> {
         const prog = this.config.silent ? null : new PrecacheProgress(6);
-        // Import scan is main-thread oxc-first (ImportScanner inside DepScanner).
-        // Transform workers are only created for the compile phase below.
         const oxc = this.getOxc();
+        // oxc scan is sync on main (ImportScanner); workers only help Sucrase fallback.
+        // Keep ParseDriver alive for the transform phase either way.
         const parseDriver = new ParseDriver(oxc);
-        const scanner = new DepScanner(this.resolver, this.config, prog, oxc);
-        log.debug('precache', () => `pipeline: scan=${oxc ? 'oxc' : 'sucrase'}, transform=${oxc ? 'oxc+workers' : 'sucrase+workers'}`);
+        const scanner = new DepScanner(
+            this.resolver,
+            this.config,
+            prog,
+            oxc,
+            oxc ? null : parseDriver.scanFile.bind(parseDriver),
+        );
+        log.debug('precache', () =>
+            `pipeline: scan=${oxc ? 'oxc-main' : 'sucrase+workers'}, ` +
+            `transform=${oxc ? 'oxc+workers' : 'sucrase+workers'}, compile=main`);
 
         let result: ScanResult;
         try {
@@ -373,7 +474,18 @@ export class TypeScriptRuntime {
 
         if (this.config.nodeModulesMode !== 'normal') {
             const nodeModulesMode = this.config.nodeModulesMode;
+            // Import scan only installs packages it resolves. Materialize walks
+            // package.json deps/peers — fill those into the store first.
+            log.debug('precache', () => 'ensure install-graph begin');
+            try {
+                await this.resolver.ensureInstallGraph(collectInstallGraphSeeds(result.edges));
+            } catch (e) {
+                // Soft: keep going; materialize still fail-closes on required misses.
+                log.debug('precache', () => `ensure install-graph: ${errMsg(e)}`);
+            }
+            log.debug('precache', () => 'ensure install-graph end');
             log.debug('precache', () => 'materialize node_modules begin');
+            prog?.setActivity(`materialize node_modules (${nodeModulesMode})`);
             try {
                 await materializeNodeModules(
                     result.edges,
@@ -382,6 +494,7 @@ export class TypeScriptRuntime {
                     projectDir,
                     (done, total) => prog?.setLinkProgress(done, total),
                 );
+                prog?.setActivity(null);
             } catch (e) {
                 // Fail closed: --npm-mode=soft|hard promised real node_modules.
                 // Swallowing here printed "✔ N modules cached" after zero links.
@@ -539,57 +652,93 @@ export class TypeScriptRuntime {
         const isWin = isWindows;
         const shell = isWin ? 'cmd.exe' : 'sh';
         const shellArg = isWin ? '/c' : '-c';
+        // Run every deferred script first; report all failures after the batch.
+        const failures: string[] = [];
         for (const { name, version, dir, lifecycle, script } of scripts) {
             log.debug('lifecycle', () => `${lifecycle} ${name}@${version}: ${script}`);
             if (!this.config.silent) {
                 progress?.clearForOutput();
                 console.log(`  ${lifecycle}: ${name}@${version}`);
             }
-            let code: number;
+            let result: { code: number; diag?: string };
             try {
-                code = await this.runLifecycleScript(script, dir, shell, shellArg);
+                result = await this.runLifecycleScript(script, dir, shell, shellArg);
             } catch (e) {
                 const message = `${lifecycle} ${name}@${version} failed: ${errMsg(e)}`;
                 progress?.clearForOutput();
                 log.warn('lifecycle', () => message);
-                throw new Error(message);
+                if (!this.config.silent) console.error(`  ✗ ${message}`);
+                failures.push(message);
+                continue;
             }
-            if (code !== 0) {
-                const message = `${lifecycle} ${name}@${version} exited with code ${code}`;
+            if (result.code !== 0) {
+                const detail = result.diag ? ` — ${result.diag}` : '';
+                const message = `${lifecycle} ${name}@${version} exited with code ${result.code}${detail}`;
                 progress?.clearForOutput();
                 log.warn('lifecycle', () => message);
-                throw new Error(message);
+                if (!this.config.silent) console.error(`  ✗ ${message}`);
+                failures.push(message);
             }
+        }
+        if (failures.length) {
+            progress?.clearForOutput();
+            const summary = failures.length === 1
+                ? failures[0]!
+                : `${failures.length} lifecycle script(s) failed:\n${failures.map((m) => `  - ${m}`).join('\n')}`;
+            throw new Error(summary);
         }
         return scripts.length;
     }
 
-    private async runLifecycleScript(script: string, cwd: string, shell: string, shellArg: string): Promise<number> {
+    private async runLifecycleScript(
+        script: string,
+        cwd: string,
+        shell: string,
+        shellArg: string,
+    ): Promise<{ code: number; diag?: string }> {
         const plan = planLifecycleScript(script, { exePath: os.exePath, shell, shellArg });
-        return runLifecyclePlan(plan, (command) => this.spawnLifecycleCommand(command, cwd));
+        const session = newLifecycleSession(cwd);
+        let lastDiag: string | undefined;
+        const code = await runLifecyclePlan(plan, async (command, sess) => {
+            const r = await this.spawnLifecycleCommand(command, sess);
+            if (r.code !== 0) lastDiag = r.diag;
+            return r.code;
+        }, session);
+        return { code, diag: code !== 0 ? lastDiag : undefined };
     }
 
-    private async spawnLifecycleCommand(command: LifecycleCommand, cwd: string): Promise<number> {
+    private async spawnLifecycleCommand(
+        command: LifecycleCommand,
+        session: LifecycleSession,
+    ): Promise<{ code: number; diag?: string }> {
+        const cwd = session.cwd;
         const argv = resolveLifecycleCommandArgv(command.argv, (name) => this.resolver.resolveBin(name, cwd));
-        log.debug('lifecycle', () => `spawn: ${argv.join(' ')}`);
+        log.debug('lifecycle', () => `spawn cwd=${cwd}: ${argv.join(' ')}`);
         try {
             const child = process.spawn(argv, {
                 cwd,
                 stdin: 'inherit',
                 stdout: 'pipe',
                 stderr: 'pipe',
-                env: lifecycleEnv(cwd),
+                env: lifecycleEnv(cwd, os.exePath, session.env),
             });
-            const stdout = drainPipe(child.stdout);
-            const stderr = drainPipe(child.stderr);
+            const stdout = drainPipe(child.stdout, false);
+            const stderrP = drainPipe(child.stderr, true);
             const info = await child.wait();
-            await Promise.allSettled([stdout, stderr]);
-            return info.exit_status ?? 0;
+            const [, stderr] = await Promise.all([stdout, stderrP]);
+            const code = info.exit_status ?? 0;
+            if (code === 0) return { code: 0 };
+            return { code, diag: formatLifecycleDiag(argv, code, stderr) };
         } catch (e) {
             // Shell-compatible: missing binary is exit 127 so `||` chains continue.
-            const code = (e as { code?: unknown; errno?: unknown })?.code
+            const errno = (e as { code?: unknown; errno?: unknown })?.code
                 ?? (e as { errno?: unknown })?.errno;
-            if (code === 'ENOENT' || code === -2 || /ENOENT/i.test(errMsg(e))) return 127;
+            if (errno === 'ENOENT' || errno === -2 || /ENOENT/i.test(errMsg(e))) {
+                return {
+                    code: 127,
+                    diag: formatLifecycleDiag(argv, 127, `ENOENT: ${errMsg(e)}`),
+                };
+            }
             throw e;
         }
     }
@@ -700,6 +849,27 @@ export class TypeScriptRuntime {
         ].join('\n'));
         throw new SyntaxError(`${source.message} (see ${logPath})`, { cause: e.cause });
     }
+}
+
+/** Seed packages for install-graph ensure (scan roots + npm parents/children). */
+function collectInstallGraphSeeds(
+    edges: ScanResult['edges'],
+): Array<{ name: string; version: string }> {
+    const map = new Map<string, { name: string; version: string }>();
+    const add = (name: string, version: string) => {
+        if (!name || !version) return;
+        const key = `${name}@${version}`;
+        if (!map.has(key)) map.set(key, { name, version });
+    };
+    for (const edge of edges) {
+        if (edge.parentSpecPath.startsWith('npm:')) {
+            const pv = npmNameVersion(edge.parentSpecPath);
+            if (pv) add(pv.name, pv.version);
+        }
+        const cv = npmNameVersion(edge.childSpecPath);
+        if (cv) add(cv.name, cv.version);
+    }
+    return [...map.values()];
 }
 
 export function createRuntime(cfg: Partial<RuntimeConfig> = {}, entryDir?: string): TypeScriptRuntime {

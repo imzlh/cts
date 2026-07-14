@@ -40,11 +40,17 @@ function write(s: string): void {
 }
 
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const PAINT_MS = 200;
 
-// PrecacheProgress — one object for the entire precache lifecycle
-
-const BIG_THRESHOLD = 100 * 1024;
-
+/**
+ * TTY progress for precache/pack.
+ *
+ * Ownership:
+ * - Callers only mutate state (counters, activity, download rows).
+ * - This class owns all paints via a private setInterval.
+ * - Long sync work must yield the event loop elsewhere (`yieldEventLoop`)
+ *   so the timer can fire — yielding is not a progress API.
+ */
 interface DownloadItem {
     label: string;
     total: number;
@@ -52,12 +58,10 @@ interface DownloadItem {
     finished: boolean;
     downloaded: boolean;
     error?: string;
-    /** Wall-clock start for stall visibility (resolve/scan may never download). */
     startedMs: number;
 }
 
 export class PrecacheProgress {
-    // Global counters
     private resolved    = 0;
     private downloaded  = 0;
     private linked      = 0;
@@ -65,7 +69,6 @@ export class PrecacheProgress {
     private compiled    = 0;
     private compileTotal = 0;
 
-    // Active big downloads (for detail lines)
     private items  = new Map<string, DownloadItem>();
     private activeOrder: string[] = [];
     private lastFinished: DownloadItem | null = null;
@@ -81,8 +84,7 @@ export class PrecacheProgress {
     private stopped = false;
     private drawn = 0;
     private startMs = Date.now();
-    /** Last paint wall time — producer path paints when the interval is starved. */
-    private lastPaintMs = 0;
+    private activity: string | null = null;
 
     readonly maxLines: number;
     private readonly title: string;
@@ -90,22 +92,25 @@ export class PrecacheProgress {
     constructor(maxLines = 5, title = 'Precaching') {
         this.maxLines = maxLines;
         this.title = title;
+        this.ensureTimer();
     }
 
-    // ---- Scan phase ----
+    // ---- State only (never paint) ----
 
-    /** One specifier resolved (cached or downloaded). */
     bumpResolved(n = 1): void {
         this.resolved += n;
-        this.kick();
+        this.ensureTimer();
     }
 
-    /** Show that a specifier is actively being resolved, even before network starts. */
+    setActivity(label: string | null): void {
+        this.activity = label ? short(label) : null;
+        this.ensureTimer();
+    }
+
     startResolve(spec: string): void {
         this.addItem(spec, `resolve ${short(spec)}`, 0, false);
     }
 
-    /** Build onProgress callback for a specifier. */
     onDownloadProgress(spec: string): (now: number, total: number) => void {
         return (now: number, total: number) => {
             const item = this.items.get(spec);
@@ -116,10 +121,10 @@ export class PrecacheProgress {
                 item.downloaded = true;
             }
             this.updateItem(spec, now, total);
+            this.ensureTimer();
         };
     }
 
-    /** A tracked (big) download finished. */
     finishDownload(key: string, error?: string): void {
         const item = this.items.get(key);
         if (!item || item.finished) return;
@@ -130,26 +135,24 @@ export class PrecacheProgress {
         this.removeActive(key);
         this.lastFinished = item;
         this.items.delete(key);
-        this.kick();
+        this.ensureTimer();
     }
-
-    // ---- Precompile phase ----
 
     setLinkProgress(done: number, total: number): void {
         this.linked = done;
         this.linkTotal = total;
-        this.kick();
+        this.ensureTimer();
     }
 
     setCompileProgress(done: number, total: number): void {
         this.compiled = done;
         this.compileTotal = total;
-        this.kick();
+        this.ensureTimer();
     }
 
-    // ---- Lifecycle ----
+    // ---- Lifecycle (may clear the TTY region) ----
 
-    /** Pause spinner; later phases may repaint. */
+    /** Hide spinner; later mutations re-arm the paint timer. */
     pause(): void {
         if (this.timer !== null) {
             clearInterval(this.timer);
@@ -157,15 +160,20 @@ export class PrecacheProgress {
         }
         if (isatty && this.drawn) this.clearLines(this.drawn);
         this.drawn = 0;
-        this.lastPaintMs = 0;
+        // Drop scan/download rows so the next phase does not show stale ✓ lines.
+        this.items.clear();
+        this.activeOrder.length = 0;
+        this.lastFinished = null;
+        this.activity = null;
     }
 
-    /** Terminal shutdown: no further paints; late callbacks are ignored. */
+    /** Terminal shutdown: no further paints. */
     stop(): void {
         this.stopped = true;
         this.pause();
     }
 
+    /** Temporarily clear the spinner region so log lines can print. */
     clearForOutput(): void {
         if (isatty && this.drawn) this.clearLines(this.drawn);
         this.drawn = 0;
@@ -173,16 +181,9 @@ export class PrecacheProgress {
 
     // ---- Internals ----
 
-    private kick(): void {
-        if (this.stopped || !isatty) return;
-        // Interval for idle gaps + producer-path paint (~200ms; timers starve on sync).
-        if (this.timer === null) {
-            this.timer = setInterval(() => this.render(), 200);
-        }
-        const now = Date.now();
-        if (this.lastPaintMs === 0 || now - this.lastPaintMs >= 200) {
-            this.render();
-        }
+    private ensureTimer(): void {
+        if (this.stopped || !isatty || this.timer !== null) return;
+        this.timer = setInterval(() => this.render(), PAINT_MS);
     }
 
     private addItem(key: string, label: string, totalBytes: number, downloaded: boolean): void {
@@ -197,7 +198,7 @@ export class PrecacheProgress {
         });
         this.activeOrder.push(key);
         this.itemTotal++;
-        this.kick();
+        this.ensureTimer();
     }
 
     private removeActive(key: string): void {
@@ -227,11 +228,11 @@ export class PrecacheProgress {
 
     private render(): void {
         if (!isatty || this.stopped) return;
-        this.lastPaintMs = Date.now();
+        const now = Date.now();
         this.tick = (this.tick + 1) % SPIN.length;
         const spin = SPIN[this.tick] ?? SPIN[0] ?? '';
 
-        const elapsed = (this.lastPaintMs - this.startMs) / 1000;
+        const elapsed = (now - this.startMs) / 1000;
         const elapsedStr = elapsed < 10 ? elapsed.toFixed(1) : String(Math.floor(elapsed));
 
         const parts: string[] = [];
@@ -247,8 +248,10 @@ export class PrecacheProgress {
 
         const lines = [`${spin} ${C.bold(this.title)}: ${parts.join(', ')} ${C.dim(`${elapsedStr}s`)}`];
 
-        // Oldest in-flight first so a stuck resolve is always visible (not buried).
-        const now = Date.now();
+        if (this.activity) {
+            lines.push(`  ${C.cyan(spin)} ${truncate(this.activity, termWidth - 8)}`);
+        }
+
         const active: Array<{ key: string; item: DownloadItem; age: number }> = [];
         for (const key of this.activeOrder) {
             const item = this.items.get(key);
@@ -257,8 +260,9 @@ export class PrecacheProgress {
         }
         active.sort((a, b) => b.age - a.age);
 
-        const activeLimit = this.lastFinished ? this.maxLines - 1 : this.maxLines;
-        for (let i = 0; i < active.length && i < activeLimit; i++) {
+        let room = this.maxLines - (this.activity ? 1 : 0);
+        if (this.lastFinished) room = Math.max(0, room - 1);
+        for (let i = 0; i < active.length && i < room; i++) {
             const { item, age } = active[i]!;
             const ageStr = age >= 2000 ? C.yellow(` ${Math.floor(age / 1000)}s`) : '';
             const lbl = truncate(item.label, termWidth - 36);

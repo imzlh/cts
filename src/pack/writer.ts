@@ -2,7 +2,6 @@ import type { TypeScriptRuntime } from '../runtime/index';
 import type { ModuleFormat } from '../types';
 import { ParseDriver } from '../parse';
 import { DepScanner } from '../deps';
-import { ImportScanner } from '../import-scanner';
 import { guessFileKind } from '../resolve/protocols/base';
 import { hasImportAttributes, isScannablePath, isTsLikePath, isWasmPath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
@@ -129,22 +128,25 @@ export async function writePack(
 ): Promise<PackManifest> {
     // Reuse the runtime's oxc (createRuntime already tried tryLoadOxc).
     const oxc = runtime.getOxc();
-    // Inline OXC: pack compiles on main thread; avoids stranded worker replies.
-    const importScanner = new ImportScanner(oxc);
-    const parseDriver = new ParseDriver(oxc, 0);
+    // Transform workers + compileForCache on main; oxc import-scan stays main-thread.
+    const parseDriver = new ParseDriver(oxc);
     const prog = runtime.config.silent ? null : new PrecacheProgress(5, 'Packing');
-    log.debug('pack', () => `pipeline: scan=${oxc ? 'oxc' : 'sucrase'} transform=${oxc ? 'oxc+inline' : 'sucrase+inline'}`);
+    log.debug('pack', () =>
+        `pipeline: scan=${oxc ? 'oxc-main' : 'sucrase+workers'} ` +
+        `transform=${oxc ? 'oxc+workers' : 'sucrase+workers'} compile=main`);
 
     try {
         const entryInfo = runtime.resolver.resolve(entrySpecifier, `${projectDir}/<pack>`);
         // Offline edges come only from scanResult.resolutions (JS/TS + WASM).
-        const parseImports = async (localPath: string): Promise<string[]> => {
-            const lang = localPath === entryInfo.localPath ? options.entryLang : undefined;
-            if (isScannablePath(localPath) || isWasmPath(localPath) || lang) {
-                return importScanner.scanFile(localPath, lang);
+        // entryLang needs ParseDriver; otherwise oxc-main uses sync ImportScanner.
+        const needsLangScan = options.entryLang !== undefined;
+        const parseImports = needsLangScan
+            ? async (localPath: string): Promise<string[]> => {
+                const lang = localPath === entryInfo.localPath ? options.entryLang : undefined;
+                if (!(isScannablePath(localPath) || isWasmPath(localPath) || lang)) return [];
+                return parseDriver.scanFile(localPath, lang);
             }
-            return [];
-        };
+            : null;
         const scanner = new DepScanner(runtime.resolver, runtime.config, prog, oxc, parseImports, {
             fullGraph: true,
             reportSummary: false,

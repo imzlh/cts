@@ -179,3 +179,23 @@ export function isRelative(s: string): boolean {
     return s === '.' || s === '..' ||
         s.startsWith('./') || s.startsWith('../') || s.startsWith('.\\') || s.startsWith('..\\');
 }
+
+/**
+ * Parent directory identity for relative (./ ../) resolve/scan caches.
+ * Same-dir importers of `./util.js` must share one key. Handles file://,
+ * Windows /C:…, and scheme parents (npm:/pack:…); no slash → keep full parent.
+ */
+export function parentDirKey(parent: string): string {
+    let base = parent;
+    if (base.startsWith('file://')) {
+        const raw = base.slice(7);
+        const query = raw.indexOf('?');
+        const hash = raw.indexOf('#');
+        const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
+        base = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
+        if (hasLeadingSlashDrive(base)) base = base.slice(1);
+    }
+    const dir = dirname(base);
+    // dirname('npm:pkg@1') is '.' — keep the whole parent ref.
+    return dir === '.' ? base : dir;
+}

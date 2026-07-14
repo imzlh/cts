@@ -1,9 +1,8 @@
 /** WASM import modules for the dep graph (host modules excluded). */
 
-import { errMsg, log } from './utils';
+import { errMsg, log, readBytes } from './utils';
 
 const wasm = import.meta.use('wasm');
-const fs = import.meta.use('fs');
 
 /** Host-only import module names (exact match; not path-like). */
 const HOST_WASM_IMPORT_MODULES = new Set([
@@ -38,7 +37,7 @@ export function scanWasmImportModules(bytes: Uint8Array): string[] {
 
 export function scanWasmImportModulesFile(localPath: string): string[] {
     try {
-        return scanWasmImportModules(new Uint8Array(fs.readFile(localPath)));
+        return scanWasmImportModules(readBytes(localPath));
     } catch (e) {
         log.debug('wasm', () => `import scan read failed ${localPath}: ${errMsg(e)}`);
         return [];

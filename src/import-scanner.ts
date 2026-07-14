@@ -2,10 +2,9 @@
 import type { OxcTranspiler } from './oxc';
 import { extractImports, isTsLikePath, isWasmPath } from './scan';
 import { scanWasmImportModules } from './wasm-imports';
-import { errMsg, log, readText } from './utils';
+import { errMsg, log, readBytes, readText } from './utils';
 
 const engine = import.meta.use('engine');
-const fs = import.meta.use('fs');
 
 function isTypeScriptLanguage(lang: string | undefined, localPath: string): boolean {
     if (!lang) return isTsLikePath(localPath);
@@ -20,12 +19,17 @@ export class ImportScanner {
 
     /** Sync scan of an on-disk file. Prefer this for oxc (no worker pool). */
     scanFile(localPath: string, lang?: string): string[] {
+        return this.scanFileResult(localPath, lang) ?? [];
+    }
+
+    /** Null means the file could not be read, so callers must not cache the result. */
+    scanFileResult(localPath: string, lang?: string): string[] | null {
         try {
-            const bytes = new Uint8Array(fs.readFile(localPath));
-            return this.scanBytes(bytes, localPath, lang);
+            // VFS-aware (pack: overlay); empty Uint8Array is a valid hit.
+            return this.scanBytes(readBytes(localPath), localPath, lang);
         } catch (e) {
             log.debug('scan', () => `read fail ${localPath}: ${errMsg(e)}`);
-            return [];
+            return null;
         }
     }
 

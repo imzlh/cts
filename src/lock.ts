@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS sources (
     key  TEXT PRIMARY KEY,
     spec TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS imports (
+    spec TEXT PRIMARY KEY,
+    deps TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS bins (
     name TEXT PRIMARY KEY,
     path TEXT NOT NULL,
@@ -58,6 +62,7 @@ export class LockStore {
     get enabled(): boolean { return !this.disabled; }
 
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
+    private readonly statements = new Map<string, CModuleSQLite3.Sqlite3Stmt>();
     private loadFailed = false;
     private recoveredInvalidLock = false;
     private readonly dbPath: string;
@@ -66,8 +71,13 @@ export class LockStore {
 
     private readonly pendingModules = new Map<string, ModuleInfo>();
     private readonly pendingSources = new Map<string, string>();
+    private readonly pendingImports = new Map<string, string[]>();
     private readonly pendingBins = new Map<string, { path: string; pkg: string }>();
     private readonly pendingRemovedBinPkgs = new Set<string>();
+    private readonly moduleCache = new Map<string, ModuleInfo | null>();
+    private readonly sourceCache = new Map<string, string | null>();
+    private readonly importCache = new Map<string, string[] | null>();
+    private readonly binCache = new Map<string, { path: string; pkg: string } | null>();
 
     constructor(lockDir: string, readOnly: boolean, disabled = false) {
         this.readOnly = readOnly;
@@ -187,11 +197,18 @@ export class LockStore {
     private query(sql: string, params: CModuleSQLite3.SqliteValue[] = []): LockRow[] {
         const db = this.getDb(); if (!db) return [];
         try {
-            const stmt = db.prepare(sql);
-            const rows = stmt.all(params);
-            stmt.finalize();
-            return rows;
+            let stmt = this.statements.get(sql);
+            if (!stmt) {
+                stmt = db.prepare(sql);
+                this.statements.set(sql, stmt);
+            }
+            return stmt.all(params);
         } catch (e) {
+            const stmt = this.statements.get(sql);
+            if (stmt) {
+                try { stmt.finalize(); } catch {}
+                this.statements.delete(sql);
+            }
             log.debug('lock', () => `query failed: ${e}`);
             return [];
         }
@@ -199,14 +216,32 @@ export class LockStore {
 
     private exec(sql: string, params: CModuleSQLite3.SqliteValue[]): void {
         const db = this.getDb(); if (!db) return;
-        const stmt = db.prepare(sql);
+        let stmt = this.statements.get(sql);
+        if (!stmt) {
+            stmt = db.prepare(sql);
+            this.statements.set(sql, stmt);
+        }
         stmt.run(params);
-        stmt.finalize();
+    }
+
+    private finalizeStatements(): void {
+        for (const stmt of this.statements.values()) {
+            try { stmt.finalize(); } catch {}
+        }
+        this.statements.clear();
+    }
+
+    private clearReadCaches(): void {
+        this.moduleCache.clear();
+        this.sourceCache.clear();
+        this.importCache.clear();
+        this.binCache.clear();
     }
 
     private hasPendingWrites(): boolean {
         return this.pendingModules.size > 0
             || this.pendingSources.size > 0
+            || this.pendingImports.size > 0
             || this.pendingBins.size > 0
             || this.pendingRemovedBinPkgs.size > 0;
     }
@@ -214,6 +249,7 @@ export class LockStore {
     private clearPendingWrites(): void {
         this.pendingModules.clear();
         this.pendingSources.clear();
+        this.pendingImports.clear();
         this.pendingBins.clear();
         this.pendingRemovedBinPkgs.clear();
     }
@@ -238,6 +274,8 @@ export class LockStore {
                     [info.specPath, info.localPath, info.format, info.fileKind]);
             for (const [key, spec] of this.pendingSources)
                 this.exec('INSERT OR REPLACE INTO sources (key, spec) VALUES (?, ?)', [key, spec]);
+            for (const [spec, deps] of this.pendingImports)
+                this.exec('INSERT OR REPLACE INTO imports (spec, deps) VALUES (?, ?)', [spec, JSON.stringify(deps)]);
             for (const [name, bin] of this.pendingBins)
                 this.exec('INSERT OR REPLACE INTO bins (name, path, pkg) VALUES (?, ?, ?)',
                     [name, bin.path, bin.pkg]);
@@ -251,11 +289,18 @@ export class LockStore {
 
     getModule(sp: string): ModuleInfo | undefined {
         const pending = this.pendingModules.get(sp);
-        if (pending) return pending;
+        if (pending !== undefined) return pending;
+        const cached = this.moduleCache.get(sp);
+        if (cached !== undefined) return cached ?? undefined;
         const rows = this.query('SELECT local, fmt, kind FROM modules WHERE spec = ?', [sp]);
-        if (!rows.length) return undefined;
+        if (!rows.length) {
+            this.moduleCache.set(sp, null);
+            return undefined;
+        }
         const r = rows[0];
-        return { specPath: sp, localPath: String(r.local), format: r.fmt as ModuleFormat, fileKind: r.kind as FileKind };
+        const info = { specPath: sp, localPath: String(r.local), format: r.fmt as ModuleFormat, fileKind: r.kind as FileKind };
+        this.moduleCache.set(sp, info);
+        return info;
     }
 
     findModuleSpecsByPrefix(prefix: string): string[] {
@@ -277,23 +322,65 @@ export class LockStore {
     getSourceByKey(key: string): string | undefined {
         const pending = this.pendingSources.get(key);
         if (pending !== undefined) return pending;
+        const cached = this.sourceCache.get(key);
+        if (cached !== undefined) return cached ?? undefined;
         const rows = this.query('SELECT spec FROM sources WHERE key = ?', [key]);
-        return rows.length ? String(rows[0].spec) : undefined;
+        const spec = rows.length ? String(rows[0].spec) : null;
+        this.sourceCache.set(key, spec);
+        return spec ?? undefined;
     }
 
     getBin(name: string): { path: string; pkg: string } | undefined {
         const pending = this.pendingBins.get(name);
-        if (pending) return pending;
+        if (pending !== undefined) return pending;
+        const cached = this.binCache.get(name);
+        if (cached !== undefined) return cached ?? undefined;
         const rows = this.query('SELECT path, pkg FROM bins WHERE name = ?', [name]);
-        if (!rows.length) return undefined;
+        if (!rows.length) {
+            this.binCache.set(name, null);
+            return undefined;
+        }
         const bin = { path: String(rows[0].path), pkg: String(rows[0].pkg) };
-        if (this.pendingRemovedBinPkgs.has(bin.pkg)) return undefined;
+        if (this.pendingRemovedBinPkgs.has(bin.pkg)) {
+            this.binCache.set(name, null);
+            return undefined;
+        }
+        this.binCache.set(name, bin);
         return bin;
+    }
+
+    getImports(spec: string): string[] | undefined {
+        const pending = this.pendingImports.get(spec);
+        // Empty [] is a valid warm hit (no static imports) — do not treat as miss.
+        // Callers only read; setImports always stores a fresh copy.
+        if (pending !== undefined) return pending;
+        const cached = this.importCache.get(spec);
+        // null = negative miss; [] is a valid positive hit.
+        if (cached !== undefined) return cached === null ? undefined : cached;
+        const rows = this.query('SELECT deps FROM imports WHERE spec = ?', [spec]);
+        if (!rows.length || typeof rows[0].deps !== 'string') {
+            this.importCache.set(spec, null);
+            return undefined;
+        }
+        try {
+            const deps = JSON.parse(rows[0].deps);
+            if (!Array.isArray(deps) || !deps.every(dep => typeof dep === 'string')) {
+                this.importCache.set(spec, null);
+                return undefined;
+            }
+            const frozen = Object.freeze(deps) as string[];
+            this.importCache.set(spec, frozen);
+            return frozen;
+        } catch {
+            this.importCache.set(spec, null);
+            return undefined;
+        }
     }
 
     setModule(info: ModuleInfo): void {
         if (this.readOnly) return;
         this.pendingModules.set(info.specPath, info);
+        this.moduleCache.set(info.specPath, info);
     }
 
     setSource(spec: string, parent: string, sp: string): void {
@@ -303,11 +390,22 @@ export class LockStore {
     setSourceByKey(key: string, sp: string): void {
         if (this.readOnly) return;
         this.pendingSources.set(key, sp);
+        this.sourceCache.set(key, sp);
+    }
+
+    setImports(spec: string, deps: string[]): void {
+        if (this.readOnly) return;
+        // Copy + freeze so getImports can return the cached array without cloning.
+        const copy = Object.freeze(deps.slice()) as string[];
+        this.pendingImports.set(spec, copy);
+        this.importCache.set(spec, copy);
     }
 
     addBin(name: string, path: string, pkg: string): void {
         if (this.readOnly) return;
-        this.pendingBins.set(name, { path, pkg });
+        const bin = { path, pkg };
+        this.pendingBins.set(name, bin);
+        this.binCache.set(name, bin);
     }
 
     removeBinsForPackage(pkg: string): void {
@@ -315,6 +413,9 @@ export class LockStore {
         this.pendingRemovedBinPkgs.add(pkg);
         for (const [name, bin] of this.pendingBins) {
             if (bin.pkg === pkg) this.pendingBins.delete(name);
+        }
+        for (const [name, bin] of this.binCache) {
+            if (bin?.pkg === pkg) this.binCache.set(name, null);
         }
     }
 
@@ -328,14 +429,19 @@ export class LockStore {
         const db = this.db;
         if (!db) {
             this.clearPendingWrites();
+            this.clearReadCaches();
             if (!this.readOnly) this.cleanupSidecars();
             LockStore.openStores.delete(this);
             return;
         }
-        try { db.close(); }
+        try {
+            this.finalizeStatements();
+            db.close();
+        }
         finally {
             this.db = null;
             this.clearPendingWrites();
+            this.clearReadCaches();
             if (!this.readOnly) this.cleanupSidecars();
             LockStore.openStores.delete(this);
         }
@@ -343,11 +449,18 @@ export class LockStore {
 
     closeFast(): void {
         const db = this.db;
-        if (!db) return;
-        try { db.close(); }
+        if (!db) {
+            this.clearReadCaches();
+            return;
+        }
+        try {
+            this.finalizeStatements();
+            db.close();
+        }
         finally {
             this.db = null;
             this.clearPendingWrites();
+            this.clearReadCaches();
             if (!this.readOnly) this.cleanupSidecars();
             LockStore.openStores.delete(this);
         }
@@ -377,6 +490,7 @@ export class LockStore {
     get dirtyCount(): number {
         return this.pendingModules.size
             + this.pendingSources.size
+            + this.pendingImports.size
             + this.pendingBins.size
             + this.pendingRemovedBinPkgs.size;
     }

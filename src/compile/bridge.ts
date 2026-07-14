@@ -12,6 +12,18 @@ const CTS_INTERNAL = Symbol.for('cts.internal');
 const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
 let cjsBridgeId = 0;
 
+/** Package name end in npm body: after scope for @scope/name, else first /. */
+function npmBodyNameEnd(body: string): number {
+    if (body.startsWith('@')) {
+        const scopeSlash = body.indexOf('/');
+        if (scopeSlash <= 1) return -1;
+        const next = body.indexOf('/', scopeSlash + 1);
+        return next === -1 ? body.length : next;
+    }
+    const slash = body.indexOf('/');
+    return slash === -1 ? body.length : slash;
+}
+
 function buildCjsEsmWrapper(specPath: string, exports: Record<string, unknown>): CModuleEngine.Module {
     const slot = `__cts_cjs_bridge_${cjsBridgeId++}`;
     Reflect.set(globalThis, slot, exports);
@@ -104,7 +116,7 @@ export function buildCjsDeps(
         },
 
         loadEsmSync(info: ModuleInfo): Record<string, unknown> {
-            return loadEsmSync(info, esm, (p) => resolver.getCachedMtime(p));
+            return loadEsmSync(info, esm);
         },
 
         loadWasmSync,
@@ -140,15 +152,17 @@ export function buildCjsDeps(
 
 // Global require + CTS_INTERNAL installation
 
-/** Normalize path traversal (../..) in npm spec paths. */
+/** Normalize path traversal (../..) in npm subpaths (scoped names keep @scope/pkg). */
 function normalizeNpmSpec(spec: string): string {
     if (!spec.startsWith('npm:')) return spec;
     const body = spec.slice(4);
-    const slash = body.indexOf('/');
-    if (slash === -1) return spec;
-    const pkg = body.slice(0, slash);
+    const nameEnd = npmBodyNameEnd(body);
+    if (nameEnd < 0 || nameEnd >= body.length) return spec;
+    // nameEnd points at '/' after package name (or body end if bare package).
+    const pkg = body.slice(0, nameEnd);
+    if (body.charCodeAt(nameEnd) !== 47) return spec;
     const normalized: string[] = [];
-    let start = slash + 1;
+    let start = nameEnd + 1;
     for (let i = start; i <= body.length; i++) {
         if (i !== body.length && body.charCodeAt(i) !== 47) continue;
         const len = i - start;

@@ -3,7 +3,7 @@ import type { ModuleResolver } from '../resolve/index';
 import type { ModuleCompiler } from '../compile/index';
 import { fillMeta } from './meta';
 import { errMsg, log } from '../utils';
-import { err, ErrorKind } from '../errors';
+import { err, ErrorKind, isErrorKind } from '../errors';
 
 const engine = import.meta.use('engine');
 
@@ -59,7 +59,13 @@ export function installEngineHooks(
                 }
                 return moduleRef(info);
             } catch (e) {
-                throw err(ErrorKind.ModuleNotFound,
+                // Preserve LockFrozen / ProtocolDisabled / NetworkError / … —
+                // rewriting everything as ModuleNotFound hid real failure kinds.
+                // Reject non-enum .kind (garbage numbers would poison formatError).
+                const kind = e instanceof Error && isErrorKind(e.kind)
+                    ? e.kind
+                    : ErrorKind.ModuleNotFound;
+                throw err(kind,
                     `Cannot resolve "${spec}" from "${parent}": ${errMsg(e)}`, e);
             }
         },

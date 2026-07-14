@@ -10,7 +10,7 @@ export {
     runParseWorker,
 } from '../parse';
 export { ImportScanner } from '../import-scanner';
-export { fatal, formatError, err, ErrorKind, TransformError, isResolutionMiss } from '../errors';
+export { fatal, formatError, err, ErrorKind, TransformError, isErrorKind, isResolutionMiss } from '../errors';
 export {
     log, errMsg, fmtBytes, uname, isWindows, stripJsonc,
     dirname, normalizePath, isAbsolute, joinPaths, cwd, toPosixPath,

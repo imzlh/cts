@@ -1,7 +1,6 @@
 import type { FileKind, PackageJson, ModuleFormat } from '../types';
 import { dirname, extname, joinPaths, normalizePath, resolveFile, safeParse, LRU, log } from '../utils';
 import { err, ErrorKind } from '../errors';
-import { hasTopLevelEsmSyntax } from '../scan';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -68,15 +67,7 @@ export function getBinMap(pkg: PackageJson): Record<string, string> {
 export function detectFormat(localPath: string): ModuleFormat {
     const hit = formatCache.get(localPath);
     if (hit) return hit;
-    let result = _detectFormat(localPath);
-    // CJS package `.js` with static import/export is still ESM (Deno dual detect).
-    if (result === 'cjs' && localPath.endsWith('.js')) {
-        try {
-            if (hasTopLevelEsmSyntax(engine.decodeString(fs.readFile(localPath)), false)) {
-                result = 'esm';
-            }
-        } catch { /* keep cjs */ }
-    }
+    const result = _detectFormat(localPath);
     formatCache.set(localPath, result);
     return result;
 }

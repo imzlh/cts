@@ -17,9 +17,9 @@ cts/
 │   ├── errors.ts            # ErrorKind enum, err(), formatError(), fatal(), TransformError
 │   ├── flow.ts              # ProgressCallback, FetchOptions, StepType, Fs*Step types
 │   ├── lock.ts              # LockStore class
-│   ├── import-scanner.ts    # ImportScanner — main-thread oxc-first import graph scan
-│   ├── scan.ts              # extractImports(), hasImportAttributes(), hasTopLevelEsmSyntax(), path helpers
-│   ├── parse.ts             # ParseDriver — transform/precompile worker pool only
+│   ├── import-scanner.ts    # ImportScanner — oxc-first extraction used by parse workers
+│   ├── scan.ts              # extractImports(), hasImportAttributes(), path helpers
+│   ├── parse.ts             # ParseDriver — worker scan/transform, main-thread compile
 │   ├── pack/                # .jspack format, writer, validated extraction/reader
 │   ├── precompile.ts        # Thin re-export of parse.ts (ParseDriver / isParseWorker only)
 │   ├── shell.ts             # parseShellCommand(), isShellOperator(), resolveWinBinEntry(), resolveUnixBinEntry()
@@ -40,10 +40,10 @@ cts/
 │   ├── resolve/             # Specifier → local path
 │   │   ├── index.ts         # ModuleResolver class
 │   │   ├── builtins.ts      # BUILTINS set, isBuiltinSpecifier()
-│   │   ├── linker.ts        # Hard-link materialization of node_modules tree
+│   │   ├── linker.ts        # Project node_modules materialize (store read-only)
 │   │   ├── pkg.ts           # readPkg(), readPkgFresh(), clearPkgCache(), normalizeBinField(), getBinMap()
 │   │   ├── flow.ts          # I/O step types and runner (Step/StepResult protocol)
-│   │   ├── lock.ts          # LockStore (SQLite-backed, module/source/bin tables)
+│   │   ├── lock.ts          # LockStore (SQLite-backed module/source/import/bin tables)
 │   │   ├── deps.ts          # DepScanner — concurrent BFS dependency discovery
 │   │   └── protocols/       # Protocol handlers
 │   │       ├── base.ts      # ProtocolHandler interface, guessFileKind()
@@ -107,19 +107,19 @@ cts/
   │   ├── EsmCompiler ─── Transformer (oxc native → sucrase fallback) → JscCache
   │   ├── CjsLoader ───── bridgeCjsToEsm / installGlobalRequire
   │   └── WasmCompiler
-  ├── ImportScanner ─────── Main-thread import scan (oxc → Sucrase); never on transform workers
-  ├── ParseDriver ───────── Transform/precompile worker pool only
+  ├── ImportScanner ─────── OXC/Sucrase import extraction used inside parse workers
+  ├── ParseDriver ───────── Worker scan/transform; main-thread QuickJS bytecode compile
   ├── ResourceManager ───── Cleanup for caches/connections
   └── Engine Hooks ──────── resolve/load/init callbacks on QuickJS
 ```
 
 ### Key Flows
 
-**`cno cache <entry>`**: DepScanner parallel BFS → resolve each import → ImportScanner (main) → ParseDriver workers transform to bytecode → persist .jsc → flush lock. Optionally run lifecycle scripts and materialize node_modules.
+**`cno cache <entry>`**: DepScanner parallel BFS → resolve each import → ParseDriver workers scan/transform → main thread compiles bytecode → persist .jsc → flush lock. Optionally run lifecycle scripts and materialize node_modules.
 
 **`cno run <entry>`**: Create resolver + compiler → install engine.onModule hooks → QuickJS calls resolve/load/init per import → source transformed and compiled on demand (no DepScanner unless `--precache`).
 
-**`cno pack <entry>`**: DepScanner `fullGraph` + ImportScanner (JS/TS + WASM import modules) → classify relocatable identities → build offline `edges` from scan `resolutions` only → compile under `pack:` ids → validate manifest/ranges → stream an atomic `.jspack`. Running it maps the container, registers `PackHandler`, then resolves only through recorded edges.
+**`cno pack <entry>`**: DepScanner `fullGraph` + worker import scan (JS/TS + WASM import modules) → classify relocatable identities → build offline `edges` from scan `resolutions` only → transform on workers and compile under `pack:` ids on main → validate manifest/ranges → stream an atomic `.jspack`. Running it maps the container, registers `PackHandler`, then resolves only through recorded edges.
 
 ## Layer Responsibilities
 
@@ -132,10 +132,10 @@ Cross-cutting concerns shared by all layers. No dependencies on compile/resolve/
 | `config.ts` | `parseSize()`, `createConfig()`, `loadConfigFile()` | CLI flags, env vars, config file loading (tsconfig/deno.json/package.json), cache dir |
 | `errors.ts` | `ErrorKind` enum, `err()`, `formatError()`, `fatal()`, `TransformError` | Error creation, formatting, colourised output |
 | `flow.ts` | `ProgressCallback`, `FetchOptions`, `StepType`, `FsExistsStep`, `FsReadTextStep` | Generator-based async I/O — Step/StepResult protocol |
-| `lock.ts` | `LockStore` | SQLite-backed persistent cache (modules, sources, bins tables) |
-| `import-scanner.ts` | `ImportScanner` | Main-thread oxc-first import graph scan (pack + precache) |
-| `scan.ts` | `extractImports()`, `hasImportAttributes()`, `hasTopLevelEsmSyntax()`, path helpers | Sucrase extractImports fallback + cheap linear detectors |
-| `parse.ts` | `ParseDriver`, `isParseWorker()`, `runParseWorker()` | Transform/precompile worker pool only (no scan tasks) |
+| `lock.ts` | `LockStore` | SQLite-backed persistent cache (modules, sources, imports, bins tables) |
+| `import-scanner.ts` | `ImportScanner` | OXC-first import extraction shared by workers and explicit inline mode |
+| `scan.ts` | `extractImports()`, `hasImportAttributes()`, path helpers | Sucrase extractImports fallback + cheap attribute detector |
+| `parse.ts` | `ParseDriver`, `isParseWorker()`, `runParseWorker()` | Worker import scan/transform; main-thread bytecode compile |
 | `shell.ts` | `parseShellCommand()`, `isShellOperator()`, `resolveWinBinEntry()`, `resolveUnixBinEntry()` | Shell command parsing, npm bin-wrapper resolution |
 | `task.ts` | `TaskRunner`, `BinResolver`, `loadTasks()` | Deno task runner, binary resolution |
 | `oxc.ts` | `OxcTranspiler`, `OxcModule`, `tryLoadOxc()`, `oxcExtPath()` | OXC native extension wrapper |
@@ -150,7 +150,7 @@ Pure resolution logic. Given a specifier + referrer, produces a local file path 
 |---|---|---|
 | `index.ts` | `ModuleResolver` | 3-level cache + protocol dispatch orchestrator |
 | `builtins.ts` | `BUILTINS`, `isBuiltinSpecifier()` | Node.js builtin module detection |
-| `linker.ts` | (none — internal) | Hard-link materialization of node_modules tree |
+| `linker.ts` | `materializeNodeModules`, `buildInstallViewEdges` | soft roots / hard virtual store (`.cts`); store never written |
 | `pkg.ts` | `readPkg()`, `readPkgFresh()`, `clearPkgCache()`, `normalizeBinField()`, `getBinMap()` | package.json utilities |
 | `flow.ts` | Step types, `runSync()`, `runAsync()` | Generator-based I/O driver |
 | `lock.ts` | `LockStore` | SQLite lock store (same class, different import path) |
@@ -231,7 +231,10 @@ No circular deps. Used everywhere.
 - **Pack writes**: validate first, stream to a same-directory temporary file, `fsync`, and atomically rename
 - **Pack extract integrity**: reuse only byte-identical files; heal with temp + `fsync` + rename (`.complete`/size alone is not integrity)
 - **Lock ownership**: pack may fill dependency caches but never persists `cts.lock` or runs lifecycle scripts
-- **Workers**: ParseDriver grows lazily; always `terminate()` when done
+- **Lock trust**: resolver lock hits are authoritative; never add path, format, existence, or cache-dir revalidation
+- **Import graph cache**: warm precache may reuse `imports`; pack/fullGraph callbacks must scan their current source
+- **Workers**: ParseDriver grows lazily for scan/transform; transport failures retry on replacement workers, never degrade to main; always `terminate()` when done
+- **Module format**: never infer ESM/CJS from source contents; use extensions, package metadata/conditions, or an explicit caller format
 - **Header comments**: removed — responsibilities documented here, not in-file
 
 ## Pack Verification

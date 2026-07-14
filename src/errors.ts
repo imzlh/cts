@@ -1,3 +1,5 @@
+import { getMemoryFile } from './utils/memfs';
+
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -43,8 +45,12 @@ declare global {
     }
 }
 
-function isErrorKind(value: unknown): value is ErrorKind {
-    return typeof value === 'number' && 0 <= value && value < ErrorKind.Generic;
+/** True when value is a known ErrorKind (incl. Generic). */
+export function isErrorKind(value: unknown): value is ErrorKind {
+    // Inclusive of Generic (last enum member); `< Generic` dropped kind on duck-typed errors.
+    return typeof value === 'number'
+        && ErrorKind.ModuleNotFound <= value
+        && value <= ErrorKind.Generic;
 }
 
 function errorFromUnknown(value: unknown): Error {
@@ -199,8 +205,12 @@ function suggest(kind: ErrorKind, msg: string): string {
 
 function sourceContext(file: string, line: number, col: number): string {
     let src: string;
-    try { src = engine.decodeString(fs.readFile(file)); }
-    catch { return ''; }
+    // Prefer active VFS (pack:) so transform/syntax frames can show context.
+    // Import memfs only (not utils barrel) — utils/io imports errors.
+    try {
+        const mem = getMemoryFile(file);
+        src = engine.decodeString(mem !== undefined ? mem : fs.readFile(file));
+    } catch { return ''; }
 
     const lines = src.split(/\r?\n/);
     // A trailing newline produces a final empty split element that isn't a

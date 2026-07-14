@@ -130,11 +130,17 @@ export class JscCache {
             }
         }
 
-        // L1b: active VFS bytecode() — 0-copy view, deserialize on demand
+        // L1b: active VFS bytecode() — 0-copy view, deserialize on demand.
+        // engine.deserialize is typed as ArrayBuffer-backed (not SharedArrayBuffer);
+        // pack/VFS views are subarrays of that kind — re-wrap without copying when possible.
         const view = getMemoryBytecode(localPath);
         if (view) {
             try {
-                return engine.deserialize(view);
+                const buf = view.buffer;
+                const bytes = buf instanceof ArrayBuffer
+                    ? new Uint8Array(buf, view.byteOffset, view.byteLength)
+                    : new Uint8Array(view);
+                return engine.deserialize(bytes);
             } catch {
                 log.debug('jsc', () => `vfs bytecode deserialize failed: ${localPath}`);
                 // Fall through: source recompile (ABI mismatch / corrupt blob).

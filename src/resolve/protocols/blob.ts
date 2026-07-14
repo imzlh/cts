@@ -24,6 +24,7 @@ const MIME_EXT: Record<string, string> = {
     'text/tsx': '.tsx',
     'application/javascript': '.js',
     'application/jsx': '.jsx',
+    'application/tsx': '.tsx',
     'application/json': '.json',
     'application/typescript': '.ts',
     'application/wasm': '.wasm',
@@ -43,7 +44,13 @@ function mimeToKind(mime: string): FileKind {
     const m = mimeBase(mime);
     if (m === 'application/wasm') return 'wasm';
     if (m === 'application/json') return 'json';
-    if (m.startsWith('text/') || m === 'application/javascript' || m === 'application/typescript') return 'source';
+    if (m.startsWith('text/')
+        || m === 'application/javascript'
+        || m === 'application/typescript'
+        || m === 'application/jsx'
+        || m === 'application/tsx') {
+        return 'source';
+    }
     return 'binary';
 }
 

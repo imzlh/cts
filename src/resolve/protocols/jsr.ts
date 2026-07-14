@@ -160,8 +160,11 @@ export class JsrHandler implements ProtocolHandler {
         }
         const url = `${JSR}/@${scope}/${name}/meta.json`;
         log.debug('jsr', () => `fetch meta @${scope}/${name} <- ${url}`);
-        const { body } = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout });
-        const meta = safeParse<JsrPackageMeta>(engine.decodeString(body));
+        const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout });
+        if (res.status < 200 || res.status >= 300) {
+            throw err(ErrorKind.NetworkError, `HTTP ${res.status} fetching JSR meta ${url}`);
+        }
+        const meta = safeParse<JsrPackageMeta>(engine.decodeString(res.body));
         if (!meta.latest) throw err(ErrorKind.VersionNotFound, `@${scope}/${name}: registry returned no latest`);
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
         yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: Date.now() }, null, 2) };
@@ -180,8 +183,11 @@ export class JsrHandler implements ProtocolHandler {
         }
         const url = `${JSR}/@${scope}/${name}/${ver}_meta.json`;
         log.debug('jsr', () => `fetch version meta @${scope}/${name}@${ver} <- ${url}`);
-        const { body } = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout });
-        const meta = safeParse<JsrVersionMeta>(engine.decodeString(body));
+        const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout });
+        if (res.status < 200 || res.status >= 300) {
+            throw err(ErrorKind.NetworkError, `HTTP ${res.status} fetching JSR version meta ${url}`);
+        }
+        const meta = safeParse<JsrVersionMeta>(engine.decodeString(res.body));
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
         yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: Date.now() }, null, 2) };
         return meta;
@@ -195,8 +201,11 @@ export class JsrHandler implements ProtocolHandler {
             const url = `${JSR}/@${scope}/${name}/${ver}/${file}`;
             log.debug('jsr', () => `fetch file @${scope}/${name}@${ver}/${file} <- ${url}`);
             yield { type: StepType.FS_ENSURE_DIR, path: dirname(local) };
-            const { body } = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout, onProgress });
-            yield { type: StepType.FS_WRITE_BYTES, path: local, data: body };
+            const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout, onProgress });
+            if (res.status < 200 || res.status >= 300) {
+                throw err(ErrorKind.ModuleNotFound, `HTTP ${res.status} fetching ${url}`);
+            }
+            yield { type: StepType.FS_WRITE_BYTES, path: local, data: res.body };
         }
         return local;
     }

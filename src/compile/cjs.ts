@@ -729,8 +729,7 @@ export class CjsLoader {
     private resolveLocalPath(candidate: string): ResolvedCjsRequest | null {
         try {
             const path = normalizePath(resolveFile(normalizePath(candidate)));
-            // .node always CJS; .js uses detectFormat (package type + ESM-syntax promote)
-            // so require() of dual ESM-in-.js packages reaches loadEsmSync instead of CJS eval.
+            // .node always CJS; .js uses package type / extension (no source scan).
             const format = extname(path) === '.node' ? 'cjs' : detectFormat(path);
             const fileKind = guessFileKind(path);
             return this.infoFromLocalPath(path, format, fileKind);

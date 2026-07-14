@@ -1,18 +1,17 @@
 import type { RuntimeConfig, ModuleFormat } from './types';
 import { ModuleResolver } from './resolve/index';
-import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative } from './utils';
+import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative, isAbsolute, parentDirKey, yieldEventLoop } from './utils';
 import { isRemote } from './source/cache';
 import type { OxcTranspiler } from './oxc';
 import { ImportScanner } from './import-scanner';
+import { isParseWorkerError } from './parse';
 import { isScannablePath, isWasmPath } from './scan';
 
 const os = import.meta.use('os');
-const { setTimeout } = import.meta.use('timers');
 
-/** Yield so libuv timers (progress UI) can run during long sync parse stretches. */
-function yieldEventLoop(): Promise<void> {
-    return new Promise(resolve => { setTimeout(resolve, 0); });
-}
+// Batch size / wall budget before flush+yield (UI needs macrotasks to paint).
+const SCAN_BATCH_ITEMS = 32;
+const SCAN_BATCH_MS = 16;
 
 // Parallel BFS — full scan, no lock deps shortcut
 
@@ -136,9 +135,11 @@ export class DepScanner {
         seeds: Array<{ spec: string; parent: string }>,
     ): Promise<ScanResult> {
         // Queue holds specifiers to resolve (spec, parentSpecPath)
-        const queue: Array<{ spec: string; parent: string }> = [];
+        const queue: Array<{ spec: string; parent: string } | undefined> = [];
+        let queueHead = 0;
         // pending counts items not yet fully processed (queued + active).
         let pending = 0;
+        let fatalWorkerError: Error | null = null;
         const wakeWaiters: Array<() => void> = [];
 
         const wake = () => {
@@ -147,6 +148,7 @@ export class DepScanner {
         };
 
         const enqueue = (spec: string, parent: string) => {
+            if (fatalWorkerError) return;
             queue.push({ spec, parent });
             pending++;
             wake();
@@ -162,84 +164,159 @@ export class DepScanner {
             return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [], resolutions: [] };
         }
 
-        const CONCURRENCY = { low: 4, normal: 8, high: 16 }[getMemoryTier()] ?? 8;
+        // parseImports is the worker (or async) scanner; null → sync ImportScanner.
+        const syncScan = this.parseImports === null;
+        // Local resolve+oxc-scan is sync on main. Extra pool slots only help when
+        // edges hit network or worker scan; pure local graphs want a tiny pool.
+        const CONCURRENCY = !syncScan
+            ? ({ low: 4, normal: 12, high: 24 }[getMemoryTier()] ?? 12)
+            : ({ low: 1, normal: 2, high: 4 }[getMemoryTier()] ?? 2);
+        // Dedupe identical edges for precache. fullGraph/pack must keep every
+        // parent edge in resolutions — only collapse same-dir relative fan-in
+        // when we do not need per-parent resolution records.
+        const fullGraph = this.options.fullGraph === true;
+        const queuedKeys = new Set<string>();
+        const edgeKey = (spec: string, parent: string): string => {
+            // Same parentDirKey as ModuleResolver.exactResolveKey (shared helper).
+            if (!fullGraph && isRelative(spec)) return `${spec}\0${parentDirKey(parent)}`;
+            return `${spec}\0${parent}`;
+        };
         const nextItem = async (): Promise<{ spec: string; parent: string } | null> => {
-            while (queue.length === 0) {
+            while (queueHead >= queue.length) {
+                if (fatalWorkerError) return null;
                 if (pending === 0) return null;
                 await new Promise<void>(resolve => { wakeWaiters.push(resolve); });
             }
-            return queue.shift() ?? null;
+            if (fatalWorkerError) return null;
+            const item = queue[queueHead];
+            queue[queueHead++] = undefined;
+            return item ?? null;
+        };
+
+        const enqueueEdge = (spec: string, parent: string) => {
+            const key = edgeKey(spec, parent);
+            if (queuedKeys.has(key)) return;
+            queuedKeys.add(key);
+            enqueue(spec, parent);
+        };
+
+        // Seeds already enqueued above — mark so re-seed / re-import is skipped.
+        for (const seed of seeds) queuedKeys.add(edgeKey(seed.spec, seed.parent));
+
+        // Yield the event loop so timers (progress paint, etc.) can run.
+        // Progress only receives state updates — never paint calls from here.
+        const prog = this.prog;
+        let batchItems = 0;
+        let batchStartedMs = Date.now();
+        const maybeYieldBatch = (): Promise<void> | undefined => {
+            batchItems++;
+            if (batchItems < SCAN_BATCH_ITEMS && Date.now() - batchStartedMs < SCAN_BATCH_MS) {
+                return undefined;
+            }
+            batchItems = 0;
+            batchStartedMs = Date.now();
+            return yieldEventLoop();
+        };
+
+        const processEdge = async (item: { spec: string; parent: string }): Promise<void> => {
+            let didDownload = false;
+            // Always update the light activity label (incl. relatives). Only bare
+            // / remote specs use the heavier startResolve Map for download rows.
+            prog?.setActivity(item.spec);
+            const trackProgress = prog !== null && !isRelative(item.spec);
+            const baseProgress = trackProgress ? prog.onDownloadProgress(item.spec) : undefined;
+            const onProgress = baseProgress
+                ? (now: number, total: number) => { didDownload = true; baseProgress(now, total); }
+                : undefined;
+            const startedMs = Date.now();
+            let resolvedMs = 0;
+            if (trackProgress) prog.startResolve(item.spec);
+
+            try {
+                // Relative/absolute local edges never download — keep them sync.
+                const info = (isRelative(item.spec) || isAbsolute(item.spec) || item.spec.startsWith('file:'))
+                    ? this.resolver.resolve(item.spec, item.parent)
+                    : await this.resolver.resolveAsync(item.spec, item.parent, undefined, onProgress);
+                resolvedMs = Date.now() - startedMs;
+                if (didDownload) this.downloaded++;
+                prog?.bumpResolved();
+                if (fullGraph) {
+                    this.resolutions.push({
+                        parentSpecPath: item.parent,
+                        specifier: item.spec,
+                        childSpecPath: info.specPath,
+                    });
+                }
+                if (this.options.excludeSpecPath?.(info.specPath) === true) return;
+
+                // Always record edge (per-parent node_modules link). Use resolved npm: path.
+                if (info.specPath.startsWith('npm:') && isEligibleParent(item.parent)) {
+                    const name = npmPackageName(info.specPath);
+                    const parentName = item.parent.startsWith('npm:') ? npmPackageName(item.parent) : null;
+                    // Skip self-deps (pkg → pkg/...) — soft mode would self-link forever.
+                    if (name && name !== parentName) {
+                        this.edges.push({
+                            parentSpecPath: item.parent,
+                            name,
+                            childSpecPath: info.specPath,
+                            childLocalPath: info.localPath,
+                        });
+                    }
+                }
+
+                if (!this.seen.has(info.specPath)) {
+                    this.seen.add(info.specPath);
+                    this.found.push({
+                        specPath: info.specPath,
+                        localPath: info.localPath,
+                        format: info.format,
+                        remote: isRemote(info.specPath),
+                    });
+
+                    // Sync ImportScanner when parseImports is null (oxc-main).
+                    const children = syncScan
+                        ? this.parseOneSync(info.specPath, info.localPath)
+                        : await this.parseOne(info.specPath, info.localPath);
+                    for (const child of children) enqueueEdge(child.spec, info.specPath);
+                }
+            } catch (e) {
+                if (isParseWorkerError(e)) {
+                    fatalWorkerError = e;
+                    wake();
+                    return;
+                }
+                prog?.bumpResolved();
+                this.errs.push({ spec: item.spec, parent: item.parent, error: errMsg(e) });
+            } finally {
+                // Clear tracked row even on resolve-only (never downloaded) work.
+                if (trackProgress) prog.finishDownload(item.spec);
+                const age = Date.now() - startedMs;
+                if (age >= 5000) {
+                    log.debug('deps', () =>
+                        `slow item ${age}ms (resolve=${resolvedMs}ms, scan=${Math.max(0, age - resolvedMs)}ms): ` +
+                        `"${item.spec}" from "${item.parent}"`);
+                }
+                this.maybeLogStall(pending, queue.length - queueHead);
+                pending--;
+                // Wake only when pending===0; enqueue() already wakes new work.
+                if (pending === 0) wake();
+            }
         };
 
         const rootedWorker = async () => {
             while (true) {
                 const item = await nextItem();
                 if (!item) return;
-
-                let didDownload = false;
-                const baseProgress = this.prog?.onDownloadProgress(item.spec);
-                const onProgress = baseProgress
-                    ? (now: number, total: number) => { didDownload = true; baseProgress(now, total); }
-                    : undefined;
-                const startedMs = Date.now();
-                this.prog?.startResolve(item.spec);
-
-                try {
-                    const info = await this.resolver.resolveAsync(item.spec, item.parent, undefined, onProgress);
-                    if (didDownload) this.downloaded++;
-                    this.prog?.bumpResolved();
-                    if (this.options.fullGraph === true) {
-                        this.resolutions.push({
-                            parentSpecPath: item.parent,
-                            specifier: item.spec,
-                            childSpecPath: info.specPath,
-                        });
-                    }
-                    if (this.options.excludeSpecPath?.(info.specPath) === true) continue;
-
-                    // Always record edge (per-parent node_modules link). Use resolved npm: path.
-                    if (info.specPath.startsWith('npm:') && isEligibleParent(item.parent)) {
-                        const name = npmPackageName(info.specPath);
-                        const parentName = item.parent.startsWith('npm:') ? npmPackageName(item.parent) : null;
-                        // Skip self-deps (pkg → pkg/...) — soft mode would self-link forever.
-                        if (name && name !== parentName) {
-                            this.edges.push({ parentSpecPath: item.parent, name, childSpecPath: info.specPath, childLocalPath: info.localPath });
-                        }
-                    }
-
-                    if (!this.seen.has(info.specPath)) {
-                        this.seen.add(info.specPath);
-                        this.found.push({ specPath: info.specPath, localPath: info.localPath, format: info.format, remote: isRemote(info.specPath) });
-
-                        // parseOne self-gates on extension and tolerates a missing
-                        // file (readFile failure → []), so no extra fs.exists stat.
-                        const children = await this.parseOne(info.specPath, info.localPath);
-                        for (const child of children) enqueue(child.spec, info.specPath);
-                        // Sync parse of large graphs starves the progress timer;
-                        // yield so UI (and other timers) can paint.
-                        if ((this.seen.size & 31) === 0) await yieldEventLoop();
-                    }
-                } catch (e) {
-                    this.prog?.bumpResolved();
-                    this.errs.push({ spec: item.spec, parent: item.parent, error: errMsg(e) });
-                } finally {
-                    // Always clear progress — resolve-only work never called
-                    // finishDownload and left the spinner stuck on one label.
-                    this.prog?.finishDownload(item.spec);
-                    const age = Date.now() - startedMs;
-                    if (age >= 5000) {
-                        log.debug('deps', () => `slow item ${age}ms: "${item.spec}" from "${item.parent}"`);
-                    }
-                    this.maybeLogStall(pending, queue.length);
-                    pending--;
-                    // Wake only when pending===0; otherwise idle workers busy-loop.
-                    if (pending === 0) wake();
-                }
+                await processEdge(item);
+                const yieldP = maybeYieldBatch();
+                if (yieldP) await yieldP;
             }
         };
 
         // Full pool from the start; empty workers wait for newly enqueued imports.
         await Promise.all(Array.from({ length: CONCURRENCY }, () => rootedWorker()));
+        prog?.setActivity(null);
+        if (fatalWorkerError) throw fatalWorkerError;
 
         if (!this.cfg.silent && this.options.reportSummary !== false) {
             const e = this.errs.length ? `, ${this.errs.length} error(s)` : '';
@@ -257,30 +334,79 @@ export class DepScanner {
 
     // Read + parse a single file, return its import specifiers
 
+    private filterImports(
+        specPath: string,
+        imports: string[],
+        fullGraph: boolean,
+    ): Array<{ spec: string; parent: string }> {
+        const out: Array<{ spec: string; parent: string }> = [];
+        for (let i = 0; i < imports.length; i++) {
+            const spec = imports[i];
+            if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec, fullGraph)) {
+                out.push({ spec, parent: specPath });
+            }
+        }
+        return out;
+    }
+
+    /** Resolve import list: lock cache (precache) or scan callback / ImportScanner. */
+    private async loadImports(specPath: string, localPath: string): Promise<string[] | null> {
+        const fullGraph = this.options.fullGraph === true;
+        // Warm precache may reuse lock imports; pack/fullGraph always rescans.
+        if (!fullGraph) {
+            const cached = this.resolver.lockStore.getImports(specPath);
+            if (cached !== undefined) return cached;
+        }
+        let imports: string[];
+        if (this.parseImports) {
+            imports = await this.parseImports(localPath);
+        } else if (isWasmPath(localPath) || isScannablePath(localPath)) {
+            const scanned = this.importScanner.scanFileResult(localPath);
+            if (scanned === null) return null;
+            imports = scanned;
+        } else {
+            return [];
+        }
+        if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
+        return imports;
+    }
+
+    /** Sync path when ImportScanner owns scan (no worker parseImports). */
+    private parseOneSync(
+        specPath: string,
+        localPath: string,
+    ): Array<{ spec: string; parent: string }> {
+        try {
+            const fullGraph = this.options.fullGraph === true;
+            let imports: string[] | undefined;
+            if (!fullGraph) {
+                const cached = this.resolver.lockStore.getImports(specPath);
+                if (cached !== undefined) imports = cached;
+            }
+            if (imports === undefined) {
+                if (!(isWasmPath(localPath) || isScannablePath(localPath))) return [];
+                const scanned = this.importScanner.scanFileResult(localPath);
+                if (scanned === null) return [];
+                imports = scanned;
+                if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
+            }
+            return this.filterImports(specPath, imports, fullGraph);
+        } catch {
+            return [];
+        }
+    }
+
     private async parseOne(
         specPath: string,
         localPath: string,
     ): Promise<Array<{ spec: string; parent: string }>> {
         try {
-            // All file kinds via ImportScanner — do not special-case wasm here.
-            let imports: string[];
-            if (this.parseImports) {
-                imports = await this.parseImports(localPath);
-            } else if (isWasmPath(localPath) || isScannablePath(localPath)) {
-                imports = this.importScanner.scanFile(localPath);
-            } else {
-                return [];
-            }
-            const out: Array<{ spec: string; parent: string }> = [];
-            const fullGraph = this.options.fullGraph === true;
-            for (let i = 0; i < imports.length; i++) {
-                const spec = imports[i];
-                if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec, fullGraph)) {
-                    out.push({ spec, parent: specPath });
-                }
-            }
-            return out;
-        } catch {
+            const imports = await this.loadImports(specPath, localPath);
+            if (imports === null) return [];
+            return this.filterImports(specPath, imports, this.options.fullGraph === true);
+        } catch (e) {
+            // Worker scanner reports real file errors; infrastructure aborts the scan.
+            if (this.parseImports || isParseWorkerError(e)) throw e;
             return [];
         }
     }

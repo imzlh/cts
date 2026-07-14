@@ -176,69 +176,6 @@ function isWordAt(source: string, idx: number, word: string): boolean {
     return isIdentBoundary(source, idx + word.length);
 }
 
-/** Top-level import/export (not import())? Linear scan; isTs unused. */
-export function hasTopLevelEsmSyntax(source: string, _isTs = false): boolean {
-    const n = source.length;
-    let i = 0;
-    let brace = 0;
-    let paren = 0;
-    let bracket = 0;
-    while (i < n) {
-        const c = source.charCodeAt(i);
-        // // and /* */ comments
-        if (c === 47 && i + 1 < n) {
-            const n1 = source.charCodeAt(i + 1);
-            if (n1 === 47) {
-                i += 2;
-                while (i < n && source.charCodeAt(i) !== 10) i++;
-                continue;
-            }
-            if (n1 === 42) {
-                i += 2;
-                while (i + 1 < n && !(source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47)) i++;
-                i += 2;
-                continue;
-            }
-        }
-        // strings / templates (no full template nesting; good enough for dual detect)
-        if (c === 34 || c === 39 || c === 96) {
-            const q = c;
-            i++;
-            while (i < n) {
-                const ch = source.charCodeAt(i);
-                if (ch === 92) { i += 2; continue; }
-                if (ch === q) { i++; break; }
-                i++;
-            }
-            continue;
-        }
-        if (c === 123) { brace++; i++; continue; }
-        if (c === 125) { brace = Math.max(0, brace - 1); i++; continue; }
-        if (c === 40) { paren++; i++; continue; }
-        if (c === 41) { paren = Math.max(0, paren - 1); i++; continue; }
-        if (c === 91) { bracket++; i++; continue; }
-        if (c === 93) { bracket = Math.max(0, bracket - 1); i++; continue; }
-        // Only top-level statements count as ESM markers.
-        if (brace === 0 && paren === 0 && bracket === 0) {
-            if (c === 101 && isWordAt(source, i, 'export')) {
-                return true;
-            }
-            if (c === 105 && isWordAt(source, i, 'import')) {
-                let j = i + 6;
-                while (j < n && isWs(source.charCodeAt(j))) j++;
-                // dynamic import(...) is valid in CJS
-                if (j < n && source.charCodeAt(j) === 40) {
-                    i = j;
-                    continue;
-                }
-                return true;
-            }
-        }
-        i++;
-    }
-    return false;
-}
-
 type Tokens = ReturnType<typeof parse>['tokens'];
 
 export function isTsLikePath(filename: string): boolean {
@@ -274,9 +211,15 @@ export function isScannablePath(filename: string): boolean {
     const last = filename.charCodeAt(length - 1);
     if (last === 115) {
         const prev = filename.charCodeAt(length - 2);
+        // .ts / .mts / .cts (same family as isTsLikePath, plus JS below)
         if (prev === 116) {
-            return filename.charCodeAt(length - 3) === 46;
+            const third = filename.charCodeAt(length - 3);
+            if (third === 46) return true;
+            return length >= 4 &&
+                (third === 109 || third === 99) &&
+                filename.charCodeAt(length - 4) === 46;
         }
+        // .js / .mjs / .cjs
         if (prev !== 106) return false;
         const third = filename.charCodeAt(length - 3);
         return third === 46 ||

@@ -1,6 +1,7 @@
 import { Transformer, isPassthroughSource } from './source/transform';
 import { OxcTranspiler, oxcExtPath, tryLoadOxc } from './oxc';
-import { errMsg, log, getMemoryTier, readText, type MemoryTier } from './utils';
+import { ImportScanner } from './import-scanner';
+import { errMsg, log, getMemoryTier, getMemoryFile, readBytes, readText, type MemoryTier } from './utils';
 import { buildCjsWrapperSource } from './compile/cjs-wrap';
 import type { ModuleFormat } from './types';
 
@@ -10,13 +11,12 @@ const engine = import.meta.use('engine');
 const worker = import.meta.use('worker');
 const smap = import.meta.use('sourcemap');
 const asyncfs = import.meta.use('asyncfs');
-const fs = import.meta.use('fs');
 
-// Worker protocol — transform only (import scan is ImportScanner on main)
+// Workers read/scan/transform; QuickJS bytecode compilation stays on main.
 
 interface WorkerTask {
     id: number;
-    kind: 'transform';
+    kind: 'scan' | 'transform';
     localPath: string;
     /** Module runtime identity for Transformer.transform mapKey. */
     specPath?: string;
@@ -25,6 +25,7 @@ interface WorkerTask {
 
 interface WorkerResult {
     id: number;
+    deps?: string[];
     code?: Uint8Array;
     sourceMap?: Uint8Array | object;
     error?: string;
@@ -40,7 +41,21 @@ interface ParseWorkerData {
     __cts_enable_oxc?: unknown;
 }
 
+interface ScanCallback {
+    resolve: (deps: string[]) => void;
+    reject: (error: Error) => void;
+}
+
+export class ParseWorkerError extends Error {
+    override name = 'ParseWorkerError';
+}
+
+export function isParseWorkerError(error: unknown): error is ParseWorkerError {
+    return error instanceof ParseWorkerError;
+}
+
 // Bytecode: CJS via cjs-wrap; ESM via Module.dump() under stub onModule (no dep cascade).
+// CJS must strip TS/JSX first — workers only run ESM transform; .cts is main-thread.
 function compileForCache(code: string | Uint8Array, specPath: string, format: ModuleFormat | undefined): ArrayBuffer {
     if (format === 'cjs') {
         const src = typeof code === 'string' ? code : engine.decodeString(code);
@@ -52,7 +67,20 @@ function compileForCache(code: string | Uint8Array, specPath: string, format: Mo
     return mod.dump();
 }
 
-/** Transform worker safety timeout (ms). Import scan never uses this pool. */
+function prepareForCache(
+    transformer: Transformer,
+    code: string,
+    localPath: string,
+    format: ModuleFormat | undefined,
+    lang?: string,
+    mapKey?: string,
+): string {
+    // CJS keeps require/exports; transform() would rewrite import/export.
+    if (format === 'cjs') return transformer.transformForCjs(code, localPath, lang);
+    return transformer.transform(code, localPath, lang, mapKey);
+}
+
+/** Transform worker safety timeout (ms). Scan tasks have no wall-clock kill. */
 export function parseTaskTimeoutMs(_kind: 'transform' = 'transform'): number {
     return 60_000;
 }
@@ -68,7 +96,7 @@ function parseWorkerData(): ParseWorkerData {
 function isWorkerTask(value: unknown): value is WorkerTask {
     return isRecord(value)
         && typeof value.id === 'number'
-        && value.kind === 'transform'
+        && (value.kind === 'scan' || value.kind === 'transform')
         && typeof value.localPath === 'string'
         && (value.lang === undefined || typeof value.lang === 'string');
 }
@@ -134,6 +162,7 @@ export async function runParseWorker(): Promise<void> {
     const transformer = new Transformer({ sourceMaps: true });
     const oxcTranspiler: OxcTranspiler | null = wd.__cts_enable_oxc === false ? null : tryLoadOxc();
     if (oxcTranspiler) transformer.setOxc(oxcTranspiler);
+    const importScanner = new ImportScanner(oxcTranspiler);
     const postResult = (result: WorkerResult) => pipe.postMessage(result);
     const queue: WorkerTask[] = [];
     let processing = false;
@@ -141,13 +170,19 @@ export async function runParseWorker(): Promise<void> {
     const runTask = async (task: WorkerTask): Promise<void> => {
         let bytes: Uint8Array;
         try {
-            bytes = await asyncfs.readFile(task.localPath);
+            // Pack/VFS paths are not on disk; workers share process store when installed.
+            const mem = getMemoryFile(task.localPath);
+            bytes = mem !== undefined ? mem : await asyncfs.readFile(task.localPath);
         } catch (e) {
             postResult({ id: task.id, error: errMsg(e) });
             return;
         }
 
         try {
+            if (task.kind === 'scan') {
+                postResult({ id: task.id, deps: importScanner.scanBytes(bytes, task.localPath, task.lang) });
+                return;
+            }
             let result = transformer.transformCaptureBytes(bytes, task.localPath, task.lang, task.specPath);
             if (result === null) {
                 const source = engine.decodeString(bytes);
@@ -197,6 +232,8 @@ class TxWorker {
     readonly pipe: CModuleWorker.MessagePipe;
     inFlight = 0;
     idx: number;
+    private stopped = false;
+    private termination: Promise<void> | null = null;
 
     constructor(
         idx: number,
@@ -238,21 +275,28 @@ class TxWorker {
     }
 
     stop(): void {
+        if (this.stopped) return;
+        this.stopped = true;
         this.detach();
         this.w.stop();
     }
 
-    async terminate(): Promise<void> {
-        this.detach();
-        await this.w.terminate();
+    terminate(): Promise<void> {
+        if (!this.termination) {
+            this.stop();
+            this.termination = Promise.resolve(this.w.terminate());
+        }
+        return this.termination;
     }
 }
 
-// ParseDriver — transform / precompile only
+// ParseDriver — worker scan/transform, main-thread bytecode compile
 
 export class ParseDriver {
     private workers: TxWorker[] = [];
     private pending: WorkerTask[] = [];
+    private scanQueue: WorkerTask[] = [];
+    private scanCallbacks = new Map<number, ScanCallback>();
     /** id → {specPath, format} for in-flight transform tasks */
     private specMap = new Map<number, { specPath: string; format: ModuleFormat | undefined }>();
     private bytecodes = new Map<string, ArrayBuffer>();
@@ -262,19 +306,26 @@ export class ParseDriver {
     private maxWorkers: number;
     private oxcPath: string | null;
     private oxc: OxcTranspiler | null;
+    private readonly importScanner: ImportScanner;
     private inlineTransformer: Transformer | null = null;
     private taskTimers = new Map<number, ReturnType<typeof setTimeout>>();
     private workerTaskIds = new Map<number, Set<number>>();
-    private taskInfo = new Map<number, { localPath: string; workerIdx: number }>();
+    private taskInfo = new Map<number, { task: WorkerTask; workerIdx: number }>();
+    private taskRetries = new Map<number, number>();
     private deadWorkers = new Set<number>();
+    private retiringWorkers = new Set<number>();
+    private workerFailure: ParseWorkerError | null = null;
+    private spawnFailures = 0;
     private settled = false;
     private closing = false;
     private transformDone = 0;
     private transformFail = 0;
     private taskTotal = 0;
     private resolveTransforms?: () => void;
+    private rejectTransforms?: (error: Error) => void;
     private onProgressCb?: (done: number, total: number) => void;
 
+    private static readonly MAX_WORKER_RETRIES = 2;
     private static readonly TRANSFORM_PREFETCH = 2;
     private static readonly GLOBAL_TIMEOUT_MS = 1200_000;
     private globalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -282,6 +333,7 @@ export class ParseDriver {
     constructor(oxc: OxcTranspiler | null = null, maxWorkers?: number) {
         this.oxc = oxc;
         this.oxcPath = oxc ? oxcExtPath() : null;
+        this.importScanner = new ImportScanner(oxc);
         const policy = resolveWorkerPolicy();
         this.maxWorkers = maxWorkers === undefined
             ? policy.maxWorkers
@@ -292,21 +344,61 @@ export class ParseDriver {
     }
 
     private ensureWorkers(): void {
-        if (this.maxWorkers <= 0 || this.closing) return;
+        if (this.maxWorkers <= 0 || this.closing || this.workerFailure) return;
+        // Native worker teardown must join before a replacement is created.
+        if (this.retiringWorkers.size > 0) return;
         const active = this.workerTaskIds.size;
-        const desired = Math.min(this.maxWorkers, active + this.pending.length);
+        const desired = Math.min(this.maxWorkers, active + this.scanQueue.length + this.pending.length);
         let live = this.workers.length - this.deadWorkers.size;
         while (live < desired) {
-            const w = new TxWorker(
-                this.workers.length,
-                (r) => this.onWorkerResult(r),
-                (workerIdx, error) => this.onWorkerError(workerIdx, error),
-                this.oxc !== null,
-            );
+            let w: TxWorker;
+            try {
+                w = new TxWorker(
+                    this.workers.length,
+                    (r) => this.onWorkerResult(r),
+                    (workerIdx, error) => this.onWorkerError(workerIdx, error),
+                    this.oxc !== null,
+                );
+                this.spawnFailures = 0;
+            } catch (e) {
+                this.spawnFailures++;
+                const reason = `parse worker spawn failed (${this.spawnFailures}/${ParseDriver.MAX_WORKER_RETRIES + 1}): ${errMsg(e)}`;
+                log.debug('precompile', () => reason);
+                if (this.spawnFailures > ParseDriver.MAX_WORKER_RETRIES) {
+                    this.failInfrastructure(new ParseWorkerError(reason));
+                    return;
+                }
+                continue;
+            }
             this.workers.push(w);
             live++;
             log.debug('precompile', () => `spawned worker ${w.idx}`);
         }
+    }
+
+    /**
+     * Import extraction for dep scan.
+     * oxc is native and cheap on the main thread — worker IPC dominates for 1k+
+     * small files and shows up as main-thread 100% (resolve + wait). Workers only
+     * help when falling back to Sucrase (no oxc).
+     */
+    async scanFile(localPath: string, lang?: string): Promise<string[]> {
+        if (this.closing) throw new ParseWorkerError('parse worker pool is closing');
+        if (this.workerFailure) throw this.workerFailure;
+        // Prefer main-thread oxc (or forced inline). Worker path is Sucrase-only.
+        if (this.oxc || this.maxWorkers <= 0) {
+            const result = this.importScanner.scanFileResult(localPath, lang);
+            if (result === null) throw new Error(`Could not read source for import scan: ${localPath}`);
+            return result;
+        }
+
+        const id = this.nextId++;
+        const task: WorkerTask = { id, kind: 'scan', localPath, lang };
+        return new Promise<string[]>((resolve, reject) => {
+            this.scanCallbacks.set(id, { resolve, reject });
+            this.scanQueue.push(task);
+            this.drain();
+        });
     }
 
     async compileModules(
@@ -316,6 +408,7 @@ export class ParseDriver {
         onFailed?: (localPath: string, specPath: string, error: unknown) => void,
     ): Promise<Map<string, ArrayBuffer>> {
         if (this.closing) return new Map();
+        if (this.workerFailure) throw this.workerFailure;
         if (!modules.length) return new Map();
         if (this.maxWorkers <= 0) {
             return this.compileModulesInline(modules, onProgress, onCompiled, onFailed);
@@ -328,10 +421,11 @@ export class ParseDriver {
         log.debug('precompile', () => `queuing ${modules.length} modules`);
 
         const tasks: WorkerTask[] = [];
-        const passthrough: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }> = [];
+        // CJS (+ plain passthrough) stay on main: transformForCjs is not worker-side.
+        const mainThread: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }> = [];
         for (const m of modules) {
-            if (isPassthroughSource(m.localPath) && !m.lang) {
-                passthrough.push(m);
+            if (m.format === 'cjs' || (isPassthroughSource(m.localPath) && !m.lang)) {
+                mainThread.push(m);
                 continue;
             }
             const id = this.nextId++;
@@ -345,8 +439,9 @@ export class ParseDriver {
         this.settled = false;
         this.onProgressCb = onProgress;
 
-        const allTransformsDone = new Promise<void>(resolve => {
+        const allTransformsDone = new Promise<void>((resolve, reject) => {
             this.resolveTransforms = resolve;
+            this.rejectTransforms = reject;
         });
 
         this.ensureWorkers();
@@ -355,7 +450,7 @@ export class ParseDriver {
         // Safety net only — must abandon remaining work (not silently resolve).
         this.globalTimer = setTimeout(() => this.onGlobalTimeout(), ParseDriver.GLOBAL_TIMEOUT_MS);
         this.drain();
-        for (const m of passthrough) this.compilePassthrough(m);
+        for (const m of mainThread) this.compileOnMain(m);
         if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
 
         await allTransformsDone;
@@ -370,6 +465,8 @@ export class ParseDriver {
         this.onCompiled = undefined;
         this.onFailed = undefined;
         this.onProgressCb = undefined;
+        this.resolveTransforms = undefined;
+        this.rejectTransforms = undefined;
         this.taskTotal = 0;
         return out;
     }
@@ -378,10 +475,10 @@ export class ParseDriver {
     private onGlobalTimeout(): void {
         if (this.settled) return;
         const left = this.pending.length + this.taskInfo.size;
-        log.debug('precompile', () =>
-            `global timeout (${ParseDriver.GLOBAL_TIMEOUT_MS}ms), abandoning ${left} remaining task(s)`);
-        this.cancelOutstanding();
-        this.finish();
+        const error = new ParseWorkerError(
+            `parse worker batch timeout (${ParseDriver.GLOBAL_TIMEOUT_MS}ms), ${left} task(s) remaining`);
+        log.debug('precompile', () => error.message);
+        this.failInfrastructure(error);
     }
 
     async precompile(
@@ -409,7 +506,7 @@ export class ParseDriver {
         for (const m of modules) {
             try {
                 const source = readText(m.localPath);
-                const code = transformer.transform(source, m.localPath, m.lang, m.specPath);
+                const code = prepareForCache(transformer, source, m.localPath, m.format, m.lang, m.specPath);
                 const bc = compileForCache(code, m.specPath, m.format);
                 if (onCompiled) onCompiled(m.localPath, bc, m.specPath);
                 else bytecodes.set(m.localPath, bc);
@@ -436,14 +533,36 @@ export class ParseDriver {
     }
 
     private onWorkerResult(r: WorkerResult): void {
-        const task = this.takeTask(r.id);
-        if (!task) {
+        const taken = this.takeTask(r.id);
+        if (!taken) {
             log.debug('precompile', () => `late result discarded: ${r.id}`);
+            return;
+        }
+        const task = taken.task;
+
+        if (task.kind === 'scan') {
+            if (!Array.isArray(r.deps) && !r.error) {
+                this.retryTask(task, 'invalid scan worker result');
+            } else {
+                const callback = this.scanCallbacks.get(task.id);
+                this.scanCallbacks.delete(task.id);
+                this.taskRetries.delete(task.id);
+                if (r.error) callback?.reject(new Error(`Import scan failed for ${task.localPath}: ${r.error}`));
+                else callback?.resolve(r.deps ?? []);
+            }
+            this.drain();
+            return;
+        }
+
+        if (!r.code && !r.error) {
+            this.retryTask(task, 'invalid transform worker result');
+            this.drain();
             return;
         }
 
         const entry = this.specMap.get(r.id);
         if (entry) this.specMap.delete(r.id);
+        this.taskRetries.delete(task.id);
         if (r.code && entry) {
             const { specPath, format } = entry;
             try {
@@ -473,21 +592,30 @@ export class ParseDriver {
         if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
     }
 
-    private compilePassthrough(m: { specPath: string; localPath: string; format?: ModuleFormat; lang?: string }): void {
+    /** Main-thread compile: CJS (transformForCjs) or plain JS passthrough. */
+    private compileOnMain(m: { specPath: string; localPath: string; format?: ModuleFormat; lang?: string }): void {
         try {
-            const bytes = new Uint8Array(fs.readFile(m.localPath));
+            const transformer = this.getInlineTransformer();
             let bc: ArrayBuffer;
-            if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
-                const code = this.getInlineTransformer().transform(engine.decodeString(bytes), m.localPath, m.lang, m.specPath);
-                bc = compileForCache(code, m.specPath, m.format);
+            if (m.format === 'cjs') {
+                // Always strip TS/JSX; .cts must not hit EVAL_COMPILE_ONLY raw.
+                const code = prepareForCache(transformer, readText(m.localPath), m.localPath, 'cjs', m.lang, m.specPath);
+                bc = compileForCache(code, m.specPath, 'cjs');
             } else {
-                try {
-                    bc = compileForCache(bytes, m.specPath, m.format);
-                } catch (e) {
+                const bytes = readBytes(m.localPath);
+                if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
+                    const code = prepareForCache(
+                        transformer, engine.decodeString(bytes), m.localPath, m.format, m.lang, m.specPath);
+                    bc = compileForCache(code, m.specPath, m.format);
+                } else {
                     try {
-                        bc = compileForCache(engine.decodeString(bytes), m.specPath, m.format);
-                    } catch {
-                        throw e;
+                        bc = compileForCache(bytes, m.specPath, m.format);
+                    } catch (e) {
+                        try {
+                            bc = compileForCache(engine.decodeString(bytes), m.specPath, m.format);
+                        } catch {
+                            throw e;
+                        }
                     }
                 }
             }
@@ -496,7 +624,7 @@ export class ParseDriver {
             this.transformDone++;
         } catch (e) {
             this.transformFail++;
-            log.debug('precompile', () => `passthrough compile fail: ${m.localPath}: ${errMsg(e)}`);
+            log.debug('precompile', () => `main compile fail: ${m.localPath}: ${errMsg(e)}`);
             this.onFailed?.(m.localPath, m.specPath, e);
         }
         this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
@@ -505,12 +633,14 @@ export class ParseDriver {
     private onWorkerError(workerIdx: number, error: unknown): void {
         const taskIds = [...(this.workerTaskIds.get(workerIdx) ?? [])];
         const suffix = taskIds.length > 0 ? ` while handling ${taskIds.length} task(s)` : '';
-        log.debug('precompile', () => `worker ${workerIdx} message error${suffix}: ${errMsg(error)}`);
+        const reason = `worker ${workerIdx} transport error${suffix}: ${errMsg(error)}`;
+        log.debug('precompile', () => reason);
         this.deadWorkers.add(workerIdx);
+        this.retireWorker(workerIdx);
         for (const taskId of taskIds) {
-            this.failTask(taskId, `worker ${workerIdx} message error: ${errMsg(error)}`);
+            const taken = this.takeTask(taskId);
+            if (taken) this.retryTask(taken.task, reason);
         }
-        this.workers[workerIdx]?.stop();
         this.drain();
     }
 
@@ -519,39 +649,36 @@ export class ParseDriver {
         if (!timedTask) return;
         const timeout = parseTaskTimeoutMs('transform');
         this.deadWorkers.add(timedTask.workerIdx);
-        this.workers[timedTask.workerIdx]?.stop();
+        this.retireWorker(timedTask.workerIdx);
         const taskIds = [...(this.workerTaskIds.get(timedTask.workerIdx) ?? [])];
         for (const id of taskIds) {
-            const task = this.taskInfo.get(id);
-            if (!task) continue;
+            const taken = this.takeTask(id);
+            if (!taken) continue;
             const reason = id === taskId
-                ? `transform timeout (${timeout}ms), worker ${task.workerIdx} dead`
-                : `worker ${task.workerIdx} stopped after task ${taskId} timeout`;
-            this.failTask(id, reason);
+                ? `worker ${taken.workerIdx} transform timeout (${timeout}ms)`
+                : `worker ${taken.workerIdx} stopped after task ${taskId} timeout`;
+            this.retryTask(taken.task, reason);
         }
 
         this.drain();
-
-        if (this.deadWorkers.size >= this.workers.length) {
-            if (this.pending.length > 0) {
-                log.debug('precompile', () => `all workers dead, abandoning ${this.pending.length} transform tasks`);
-                while (this.pending.length > 0) {
-                    const t = this.pending.shift();
-                    if (!t) break;
-                    const specPath = this.specMap.get(t.id)?.specPath ?? t.localPath;
-                    this.specMap.delete(t.id);
-                    this.transformFail++;
-                    log.debug('precompile', () => `abandoned: ${t.localPath}`);
-                    this.onFailed?.(t.localPath, specPath, new Error('all parse workers stopped'));
-                }
-            }
-        }
-
-        this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
-        if (this.taskTotal > 0 && this.transformDone + this.transformFail >= this.taskTotal) this.finish();
     }
 
-    private finish(): void {
+    private retireWorker(workerIdx: number): void {
+        const failed = this.workers[workerIdx];
+        if (!failed || this.retiringWorkers.has(workerIdx)) return;
+        this.retiringWorkers.add(workerIdx);
+        failed.stop();
+        void failed.terminate().then(() => {
+            this.retiringWorkers.delete(workerIdx);
+            this.drain();
+        }).catch((e: unknown) => {
+            this.retiringWorkers.delete(workerIdx);
+            this.failInfrastructure(new ParseWorkerError(
+                `parse worker ${workerIdx} teardown failed: ${errMsg(e)}`));
+        });
+    }
+
+    private finish(error?: Error): void {
         if (this.settled) return;
         this.settled = true;
         for (const t of this.taskTimers.values()) clearTimeout(t);
@@ -561,13 +688,24 @@ export class ParseDriver {
             this.globalTimer = null;
         }
         const resolve = this.resolveTransforms;
+        const reject = this.rejectTransforms;
         this.resolveTransforms = undefined;
-        resolve?.();
+        this.rejectTransforms = undefined;
+        if (error) reject?.(error);
+        else resolve?.();
     }
 
     private drain(): void {
-        if (this.closing) return;
+        if (this.closing || this.workerFailure) return;
         this.ensureWorkers();
+
+        while (this.scanQueue.length > 0) {
+            const idle = this.workers.find(w => w.inFlight === 0 && !this.deadWorkers.has(w.idx));
+            if (!idle) break;
+            const task = this.scanQueue.shift();
+            if (!task) break;
+            this.sendToWorker(idle, task);
+        }
 
         while (this.pending.length > 0) {
             const idle = this.workers.find(w =>
@@ -580,27 +718,26 @@ export class ParseDriver {
     }
 
     private sendToWorker(w: TxWorker, task: WorkerTask): void {
-        this.taskInfo.set(task.id, { localPath: task.localPath, workerIdx: w.idx });
+        this.taskInfo.set(task.id, { task, workerIdx: w.idx });
         let taskIds = this.workerTaskIds.get(w.idx);
         if (!taskIds) {
             taskIds = new Set();
             this.workerTaskIds.set(w.idx, taskIds);
         }
         taskIds.add(task.id);
-        const timeout = parseTaskTimeoutMs('transform');
-        const timer = setTimeout(() => this.onTaskTimeout(task.id), timeout);
-        this.taskTimers.set(task.id, timer);
+        if (task.kind === 'transform') {
+            const timeout = parseTaskTimeoutMs('transform');
+            const timer = setTimeout(() => this.onTaskTimeout(task.id), timeout);
+            this.taskTimers.set(task.id, timer);
+        }
         try {
             w.send(task);
         } catch (e) {
-            this.deadWorkers.add(w.idx);
-            log.debug('precompile', () => `dispatch fail: ${task.localPath}: ${errMsg(e)}`);
-            this.failTask(task.id, `dispatch fail: ${errMsg(e)}`);
-            return;
+            this.onWorkerError(w.idx, e);
         }
     }
 
-    private takeTask(taskId: number): { localPath: string; workerIdx: number } | null {
+    private takeTask(taskId: number): { task: WorkerTask; workerIdx: number } | null {
         const task = this.taskInfo.get(taskId);
         if (!task) return null;
         this.taskInfo.delete(taskId);
@@ -615,35 +752,50 @@ export class ParseDriver {
         return task;
     }
 
-    private failTask(taskId: number, reason: string): void {
-        const task = this.takeTask(taskId);
-        if (!task) return;
+    private retryTask(task: WorkerTask, reason: string): void {
+        const retries = (this.taskRetries.get(task.id) ?? 0) + 1;
+        if (retries > ParseDriver.MAX_WORKER_RETRIES) {
+            this.taskRetries.delete(task.id);
+            const error = new ParseWorkerError(
+                `Parse worker infrastructure failed after ${retries} attempts: ${reason}`);
+            this.failInfrastructure(error);
+            return;
+        }
 
-        const specPath = this.specMap.get(taskId)?.specPath ?? task.localPath;
-        this.specMap.delete(taskId);
-        this.transformFail++;
-        log.debug('precompile', () => `${reason}: ${task.localPath}`);
-        this.onFailed?.(task.localPath, specPath, new Error(reason));
-        this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
-        this.drain();
-        if (this.taskTotal > 0 && this.transformDone + this.transformFail >= this.taskTotal) this.finish();
+        this.taskRetries.set(task.id, retries);
+        log.debug('precompile', () =>
+            `${reason}; retry ${retries}/${ParseDriver.MAX_WORKER_RETRIES}: ${task.localPath}`);
+        if (task.kind === 'scan') this.scanQueue.unshift(task);
+        else this.pending.unshift(task);
     }
 
-    private cancelOutstanding(): void {
-        let cancelledPending = 0;
+    private failInfrastructure(error: ParseWorkerError): void {
+        if (this.workerFailure) return;
+        this.workerFailure = error;
+        this.cancelOutstanding(error);
+        this.finish(error);
+    }
+
+    private cancelOutstanding(error = new ParseWorkerError('parse worker pool terminated')): void {
+        for (const task of this.scanQueue) this.taskRetries.delete(task.id);
+        this.scanQueue.length = 0;
+
         while (this.pending.length > 0) {
             const task = this.pending.shift();
             if (!task) break;
-            const specPath = this.specMap.get(task.id)?.specPath ?? task.localPath;
             this.specMap.delete(task.id);
-            this.transformFail++;
-            cancelledPending++;
-            this.onFailed?.(task.localPath, specPath, new Error('cancelled during shutdown'));
+            this.taskRetries.delete(task.id);
         }
 
         for (const taskId of [...this.taskInfo.keys()]) {
-            this.failTask(taskId, 'cancelled during shutdown');
+            const taken = this.takeTask(taskId);
+            if (!taken) continue;
+            if (taken.task.kind === 'transform') this.specMap.delete(taskId);
+            this.taskRetries.delete(taskId);
         }
+
+        for (const callback of this.scanCallbacks.values()) callback.reject(error);
+        this.scanCallbacks.clear();
 
         for (const timer of this.taskTimers.values()) clearTimeout(timer);
         this.taskTimers.clear();
@@ -653,11 +805,6 @@ export class ParseDriver {
         }
         this.workerTaskIds.clear();
         this.taskInfo.clear();
-        // failTask reports in-flight cancellations itself. Only pending tasks
-        // need one final aggregate update, and a completed batch needs none.
-        if (cancelledPending > 0 && this.taskTotal > 0) {
-            this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
-        }
     }
 
     async terminate(): Promise<void> {
@@ -673,6 +820,10 @@ export class ParseDriver {
         }
         this.workers.length = 0;
         this.deadWorkers.clear();
+        this.retiringWorkers.clear();
+        this.workerFailure = null;
+        this.spawnFailures = 0;
         this.specMap.clear();
+        this.taskRetries.clear();
     }
 }

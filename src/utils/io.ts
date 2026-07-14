@@ -1,21 +1,24 @@
-import { dirname, joinPaths } from './path';
+import { dirname, isAbsolute, joinPaths } from './path';
 import { LRU } from './lru';
 import { err, ErrorKind } from '../errors';
 import { getMemoryFile } from './memfs';
+import { isWindows } from './platform';
+import { yieldEventLoop } from './yield';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
 export const readText = (p: string) => {
     const v = getMemoryFile(p);
-    if (v) return engine.decodeString(v);
+    // undefined only — empty Uint8Array is a valid VFS hit.
+    if (v !== undefined) return engine.decodeString(v);
     return engine.decodeString(fs.readFile(p));
 };
 export const writeText = (p: string, s: string) => fs.writeFile(p, engine.encodeString(s));
 /** Prefer active VFS view (0-copy subarray); else fs. */
 export const readBytes = (p: string) => {
     const v = getMemoryFile(p);
-    if (v) return v;
+    if (v !== undefined) return v;
     return new Uint8Array(fs.readFile(p));
 };
 
@@ -103,26 +106,101 @@ function _resolve(base: string, exts: string[]): string {
 
 export function clearResolveCache(): void { cache.clear(); negCache.clear(); }
 
-// hardlinkOrCopyDirRecursiveSync — hard mode: hardlink files, copy on EXDEV; keep symlinks.
+// hardlinkOrCopyDirRecursive — hard mode: hardlink files, copy on EXDEV; keep symlinks.
+// Yields the event loop during huge trees so other timers can run (not a UI API).
 
+/** Sync walk — only for tiny trees / tests; prefer async for materialize. */
 export function hardlinkOrCopyDirRecursiveSync(src: string, dest: string): void {
     ensureDir(dest);
     for (const entry of fs.readdir(src, true)) {
         const s = joinPaths(src, entry.name);
         const d = joinPaths(dest, entry.name);
         if (entry.isSymbolicLink) {
-            const target = fs.readlink(s);
-            unlinkIfExists(d);
-            fs.symlink(target, d);
+            linkSymlinkEntry(s, d);
         } else if (entry.isDirectory) {
             hardlinkOrCopyDirRecursiveSync(s, d);
         } else {
-            unlinkIfExists(d);
-            try {
-                fs.link(s, d);
-            } catch {
-                fs.copy(s, d);
+            hardlinkOrCopyFile(s, d);
+        }
+    }
+}
+
+export interface HardlinkWalkOptions {
+    /** Top-level entry names to skip (e.g. store-owned `node_modules`). */
+    skipNames?: readonly string[];
+    /** Yield after this many file ops (default 256; was 64). */
+    yieldEvery?: number;
+    /** Min ms between yields (default 50; was 16). */
+    yieldMs?: number;
+}
+
+/** Cooperative hard materialize walk; yields every ~256 files or ~50ms by default. */
+export async function hardlinkOrCopyDirRecursive(
+    src: string,
+    dest: string,
+    opts?: HardlinkWalkOptions,
+): Promise<void> {
+    const skip = opts?.skipNames?.length ? new Set(opts.skipNames) : null;
+    const yieldEvery = opts?.yieldEvery ?? 256;
+    const yieldMs = opts?.yieldMs ?? 50;
+    let ops = 0;
+    let lastYieldMs = Date.now();
+    const maybeYield = async (): Promise<void> => {
+        ops++;
+        const now = Date.now();
+        if (ops < yieldEvery && now - lastYieldMs < yieldMs) return;
+        ops = 0;
+        lastYieldMs = now;
+        await yieldEventLoop();
+    };
+
+    const walk = async (from: string, to: string, top: boolean): Promise<void> => {
+        ensureDir(to);
+        for (const entry of fs.readdir(from, true)) {
+            if (top && skip?.has(entry.name)) continue;
+            const s = joinPaths(from, entry.name);
+            const d = joinPaths(to, entry.name);
+            if (entry.isSymbolicLink) {
+                linkSymlinkEntry(s, d);
+                await maybeYield();
+            } else if (entry.isDirectory) {
+                await walk(s, d, false);
+            } else {
+                hardlinkOrCopyFile(s, d);
+                await maybeYield();
             }
         }
+    };
+    await walk(src, dest, true);
+}
+
+function linkSymlinkEntry(s: string, d: string): void {
+    // Relative install links (../pkg@ver) break when re-rooted under hard views.
+    let target = fs.readlink(s);
+    if (!isAbsolute(target)) {
+        try {
+            target = fs.realpath(s);
+        } catch {
+            // Dangling relative: keep as-is.
+        }
+    }
+    unlinkIfExists(d);
+    if (isWindows) {
+        let kind: 'file' | 'dir' = 'file';
+        try {
+            if (fs.stat(s).isDirectory) kind = 'dir';
+        } catch {}
+        fs.symlink(target, d, kind);
+    } else {
+        fs.symlink(target, d);
+    }
+}
+
+function hardlinkOrCopyFile(s: string, d: string): void {
+    unlinkIfExists(d);
+    try {
+        fs.link(s, d);
+    } catch {
+        fs.copy(s, d);
     }
 }

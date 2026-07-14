@@ -54,9 +54,11 @@ The hot path for cache preparation is:
 TypeScriptRuntime.runPrecache()
   -> DepScanner
   -> ModuleResolver.resolveAsync()
+  -> ParseDriver.scanFile() workers
   -> optional node_modules materialization
   -> optional npm lifecycle scripts
-  -> ParseDriver.compileModules()
+  -> ParseDriver transform workers
+  -> main-thread QuickJS bytecode compile
 ```
 
 ## Key Files
@@ -145,16 +147,19 @@ CTS normally resolves npm packages from a flat cache:
 <cacheDir>/npm/<name>@<version>/
 ```
 
-Some tools expect a real filesystem `node_modules`. `cno cache` can materialize
-one from the actual scan graph:
+**Install** owns store-internal soft links (`storePkg/node_modules/dep` → store).
+**Materialize never writes under the store** — only the project `node_modules`.
 
 ```sh
 cno cache --npm-mode=soft
 cno cache --npm-mode=hard
 ```
 
-`soft` creates top-level links into the flat cache. `hard` creates per-file
-hard links and copies only when linking is not possible.
+- `soft` — project-root symlinks into the flat store; nested resolution walks
+  install-owned store links.
+- `hard` — hard-link package bodies into the project tree (skip store
+  `node_modules`), expand package.json deps under project-side paths; cycles
+  soft-link back to the store.
 
 ## Development
 

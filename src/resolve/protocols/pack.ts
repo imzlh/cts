@@ -57,6 +57,8 @@ export class PackHandler implements ProtocolHandler {
             fileKind: entry.fileKind,
             // Serialized bytecode drops import-attribute semantics; never cache.
             cacheBytecode: entry.sourceOnly || entry.fileKind !== 'source' ? false : undefined,
+            // Extensionless pack entries need lang on ABI-mismatch recompile.
+            lang: entry.lang,
         };
     }
 

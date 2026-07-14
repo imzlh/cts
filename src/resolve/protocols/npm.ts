@@ -4,7 +4,7 @@ import { guessFileKind } from './base';
 import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
-import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes } from '../../utils/misc';
+import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString } from '../../utils/misc';
 import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
@@ -14,6 +14,8 @@ import { findLocalBin } from '../../utils/bin';
 import pkg from '../../../package.json';
 
 const version = String(pkg.version ?? '0.0.0');
+/** Shared empty cycle path for top-level ensure/prepare entry points. */
+const EMPTY_CYCLE: ReadonlySet<string> = new Set();
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -33,6 +35,18 @@ function chmodQuietly(path: string, mode: number): void {
     } catch {
         // Preserve install/link progress; execution will surface permissions.
     }
+}
+
+/** Directory package link (node_modules/pkg → store). Windows needs type=dir. */
+function symlinkDir(target: string, linkPath: string): void {
+    if (isWindows) fs.symlink(target, linkPath, 'dir');
+    else fs.symlink(target, linkPath);
+}
+
+/** File bin link (node_modules/.bin/x → script). Windows needs type=file. */
+function symlinkFile(target: string, linkPath: string): void {
+    if (isWindows) fs.symlink(target, linkPath, 'file');
+    else fs.symlink(target, linkPath);
 }
 
 function normalizeNpmrcValue(raw: string): string {
@@ -119,8 +133,8 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
             name = `${scope}/${rest.slice(0, at)}`;
             const after = rest.slice(at + 1);
             if (!after) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (empty version): ${raw}`);
-            // http(s) tarball URLs contain '/' — do not treat path as subpath.
-            if (isTarballUrl(after)) {
+            // http(s) tarball / github: ranges contain '/' — keep as version.
+            if (isOpaqueVersionRange(after)) {
                 ver = after;
                 sub = '';
             } else {
@@ -138,7 +152,7 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
             name = rest.slice(0, at);
             const after = rest.slice(at + 1);
             if (!after) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (empty version): ${raw}`);
-            if (isTarballUrl(after)) {
+            if (isOpaqueVersionRange(after)) {
                 ver = after;
                 sub = '';
             } else {
@@ -273,7 +287,18 @@ function hasSemverPrefix(value: string): boolean {
     return false;
 }
 
+/** Strip a single leading `v`/`V` when the rest looks like a semver (v0.2.1). */
+function stripLeadingV(value: string): string {
+    if (value.length < 2) return value;
+    const c0 = value.charCodeAt(0);
+    if (c0 !== 118 && c0 !== 86) return value; // v / V
+    const c1 = value.charCodeAt(1);
+    if (!isDigitCode(c1)) return value;
+    return value.slice(1);
+}
+
 function isExactSemver(value: string): boolean {
+    value = stripLeadingV(value);
     let dots = 0, partDigits = 0, suffix = false;
     for (let i = 0; i < value.length; i++) {
         const c = value.charCodeAt(i);
@@ -312,6 +337,57 @@ function isTarballUrl(range: string): boolean {
         || path.endsWith('.tar.bz2');
 }
 
+/**
+ * github:owner/repo[#ref] and git+https://github.com/… — used by packages such
+ * as @marktext/file-icons (`file-icons: "github:file-icons/atom"`).
+ * Map to codeload tar.gz so the existing tarball install path can extract them.
+ */
+function githubRangeToTarballUrl(range: string): string | null {
+    const raw = range.trim();
+    if (!raw) return null;
+
+    let owner = '';
+    let repo = '';
+    let ref = 'HEAD';
+
+    if (raw.startsWith('github:')) {
+        let rest = raw.slice(7);
+        const hash = rest.indexOf('#');
+        if (hash !== -1) {
+            ref = rest.slice(hash + 1) || 'HEAD';
+            rest = rest.slice(0, hash);
+        }
+        const parts = rest.split('/').filter(Boolean);
+        if (parts.length < 2) return null;
+        owner = parts[0]!;
+        repo = parts[1]!;
+    } else {
+        // git+https://github.com/owner/repo.git#ref
+        // https://github.com/owner/repo(.git)?#ref
+        const m = raw.match(
+            /^(?:git\+)?https:\/\/github\.com\/([^/]+)\/([^/#]+?)(?:\.git)?(?:#(.*))?$/i,
+        );
+        if (!m) return null;
+        owner = m[1]!;
+        repo = m[2]!;
+        if (m[3]) ref = m[3];
+    }
+
+    if (repo.endsWith('.git')) repo = repo.slice(0, -4);
+    if (!owner || !repo) return null;
+    // codeload accepts branch / tag / commit; HEAD resolves to default branch.
+    return `https://codeload.github.com/${owner}/${repo}/tar.gz/${encodeURIComponent(ref)}`;
+}
+
+function isGithubDepRange(range: string): boolean {
+    return githubRangeToTarballUrl(range) !== null;
+}
+
+/** Version field that must not be split on '/' (tarball URL or github:…). */
+function isOpaqueVersionRange(range: string): boolean {
+    return isTarballUrl(range) || isGithubDepRange(range);
+}
+
 /** Best-effort version from URL filename: …/xlsx-0.20.3.tgz → 0.20.3 */
 function versionHintFromTarballUrl(url: string): string | null {
     const path = url.split(/[?#]/, 1)[0]!;
@@ -322,11 +398,67 @@ function versionHintFromTarballUrl(url: string): string | null {
     return m?.[1] ?? null;
 }
 
+/**
+ * Store identity for URL/github installs. package.json version alone collides
+ * when two different dist pins claim the same semver (or both lack one).
+ */
+function urlStoreVersion(url: string, baseVer: string): string {
+    const base = baseVer || '0.0.0';
+    return `${base}+u${hashString(url).slice(0, 8)}`;
+}
+
+/** True for store keys produced by urlStoreVersion (`1.2.3+u` + 8 hex). */
+function isUrlStoreVersion(ver: string): boolean {
+    const i = ver.lastIndexOf('+u');
+    if (i < 0) return false;
+    const tag = ver.slice(i + 2);
+    if (tag.length !== 8) return false;
+    for (let j = 0; j < 8; j++) {
+        const c = tag.charCodeAt(j);
+        if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) return false;
+    }
+    return true;
+}
+
+/** Required + optional package.json edges for install-view BFS (mirrors linker). */
+function collectInstallGraphDeps(pkg: {
+    dependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+    peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+}): Array<{ name: string; range: string; optional: boolean }> {
+    const out: Array<{ name: string; range: string; optional: boolean }> = [];
+    const index = new Map<string, number>();
+    const push = (name: string, range: string, optional: boolean, prefer = false) => {
+        if (!name) return;
+        const i = index.get(name);
+        if (i !== undefined) {
+            // npm: optionalDependencies wins over dependencies for same name.
+            if (prefer) out[i] = { name, range: range || '*', optional };
+            return;
+        }
+        index.set(name, out.length);
+        out.push({ name, range: range || '*', optional });
+    };
+    const deps = pkg.dependencies;
+    if (deps) for (const n in deps) push(n, deps[n] ?? '*', false);
+    const peers = pkg.peerDependencies;
+    const meta = pkg.peerDependenciesMeta;
+    if (peers) {
+        for (const n in peers) {
+            push(n, peers[n] ?? '*', meta?.[n]?.optional === true);
+        }
+    }
+    const opt = pkg.optionalDependencies;
+    if (opt) for (const n in opt) push(n, opt[n] ?? '*', true, true);
+    return out;
+}
+
 function localPackageMatchesRange(version: string | undefined, range: string): boolean {
     if (!version) return canUseLocalPackageForRange(range);
     if (canUseLocalPackageForRange(range)) return true;
-    // URL ranges pin a dist, not a semver — never treat a local copy as a match.
-    if (isTarballUrl(range)) return false;
+    // URL / github ranges pin a dist, not a semver — never treat a local copy as a match.
+    if (isOpaqueVersionRange(range)) return false;
     return version === range || matchLatestVersion([version], range) === version;
 }
 
@@ -409,8 +541,15 @@ export class NpmHandler implements ProtocolHandler {
     private readonly dependenciesChecked = new Set<string>();
     /** name@version already had bins/optional/lifecycle prepared this process. */
     private readonly packagesPrepared = new Set<string>();
+    /** Process-local registry meta (avoids re-parse + coalesces concurrent fetches). */
+    private readonly metaMem = new Map<string, NpmMeta>();
     private readonly pendingLifecycle: LifecycleScriptEntry[] = [];
     private readonly queuedLifecycle = new Set<string>();
+    /** Flat-store version lists per package name (avoids readdir thrash). */
+    private readonly storeVersionsCache = new Map<string, string[]>();
+    /** One readdir of cacheDir / scope dirs for listStoreVersions. */
+    private storeRootListing: string[] | null = null;
+    private readonly storeScopeListing = new Map<string, string[]>();
 
     constructor(private readonly cfg: RuntimeConfig) {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
@@ -425,6 +564,10 @@ export class NpmHandler implements ProtocolHandler {
         this.specLocalPath.clear();
         this.dependenciesChecked.clear();
         this.packagesPrepared.clear();
+        this.metaMem.clear();
+        this.storeVersionsCache.clear();
+        this.storeRootListing = null;
+        this.storeScopeListing.clear();
         this.npmCfg = null;
     }
 
@@ -432,6 +575,130 @@ export class NpmHandler implements ProtocolHandler {
     drainLifecycleScripts(): LifecycleScriptEntry[] {
         const scripts = this.pendingLifecycle.splice(0);
         return scripts;
+    }
+
+    /**
+     * Populate the flat store with required package.json deps/peers for the
+     * install-view graph (scan seeds + BFS). Soft/hard materialize needs these
+     * packages even when import scan never resolved them. Optional deps skipped.
+     */
+    *ensureInstallGraph(
+        seeds: Array<{ name: string; version: string }>,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        const seen = new Set<string>();
+        const queue: Array<{ name: string; version: string }> = [];
+        for (const s of seeds) {
+            if (!s.name || !s.version) continue;
+            const key = `${s.name}@${s.version}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            queue.push(s);
+        }
+        while (queue.length > 0) {
+            // Batch one BFS layer so FLOW_ALL can parallelize ensureInstalled.
+            const layer = queue.splice(0, queue.length);
+            const flows: Flow<void>[] = [];
+            for (const seed of layer) {
+                flows.push(this.ensureInstallGraphNode(seed.name, seed.version, seen, queue, onProgress));
+            }
+            if (flows.length > 0) {
+                yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
+            }
+        }
+    }
+
+    private *ensureInstallGraphNode(
+        name: string,
+        version: string,
+        seen: Set<string>,
+        queue: Array<{ name: string; version: string }>,
+        onProgress?: ProgressCallback,
+    ): Flow<void> {
+        // Body-only ensure: never prepareInstalledPackage here — a missing
+        // required child would throw and abort the whole BFS; materialize
+        // fail-closes those. We fill each required edge one hop at a time.
+        let dir: string;
+        let ver: string;
+        try {
+            const body = yield* this.ensurePackageInStore(name, version, onProgress);
+            if (!body) return;
+            dir = body.dir;
+            ver = body.resolvedVer;
+        } catch (e) {
+            log.debug('npm', () =>
+                `install-graph seed ensure failed: ${name}@${version}: ${e instanceof Error ? e.message : String(e)}`);
+            return;
+        }
+        const manifest = readPkg(dir);
+        if (!manifest) return;
+        this.linkCacheAlias(name, dir);
+        const declared = collectInstallGraphDeps(manifest);
+        for (const dep of declared) {
+            if (dep.optional) continue;
+            let child: { dir: string; resolvedVer: string } | null = null;
+            try {
+                child = yield* this.ensurePackageInStore(dep.name, dep.range, onProgress);
+            } catch (e) {
+                log.debug('npm', () =>
+                    `install-graph ensure failed: ${dep.name}@${dep.range} from ${name}@${ver}: ${e instanceof Error ? e.message : String(e)}`);
+                continue;
+            }
+            if (!child) continue;
+            this.linkDependency(dir, dep.name, child.dir);
+            const childKey = `${dep.name}@${child.resolvedVer}`;
+            if (!seen.has(childKey)) {
+                seen.add(childKey);
+                queue.push({ name: dep.name, version: child.resolvedVer });
+            }
+        }
+    }
+
+    /**
+     * Ensure name@range is extracted under the flat store (package.json present).
+     * Does not walk dependencies — install-graph BFS owns that. Returns null when
+     * the package cannot be obtained (cachedOnly miss, etc.) without throwing for
+     * pure store misses after a failed fetch attempt path that throws.
+     */
+    private *ensurePackageInStore(
+        name: string,
+        range: string,
+        onProgress?: ProgressCallback,
+    ): Flow<{ dir: string; resolvedVer: string } | null> {
+        if (isTarballUrl(range) || githubRangeToTarballUrl(range)) {
+            // Opaque ranges need the full ensure path (URL / github codeload).
+            try {
+                return yield* this.ensureInstalled(name, range, undefined, onProgress);
+            } catch {
+                return null;
+            }
+        }
+        const hit = this.findCachedPackageMatching(name, range);
+        if (hit) {
+            const pkg = readPkg(hit);
+            const ver = pkg?.version ?? stripLeadingV(range);
+            return { dir: hit, resolvedVer: ver };
+        }
+        // Not in store (or hollow without package.json): resolve + install body.
+        if (this.cfg.cachedOnly) return null;
+        const exactRange = stripLeadingV(range);
+        let exactVer: string;
+        if (isExactSemver(exactRange)) {
+            exactVer = exactRange;
+        } else {
+            exactVer = yield* this.resolveVersion(name, range, onProgress);
+        }
+        const pkgDir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
+        if (!fs.exists(joinPaths(pkgDir, 'package.json'))) {
+            if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
+            // Body-only FLOW (same key as installOnce) — no dep walk under the key.
+            yield {
+                type: StepType.FLOW,
+                key: `npm-install:${name}@${exactVer}`,
+                flow: this.installPackageBody(name, exactVer, pkgDir, onProgress),
+            };
+        }
+        return { dir: pkgDir, resolvedVer: exactVer };
     }
 
     private ctxOptions(forceCjs?: boolean): { forceCjs?: boolean; conditions?: string[] } {
@@ -796,10 +1063,14 @@ export class NpmHandler implements ProtocolHandler {
         const prefix = `npm:${name}@`;
         const specs = lock.findModuleSpecsByPrefix(prefix);
         const versions = new Set<string>();
+        // Semver ranges must not pin a URL/github store key from lock.
+        const allowUrlTag = isOpaqueVersionRange(range);
         for (const spec of specs) {
             try {
                 const parsed = parseNpmSpec(spec);
-                if (parsed.name === name && parsed.version) versions.add(parsed.version);
+                if (parsed.name !== name || !parsed.version) continue;
+                if (!allowUrlTag && isUrlStoreVersion(parsed.version)) continue;
+                versions.add(parsed.version);
             } catch {}
         }
         if (!versions.size) return null;
@@ -929,10 +1200,26 @@ export class NpmHandler implements ProtocolHandler {
         return (this.npmCfg ??= loadNpmConfig());
     }
 
-    private *ensureInstalled(name: string, version: string, parent?: string, onProgress?: ProgressCallback): Flow<{ dir: string; resolvedVer: string }> {
+    /**
+     * Ensure package body + dep graph. `cyclePath` is the call-stack of packages
+     * currently being prepared on this chain (not a process-global set): cycle
+     * edges return partial without awaiting self.
+     */
+    private *ensureInstalled(
+        name: string,
+        version: string,
+        parent?: string,
+        onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
+    ): Flow<{ dir: string; resolvedVer: string }> {
         // Direct tarball URL (e.g. sheetjs CDN) — skip registry meta entirely.
         if (isTarballUrl(version)) {
-            return yield* this.ensureInstalledFromTarballUrl(name, version, onProgress);
+            return yield* this.ensureInstalledFromTarballUrl(name, version, onProgress, cyclePath);
+        }
+        // github:owner/repo[#ref] → codeload tar.gz (same extract path as tarball URLs).
+        const githubUrl = githubRangeToTarballUrl(version);
+        if (githubUrl) {
+            return yield* this.ensureInstalledFromTarballUrl(name, githubUrl, onProgress, cyclePath);
         }
         const origin = this.parentOrigin(parent);
         const locked = this.lockedVersionForRange(name, version);
@@ -941,10 +1228,11 @@ export class NpmHandler implements ProtocolHandler {
             // Need package.json; bare dir may be a partial extract (never re-installed).
             const lockedExists = yield { type: StepType.FS_EXISTS, path: joinPaths(lockedDir, 'package.json') };
             if (lockedExists) {
-                yield* this.prepareInstalledPackage(name, locked, lockedDir, onProgress);
+                yield* this.prepareInstalledPackage(name, locked, lockedDir, onProgress, cyclePath);
                 return { dir: lockedDir, resolvedVer: locked };
             }
         }
+        // Parent-local install link (project or package node_modules) wins.
         if (origin !== 'cache') {
             const local = this.findLocal(name, parent);
             const pkg = local ? readPkg(local) : null;
@@ -952,18 +1240,30 @@ export class NpmHandler implements ProtocolHandler {
                 return { dir: local, resolvedVer: pkg?.version ?? version };
             }
         }
-        if (isExactSemver(version)) {
-            const exactDir = joinPaths(this.cacheDir, `${name}@${version}`);
+        const exactRange = stripLeadingV(version);
+        if (isExactSemver(exactRange)) {
+            const exactDir = joinPaths(this.cacheDir, `${name}@${exactRange}`);
             const exactExists = yield { type: StepType.FS_EXISTS, path: joinPaths(exactDir, 'package.json') };
             if (exactExists) {
-                yield* this.prepareInstalledPackage(name, version, exactDir, onProgress);
-                return { dir: exactDir, resolvedVer: version };
+                yield* this.prepareInstalledPackage(name, exactRange, exactDir, onProgress, cyclePath);
+                return { dir: exactDir, resolvedVer: exactRange };
             }
             const local = this.findLocal(name, parent);
             const pkg = local ? readPkg(local) : null;
-            if (local && pkg?.version === version) {
-                return { dir: local, resolvedVer: version };
+            if (local && pkg?.version === exactRange) {
+                return { dir: local, resolvedVer: exactRange };
             }
+        }
+        // Warm store hit for ranges (^/~/*): use already-extracted name@version
+        // without registry meta. Re-cache of large trees was stuck minutes on
+        // resolve npm:foo@^x while foo@y sat in ~/.cts/npm.
+        const storeHit = this.findCachedPackageMatching(name, version);
+        if (storeHit) {
+            const hitPkg = readPkg(storeHit);
+            const hitVer = hitPkg?.version ?? exactRange;
+            yield* this.prepareInstalledPackage(name, hitVer, storeHit, onProgress, cyclePath);
+            this.verCache.set(`${name}@${exactRange}`, hitVer);
+            return { dir: storeHit, resolvedVer: hitVer };
         }
         const exactVer = yield* this.resolveVersion(name, version, onProgress);
         const pkgDir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
@@ -973,11 +1273,35 @@ export class NpmHandler implements ProtocolHandler {
                 throw err(ErrorKind.ModuleNotFound, `npm package not found in cache: "${name}", --cached-only is specified.`);
             }
             if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
-            yield* this.installOnce(name, exactVer, pkgDir, onProgress);
+            yield* this.installOnce(name, exactVer, pkgDir, onProgress, cyclePath);
         } else {
-            yield* this.prepareInstalledPackage(name, exactVer, pkgDir, onProgress);
+            yield* this.prepareInstalledPackage(name, exactVer, pkgDir, onProgress, cyclePath);
         }
         return { dir: pkgDir, resolvedVer: exactVer };
+    }
+
+    /** Disk pin: opaque URL/github range → resolved store version (warm re-cache). */
+    private urlRangePinPath(name: string, url: string): string {
+        return joinPaths(this.cacheDir, '.url-pins', `${hashString(`${name}\0${url}`)}.txt`);
+    }
+
+    private readUrlRangePin(name: string, url: string): string | null {
+        try {
+            const text = readText(this.urlRangePinPath(name, url)).trim();
+            return text || null;
+        } catch {
+            return null;
+        }
+    }
+
+    private writeUrlRangePin(name: string, url: string, ver: string): void {
+        try {
+            const path = this.urlRangePinPath(name, url);
+            ensureDir(dirname(path));
+            fs.writeFile(path, engine.encodeString(ver));
+        } catch {
+            // Pin is a warm-path optimisation; install already succeeded.
+        }
     }
 
     /** Install/resolve a package pinned to an http(s) .tgz URL in package.json. */
@@ -985,6 +1309,7 @@ export class NpmHandler implements ProtocolHandler {
         name: string,
         url: string,
         onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<{ dir: string; resolvedVer: string }> {
         const cacheKey = `${name}@${url}`;
         const hit = (ver: string): Flow<{ dir: string; resolvedVer: string } | null> => {
@@ -992,7 +1317,7 @@ export class NpmHandler implements ProtocolHandler {
                 const dir = joinPaths(self.cacheDir, `${name}@${ver}`);
                 const ok = yield { type: StepType.FS_EXISTS, path: joinPaths(dir, 'package.json') };
                 if (!ok) return null;
-                yield* self.prepareInstalledPackage(name, ver, dir, onProgress);
+                yield* self.prepareInstalledPackage(name, ver, dir, onProgress, cyclePath);
                 self.verCache.set(cacheKey, ver);
                 return { dir, resolvedVer: ver };
             })(this);
@@ -1002,18 +1327,27 @@ export class NpmHandler implements ProtocolHandler {
             const ready = yield* hit(cachedVer);
             if (ready) return ready;
         }
-        // Skip re-download when URL embeds a version and that store dir exists.
+        // Cross-process pin for github:/opaque URLs (stores url-tagged version).
+        const pinned = this.readUrlRangePin(name, url);
+        if (pinned) {
+            const ready = yield* hit(pinned);
+            if (ready) return ready;
+        }
+        // Warm path: URL embeds a version — prefer url-tagged store key, then
+        // legacy plain name@version from older caches.
         const hinted = versionHintFromTarballUrl(url);
         if (hinted) {
-            const ready = yield* hit(hinted);
+            const tagged = urlStoreVersion(url, hinted);
+            const ready = (yield* hit(tagged)) ?? (yield* hit(hinted));
             if (ready) return ready;
         }
         if (this.cfg.cachedOnly) {
             throw err(ErrorKind.ModuleNotFound, `npm package not found in cache: "${name}" (${url}), --cached-only is specified.`);
         }
         if (!this.cfg.silent && !isatty) log.download(`${name} <- ${url}`);
-        const result = yield* this.installFromTarballUrlOnce(name, url, onProgress);
+        const result = yield* this.installFromTarballUrlOnce(name, url, onProgress, cyclePath);
         this.verCache.set(cacheKey, result.resolvedVer);
+        this.writeUrlRangePin(name, url, result.resolvedVer);
         return result;
     }
 
@@ -1021,97 +1355,200 @@ export class NpmHandler implements ProtocolHandler {
         name: string,
         url: string,
         onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<{ dir: string; resolvedVer: string }> {
         const cacheKey = `${name}@${url}`;
-        // FLOW is void-only and key-deduped: write result into verCache so concurrent
-        // waiters can read it after the shared flow settles.
+        // Body-only FLOW: waiters must not join a prepare that can re-enter this key.
         yield {
             type: StepType.FLOW,
             key: `npm-tarball:${cacheKey}`,
-            flow: this.installFromTarballUrl(name, url, cacheKey, onProgress),
+            flow: this.extractFromTarballUrl(name, url, cacheKey, onProgress),
         };
         const ver = this.verCache.get(cacheKey);
         if (!ver) throw err(ErrorKind.Generic, `Failed to install ${name} from ${url}`);
-        return { dir: joinPaths(this.cacheDir, `${name}@${ver}`), resolvedVer: ver };
+        const pkgDir = joinPaths(this.cacheDir, `${name}@${ver}`);
+        yield* this.prepareInstalledPackage(name, ver, pkgDir, onProgress, cyclePath);
+        return { dir: pkgDir, resolvedVer: ver };
     }
 
-    private *installFromTarballUrl(
+    /** Fetch+extract URL tarball; sets verCache. Dep walk stays outside the FLOW key. */
+    private *extractFromTarballUrl(
         name: string,
         url: string,
         cacheKey: string,
         onProgress?: ProgressCallback,
     ): Flow<void> {
+        const cachedVer = this.verCache.get(cacheKey);
+        if (cachedVer) {
+            const dir = joinPaths(this.cacheDir, `${name}@${cachedVer}`);
+            if (fs.exists(joinPaths(dir, 'package.json'))) return;
+        }
         log.debug('npm', () => `fetch tarball URL ${name} <- ${url}`);
         const fetchStarted = Date.now();
-        const { body } = expectFetch(yield {
+        const tarRes = expectFetch(yield {
             type: StepType.NET_FETCH,
             url,
             timeout: this.cfg.requestTimeout,
             onProgress,
         });
+        if (tarRes.status < 200 || tarRes.status >= 300) {
+            throw err(ErrorKind.NetworkError, `HTTP ${tarRes.status} fetching tarball ${url}`);
+        }
+        const body = tarRes.body;
         log.debug('npm', () => `fetched tarball URL ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - fetchStarted}ms`);
         const files = expectTarFiles(yield { type: StepType.ARCHIVE_UNTAR_GZ, data: body });
-        const ver = packageJsonVersionFromTar(files) ?? '0.0.0';
+        // Tag with URL hash so two dist pins with the same package.json version
+        // never share a store directory (wrong content / silent reuse).
+        const baseVer = packageJsonVersionFromTar(files)
+            ?? versionHintFromTarballUrl(url)
+            ?? '0.0.0';
+        const ver = urlStoreVersion(url, baseVer);
         this.verCache.set(cacheKey, ver);
         const pkgDir = joinPaths(this.cacheDir, `${name}@${ver}`);
-        const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(pkgDir, 'package.json') };
-        if (!exists) {
-            yield { type: StepType.FS_ENSURE_DIR, path: pkgDir };
-            log.debug('npm', () => `write ${name}@${ver} (url) -> ${pkgDir}`);
-            yield* this.writeArchive(pkgDir, files);
-            clearNegativeCache();
-            yield* this.indexInstalledBins(name, ver, pkgDir);
-            yield* this.installDependencies(name, ver, pkgDir, onProgress);
-            yield* this.installPeerDeps(pkgDir, name, ver, onProgress);
-            yield* this.installOptionalDeps(pkgDir, onProgress);
-            this.queueLifecycleScripts(name, ver, pkgDir);
-            this.packagesPrepared.add(`${name}@${ver}`);
-            this.linkCacheAlias(name, pkgDir);
-        } else {
-            yield* this.prepareInstalledPackage(name, ver, pkgDir, onProgress);
-        }
+        if (fs.exists(joinPaths(pkgDir, 'package.json'))) return;
+        yield { type: StepType.FS_ENSURE_DIR, path: pkgDir };
+        log.debug('npm', () => `write ${name}@${ver} (url) -> ${pkgDir}`);
+        yield* this.writeArchive(pkgDir, files);
+        this.invalidateStoreListing(name);
+        clearNegativeCache();
+        yield* this.indexInstalledBins(name, ver, pkgDir);
+        this.linkCacheAlias(name, pkgDir);
     }
 
-    /** Once per installed package: alias, bins, deps, optionals, lifecycle. */
+    /**
+     * Once per installed package: alias, bins, deps, optionals, lifecycle.
+     * cyclePath is call-stack only (A→B→A → partial). Do NOT coalesce prepare
+     * under a FLOW key: FLOW_ALL of mutual deps would cross-await and hang.
+     * Body extract still uses npm-install / npm-tarball keys.
+     */
     private *prepareInstalledPackage(
         name: string,
         ver: string,
         dir: string,
         onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
         const key = `${name}@${ver}`;
         if (this.packagesPrepared.has(key)) return;
-        this.packagesPrepared.add(key);
+        // Same prepare chain re-entered via a cycle edge — partial link only.
+        if (cyclePath.has(key)) {
+            log.debug('npm', () => `prepare cycle ${key} — partial`);
+            return;
+        }
+        // Hollow/partial extract (no package.json): never mark prepared.
+        if (!fs.exists(joinPaths(dir, 'package.json'))) return;
+        const nextPath = new Set(cyclePath);
+        nextPath.add(key);
         this.linkCacheAlias(name, dir);
         yield* this.indexInstalledBins(name, ver, dir);
-        yield* this.installDependencies(name, ver, dir, onProgress);
-        yield* this.installPeerDeps(dir, name, ver, onProgress);
-        yield* this.installOptionalDeps(dir, onProgress);
-        // No hoist/inject: soft+realpath cannot safely mirror npm hoisting (CPU
-        // blow-up). Vite/tools that need a real tree use --npm-mode=hard.
+        // Warm re-cache: complete package-local views skip recursive dep walks.
+        if (this.isPackageViewComplete(dir)) {
+            this.dependenciesChecked.add(key);
+            this.queueLifecycleScripts(name, ver, dir);
+            this.packagesPrepared.add(key);
+            return;
+        }
+        yield* this.installDependencies(name, ver, dir, onProgress, nextPath);
+        yield* this.installPeerDeps(dir, name, ver, onProgress, nextPath);
+        yield* this.installOptionalDeps(dir, onProgress, nextPath);
         this.queueLifecycleScripts(name, ver, dir);
+        // Mark prepared only after deps succeed so a failed github: child can
+        // retry on the next resolve instead of leaving a hollow package.
+        this.packagesPrepared.add(key);
+    }
+
+    /**
+     * True when every required dependency and required peer is already linked
+     * under dir/node_modules and still satisfies its declared range. Optional
+     * peers/deps may be absent. Used to skip same-day re-walks of complete
+     * store packages — wrong-version leftovers must return false so install
+     * can retarget soft links.
+     */
+    private isPackageViewComplete(dir: string): boolean {
+        const pkg = readPkg(dir);
+        if (!pkg) return false;
+        const nm = joinPaths(dir, 'node_modules');
+        const hasSatisfying = (depName: string, range: string): boolean => {
+            try {
+                const linked = joinPaths(nm, depName);
+                if (!fs.exists(joinPaths(linked, 'package.json'))) return false;
+                // github:/tarball pins land in URL-tagged store dirs (+u…).
+                // A plain registry copy must not count as "complete".
+                if (isOpaqueVersionRange(range)) {
+                    try {
+                        const real = fs.realpath(linked);
+                        const id = this.storePackageId(real);
+                        return !!id && isUrlStoreVersion(id.version);
+                    } catch {
+                        return false;
+                    }
+                }
+                const child = readPkg(linked);
+                return !!child && localPackageMatchesRange(child.version, range);
+            } catch {
+                return false;
+            }
+        };
+        // optionalDependencies overrides dependencies (npm): those names are optional.
+        const optional = pkg.optionalDependencies;
+        const deps = pkg.dependencies;
+        if (deps) {
+            for (const depName in deps) {
+                if (optional && Object.prototype.hasOwnProperty.call(optional, depName)) continue;
+                if (!hasSatisfying(depName, deps[depName] ?? '*')) return false;
+            }
+        }
+        const peers = pkg.peerDependencies;
+        if (peers) {
+            const meta = (pkg as { peerDependenciesMeta?: Record<string, { optional?: boolean }> })
+                .peerDependenciesMeta;
+            for (const peerName in peers) {
+                if (meta?.[peerName]?.optional === true) continue;
+                if (!hasSatisfying(peerName, peers[peerName] ?? '*')) return false;
+            }
+        }
+        return true;
     }
 
     private *resolveVersion(name: string, range: string, onProgress?: ProgressCallback): Flow<string> {
-        const key = `${name}@${range}`;
+        // npm/git often write `v0.2.1`; registry keys are unprefixed.
+        const norm = stripLeadingV(range);
+        const key = `${name}@${norm}`;
         const cached = this.verCache.get(key);
         if (cached !== undefined) return cached;
         const meta = yield* this.fetchMeta(name, onProgress);
         const tags = meta['dist-tags'] ?? {};
         let resolved: string;
-        if (!range || range === 'latest') resolved = tags.latest ?? this.highestVersion(meta);
-        else if (tags[range]) resolved = tags[range];
-        else if (hasSemverPrefix(range) && meta.versions[range]) resolved = range;
+        if (!norm || norm === 'latest') resolved = tags.latest ?? this.highestVersion(meta);
+        else if (tags[norm]) resolved = tags[norm];
+        else if (hasSemverPrefix(norm) && meta.versions[norm]) resolved = norm;
         else {
-            const matched = matchLatestRecordVersion(meta.versions, range);
+            const matched = matchLatestRecordVersion(meta.versions, norm);
             if (!matched) throw err(ErrorKind.VersionNotFound, `Could not find npm package '${name}' matching '${range}'.`);
             resolved = matched;
         }
         this.verCache.set(key, resolved);
+        // Also cache under the original range so locked lookups with `v` hit.
+        if (norm !== range) this.verCache.set(`${name}@${range}`, resolved);
         return resolved;
     }
 
     private *fetchMeta(name: string, onProgress?: ProgressCallback): Flow<NpmMeta> {
+        const mem = this.metaMem.get(name);
+        if (mem) return mem;
+        // Coalesce concurrent registry GETs for the same package name.
+        yield {
+            type: StepType.FLOW,
+            key: `npm-meta:${name}`,
+            flow: this.fetchMetaBody(name, onProgress),
+        };
+        const after = this.metaMem.get(name);
+        if (!after) throw err(ErrorKind.Generic, `Failed to fetch npm metadata for ${name}`);
+        return after;
+    }
+
+    private *fetchMetaBody(name: string, onProgress?: ProgressCallback): Flow<void> {
+        if (this.metaMem.has(name)) return;
         const cfg = this.getNpmCfg();
         const scope = packageScope(name);
         const registry = scope ? cfg.scopeRegistries[scope] ?? cfg.registry : cfg.registry;
@@ -1124,7 +1561,9 @@ export class NpmHandler implements ProtocolHandler {
                 const tsText = expectText(yield { type: StepType.FS_READ_TEXT, path: cacheTs });
                 const age = Date.now() - +(tsText || '0');
                 if (age < 24 * 60 * 60 * 1000) {
-                    return safeParse<NpmMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: cacheFile }));
+                    const meta = safeParse<NpmMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: cacheFile }));
+                    this.metaMem.set(name, meta);
+                    return;
                 }
             } catch {}
         }
@@ -1134,31 +1573,43 @@ export class NpmHandler implements ProtocolHandler {
         const url = `${registry}/${name}`;
         log.debug('npm', () => `fetch meta ${name} <- ${url}`);
         const started = Date.now();
-        const { body } = expectFetch(yield {
+        const metaRes = expectFetch(yield {
             type: StepType.NET_FETCH,
             url,
             headers: { 'User-Agent': 'cts/' + version, Accept: 'application/json' },
             timeout: this.cfg.requestTimeout,
             onProgress,
         });
+        if (metaRes.status < 200 || metaRes.status >= 300) {
+            throw err(ErrorKind.NetworkError, `HTTP ${metaRes.status} fetching npm meta ${url}`);
+        }
+        const body = metaRes.body;
         log.debug('npm', () => `fetched meta ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - started}ms`);
         const meta = safeParse<NpmMeta>(engine.decodeString(body));
+        this.metaMem.set(name, meta);
         yield { type: StepType.FS_ENSURE_DIR, path: dirname(cacheFile) };
         // Cache the raw response bytes verbatim — avoids re-serializing the
         // whole (often multi-MB) metadata object just to persist it.
         yield { type: StepType.FS_WRITE_BYTES, path: cacheFile, data: body };
         yield { type: StepType.FS_WRITE_TEXT, path: cacheTs, text: String(Date.now()) };
-        return meta;
     }
 
-    private *install(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
+    /** Fetch+extract registry tarball only — dep walks stay outside the FLOW key. */
+    private *installPackageBody(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
+        if (fs.exists(joinPaths(dir, 'package.json'))) return;
         const meta = yield* this.fetchMeta(name, onProgress);
+        if (fs.exists(joinPaths(dir, 'package.json'))) return;
         const tarball = meta.versions[ver]?.dist.tarball;
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
         log.debug('npm', () => `fetch tarball ${name}@${ver} <- ${tarball}`);
         const fetchStarted = Date.now();
-        const { body } = expectFetch(yield { type: StepType.NET_FETCH, url: tarball, timeout: this.cfg.requestTimeout, onProgress });
+        const tarRes = expectFetch(yield { type: StepType.NET_FETCH, url: tarball, timeout: this.cfg.requestTimeout, onProgress });
+        if (tarRes.status < 200 || tarRes.status >= 300) {
+            throw err(ErrorKind.NetworkError, `HTTP ${tarRes.status} fetching tarball ${tarball}`);
+        }
+        const body = tarRes.body;
         log.debug('npm', () => `fetched tarball ${name}@${ver} ${fmtBytes(body.byteLength)} in ${Date.now() - fetchStarted}ms`);
+        if (fs.exists(joinPaths(dir, 'package.json'))) return;
         log.debug('npm', () => `extract ${name}@${ver} ${fmtBytes(body.byteLength)}`);
         const extractStarted = Date.now();
         const files = expectTarFiles(yield { type: StepType.ARCHIVE_UNTAR_GZ, data: body });
@@ -1168,28 +1619,33 @@ export class NpmHandler implements ProtocolHandler {
             if (f?.type === 'file') fileBytes += f.size;
         }
         log.debug('npm', () => `extracted ${name}@${ver}: ${files.length} entries, ${fmtBytes(fileBytes)} in ${Date.now() - extractStarted}ms`);
+        if (fs.exists(joinPaths(dir, 'package.json'))) return;
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
         log.debug('npm', () => `write ${name}@${ver} -> ${dir}`);
         const writeStarted = Date.now();
         yield* this.writeArchive(dir, files);
         log.debug('npm', () => `wrote ${name}@${ver} in ${Date.now() - writeStarted}ms`);
+        this.invalidateStoreListing(name);
         this.linkCacheAlias(name, dir);
         // Clear negative exists cache poisoned by mid-extract sibling resolves.
         clearNegativeCache();
         yield* this.indexInstalledBins(name, ver, dir);
-        yield* this.installDependencies(name, ver, dir, onProgress);
-        yield* this.installPeerDeps(dir, name, ver, onProgress);
-        yield* this.installOptionalDeps(dir, onProgress);
-        this.queueLifecycleScripts(name, ver, dir);
-        this.packagesPrepared.add(`${name}@${ver}`);
     }
 
-    private *installOnce(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
+    /** Coalesce concurrent body extracts; prepare (deps) runs after the key settles. */
+    private *installOnce(
+        name: string,
+        ver: string,
+        dir: string,
+        onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
+    ): Flow<void> {
         yield {
             type: StepType.FLOW,
             key: `npm-install:${name}@${ver}`,
-            flow: this.install(name, ver, dir, onProgress),
+            flow: this.installPackageBody(name, ver, dir, onProgress),
         };
+        yield* this.prepareInstalledPackage(name, ver, dir, onProgress, cyclePath);
     }
 
     private queueLifecycleScripts(name: string, ver: string, dir: string): void {
@@ -1206,27 +1662,45 @@ export class NpmHandler implements ProtocolHandler {
         }
     }
 
-    private *installDependencies(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
+    private *installDependencies(
+        name: string,
+        ver: string,
+        dir: string,
+        onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
+    ): Flow<void> {
         // Always link deps into the store package. Flat store + realpath require a
         // complete package-local node_modules; gating on persistLock left packages
         // extracted by `cno run` permanently incomplete.
         const key = `${name}@${ver}`;
         if (this.dependenciesChecked.has(key)) return;
-        this.dependenciesChecked.add(key);
 
         const pkg = readPkg(dir);
         const deps = pkg?.dependencies;
-        if (!deps) return;
-
-        const depNames = recordKeysForLog(deps);
-        if (!depNames) return;
+        if (!deps) {
+            this.dependenciesChecked.add(key);
+            return;
+        }
+        // Names also listed in optionalDependencies are installed as optional only.
+        const optional = pkg?.optionalDependencies;
+        const required: Record<string, string> = Object.create(null);
+        for (const depName in deps) {
+            if (optional && Object.prototype.hasOwnProperty.call(optional, depName)) continue;
+            required[depName] = deps[depName]!;
+        }
+        const depNames = recordKeysForLog(required);
+        if (!depNames) {
+            this.dependenciesChecked.add(key);
+            return;
+        }
         log.debug('npm', () => `deps for ${key}: ${depNames}`);
         const flows: Flow<void>[] = [];
-        for (const depName in deps) {
-            const depRange = deps[depName]!;
-            flows.push(this.installDependency(dir, name, ver, depName, depRange, onProgress));
+        for (const depName in required) {
+            flows.push(this.installDependency(dir, name, ver, depName, required[depName]!, onProgress, cyclePath));
         }
         yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
+        // Only after a full successful walk — a mid-flight github: failure must retry.
+        this.dependenciesChecked.add(key);
     }
 
     private *installDependency(
@@ -1236,8 +1710,20 @@ export class NpmHandler implements ProtocolHandler {
         name: string,
         range: string,
         onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
-        const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress);
+        // Fast path: parent already has a satisfying link (prior install).
+        const existing = this.readLinkedDepDir(parentDir, name);
+        if (existing) {
+            const pkg = readPkg(existing);
+            if (pkg && localPackageMatchesRange(pkg.version, range)) {
+                const ver = pkg.version ?? range;
+                yield* this.prepareInstalledPackage(name, ver, existing, onProgress, cyclePath);
+                this.linkDependency(parentDir, name, existing);
+                return;
+            }
+        }
+        const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress, cyclePath);
         this.linkDependency(parentDir, name, dep.dir);
     }
 
@@ -1251,6 +1737,7 @@ export class NpmHandler implements ProtocolHandler {
         parentName: string,
         parentVer: string,
         onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
         const pkg = readPkg(dir);
         const peers = pkg?.peerDependencies;
@@ -1265,7 +1752,7 @@ export class NpmHandler implements ProtocolHandler {
             const range = peers[peerName]!;
             const optional = meta?.[peerName]?.optional === true;
             flows.push(this.installPeerDependency(
-                dir, parentName, parentVer, peerName, range, optional, onProgress,
+                dir, parentName, parentVer, peerName, range, optional, onProgress, cyclePath,
             ));
         }
         yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
@@ -1279,6 +1766,7 @@ export class NpmHandler implements ProtocolHandler {
         range: string,
         optional: boolean,
         onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
         // Optional peers: only link if already in the store — never fetch new trees.
         if (optional) {
@@ -1288,7 +1776,7 @@ export class NpmHandler implements ProtocolHandler {
             return;
         }
         try {
-            const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress);
+            const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress, cyclePath);
             this.linkDependency(parentDir, name, dep.dir);
         } catch (e) {
             // Unmet required peers are warnings in npm; do not fail the install tree.
@@ -1300,14 +1788,29 @@ export class NpmHandler implements ProtocolHandler {
 
     /** Prefer an already-extracted store package that satisfies `range`. */
     private findCachedPackageMatching(name: string, range: string): string | null {
+        // URL/github ranges pin a dist; only ensureInstalledFromTarballUrl may hit them.
+        if (isOpaqueVersionRange(range)) return null;
         const locked = this.lockedVersionForRange(name, range);
-        if (locked) {
+        if (locked && !isUrlStoreVersion(locked)) {
             const dir = joinPaths(this.cacheDir, `${name}@${locked}`);
             if (fs.exists(joinPaths(dir, 'package.json'))) return dir;
         }
-        if (isExactSemver(range)) {
-            const dir = joinPaths(this.cacheDir, `${name}@${range}`);
+        const norm = stripLeadingV(range);
+        if (isExactSemver(norm)) {
+            const dir = joinPaths(this.cacheDir, `${name}@${norm}`);
             if (fs.exists(joinPaths(dir, 'package.json'))) return dir;
+        }
+        // Match among flat-store versions without registry meta (warm re-cache).
+        // Skip URL-tagged dirs so a github pin cannot satisfy ^1.0.0 by accident.
+        const versions = this.listStoreVersions(name).filter(v => !isUrlStoreVersion(v));
+        if (versions.length > 0) {
+            const matched = (!norm || norm === 'latest' || norm === '*')
+                ? latestVersion(versions)
+                : (matchLatestVersion(versions, norm) ?? (versions.includes(norm) ? norm : null));
+            if (matched) {
+                const dir = joinPaths(this.cacheDir, `${name}@${matched}`);
+                if (fs.exists(joinPaths(dir, 'package.json'))) return dir;
+            }
         }
         const alias = joinPaths(this.cacheDir, name);
         try {
@@ -1319,8 +1822,94 @@ export class NpmHandler implements ProtocolHandler {
         return null;
     }
 
+    /** Absolute dir linked at parent/node_modules/name, if any. */
+    private readLinkedDepDir(parentDir: string, depName: string): string | null {
+        const target = joinPaths(parentDir, 'node_modules', depName);
+        try {
+            if (!fs.exists(joinPaths(target, 'package.json')) && !fs.exists(target)) return null;
+            try {
+                return fs.realpath(target);
+            } catch {
+                return target;
+            }
+        } catch {
+            return null;
+        }
+    }
+
+    /** Versions present as `<cache>/npm/<name>@<ver>` (scoped under scope dir). */
+    private listStoreVersions(name: string): string[] {
+        const hit = this.storeVersionsCache.get(name);
+        // [] is a valid negative listing — do not re-readdir every miss.
+        if (hit !== undefined) return hit;
+        const versions: string[] = [];
+        try {
+            if (name.startsWith('@')) {
+                const slash = name.indexOf('/');
+                if (slash > 0) {
+                    const scope = name.slice(0, slash);
+                    const leaf = name.slice(slash + 1);
+                    const prefix = `${leaf}@`;
+                    for (const entry of this.listStoreScope(scope)) {
+                        if (entry.startsWith(prefix)) {
+                            const ver = entry.slice(prefix.length);
+                            if (ver) versions.push(ver);
+                        }
+                    }
+                }
+            } else {
+                const prefix = `${name}@`;
+                for (const entry of this.listStoreRoot()) {
+                    if (entry.startsWith(prefix)) {
+                        const ver = entry.slice(prefix.length);
+                        if (ver && !ver.includes('/')) versions.push(ver);
+                    }
+                }
+            }
+        } catch {
+            // store missing / unreadable
+        }
+        this.storeVersionsCache.set(name, versions);
+        return versions;
+    }
+
+    private listStoreRoot(): string[] {
+        if (this.storeRootListing) return this.storeRootListing;
+        try {
+            this.storeRootListing = fs.readdir(this.cacheDir);
+        } catch {
+            this.storeRootListing = [];
+        }
+        return this.storeRootListing;
+    }
+
+    private listStoreScope(scope: string): string[] {
+        const hit = this.storeScopeListing.get(scope);
+        if (hit !== undefined) return hit;
+        let listing: string[] = [];
+        try {
+            listing = fs.readdir(joinPaths(this.cacheDir, scope));
+        } catch {
+            listing = [];
+        }
+        this.storeScopeListing.set(scope, listing);
+        return listing;
+    }
+
+    /** Drop cached readdir after a package is written into the store. */
+    private invalidateStoreListing(name?: string): void {
+        this.storeRootListing = null;
+        this.storeScopeListing.clear();
+        if (name) this.storeVersionsCache.delete(name);
+        else this.storeVersionsCache.clear();
+    }
+
     /** Try to install each optionalDependency. Failures are non-fatal (platform mismatch, etc). */
-    private *installOptionalDeps(dir: string, onProgress?: ProgressCallback): Flow<void> {
+    private *installOptionalDeps(
+        dir: string,
+        onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
+    ): Flow<void> {
         const pkg = readPkg(dir);
         const opts = pkg?.optionalDependencies;
         if (!opts) return;
@@ -1333,7 +1922,9 @@ export class NpmHandler implements ProtocolHandler {
         const flows: Flow<void>[] = [];
         for (const depName in opts) {
             const depRange = opts[depName]!;
-            flows.push(this.installOptionalDependency(dir, depName, depRange, osName, cpuName, abiName, onProgress));
+            flows.push(this.installOptionalDependency(
+                dir, depName, depRange, osName, cpuName, abiName, onProgress, cyclePath,
+            ));
         }
         yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
     }
@@ -1346,6 +1937,7 @@ export class NpmHandler implements ProtocolHandler {
         cpuName: string,
         abiName: string,
         onProgress?: ProgressCallback,
+        cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
         try {
             const meta = yield* this.fetchMeta(name, onProgress);
@@ -1364,8 +1956,10 @@ export class NpmHandler implements ProtocolHandler {
             const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(depDir, 'package.json') };
             if (!exists) {
                 if (!this.cfg.silent && !isatty) log.download(`${name}@${ver} (optional)`);
-                yield* this.installOnce(name, ver, depDir, onProgress);
+                yield* this.installOnce(name, ver, depDir, onProgress, cyclePath);
                 log.debug('npm', () => `optional dep installed: ${name}@${ver}`);
+            } else {
+                yield* this.prepareInstalledPackage(name, ver, depDir, onProgress, cyclePath);
             }
             this.linkDependency(parentDir, name, depDir);
         } catch (e) {
@@ -1381,9 +1975,18 @@ export class NpmHandler implements ProtocolHandler {
         const target = joinPaths(parentDir, 'node_modules', depName);
         try {
             if (!fs.exists(joinPaths(depDir, 'package.json'))) return;
-            if (!fs.exists(joinPaths(target, 'package.json'))) {
-                ensureDir(dirname(target));
-                fs.symlink(depDir, target);
+            // Keep only when the occupant already is the intended package.
+            // Wrong-version soft links used to stick forever (package.json present).
+            if (!this.isLinkedDepTarget(target, depDir)) {
+                try {
+                    const st = fs.lstat(target);
+                    // Soft install links only: never recursively wipe hard-materialized dirs.
+                    if (st.isSymbolicLink || !st.isDirectory) fs.unlink(target);
+                } catch {}
+                if (!fs.exists(joinPaths(target, 'package.json'))) {
+                    ensureDir(dirname(target));
+                    symlinkDir(depDir, target);
+                }
             }
             this.linkDependencyBins(parentDir, depDir);
         } catch (e) {
@@ -1391,22 +1994,75 @@ export class NpmHandler implements ProtocolHandler {
         }
     }
 
+    /** True when target already resolves to depDir (or same name@version identity). */
+    private isLinkedDepTarget(target: string, depDir: string): boolean {
+        try {
+            if (!fs.exists(joinPaths(target, 'package.json'))) return false;
+            try {
+                if (normalizePath(fs.realpath(target)) === normalizePath(depDir)) return true;
+            } catch {
+                return false;
+            }
+            // Prefer store path identity — URL-tagged dirs differ by +u… even when
+            // package.json.version is the same base semver.
+            const wantId = this.storePackageId(depDir);
+            const haveId = this.storePackageId(target);
+            if (wantId && haveId) {
+                return wantId.name === haveId.name && wantId.version === haveId.version;
+            }
+            // Hard-materialized real dirs outside the store: package.json identity.
+            const want = readPkg(depDir);
+            const have = readPkg(target);
+            if (want?.version && have?.version && want.version === have.version) {
+                const wantName = want.name ?? '';
+                const haveName = have.name ?? '';
+                return !wantName || !haveName || wantName === haveName;
+            }
+            return false;
+        } catch {
+            return false;
+        }
+    }
+
+    /** name@version from store path when under cacheDir; else null. */
+    private storePackageId(dir: string): { name: string; version: string } | null {
+        const root = normalizePath(this.cacheDir);
+        const norm = normalizePath(dir);
+        if (!norm.startsWith(root + '/') && norm !== root) return null;
+        const rel = norm.slice(root.length + 1);
+        const at = rel.startsWith('@') ? rel.indexOf('@', 1) : rel.indexOf('@');
+        if (at <= 0) return null;
+        const name = rel.slice(0, at);
+        const version = rel.slice(at + 1);
+        if (!name || !version || version.includes('/')) return null;
+        return { name, version };
+    }
+
     private linkCacheAlias(name: string, dir: string): void {
         const target = joinPaths(this.cacheDir, name);
         try {
             if (target === dir) return;
-            if (fs.exists(joinPaths(target, 'package.json'))) return;
-            if (fs.exists(target)) {
-                for (const entry of fs.readdir(dir)) {
-                    const source = joinPaths(dir, entry);
-                    const dest = joinPaths(target, entry);
-                    if (fs.exists(dest)) continue;
-                    fs.symlink(source, dest);
+            // Soft alias to the latest-written store package. Replace when the
+            // occupant already points elsewhere (stale version) or is broken.
+            try {
+                const st = fs.lstat(target);
+                if (st.isSymbolicLink) {
+                    try {
+                        if (normalizePath(fs.realpath(target)) === normalizePath(dir)) return;
+                    } catch {}
+                    fs.unlink(target);
+                } else if (st.isDirectory && fs.exists(joinPaths(target, 'package.json'))) {
+                    // Real dir alias (legacy merge layout) — leave alone.
+                    return;
+                } else if (!st.isDirectory) {
+                    fs.unlink(target);
                 }
-                return;
+            } catch {
+                // target missing
             }
+            if (fs.exists(target)) return;
             ensureDir(dirname(target));
-            fs.symlink(dir, target);
+            symlinkDir(dir, target);
         } catch (e) {
             log.debug('npm', () => `cache alias skipped: ${name} -> ${target} (${e instanceof Error ? e.message : String(e)})`);
         }
@@ -1421,9 +2077,22 @@ export class NpmHandler implements ProtocolHandler {
             const source = joinPaths(depDir, relPath);
             const target = joinPaths(binDir, binName);
             try {
-                if (!fs.exists(source) || fs.exists(target)) continue;
+                if (!fs.exists(source)) continue;
+                let same = false;
+                try {
+                    same = normalizePath(fs.realpath(target)) === normalizePath(fs.realpath(source));
+                } catch {
+                    same = false;
+                }
+                if (same) continue;
+                // Stale/wrong bin link from a prior package version — replace.
+                try {
+                    const st = fs.lstat(target);
+                    if (st.isSymbolicLink || !st.isDirectory) fs.unlink(target);
+                } catch {}
+                if (fs.exists(target)) continue;
                 ensureDir(binDir);
-                fs.symlink(source, target);
+                symlinkFile(source, target);
                 chmodQuietly(source, 0o755);
             } catch (e) {
                 log.debug('bin', () => `bin link skipped: ${binName} -> ${target} (${e instanceof Error ? e.message : String(e)})`);

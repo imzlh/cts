@@ -14,6 +14,8 @@ export interface ModuleInfo {
     moduleId?: string;
     /** Some source modules cannot safely round-trip through serialized bytecode. */
     cacheBytecode?: boolean;
+    /** Explicit language when localPath has no useful extension (pack entry --ext). */
+    lang?: string;
 }
 
 export function moduleRef(info: Pick<ModuleInfo, 'specPath' | 'moduleId'>): string {

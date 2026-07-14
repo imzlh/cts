@@ -26,7 +26,7 @@ const MIME_EXT: Record<string, string> = {
     'text/plain': '.txt', 'text/html': '.html', 'text/css': '.css',
     'text/javascript': '.js', 'application/javascript': '.js',
     'text/typescript': '.ts', 'text/jsx': '.jsx', 'text/tsx': '.tsx',
-    'application/jsx': '.jsx',
+    'application/jsx': '.jsx', 'application/tsx': '.tsx',
     'application/json': '.json', 'application/typescript': '.ts',
     'application/wasm': '.wasm', 'image/png': '.png', 'image/jpeg': '.jpg',
     'image/svg+xml': '.svg', 'application/octet-stream': '.bin',
@@ -45,7 +45,13 @@ function mimeToKind(mime: string): FileKind {
     const m = mimeBase(mime);
     if (m === 'application/wasm') return 'wasm';
     if (m === 'application/json') return 'json';
-    if (m.startsWith('text/') || m === 'application/javascript' || m === 'application/typescript') return 'source';
+    if (m.startsWith('text/')
+        || m === 'application/javascript'
+        || m === 'application/typescript'
+        || m === 'application/jsx'
+        || m === 'application/tsx') {
+        return 'source';
+    }
     return 'binary';
 }
 

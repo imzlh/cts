@@ -1,4 +1,4 @@
-import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows } from './utils';
+import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows, hashString } from './utils';
 import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
 import { getBinMap, readPkgFresh } from './resolve/pkg';
@@ -364,12 +364,40 @@ function findNearestPackageDir(start: string): string | null {
     return null;
 }
 
+/** URL/github pins — same class as npm isOpaqueVersionRange (no semver). */
+function isOpaqueTaskRange(range: string): boolean {
+    if (/^https?:\/\//i.test(range) || range.startsWith('github:')) return true;
+    if (/^(?:git\+)?https:\/\/github\.com\//i.test(range)) return true;
+    return false;
+}
+
+/** Warm pin written by NpmHandler for opaque URL/github installs. */
+function readUrlRangePin(npmDir: string, name: string, url: string): string | null {
+    try {
+        const path = joinPaths(npmDir, '.url-pins', `${hashString(`${name}\0${url}`)}.txt`);
+        const text = readText(path).trim();
+        return text || null;
+    } catch {
+        return null;
+    }
+}
+
 function findCachedPackageDir(cacheDir: string, pkgName: string, range: string): string | null {
     const npmDir = joinPaths(cacheDir, 'npm');
     const slash = pkgName.indexOf('/');
     const scoped = pkgName.startsWith('@') && slash !== -1;
     const baseDir = scoped ? joinPaths(npmDir, pkgName.slice(0, slash)) : npmDir;
     const leaf = scoped ? pkgName.slice(slash + 1) : pkgName;
+    // Opaque: only pin / exact store tag — never semver against a URL string.
+    if (isOpaqueTaskRange(range)) {
+        const pinned = readUrlRangePin(npmDir, pkgName, range);
+        if (pinned) {
+            const pinnedDir = joinPaths(baseDir, `${leaf}@${pinned}`);
+            if (fs.exists(joinPaths(pinnedDir, 'package.json'))) return pinnedDir;
+        }
+        return null;
+    }
+
     const exactDir = joinPaths(baseDir, `${leaf}@${range}`);
     if (fs.exists(joinPaths(exactDir, 'package.json'))) return exactDir;
 
@@ -648,8 +676,10 @@ async function execCommand(
             if (seg.op === ';') continue;   // ; — always run next
             if (seg.op === '||') continue;  // || — run next as fallback
             return prevCode;                // && or no op — bail
-        } else {
-            if (seg.op === '||') i++;       // || succeeded — skip the fallback segment
+        }
+        // a || b || c: on success skip the rest of this || chain (same as lifecycle).
+        if (seg.op === '||') {
+            while (i < segments.length - 1 && segments[i]?.op === '||') i++;
         }
     }
     return prevCode;

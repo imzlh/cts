@@ -71,6 +71,8 @@ export function fillMeta(
     meta.main     = info.specPath === resolver.entry;
     meta.use      = import.meta.use;
     meta.register = import.meta.register;
+    // Pack/extensionless: keep lang for transform on source-only recompile.
+    if (info.lang !== undefined && meta.lang === undefined) meta.lang = info.lang;
 
     // import.meta.resolve → localPath (not npm:/jsr: specPath); cache per specPath.
     let fn = importMetaResolveCache.get(info.specPath);

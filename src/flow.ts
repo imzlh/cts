@@ -1,4 +1,4 @@
-import { readText, ensureDir, writeText, unTarGz, type TarFile, fmtBytes, isEnabled, log, dirname } from './utils';
+import { readText, readBytes, ensureDir, writeText, unTarGz, type TarFile, fmtBytes, isEnabled, log, dirname, getMemoryFile } from './utils';
 import { getCurlInitHook } from './utils/curl';
 
 const fs = import.meta.use('fs');
@@ -246,11 +246,14 @@ export function closeConnectionPools(): void {
 function executeStep(step: Step, fetch: (step: NetFetchStep) => NetFetchResult): StepResult {
     switch (step.type) {
         case StepType.FS_EXISTS:
+            // Active VFS (pack:) is not on disk — has() is the existence oracle.
+            if (getMemoryFile(step.path) !== undefined) return true;
             return fs.exists(step.path);
         case StepType.FS_READ_TEXT:
             return readText(step.path);
         case StepType.FS_READ_BYTES:
-            return fs.readFile(step.path);
+            // Prefer VFS (pack:) — same as readText; raw fs misses overlays.
+            return readBytes(step.path);
         case StepType.FS_WRITE_TEXT:
             writeText(step.path, step.text);
             return undefined;
@@ -325,11 +328,18 @@ async function writeFileAsync(path: string, data: Uint8Array | ArrayBuffer): Pro
 async function executeAsync(step: Step): Promise<StepResult> {
     switch (step.type) {
         case StepType.FS_EXISTS:
+            if (getMemoryFile(step.path) !== undefined) return true;
             return existsAsync(step.path);
-        case StepType.FS_READ_TEXT:
+        case StepType.FS_READ_TEXT: {
+            const v = getMemoryFile(step.path);
+            if (v !== undefined) return engine.decodeString(v);
             return engine.decodeString(await asyncfs.readFile(step.path));
-        case StepType.FS_READ_BYTES:
+        }
+        case StepType.FS_READ_BYTES: {
+            const v = getMemoryFile(step.path);
+            if (v !== undefined) return v;
             return asyncfs.readFile(step.path);
+        }
         case StepType.FS_WRITE_TEXT:
             await writeFileAsync(step.path, engine.encodeString(step.text));
             return undefined;
@@ -363,6 +373,8 @@ async function runNestedFlow(step: FlowStep): Promise<void> {
     }
     let active = activeFlows.get(step.key);
     if (!active) {
+        // Owner chain: create the shared promise. Nested work under this key
+        // must not re-yield the same key (see npm installOnce body vs prepare).
         active = runAsync(step.flow);
         activeFlows.set(step.key, active);
         try {
@@ -372,6 +384,7 @@ async function runNestedFlow(step: FlowStep): Promise<void> {
         }
         return;
     }
+    // Coalesce: other chains wait for the owner (safe; not same-chain re-await).
     await active;
 }
 

@@ -12,7 +12,7 @@ import { BlobHandler }  from './protocols/blob';
 import { LockStore }    from '../lock';
 import { isBuiltinSpecifier } from './builtins';
 import { runAsync, runSync } from '../flow';
-import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, hasLeadingSlashDrive, assert, LRU, log } from '../utils';
+import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, hasLeadingSlashDrive, parentDirKey, assert, LRU, log } from '../utils';
 import { detectFormat } from './pkg';
 import { guessFileKind, applyAttrType } from './protocols/base';
 
@@ -140,8 +140,6 @@ export class ModuleResolver {
     private readonly resolveCache = new LRU<string, ModuleInfo>(4096);
     /** Mode-aware source cache for cjs-vs-esm lookups in the current runtime. */
     private readonly sourceInfoCache = new LRU<string, ModuleInfo>(4096);
-    /** Stat cache: localPath → { exists, mtime }. Avoids repeated sync fs.stat on hot path. */
-    private readonly statCache = new LRU<string, { exists: boolean; mtime: number }>(2048);
 
     constructor(
         private readonly cfg: RuntimeConfig,
@@ -200,6 +198,11 @@ export class ModuleResolver {
 
         parent = this.normalizeParentRef(parent);
         const requestSpec = spec;
+        // Exact cache is keyed by the caller's specifier (see exactResolveKey).
+        if (!attr) {
+            const hit = this.resolveCache.get(this.exactResolveKey(requestSpec, parent));
+            if (hit) return hit;
+        }
         if (spec.includes('\\') || spec[1] === ':') spec = canonicalizePath(spec);
 
         // pack: parent — resolve original specifier before maps/lock redirect out.
@@ -210,32 +213,42 @@ export class ModuleResolver {
             const info = packedSpec
                 ? await this.dispatchAsync(packedSpec, parent, attr, onProgress)
                 : await runAsync(this.packHandler().resolve(spec, parent, attr, onProgress));
-            return this.publishResolved(requestSpec, spec, parent, info, attr);
+            return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
         }
 
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
-        if (sourceHit) return sourceHit;
+        if (sourceHit) {
+            this.rememberExact(requestSpec, parent, attr, sourceHit);
+            return sourceHit;
+        }
 
         const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
             if (cached && this.canUseSourceIndexHit(mapped, cached)) {
-                return this.publishResolved(requestSpec, mapped, parent, cached, attr);
+                return this.publishResolved(requestSpec, mapped, parent, cached, attr, { rememberExact: true });
             }
         }
 
         const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
         if (localPreferred) {
-            return this.publishResolved(requestSpec, mapped, parent, localPreferred, attr, { persistModule: true, persistSource: true });
+            return this.publishResolved(requestSpec, mapped, parent, localPreferred, attr, {
+                persistModule: true,
+                persistSource: true,
+                rememberExact: true,
+            });
         }
 
         const proto = protoOf(mapped);
         if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
             const lockHit = this.lock.getModule(mapped);
             if (lockHit && this.canUseCachedInfo(lockHit)) {
-                return this.publishResolved(requestSpec, mapped, parent, lockHit, attr, { persistSource: true });
+                return this.publishResolved(requestSpec, mapped, parent, lockHit, attr, {
+                    persistSource: true,
+                    rememberExact: true,
+                });
             }
         }
 
@@ -245,7 +258,11 @@ export class ModuleResolver {
 
         // L3 — dispatch async if handler supports it, else sync
         const info = await this.dispatchAsync(mapped, parent, attr, onProgress);
-        return this.publishResolved(requestSpec, mapped, parent, info, attr, { persistModule: true, persistSource: true });
+        return this.publishResolved(requestSpec, mapped, parent, info, attr, {
+            persistModule: true,
+            persistSource: true,
+            rememberExact: true,
+        });
     }
 
     private async dispatchAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
@@ -293,6 +310,11 @@ export class ModuleResolver {
 
         parent = this.normalizeParentRef(parent);
         const requestSpec = spec;
+        // Exact cache is keyed by the caller's specifier (see exactResolveKey).
+        if (!attr) {
+            const hit = this.resolveCache.get(this.exactResolveKey(requestSpec, parent));
+            if (hit) return hit;
+        }
         // Canonical path before maps/dispatch (drive case + backslashes).
         spec = canonicalizePath(spec);
 
@@ -307,20 +329,16 @@ export class ModuleResolver {
             return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
         }
 
-        // Fast path: exact (spec, parent) seen before — skip import map + L1/L2/dispatch
-        if (!attr) {
-            const cacheKey = `${spec}\0${parent}`;
-            const hit = this.resolveCache.get(cacheKey);
-            if (hit) return hit;
-        }
-
         // Import map: skip for relative and absolute paths (they don't need remapping).
         // Uses isAbsolute/isRelative from utils/path to handle Windows drive letters.
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
-        if (sourceHit) return sourceHit;
+        if (sourceHit) {
+            this.rememberExact(requestSpec, parent, attr, sourceHit);
+            return sourceHit;
+        }
 
         // L1 — source index: (mapped, parent) → specPath we've seen before
         const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
@@ -376,7 +394,7 @@ export class ModuleResolver {
         const cached = this.resolvedModules.get(specPath);
         if (cached) return cached;
         const hit = this.lock.getModule(specPath);
-        if (hit && this.isUsableInfo(hit)) {
+        if (hit) {
             this.resolvedModules.set(hit.specPath, hit);
             return hit;
         }
@@ -420,7 +438,6 @@ export class ModuleResolver {
         this.resolvedModules.clear();
         this.resolveCache.clear();
         this.sourceInfoCache.clear();
-        this.statCache.clear();
     }
 
     /** Drain deferred npm lifecycle scripts from the npm handler. */
@@ -428,6 +445,19 @@ export class ModuleResolver {
         const npm = this.handlers.get('npm');
         if (npm instanceof NpmHandler) return npm.drainLifecycleScripts();
         return [];
+    }
+
+    /**
+     * Ensure required install-graph packages are in the flat store before
+     * soft/hard materialize (scan may never resolve pure package.json edges).
+     */
+    async ensureInstallGraph(
+        seeds: Array<{ name: string; version: string }>,
+        onProgress?: ProgressCallback,
+    ): Promise<void> {
+        const npm = this.handlers.get('npm');
+        if (!(npm instanceof NpmHandler) || seeds.length === 0) return;
+        await runAsync(npm.ensureInstallGraph(seeds, onProgress));
     }
 
     resolveBin(name: string, cwd: string): string | null {
@@ -610,70 +640,37 @@ export class ModuleResolver {
             // so `cno test` modules keep import.meta.main === false (Deno semantics).
         }
 
-        if (opts?.rememberExact && !attr) {
-            this.resolveCache.set(`${requestSpec}\0${parent}`, resolved);
-        }
+        if (opts?.rememberExact) this.rememberExact(requestSpec, parent, attr, resolved);
         return resolved;
     }
 
+    /** Populate exact-hit cache (caller specifier; no attr). */
+    private rememberExact(
+        requestSpec: string,
+        parent: string,
+        attr: Record<string, unknown> | undefined,
+        info: ModuleInfo,
+    ): void {
+        if (attr) return;
+        this.resolveCache.set(this.exactResolveKey(requestSpec, parent), info);
+    }
+
+    /**
+     * In-memory exact-hit key. Relative edges share parentDirKey so dense
+     * same-dir graphs do not re-run resolveFile for every `./util.js` importer.
+     * Always pass the original request specifier (not post-canonicalize).
+     */
+    private exactResolveKey(spec: string, parent: string): string {
+        if (isRelative(spec)) return `${spec}\0${parentDirKey(parent)}`;
+        return `${spec}\0${parent}`;
+    }
+
     private canUseCachedInfo(info: ModuleInfo): boolean {
-        if (!this.isUsableInfo(info)) return false;
         return !(this.cfg.persistLock && !this.cfg.ignoreScripts && protoOf(info.specPath) === 'npm');
     }
 
-    private canUseSourceIndexHit(mapped: string, info: ModuleInfo): boolean {
-        if (!this.canUseCachedInfo(info)) return false;
-        const proto = protoOf(mapped);
-        if (!proto || proto === 'file') return true;
-        const h = this.handlers.get(proto);
-        if (!h) return true;
-        try {
-            return normalizePath(info.localPath) === normalizePath(h.localPath(mapped));
-        } catch {
-            return false;
-        }
-    }
-
-    private isUsableInfo(info: ModuleInfo): boolean {
-        const proto = protoOf(info.specPath);
-        if (proto) {
-            const h = this.handlers.get(proto);
-            if (h) {
-                let expected: string;
-                try {
-                    expected = normalizePath(h.localPath(info.specPath));
-                } catch {
-                    return false;
-                }
-                if (normalizePath(info.localPath) !== expected) return false;
-                if (detectFormat(expected) !== info.format) return false;
-            }
-        }
-        return this.localPathExists(info.localPath);
-    }
-
-    private localPathExists(localPath: string): boolean {
-        // Local files: stat cache avoids repeated sync syscalls on hot path
-        const cached = this.statCache.get(localPath);
-        if (cached) return cached.exists;
-        try {
-            const st = fs.stat(localPath);
-            this.statCache.set(localPath, { exists: true, mtime: st.mtim.getTime() });
-            return true;
-        } catch {
-            this.statCache.set(localPath, { exists: false, mtime: 0 });
-            return false;
-        }
-    }
-
-    /** Evict a path from the stat cache (e.g. after a load failure). */
-    invalidatePath(localPath: string): void {
-        this.statCache.delete(localPath);
-    }
-
-    /** Get cached mtime for a local path (avoids redundant fs.stat in jsc.load). */
-    getCachedMtime(localPath: string): number | undefined {
-        return this.statCache.get(localPath)?.mtime;
+    private canUseSourceIndexHit(_mapped: string, info: ModuleInfo): boolean {
+        return this.canUseCachedInfo(info);
     }
 
     private sourceCacheKey(spec: string, parent: string, attr?: Record<string, unknown>): string {
