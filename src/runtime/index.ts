@@ -10,7 +10,7 @@ import { LockStore } from '../lock';
 import { materializeNodeModules } from '../resolve/linker';
 import { guessFileKind, isTypeDecl } from '../resolve/protocols/base';
 import { isRemote } from '../source/cache';
-import type { FileKind, ModuleFormat, ModuleInfo, NodeBuiltinResolver, RuntimeConfig } from '../types';
+import { moduleRef, type FileKind, type ModuleFormat, type ModuleInfo, type NodeBuiltinResolver, type RuntimeConfig } from '../types';
 import { PrecacheProgress, clearNegativeCache, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, npmNameVersion, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
 import { installEngineHooks, type EngineHooks } from './hooks';
 import {
@@ -558,10 +558,12 @@ export class TypeScriptRuntime {
         // CJS bytecode always uses local hashed cache (no specPath at load).
         const cacheRemote = (m: { format: ModuleFormat; specPath: string }) =>
             m.format === 'cjs' ? false : isRemote(m.specPath);
+        const cacheIdentity = (m: { format: ModuleFormat; specPath: string; localPath: string }) =>
+            m.format === 'cjs' ? m.localPath : moduleRef(m);
         for (const m of result.modules) {
             if (!isPrecompilePath(m.localPath)) continue;
             scannableModules.push(m);
-            if (!this.compiler.esm.jsc.hasFresh(m.localPath, cacheRemote(m))) {
+            if (!this.compiler.esm.jsc.hasFresh(m.localPath, cacheRemote(m), undefined, cacheIdentity(m))) {
                 toCompile.push(m);
             }
         }
@@ -583,7 +585,8 @@ export class TypeScriptRuntime {
                         (localPath, bc, specPath) => {
                             const format = formatByLocalPath.get(localPath);
                             const remote = format === 'cjs' ? false : isRemote(specPath);
-                            this.compiler.esm.jsc.persistBytecode(localPath, bc, remote);
+                            const identity = format === 'cjs' ? localPath : specPath;
+                            this.compiler.esm.jsc.persistBytecode(localPath, bc, remote, identity);
                             written++;
                         },
                         (localPath, _specPath, error) => {

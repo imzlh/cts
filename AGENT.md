@@ -225,6 +225,7 @@ No circular deps. Used everywhere.
 - **Flow**: protocol handlers `yield Step`; `runSync`/`runAsync` drive them — no direct I/O inside handlers
 - **LRU**: instantiate with capacity, use `get`/`set` — no manual eviction
 - **Module identity**: use `moduleRef(info)` (returns `info.moduleId ?? info.specPath`) as the QuickJS module name, not `localPath`
+- **Bytecode identity**: pass the effective QuickJS module identity through every `JscCache` load/freshness/write API; identity-aware sidecars reject legacy or mismatched stamps instead of reusing a bytecode graph compiled for another ref. Remote bytecode is adjacent only when the resolved file is inside the configured cache root; workspace/symlink targets use the hashed local cache.
 - **Pack isolation**: do not resolve a missing manifest edge against disk/network; incomplete scans and compiles are fatal
 - **Attribute views**: use `moduleViewRef()`; do not encode view state in a user query/hash suffix
 - **Bytecode safety**: propagate `cacheBytecode: false` for `sourceOnly` pack entries so warm caches cannot erase import attributes

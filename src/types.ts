@@ -48,6 +48,7 @@ export interface ConfigOptions {
     pathAliases?:   Record<string, string[]>;
     baseUrl?:       string;
     importMap?:     Record<string, string>;
+    importMapScopes?: Record<string, Record<string, string>>;
     conditions?:    string[];
     polyfill?:      string;
     enableCache?:   boolean;
@@ -101,9 +102,10 @@ export interface PackageJson {
     version?:      string;
     main?:         string;
     module?:       string;
-    exports?:      string | Record<string, unknown>;
+    exports?:      string | unknown[] | Record<string, unknown> | null;
     type?:         'module' | 'commonjs';
-    imports?:      Record<string, string>;
+    // Import targets may be conditional objects/arrays, like `exports`.
+    imports?:      Record<string, unknown>;
     bin?:          string | Record<string, string>;
     dependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;

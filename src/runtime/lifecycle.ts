@@ -284,23 +284,18 @@ export async function runLifecyclePlan(
     for (let i = 0; i < plan.commands.length; i++) {
         const command = plan.commands[i];
         if (!command) continue;
+
+        if (i > 0) {
+            const previousOp = plan.commands[i - 1]?.op;
+            const shouldRun = previousOp === ';' ||
+                (previousOp === '&&' && code === 0) ||
+                (previousOp === '||' && code !== 0);
+            if (!shouldRun) continue;
+        }
+
         const applied = applyShellBuiltin(command.argv, sess, applyOpts);
         code = applied !== null ? applied : await spawn(command, sess);
-
-        if (command.op === '&&') {
-            if (code !== 0) return code;
-            continue;
-        }
-
-        if (command.op === '||') {
-            if (code === 0) {
-                while (i < plan.commands.length - 1 && plan.commands[i]?.op === '||') i++;
-            }
-            continue;
-        }
-
-        if (command.op === ';') continue;
-        return code;
+        if (applied !== null && command.argv[0]?.toLowerCase() === 'exit') return code;
     }
     return code;
 }

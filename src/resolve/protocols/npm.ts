@@ -4,8 +4,8 @@ import { guessFileKind } from './base';
 import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
-import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString } from '../../utils/misc';
-import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
+import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, isValidNpmPackageName } from '../../utils/misc';
+import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, resolvePackageBinPath, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
@@ -20,6 +20,7 @@ const EMPTY_CYCLE: ReadonlySet<string> = new Set();
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+const crypto = import.meta.use('crypto');
 
 function env(name: string): string | null {
     try {
@@ -108,6 +109,31 @@ function loadNpmConfig(): NpmConfig {
 
 interface ParsedNpmSpec { name: string; version: string; subpath: string }
 
+function assertNpmPackageName(name: string): void {
+    if (!isValidNpmPackageName(name)) {
+        throw err(ErrorKind.InvalidSpecifier, `Invalid npm package name: ${name}`);
+    }
+}
+
+function assertSafeNpmSubpath(raw: string, subpath: string): void {
+    if (!subpath) return;
+    const normalized = toPosixPath(subpath);
+    if (normalized.startsWith('/') || normalized.includes('\0') || /^[a-z]:\//i.test(normalized) ||
+        normalized.split('/').some(segment => segment === '.' || segment === '..')) {
+        throw err(ErrorKind.InvalidSpecifier, `Unsafe npm package subpath: ${raw}`);
+    }
+}
+
+function isSafeStoreVersionSegment(version: string): boolean {
+    return !!version && !version.includes('/') && !version.includes('\\') && !version.includes('\0') &&
+        !version.includes(':') && !/[\u0000-\u0020\u007f]/.test(version);
+}
+
+function isSafeNpmBinName(name: string): boolean {
+    return !!name && name !== '.' && name !== '..' && !name.includes('/') &&
+        !name.includes('\\') && !name.includes('\0') && !name.includes(':');
+}
+
 function rejectVersionAfterSubpath(raw: string, name: string, subpath: string): void {
     const at = subpath.lastIndexOf('@');
     if (at <= 0) return;
@@ -168,18 +194,44 @@ function parseNpmSpec(raw: string): ParsedNpmSpec {
         }
     }
     if (!name) throw err(ErrorKind.InvalidSpecifier, `Invalid npm specifier (no package name): ${raw}`);
+    assertNpmPackageName(name);
     rejectVersionAfterSubpath(raw, name, sub);
+    const suffixIndex = sub.search(/[?#]/);
+    if (suffixIndex !== -1) sub = sub.slice(0, suffixIndex);
+    assertSafeNpmSubpath(raw, sub);
     return { name, version: ver || 'latest', subpath: sub };
+}
+
+interface NpmDist {
+    tarball: string;
+    integrity?: string;
+    shasum?: string;
 }
 
 interface NpmMeta {
     versions: Record<string, {
         version: string;
-        dist: { tarball: string };
+        dist: NpmDist;
         os?: string[];
         cpu?: string[];
     }>;
     'dist-tags': Record<string, string>;
+}
+
+function verifyRegistryTarball(data: Uint8Array | ArrayBuffer, dist: NpmDist, name: string, ver: string): void {
+    const integrity = typeof dist.integrity === 'string' ? dist.integrity.trim() : '';
+    let valid = false;
+    if (integrity) {
+        valid = matchesIntegrity(data, integrity);
+    } else if (typeof dist.shasum === 'string' && dist.shasum.trim()) {
+        const expected = dist.shasum.trim().toLowerCase();
+        valid = /^[0-9a-f]{40}$/.test(expected) &&
+            crypto.hexEncode(crypto.sha1(data)).toLowerCase() === expected;
+    }
+    if (!valid) {
+        throw err(ErrorKind.NetworkError,
+            `Integrity check failed for npm:${name}@${ver} from ${dist.tarball}`);
+    }
 }
 
 function currentOs(): string {
@@ -403,7 +455,8 @@ function versionHintFromTarballUrl(url: string): string | null {
  * when two different dist pins claim the same semver (or both lack one).
  */
 function urlStoreVersion(url: string, baseVer: string): string {
-    const base = baseVer || '0.0.0';
+    const normalized = stripLeadingV(baseVer);
+    const base = isExactSemver(normalized) ? normalized : '0.0.0';
     return `${base}+u${hashString(url).slice(0, 8)}`;
 }
 
@@ -430,7 +483,7 @@ function collectInstallGraphDeps(pkg: {
     const out: Array<{ name: string; range: string; optional: boolean }> = [];
     const index = new Map<string, number>();
     const push = (name: string, range: string, optional: boolean, prefer = false) => {
-        if (!name) return;
+        if (!isValidNpmPackageName(name)) return;
         const i = index.get(name);
         if (i !== undefined) {
             // npm: optionalDependencies wins over dependencies for same name.
@@ -526,6 +579,13 @@ function isVirtualProjectNodeModules(norm: string): boolean {
     return false;
 }
 
+type PackageImportResolver = (
+    spec: string,
+    parent: string,
+    attr?: Record<string, unknown>,
+    onProgress?: ProgressCallback,
+) => Flow<ModuleInfo>;
+
 export class NpmHandler implements ProtocolHandler {
     readonly protocols = ['npm'];
     private readonly cacheDir: string;
@@ -551,7 +611,10 @@ export class NpmHandler implements ProtocolHandler {
     private storeRootListing: string[] | null = null;
     private readonly storeScopeListing = new Map<string, string[]>();
 
-    constructor(private readonly cfg: RuntimeConfig) {
+    constructor(
+        private readonly cfg: RuntimeConfig,
+        private readonly packageImportResolver?: PackageImportResolver,
+    ) {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
     }
 
@@ -665,6 +728,7 @@ export class NpmHandler implements ProtocolHandler {
         range: string,
         onProgress?: ProgressCallback,
     ): Flow<{ dir: string; resolvedVer: string } | null> {
+        if (!isValidNpmPackageName(name)) return null;
         if (isTarballUrl(range) || githubRangeToTarballUrl(range)) {
             // Opaque ranges need the full ensure path (URL / github codeload).
             try {
@@ -714,7 +778,7 @@ export class NpmHandler implements ProtocolHandler {
             return yield* this.resolveRelative('.', parent, forceCjs, onProgress);
         }
         if (spec.startsWith('#') && parent.startsWith('npm:')) {
-            return yield* this.resolveSubpathImport(spec, parent, forceCjs, onProgress);
+            return yield* this.resolveSubpathImport(spec, parent, forceCjs, attr, onProgress);
         }
         // # imports from local node_modules files — resolve via owning package's "imports"
         if (spec.startsWith('#')) {
@@ -723,7 +787,8 @@ export class NpmHandler implements ProtocolHandler {
             const resolved = ctx ? resolveImports(ctx, spec) : null;
             if (resolved && pkgDir) {
                 const pkg = readPkg(pkgDir);
-                return this.toPackageModuleInfo(pkg?.name ?? 'unknown', pkg?.version ?? '0.0.0', pkgDir, resolved);
+                return yield* this.resolvePackageImportResult(
+                    pkg?.name ?? 'unknown', pkg?.version ?? '0.0.0', pkgDir, resolved, parent, attr, onProgress);
             }
             throw packageImportNotDefinedError(spec, pkgDir ?? '', parent);
         }
@@ -774,7 +839,7 @@ export class NpmHandler implements ProtocolHandler {
 
     /** Bin path: node_modules/.bin then lock index. */
     resolveBin(name: string, cwd: string): string | null {
-        if (name.startsWith('/') || name.startsWith('.') || name.includes('/')) return null;
+        if (name.startsWith('/') || name.startsWith('.') || !isSafeNpmBinName(name)) return null;
 
         // 1. Local node_modules/.bin (highest priority)
         const local = findLocalBin(name, cwd);
@@ -789,8 +854,22 @@ export class NpmHandler implements ProtocolHandler {
 
     localPath(specPath: string): string {
         const { name, version, subpath } = parseNpmSpec(specPath);
+        if (!isSafeStoreVersionSegment(version)) {
+            throw err(ErrorKind.InvalidSpecifier, `Unsafe npm package version: ${version}`);
+        }
         const pkgDir = joinPaths(this.cacheDir, `${name}@${version}`);
         if (!fs.exists(pkgDir)) throw err(ErrorKind.ModuleNotFound, `Package not in cache: ${specPath}`);
+        // Resolved package targets use their physical package-relative path as
+        // the canonical module ID. getInfo() must be able to restore that ID
+        // without applying package exports a second time.
+        if (subpath) {
+            const root = normalizePath(pkgDir);
+            const candidate = normalizePath(joinPaths(root, subpath));
+            if (candidate.startsWith(root + '/')) {
+                const direct = resolveFile(candidate);
+                if (direct) return direct;
+            }
+        }
         const ctx = createCtx(pkgDir, this.ctxOptions());
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkgDir}`);
         const blockedByExports = isPackageSubpathBlockedByExports(ctx, subpath);
@@ -843,14 +922,21 @@ export class NpmHandler implements ProtocolHandler {
             this.relativeFormat(parent, resolvedLocal, forceCjs));
     }
 
-    private *resolveSubpathImport(spec: string, parent: string, forceCjs: boolean, onProgress?: ProgressCallback): Flow<ModuleInfo> {
+    private *resolveSubpathImport(
+        spec: string,
+        parent: string,
+        forceCjs: boolean,
+        attr?: Record<string, unknown>,
+        onProgress?: ProgressCallback,
+    ): Flow<ModuleInfo> {
         const { name, version } = parseNpmSpec(parent);
         const pkg = yield* this.ensureInstalled(name, version, parent, onProgress);
         const ctx = createCtx(pkg.dir, this.ctxOptions(forceCjs));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
         const resolved = resolveImports(ctx, spec);
         if (!resolved) throw packageImportNotDefinedError(spec, pkg.dir, parent);
-        return this.toPackageModuleInfo(name, pkg.resolvedVer, pkg.dir, resolved);
+        return yield* this.resolvePackageImportResult(
+            name, pkg.resolvedVer, pkg.dir, resolved, parent, attr, onProgress);
     }
 
     private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
@@ -934,7 +1020,8 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private toPackageModuleInfo(name: string, version: string, pkgDir: string, resolved: ResolvedPath): ModuleInfo {
-        const specPath = NpmHandler.specPath(name, version, NpmHandler.canonicalSubpath(pkgDir, resolved.path));
+        const baseSpecPath = NpmHandler.specPath(name, version, NpmHandler.canonicalSubpath(pkgDir, resolved.path));
+        const specPath = baseSpecPath + (resolved.specifierSuffix ?? '');
         this.specFormat.set(specPath, resolved.format);
         this.specLocalPath.set(specPath, resolved.path);
         return {
@@ -943,6 +1030,24 @@ export class NpmHandler implements ProtocolHandler {
             format: resolved.format,
             fileKind: resolved.fileKind ?? guessFileKind(resolved.path),
         };
+    }
+
+    private *resolvePackageImportResult(
+        name: string,
+        version: string,
+        pkgDir: string,
+        resolved: ResolvedPath,
+        parent: string,
+        attr?: Record<string, unknown>,
+        onProgress?: ProgressCallback,
+    ): Flow<ModuleInfo> {
+        if (resolved.externalSpecifier) {
+            if (!this.packageImportResolver) {
+                throw err(ErrorKind.Generic, `No resolver is available for package import target "${resolved.path}"`);
+            }
+            return yield* this.packageImportResolver(resolved.path, parent, attr, onProgress);
+        }
+        return this.toPackageModuleInfo(name, version, pkgDir, resolved);
     }
 
     private toLocalModuleInfo(name: string, version: string, pkgDir: string, localPath: string, format: ModuleFormat = detectFormat(localPath)): ModuleInfo {
@@ -1096,6 +1201,7 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private findLocal(name: string, parent?: string): string | null {
+        if (!isValidNpmPackageName(name)) return null;
         const key = this.localCacheKey(name, parent);
         const cached = this.localCache.get(key);
         if (cached !== undefined) return cached;
@@ -1189,8 +1295,8 @@ export class NpmHandler implements ProtocolHandler {
         if (!pkg) return;
         const binMap = getBinMap(pkg);
         for (const [binName, relPath] of Object.entries(binMap)) {
-            const absPath = joinPaths(pkgDir, relPath);
-            if (fs.exists(absPath)) {
+            const absPath = resolvePackageBinPath(pkgDir, relPath);
+            if (absPath) {
                 this.cfg.lockStore?.addBin(binName, absPath, `${name}@local`);
             }
         }
@@ -1212,6 +1318,7 @@ export class NpmHandler implements ProtocolHandler {
         onProgress?: ProgressCallback,
         cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<{ dir: string; resolvedVer: string }> {
+        assertNpmPackageName(name);
         // Direct tarball URL (e.g. sheetjs CDN) — skip registry meta entirely.
         if (isTarballUrl(version)) {
             return yield* this.ensureInstalledFromTarballUrl(name, version, onProgress, cyclePath);
@@ -1469,6 +1576,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!pkg) return false;
         const nm = joinPaths(dir, 'node_modules');
         const hasSatisfying = (depName: string, range: string): boolean => {
+            if (!isValidNpmPackageName(depName)) return false;
             try {
                 const linked = joinPaths(nm, depName);
                 if (!fs.exists(joinPaths(linked, 'package.json'))) return false;
@@ -1526,6 +1634,9 @@ export class NpmHandler implements ProtocolHandler {
             const matched = matchLatestRecordVersion(meta.versions, norm);
             if (!matched) throw err(ErrorKind.VersionNotFound, `Could not find npm package '${name}' matching '${range}'.`);
             resolved = matched;
+        }
+        if (!isExactSemver(resolved)) {
+            throw err(ErrorKind.VersionNotFound, `Registry returned invalid version '${resolved}' for npm package '${name}'.`);
         }
         this.verCache.set(key, resolved);
         // Also cache under the original range so locked lookups with `v` hit.
@@ -1599,7 +1710,8 @@ export class NpmHandler implements ProtocolHandler {
         if (fs.exists(joinPaths(dir, 'package.json'))) return;
         const meta = yield* this.fetchMeta(name, onProgress);
         if (fs.exists(joinPaths(dir, 'package.json'))) return;
-        const tarball = meta.versions[ver]?.dist.tarball;
+        const dist = meta.versions[ver]?.dist;
+        const tarball = dist?.tarball;
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
         log.debug('npm', () => `fetch tarball ${name}@${ver} <- ${tarball}`);
         const fetchStarted = Date.now();
@@ -1609,6 +1721,7 @@ export class NpmHandler implements ProtocolHandler {
         }
         const body = tarRes.body;
         log.debug('npm', () => `fetched tarball ${name}@${ver} ${fmtBytes(body.byteLength)} in ${Date.now() - fetchStarted}ms`);
+        verifyRegistryTarball(body, dist, name, ver);
         if (fs.exists(joinPaths(dir, 'package.json'))) return;
         log.debug('npm', () => `extract ${name}@${ver} ${fmtBytes(body.byteLength)}`);
         const extractStarted = Date.now();
@@ -1712,6 +1825,7 @@ export class NpmHandler implements ProtocolHandler {
         onProgress?: ProgressCallback,
         cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
+        assertNpmPackageName(name);
         // Fast path: parent already has a satisfying link (prior install).
         const existing = this.readLinkedDepDir(parentDir, name);
         if (existing) {
@@ -1768,6 +1882,7 @@ export class NpmHandler implements ProtocolHandler {
         onProgress?: ProgressCallback,
         cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
+        if (!isValidNpmPackageName(name)) return;
         // Optional peers: only link if already in the store — never fetch new trees.
         if (optional) {
             const local = this.findLocal(name, `npm:${parentName}@${parentVer}`)
@@ -1788,6 +1903,7 @@ export class NpmHandler implements ProtocolHandler {
 
     /** Prefer an already-extracted store package that satisfies `range`. */
     private findCachedPackageMatching(name: string, range: string): string | null {
+        if (!isValidNpmPackageName(name)) return null;
         // URL/github ranges pin a dist; only ensureInstalledFromTarballUrl may hit them.
         if (isOpaqueVersionRange(range)) return null;
         const locked = this.lockedVersionForRange(name, range);
@@ -1824,6 +1940,7 @@ export class NpmHandler implements ProtocolHandler {
 
     /** Absolute dir linked at parent/node_modules/name, if any. */
     private readLinkedDepDir(parentDir: string, depName: string): string | null {
+        if (!isValidNpmPackageName(depName)) return null;
         const target = joinPaths(parentDir, 'node_modules', depName);
         try {
             if (!fs.exists(joinPaths(target, 'package.json')) && !fs.exists(target)) return null;
@@ -1839,6 +1956,7 @@ export class NpmHandler implements ProtocolHandler {
 
     /** Versions present as `<cache>/npm/<name>@<ver>` (scoped under scope dir). */
     private listStoreVersions(name: string): string[] {
+        if (!isValidNpmPackageName(name)) return [];
         const hit = this.storeVersionsCache.get(name);
         // [] is a valid negative listing — do not re-readdir every miss.
         if (hit !== undefined) return hit;
@@ -1939,6 +2057,7 @@ export class NpmHandler implements ProtocolHandler {
         onProgress?: ProgressCallback,
         cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
     ): Flow<void> {
+        if (!isValidNpmPackageName(name)) return;
         try {
             const meta = yield* this.fetchMeta(name, onProgress);
             const ver = yield* this.resolveVersion(name, range, onProgress);
@@ -1972,6 +2091,7 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private linkDependency(parentDir: string, depName: string, depDir: string): void {
+        if (!isValidNpmPackageName(depName)) return;
         const target = joinPaths(parentDir, 'node_modules', depName);
         try {
             if (!fs.exists(joinPaths(depDir, 'package.json'))) return;
@@ -2034,11 +2154,12 @@ export class NpmHandler implements ProtocolHandler {
         if (at <= 0) return null;
         const name = rel.slice(0, at);
         const version = rel.slice(at + 1);
-        if (!name || !version || version.includes('/')) return null;
+        if (!isValidNpmPackageName(name) || !isSafeStoreVersionSegment(version)) return null;
         return { name, version };
     }
 
     private linkCacheAlias(name: string, dir: string): void {
+        if (!isValidNpmPackageName(name)) return;
         const target = joinPaths(this.cacheDir, name);
         try {
             if (target === dir) return;
@@ -2074,10 +2195,10 @@ export class NpmHandler implements ProtocolHandler {
         const binMap = getBinMap(pkg);
         const binDir = joinPaths(parentDir, 'node_modules', '.bin');
         for (const [binName, relPath] of Object.entries(binMap)) {
-            const source = joinPaths(depDir, relPath);
+            const source = resolvePackageBinPath(depDir, relPath);
+            if (!source) continue;
             const target = joinPaths(binDir, binName);
             try {
-                if (!fs.exists(source)) continue;
                 let same = false;
                 try {
                     same = normalizePath(fs.realpath(target)) === normalizePath(fs.realpath(source));
@@ -2106,8 +2227,8 @@ export class NpmHandler implements ProtocolHandler {
         const binMap = getBinMap(pkg);
         const spec = `${name}@${ver}`;
         for (const [binName, relPath] of Object.entries(binMap)) {
-            const absPath = joinPaths(dir, relPath);
-            if (fs.exists(absPath)) {
+            const absPath = resolvePackageBinPath(dir, relPath);
+            if (absPath) {
                 this.cfg.lockStore?.addBin(binName, absPath, spec);
                 log.debug('bin', () => `indexed: ${binName} → ${absPath} (${spec})`);
             }

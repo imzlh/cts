@@ -23,6 +23,17 @@ export function hashString(s: string): string {
     return h.toString(16).padStart(8, '0');
 }
 
+export function isValidNpmPackageName(name: string): boolean {
+    if (!name || name.length > 214 || name.includes('\\') || name.includes('\0')) return false;
+    const parts = name.startsWith('@') ? name.slice(1).split('/') : [name];
+    if (name.startsWith('@') ? parts.length !== 2 : name.includes('/')) return false;
+    for (const part of parts) {
+        if (!part || part === '.' || part === '..' || part.includes(':') ||
+            /[\u0000-\u0020\u007f]/.test(part)) return false;
+    }
+    return true;
+}
+
 /** Build a stable cache filename from a URL; ext from path, hash includes query. */
 export function cacheFilename(url: string): string {
     try {
@@ -36,6 +47,34 @@ export function cacheFilename(url: string): string {
     } catch {
         return hashString(url);
     }
+}
+
+/** Verify a Subresource Integrity digest using the strongest supported token. */
+export function matchesIntegrity(data: Uint8Array | ArrayBuffer, integrity: string): boolean {
+    let strongest = 0;
+    let matched = false;
+    for (const token of integrity.trim().split(/\s+/)) {
+        const separator = token.indexOf('-');
+        if (separator <= 0) continue;
+        const algorithm = token.slice(0, separator).toLowerCase();
+        const strength = algorithm === 'sha512' ? 3 : algorithm === 'sha384' ? 2 : algorithm === 'sha256' ? 1 : 0;
+        if (strength === 0 || strength < strongest) continue;
+        const expected = token.slice(separator + 1).split('?')[0];
+        if (!expected) continue;
+        const digest = algorithm === 'sha512'
+            ? crypto.sha512(data)
+            : algorithm === 'sha384'
+                ? crypto.sha384(data)
+                : crypto.sha256(data);
+        const equal = crypto.base64Encode(digest) === expected;
+        if (strength > strongest) {
+            strongest = strength;
+            matched = equal;
+        } else if (equal) {
+            matched = true;
+        }
+    }
+    return strongest > 0 && matched;
 }
 
 export const isCacheExpired = (ts: number, ttl: number) => Date.now() - ts > ttl;
@@ -375,6 +414,8 @@ export function npmNameVersion(specPath: string): { name: string; version: strin
     const afterName = rest.slice(nameEnd + 1);
     const slash = afterName.indexOf('/');
     const version = slash === -1 ? afterName : afterName.slice(0, slash);
+    if (!isValidNpmPackageName(name) || !version || version.includes('\\') || version.includes('\0') ||
+        version.includes(':') || /[\u0000-\u0020\u007f]/.test(version)) return null;
     return { name, version };
 }
 

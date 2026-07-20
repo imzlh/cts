@@ -717,7 +717,7 @@ export class CjsLoader {
         const ctx = createCtx(pkgDir, { forceCjs: true });
         if (!ctx) return null;
 
-        if (ctx.pkg.exports) {
+        if (ctx.pkg.exports !== undefined) {
             const resolved = resolveExports(ctx, parsed.subpath);
             if (!resolved) throw packagePathNotExportedError(id);
             return this.infoFromLocalPath(resolved.path, resolved.format);

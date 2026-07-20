@@ -16,8 +16,11 @@ export function isHostWasmImportModule(name: string): boolean {
 }
 
 /** Unique non-host import module names from a wasm binary. */
-export function scanWasmImportModules(bytes: Uint8Array): string[] {
-    if (!wasm) return [];
+export function scanWasmImportModules(bytes: Uint8Array, strict = false): string[] {
+    if (!wasm) {
+        if (strict) throw new Error('WASM import scanner is unavailable');
+        return [];
+    }
     try {
         const wmod = wasm.parseModule(bytes);
         const seen = new Set<string>();
@@ -31,15 +34,17 @@ export function scanWasmImportModules(bytes: Uint8Array): string[] {
         return out;
     } catch (e) {
         log.debug('wasm', () => `import scan failed: ${errMsg(e)}`);
+        if (strict) throw e;
         return [];
     }
 }
 
-export function scanWasmImportModulesFile(localPath: string): string[] {
+export function scanWasmImportModulesFile(localPath: string, strict = false): string[] {
     try {
-        return scanWasmImportModules(readBytes(localPath));
+        return scanWasmImportModules(readBytes(localPath), strict);
     } catch (e) {
         log.debug('wasm', () => `import scan read failed ${localPath}: ${errMsg(e)}`);
+        if (strict) throw e;
         return [];
     }
 }

@@ -21,6 +21,10 @@ export class HttpHandler implements ProtocolHandler {
         if (!this.resolved.has(url)) {
             const cached = yield { type: StepType.FS_EXISTS, path: cachePath };
             if (!cached) {
+                if (this.cfg.cachedOnly) {
+                    throw err(ErrorKind.ModuleNotFound,
+                        `HTTP module not found in cache: "${url}", --cached-only is specified.`);
+                }
                 if (!this.cfg.silent && !isatty) log.download(url);
                 const result = expectFetch(yield {
                     type: StepType.NET_FETCH,

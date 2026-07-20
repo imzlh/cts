@@ -1,7 +1,7 @@
-import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows, hashString } from './utils';
-import { parseShellCommand, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
+import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows, hashString, ensureDir, isValidNpmPackageName } from './utils';
+import { parseShellCommand, requiresShellEvaluation, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
-import { getBinMap, readPkgFresh } from './resolve/pkg';
+import { getBinMap, readPkgFresh, resolvePackageBinPath } from './resolve/pkg';
 import { createConfig } from './config';
 import { NpmHandler } from './resolve/protocols/npm';
 import { runAsync } from './flow';
@@ -10,6 +10,48 @@ const os = import.meta.use('os');
 const console = import.meta.use('console');
 const fs = import.meta.use('fs');
 const process = import.meta.use('process');
+const signals = import.meta.use('signals');
+
+const taskTerminalSignalNames = [
+    'SIGINT', 'SIGQUIT', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU',
+] as const;
+
+interface TaskPackageMetadata {
+    path: string;
+    name?: string;
+    version?: string;
+    config?: unknown;
+}
+
+// Shell syntax can hide runtime commands behind assignments, `env`, or a
+// nested shell.  A process-local PATH shim keeps those on cno as well.
+let taskRuntimeShimDir: string | null | undefined;
+
+function ensureTaskRuntimeShim(): string | null {
+    if (taskRuntimeShimDir !== undefined) return taskRuntimeShimDir;
+    taskRuntimeShimDir = null;
+    try {
+        const dir = joinPaths(toPosixPath(os.tmpDir), `cno-task-bin-${os.pid}`);
+        ensureDir(dir);
+        const names = isWindows ? ['node.exe', 'deno.exe'] : ['node', 'deno'];
+        let complete = true;
+        for (const name of names) {
+            const link = joinPaths(dir, name);
+            try { fs.unlink(link); } catch { /* fresh or stale */ }
+            try {
+                if (isWindows) fs.symlink(os.exePath, link, 'file');
+                else fs.symlink(os.exePath, link);
+            } catch {
+                try { fs.link(os.exePath, link); } catch { /* checked below */ }
+            }
+            if (!fs.exists(link)) complete = false;
+        }
+        if (complete) taskRuntimeShimDir = dir;
+    } catch {
+        // Direct node/deno rewriting still works if the temp directory is unavailable.
+    }
+    return taskRuntimeShimDir;
+}
 
 // deno.json task schema
 
@@ -58,7 +100,7 @@ export class BinResolver {
     /** Bin → JS entry; opts.global uses only ~/.cts/npm (no cwd). */
     resolve(name: string, cwd: string, opts?: { global?: boolean }): ResolvedBin | null {
         if (name.startsWith('npm:')) return this.resolveNpmSpecifierBin(name);
-        if (name.startsWith('/') || name.startsWith('.') || name.includes('/')) return null;
+        if (name.startsWith('/') || name.startsWith('.') || !isSafeBinCommandName(name)) return null;
         if (name.startsWith('-')) return null;
 
         if (opts?.global) {
@@ -113,7 +155,7 @@ export class BinResolver {
 
     npmPackageSpecifier(name: string): string | null {
         if (!name.startsWith('npm:') &&
-            (name.startsWith('/') || name.startsWith('.') || name.includes('/') || name.startsWith('-'))) {
+            (name.startsWith('/') || name.startsWith('.') || !isSafeBinCommandName(name) || name.startsWith('-'))) {
             return null;
         }
         const parsed = parseNpmExecSpec(name);
@@ -143,8 +185,8 @@ export class BinResolver {
         const relPath = binMap[binName];
         if (!relPath) return null;
 
-        const absPath = normalizePath(joinPaths(installedDir, relPath));
-        return fs.exists(absPath) ? this.resolveEntry(absPath) : null;
+        const absPath = resolvePackageBinPath(installedDir, relPath);
+        return absPath ? this.resolveEntry(absPath) : null;
     }
 
     private resolveCachedProjectBin(name: string, cwd: string): string | null {
@@ -196,8 +238,8 @@ export class BinResolver {
         if (!pkg) return;
         const relPath = getBinMap(pkg)[name];
         if (!relPath) return;
-        const absPath = normalizePath(joinPaths(dir, relPath));
-        if (fs.exists(absPath)) matches.push({ version: String(pkg.version ?? '0.0.0'), path: absPath });
+        const absPath = resolvePackageBinPath(dir, relPath);
+        if (absPath) matches.push({ version: String(pkg.version ?? '0.0.0'), path: absPath });
     }
 
     /** Unwrap .cmd/sh bin to JS entry; else run via shell. */
@@ -326,7 +368,9 @@ function parseNpmExecSpec(raw: string): NpmExecSpec | null {
         }
     }
 
-    if (!name || !version || binName === '') return null;
+    if (!name || !version || binName === '' || !isValidNpmPackageName(name) ||
+        version.includes('\\') || version.includes('\0') || version.includes(':') ||
+        (binName !== undefined && !isSafeBinCommandName(binName))) return null;
     return { name, version, binName };
 }
 
@@ -340,6 +384,11 @@ function defaultBinName(pkgName: string, binMap: Record<string, string>): string
         onlyName = name;
     }
     return onlyName;
+}
+
+function isSafeBinCommandName(name: string): boolean {
+    return !!name && name !== '.' && name !== '..' && !name.includes('/') &&
+        !name.includes('\\') && !name.includes('\0') && !name.includes(':');
 }
 
 function resolveCacheDir(override?: string): string {
@@ -445,8 +494,8 @@ function findCachedBinInDeps(
         if (!cachedPkg) continue;
         const relPath = getBinMap(cachedPkg)[binName];
         if (!relPath) continue;
-        const absPath = normalizePath(joinPaths(installedDir, relPath));
-        if (fs.exists(absPath)) return absPath;
+        const absPath = resolvePackageBinPath(installedDir, relPath);
+        if (absPath) return absPath;
     }
     return null;
 }
@@ -507,14 +556,29 @@ function stripDenoRunFlags(tokens: string[]): string[] {
     return out;
 }
 
-/** Expand $VAR / ${VAR}; $$ → $; bare $ left as-is. */
-function expandVars(s: string, env: Record<string, string>): string {
-    return s.replace(/\$(\$|\{(\w+)\}|(\w+))/g, (_, esc, braced, bare) => {
-        if (esc === '$') return '$';
-        const name = braced || bare;
-        if (!name) return _;
-        return env[name] ?? '';
-    });
+function nodeTaskArgv(args: string[], forwardedArgs: string[]): string[] | null {
+    const first = args[0];
+    if (first === undefined) return [os.exePath, ...forwardedArgs];
+    if (first === '-e' || first === '--eval') {
+        const source = args[1];
+        if (source === undefined) return null;
+        return [os.exePath, ...forwardedArgs, 'eval', source, ...args.slice(2)];
+    }
+    if (first.startsWith('--eval=')) {
+        return [os.exePath, ...forwardedArgs, 'eval', first.slice('--eval='.length), ...args.slice(1)];
+    }
+    if (first === '-p' || first === '--print') {
+        const source = args[1];
+        if (source === undefined) return null;
+        return [os.exePath, ...forwardedArgs, '--print', source, ...args.slice(2)];
+    }
+    if (first === '-v' || first === '--version') return [os.exePath, '--version'];
+    if (first === '-h' || first === '--help') return [os.exePath, '--help'];
+    if (first === '--') return args.length > 1
+        ? [os.exePath, ...forwardedArgs, 'run', ...args.slice(1)]
+        : [os.exePath, ...forwardedArgs];
+    if (first.startsWith('-')) return null;
+    return [os.exePath, ...forwardedArgs, 'run', ...args];
 }
 
 function isDirectTaskOperator(op: string | undefined): boolean {
@@ -547,7 +611,7 @@ function shellCommand(script: string, extraArgs: string[]): string {
     return `${script} ${joinQuotedArgs(extraArgs)}`;
 }
 
-function shellEnv(env: Record<string, string>, cwd: string): Record<string, string> {
+export function taskShellEnv(env: Record<string, string>, cwd: string): Record<string, string> {
     const merged = { ...os.environ(), ...env };
     let pathKey = 'PATH';
     if (isWindows) {
@@ -560,8 +624,8 @@ function shellEnv(env: Record<string, string>, cwd: string): Record<string, stri
         }
     }
     const sep = isWindows ? ';' : ':';
-    // Walk up like npm: every ancestor node_modules/.bin for monorepos / nested tasks.
-    let pathPrefix = '';
+    // Keep runtime aliases before project bins, then walk up like npm for tools.
+    let pathPrefix = ensureTaskRuntimeShim() ?? '';
     let dir = toPosixPath(cwd);
     const root = pathRoot(dir);
     while (true) {
@@ -576,8 +640,26 @@ function shellEnv(env: Record<string, string>, cwd: string): Record<string, stri
     return { ...env, PWD: cwd, [pathKey]: current ? `${pathPrefix}${sep}${current}` : pathPrefix };
 }
 
-function shellArgv(script: string): string[] {
-    return isWindows ? ['cmd.exe', '/c', script] : ['sh', '-c', script];
+export function taskShellArgv(script: string): string[] {
+    if (isWindows) return [env('ComSpec') ?? env('COMSPEC') ?? 'cmd.exe', '/c', script];
+    // Keep the foreground shell alive until the leaf decides whether a
+    // terminal signal was handled or should become exit 128 + signal.
+    const signalNumbers = availableTaskSignalNumbers(taskTerminalSignalNames);
+    const trapSignals = signalNumbers.length ? signalNumbers.join(' ') : 'INT QUIT TSTP';
+    const runtime = quoteShellArg(os.exePath);
+    return ['sh', '-c', `trap ':' ${trapSignals}\nnode() { ${runtime} "$@"; }\ndeno() { ${runtime} "$@"; }\n${script}`];
+}
+
+function availableTaskSignalNumbers(
+    names: readonly string[],
+): number[] {
+    if (!signals) return [];
+    const numbers = new Set<number>();
+    for (const name of names) {
+        const signalNumber = signals.signals[name];
+        if (typeof signalNumber === 'number') numbers.add(signalNumber);
+    }
+    return [...numbers];
 }
 
 function joinQuotedArgs(args: string[]): string {
@@ -603,15 +685,11 @@ async function execCommand(
     resolver: BinResolver,
     forwardedArgs: string[] = [],
 ): Promise<number> {
-    // Expand environment variables in the command string before parsing
-    const mergedEnv = { ...os.environ(), ...env };
-    const expanded = expandVars(cmd, mergedEnv);
-
-    const segments = parseShellCommand(expanded);
+    const segments = parseShellCommand(cmd);
     if (!segments.length) return 0;
-    if (hasShellOnlySyntax(segments)) {
-        const script = shellCommand(expanded, extraArgs);
-        return rawExec(shellArgv(script), shellEnv(env, cwd), cwd);
+    if (requiresShellEvaluation(cmd) || hasShellOnlySyntax(segments)) {
+        const script = shellCommand(cmd, extraArgs);
+        return rawExec(taskShellArgv(script), taskShellEnv(env, cwd), cwd);
     }
 
     // Single-command shortcuts
@@ -636,12 +714,17 @@ async function execCommand(
             return execTask([...seg.args.slice(1), ...extraArgs], env, cwd, forwardedArgs);
         }
 
+        if (seg.bin === 'node') {
+            const argv = nodeTaskArgv(allArgs, forwardedArgs);
+            if (argv) return rawExec(argv, taskShellEnv(env, cwd), cwd);
+        }
+
         const resolved = resolver.resolve(seg.bin, cwd);
         if (resolved) {
             return execBinary(resolved, allArgs, env, cwd);
         }
 
-        return rawExec(shellArgv(shellCommand(expanded, extraArgs)), shellEnv(env, cwd), cwd);
+        return rawExec(taskShellArgv(shellCommand(cmd, extraArgs)), taskShellEnv(env, cwd), cwd);
     }
 
     // Pipeline: && / || / ; on previous segment (unsupported ops already rejected).
@@ -649,6 +732,13 @@ async function execCommand(
     for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
         if (!seg) break;
+        if (i > 0) {
+            const previousOp = segments[i - 1]?.op;
+            const shouldRun = previousOp === ';' ||
+                (previousOp === '&&' && prevCode === 0) ||
+                (previousOp === '||' && prevCode !== 0);
+            if (!shouldRun) continue;
+        }
         const isLast = i === segments.length - 1;
         const segArgs = isLast ? [...seg.args, ...extraArgs] : seg.args;
 
@@ -663,46 +753,32 @@ async function execCommand(
             }
         } else if (seg.bin === 'deno' && seg.args[0] === 'task') {
             prevCode = await execTask(isLast ? [...seg.args.slice(1), ...extraArgs] : seg.args.slice(1), env, cwd, forwardedArgs);
+        } else if (seg.bin === 'node') {
+            const argv = nodeTaskArgv(segArgs, forwardedArgs);
+            prevCode = argv
+                ? await rawExec(argv, taskShellEnv(env, cwd), cwd)
+                : await rawExec(taskShellArgv(segmentCommand(seg.bin, segArgs)), taskShellEnv(env, cwd), cwd);
         } else {
             const resolved = resolver.resolve(seg.bin, cwd);
             if (!resolved) {
-                prevCode = await rawExec(shellArgv(segmentCommand(seg.bin, segArgs)), shellEnv(env, cwd), cwd);
+                prevCode = await rawExec(taskShellArgv(segmentCommand(seg.bin, segArgs)), taskShellEnv(env, cwd), cwd);
             } else {
                 prevCode = await execBinary(resolved, segArgs, env, cwd);
             }
         }
 
-        if (prevCode !== 0) {
-            if (seg.op === ';') continue;   // ; — always run next
-            if (seg.op === '||') continue;  // || — run next as fallback
-            return prevCode;                // && or no op — bail
-        }
-        // a || b || c: on success skip the rest of this || chain (same as lifecycle).
-        if (seg.op === '||') {
-            while (i < segments.length - 1 && segments[i]?.op === '||') i++;
-        }
     }
     return prevCode;
 }
 
 async function execRun(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
-    const child = process.spawn([os.exePath, ...forwardedArgs, 'run', ...args], {
-        stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
-        env: mergedEnv, cwd,
-    });
-    const info = await child.wait();
-    return info.exit_status ?? 0;
+    const mergedEnv = { ...os.environ(), ...taskShellEnv(env, cwd), PWD: cwd };
+    return runTaskChild([os.exePath, ...forwardedArgs, 'run', ...args], mergedEnv, cwd);
 }
 
 async function execTask(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
-    const child = process.spawn([os.exePath, ...forwardedArgs, 'task', ...args], {
-        stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
-        env: mergedEnv, cwd,
-    });
-    const info = await child.wait();
-    return info.exit_status ?? 0;
+    const mergedEnv = { ...os.environ(), ...taskShellEnv(env, cwd), PWD: cwd };
+    return runTaskChild([os.exePath, ...forwardedArgs, 'task', ...args], mergedEnv, cwd);
 }
 
 function chmodExecutableQuietly(path: string): void {
@@ -715,7 +791,7 @@ function chmodExecutableQuietly(path: string): void {
 
 async function execBinary(resolved: ResolvedBin, args: string[], env: Record<string, string>, cwd: string): Promise<number> {
     // Nested tools (npm-run-all → vue-tsc) resolve via PATH; keep .bin first.
-    const pathEnv = shellEnv(env, cwd);
+    const pathEnv = taskShellEnv(env, cwd);
     const mergedEnv = { ...os.environ(), ...pathEnv, PWD: cwd };
     const isWin = isWindows;
 
@@ -738,15 +814,90 @@ async function execBinary(resolved: ResolvedBin, args: string[], env: Record<str
 async function rawExec(argv: string[], env: Record<string, string>, cwd: string): Promise<number> {
     try {
         const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
-        const child = process.spawn(argv, {
-            stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
-            env: mergedEnv, cwd,
-        });
-        const info = await child.wait();
-        return info.exit_status ?? 0;
+        return await runTaskChild(argv, mergedEnv, cwd);
     } catch (e) {
         console.error(`[task] Failed to spawn: ${argv.join(' ')}\n  ${e instanceof Error ? e.message : String(e)}`);
         return 1;
+    }
+}
+
+function appendPackageConfigEnv(out: Record<string, string>, key: string, value: unknown): void {
+    if (value === null || value === undefined) {
+        out[key] = '';
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) appendPackageConfigEnv(out, `${key}_${i}`, value[i]);
+        return;
+    }
+    if (typeof value === 'object') {
+        for (const [child, childValue] of Object.entries(value as Record<string, unknown>)) {
+            appendPackageConfigEnv(out, `${key}_${child}`, childValue);
+        }
+        return;
+    }
+    out[key] = String(value);
+}
+
+function packageTaskEnv(metadata: TaskPackageMetadata, name: string, command: string): Record<string, string> {
+    const out: Record<string, string> = {
+        npm_command: 'run-script',
+        npm_execpath: os.exePath,
+        npm_node_execpath: os.exePath,
+        npm_lifecycle_event: name,
+        npm_lifecycle_script: command,
+        npm_package_json: metadata.path,
+    };
+    if (metadata.name !== undefined) out.npm_package_name = metadata.name;
+    if (metadata.version !== undefined) out.npm_package_version = metadata.version;
+    if (metadata.config !== undefined) appendPackageConfigEnv(out, 'npm_package_config', metadata.config);
+    // Deno preserves an inherited user agent; provide a stable cno marker when absent.
+    const inherited = os.environ().npm_config_user_agent;
+    if (inherited === undefined) {
+        let platform = 'unknown';
+        let machine = 'unknown';
+        try {
+            const info = os.uname();
+            platform = String(info.sysname).toLowerCase();
+            machine = String(info.machine);
+        } catch { /* keep conservative fallback */ }
+        out.npm_config_user_agent = `cno/? npm/? cno/? ${platform} ${machine}`;
+    }
+    return out;
+}
+
+function taskExitCode(info: CModuleProcess.ExitInfo): number {
+    if (info.term_signal === null) return info.exit_status;
+    const signalNumber = signals?.signals[info.term_signal];
+    return typeof signalNumber === 'number' ? 128 + signalNumber : 1;
+}
+
+export async function runTaskChild(
+    argv: string[],
+    env: Record<string, string>,
+    cwd: string,
+): Promise<number> {
+    const signalGuards: CModuleSignals.SignalHandler[] = [];
+    try {
+        if (signals) {
+            for (const signalNumber of availableTaskSignalNumbers(taskTerminalSignalNames)) {
+                try {
+                    signalGuards.push(signals.signal(signalNumber, () => {}));
+                } catch {}
+            }
+        }
+    } catch {}
+
+    try {
+        const child = process.spawn(argv, {
+            stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
+            env, cwd,
+        });
+        return taskExitCode(await child.wait());
+    } finally {
+        for (const guard of signalGuards) {
+            try { guard.close(); } catch {}
+        }
     }
 }
 
@@ -757,16 +908,18 @@ export class TaskRunner {
     private readonly resolver: BinResolver;
     private readonly forwardedArgs: string[];
     private readonly taskSources: Record<string, TaskSource>;
+    private readonly packageMetadata?: TaskPackageMetadata;
     private readonly done = new Set<string>();
     private readonly running = new Set<string>();  // cycle detection
 
-    constructor(tasks: Record<string, TaskDef>, cwd: string, lockStore: LockStore, options?: { forwardedArgs?: string[]; taskSources?: Record<string, TaskSource>; initCwd?: string }) {
+    constructor(tasks: Record<string, TaskDef>, cwd: string, lockStore: LockStore, options?: { forwardedArgs?: string[]; taskSources?: Record<string, TaskSource>; initCwd?: string; packageMetadata?: TaskPackageMetadata }) {
         this.tasks = tasks;
         this.cwd   = cwd;
         this.initCwd = options?.initCwd ?? cwd;
         this.resolver = new BinResolver(lockStore);
         this.forwardedArgs = options?.forwardedArgs ?? [];
         this.taskSources = options?.taskSources ?? {};
+        this.packageMetadata = options?.packageMetadata;
     }
 
     list(): void {
@@ -841,6 +994,9 @@ export class TaskRunner {
         const inheritedInitCwd = os.environ().INIT_CWD;
         const env     = {
             INIT_CWD: inheritedInitCwd ?? this.initCwd,
+            ...(this.taskSources[name] === 'package' && this.packageMetadata
+                ? packageTaskEnv(this.packageMetadata, name, command)
+                : {}),
             ...(typeof def === 'string' ? {} : (def.env ?? {})),
         };
 
@@ -914,10 +1070,19 @@ function taskRunnerForConfig(
     if (!fs.exists(configPath)) return null;
     const merged: Record<string, TaskDef> = {};
     const taskSources: Record<string, TaskSource> = {};
+    let packageMetadata: TaskPackageMetadata | undefined;
     try {
         const base = basename(configPath);
         if (base === 'package.json') {
-            const pkg = safeParse<{ scripts?: Record<string, string> }>(readText(configPath));
+            const pkg = safeParse<{ name?: unknown; version?: unknown; config?: unknown; scripts?: Record<string, string> }>(readText(configPath));
+            if (pkg) {
+                packageMetadata = {
+                    path: toPosixPath(configPath),
+                    name: pkg.name === undefined ? undefined : String(pkg.name),
+                    version: pkg.version === undefined ? undefined : String(pkg.version),
+                    config: pkg.config,
+                };
+            }
             for (const [k, v] of Object.entries(pkg?.scripts ?? {})) {
                 merged[k] = String(v);
                 taskSources[k] = 'package';
@@ -937,7 +1102,7 @@ function taskRunnerForConfig(
     const configDir = dirname(configPath);
     const runCwd = options.runCwd ?? configDir;
     const initCwd = options.initCwd ?? toPosixPath(startDir);
-    return { runner: new TaskRunner(merged, runCwd, lockStore, { ...options, initCwd, taskSources }), configPath };
+    return { runner: new TaskRunner(merged, runCwd, lockStore, { ...options, initCwd, taskSources, packageMetadata }), configPath };
 }
 
 /** Find and load the nearest deno.json/deno.jsonc or package.json containing tasks. */
@@ -951,6 +1116,7 @@ export function loadTasks(startDir: string, lockStore: LockStore, options: LoadT
         // Collect tasks from both deno.json and package.json (deno.json takes priority)
         const merged: Record<string, TaskDef> = {};
         const taskSources: Record<string, TaskSource> = {};
+        let packageMetadata: TaskPackageMetadata | undefined;
         let found = false;
         let configPath = '';
 
@@ -958,7 +1124,15 @@ export function loadTasks(startDir: string, lockStore: LockStore, options: LoadT
         const pkgP = joinPaths(dir, 'package.json');
         if (fs.exists(pkgP)) {
             try {
-                const pkg = safeParse<{ scripts?: Record<string, string> }>(readText(pkgP));
+                const pkg = safeParse<{ name?: unknown; version?: unknown; config?: unknown; scripts?: Record<string, string> }>(readText(pkgP));
+                if (pkg) {
+                    packageMetadata = {
+                        path: toPosixPath(pkgP),
+                        name: pkg.name === undefined ? undefined : String(pkg.name),
+                        version: pkg.version === undefined ? undefined : String(pkg.version),
+                        config: pkg.config,
+                    };
+                }
                 if (pkg?.scripts && typeof pkg.scripts === 'object') {
                     for (const [k, v] of Object.entries(pkg.scripts)) {
                         merged[k] = String(v);
@@ -997,6 +1171,7 @@ export function loadTasks(startDir: string, lockStore: LockStore, options: LoadT
                     ...options,
                     initCwd: options.initCwd ?? toPosixPath(startDir),
                     taskSources,
+                    packageMetadata,
                 }),
                 configPath,
             };

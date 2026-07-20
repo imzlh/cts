@@ -1,15 +1,24 @@
 import { parse } from '../deps/sucrase/src/parser';
-import { IdentifierRole } from '../deps/sucrase/src/parser/tokenizer';
+import {
+    IdentifierRole,
+    isBlockScopedDeclaration,
+    isFunctionScopedDeclaration,
+    isTopLevelDeclaration,
+} from '../deps/sucrase/src/parser/tokenizer';
 import { TokenType as tt } from '../deps/sucrase/src/parser/tokenizer/types';
 import { ContextualKeyword } from '../deps/sucrase/src/parser/tokenizer/keywords';
 
-export function extractImports(source: string, isTs = true): string[] {
-    let tokens;
+export function extractImports(source: string, isTs = true, strict = false): string[] {
+    let file: ReturnType<typeof parse>;
     try {
-        const file = parse(source, true, isTs, false);
-        tokens = file.tokens;
-    } catch { return []; }
+        file = parse(source, true, isTs, false);
+    } catch (e) {
+        if (strict) throw e;
+        return [];
+    }
 
+    const tokens = file.tokens;
+    const requireShadowScopes = findRequireShadowScopes(source, tokens, file.scopes);
     let specs: Set<string> | null = null;
 
     const tokenCount = tokens.length;
@@ -25,13 +34,13 @@ export function extractImports(source: string, isTs = true): string[] {
                 if (specToken && specToken.type === tt.string &&
                     afterSpec && (afterSpec.type === tt.parenR || afterSpec.type === tt.comma)) {
                     specs ??= new Set<string>();
-                    specs.add(source.slice(specToken.start + 1, specToken.end - 1));
+                    specs.add(decodeStringToken(source, specToken.start, specToken.end));
                 }
                 continue;
             }
             if (next.type === tt.string) {
                 specs ??= new Set<string>();
-                specs.add(source.slice(next.start + 1, next.end - 1));
+                specs.add(decodeStringToken(source, next.start, next.end));
                 continue;
             }
             // type-only import; `import type from '…'` is a value binding named type.
@@ -44,7 +53,7 @@ export function extractImports(source: string, isTs = true): string[] {
                 const specToken = tokens[si];
                 if (specToken) {
                     specs ??= new Set<string>();
-                    specs.add(source.slice(specToken.start + 1, specToken.end - 1));
+                    specs.add(decodeStringToken(source, specToken.start, specToken.end));
                 }
             }
             continue;
@@ -58,7 +67,7 @@ export function extractImports(source: string, isTs = true): string[] {
                 const specToken = tokens[si];
                 if (specToken) {
                     specs ??= new Set<string>();
-                    specs.add(source.slice(specToken.start + 1, specToken.end - 1));
+                    specs.add(decodeStringToken(source, specToken.start, specToken.end));
                 }
             }
             continue;
@@ -66,13 +75,15 @@ export function extractImports(source: string, isTs = true): string[] {
         const parenToken = tokens[i + 1];
         const specToken = tokens[i + 2];
         if (tok.type === tt.name &&
+            tok.identifierRole === IdentifierRole.Access &&
             isRequireToken(source, tok.start, tok.end) &&
+            !isShadowedRequire(i, requireShadowScopes) &&
             parenToken && parenToken.type === tt.parenL &&
             specToken && specToken.type === tt.string &&
             tokens[i + 3]?.type === tt.parenR)
         {
             specs ??= new Set<string>();
-            specs.add(source.slice(specToken.start + 1, specToken.end - 1));
+            specs.add(decodeStringToken(source, specToken.start, specToken.end));
         }
     }
     return specs ? [...specs] : [];
@@ -177,6 +188,164 @@ function isWordAt(source: string, idx: number, word: string): boolean {
 }
 
 type Tokens = ReturnType<typeof parse>['tokens'];
+type Scopes = ReturnType<typeof parse>['scopes'];
+
+interface TokenRange {
+    startTokenIndex: number;
+    endTokenIndex: number;
+}
+
+function findRequireShadowScopes(source: string, tokens: Tokens, scopes: Scopes): TokenRange[] {
+    const ranges: TokenRange[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (!token || token.type !== tt.name || token.isType ||
+            !isRequireToken(source, token.start, token.end)) {
+            continue;
+        }
+        if (isTopLevelDeclaration(token)) {
+            return [{ startTokenIndex: 0, endTokenIndex: tokens.length }];
+        }
+        const functionScoped = isFunctionScopedDeclaration(token);
+        if (!functionScoped && !isBlockScopedDeclaration(token)) continue;
+
+        let best: TokenRange | null = null;
+        for (const scope of scopes) {
+            if (scope.startTokenIndex > i || i >= scope.endTokenIndex ||
+                (functionScoped && !scope.isFunctionScope)) {
+                continue;
+            }
+            if (!best ||
+                scope.endTokenIndex - scope.startTokenIndex <
+                    best.endTokenIndex - best.startTokenIndex) {
+                best = scope;
+            }
+        }
+        if (best && !ranges.some(range =>
+            range.startTokenIndex === best.startTokenIndex &&
+            range.endTokenIndex === best.endTokenIndex)) {
+            ranges.push(best);
+        }
+    }
+    return ranges;
+}
+
+function isShadowedRequire(tokenIndex: number, ranges: TokenRange[]): boolean {
+    return ranges.some(range =>
+        range.startTokenIndex <= tokenIndex && tokenIndex < range.endTokenIndex);
+}
+
+function decodeStringToken(source: string, start: number, end: number): string {
+    const contentStart = start + 1;
+    const contentEnd = end - 1;
+    const firstSlash = source.indexOf('\\', contentStart);
+    if (firstSlash === -1 || firstSlash >= contentEnd) {
+        return source.slice(contentStart, contentEnd);
+    }
+
+    let value = source.slice(contentStart, firstSlash);
+    let i = firstSlash;
+    while (i < contentEnd) {
+        const code = source.charCodeAt(i++);
+        if (code !== 92) {
+            value += String.fromCharCode(code);
+            continue;
+        }
+        if (i >= contentEnd) {
+            value += '\\';
+            break;
+        }
+
+        const escaped = source.charCodeAt(i++);
+        if (escaped === 10 || escaped === 0x2028 || escaped === 0x2029) continue;
+        if (escaped === 13) {
+            if (source.charCodeAt(i) === 10) i++;
+            continue;
+        }
+        if (escaped >= 48 && escaped <= 55) {
+            let charCode = escaped - 48;
+            const limit = escaped <= 51 ? 3 : 2;
+            let digits = 1;
+            while (digits < limit && i < contentEnd) {
+                const next = source.charCodeAt(i);
+                if (next < 48 || next > 55) break;
+                charCode = charCode * 8 + next - 48;
+                digits++;
+                i++;
+            }
+            value += String.fromCharCode(charCode);
+            continue;
+        }
+
+        switch (escaped) {
+            case 98: value += '\b'; break;
+            case 102: value += '\f'; break;
+            case 110: value += '\n'; break;
+            case 114: value += '\r'; break;
+            case 116: value += '\t'; break;
+            case 118: value += '\v'; break;
+            case 120: {
+                const decoded = decodeFixedHex(source, i, 2, contentEnd);
+                if (decoded === null) value += '\\x';
+                else {
+                    value += String.fromCharCode(decoded);
+                    i += 2;
+                }
+                break;
+            }
+            case 117: {
+                if (source.charCodeAt(i) === 123) {
+                    const close = source.indexOf('}', i + 1);
+                    const raw = close === -1 || close >= contentEnd ? '' : source.slice(i + 1, close);
+                    const decoded = raw.length > 0 ? decodeHex(raw) : null;
+                    if (decoded === null || decoded > 0x10ffff) value += '\\u';
+                    else {
+                        value += String.fromCodePoint(decoded);
+                        i = close + 1;
+                    }
+                } else {
+                    const decoded = decodeFixedHex(source, i, 4, contentEnd);
+                    if (decoded === null) value += '\\u';
+                    else {
+                        value += String.fromCharCode(decoded);
+                        i += 4;
+                    }
+                }
+                break;
+            }
+            default: value += String.fromCharCode(escaped);
+        }
+    }
+    return value;
+}
+
+function decodeFixedHex(source: string, start: number, length: number, end: number): number | null {
+    if (start + length > end) return null;
+    let value = 0;
+    for (let i = start; i < start + length; i++) {
+        const digit = hexDigit(source.charCodeAt(i));
+        if (digit === -1) return null;
+        value = value * 16 + digit;
+    }
+    return value;
+}
+
+function decodeHex(raw: string): number | null {
+    let value = 0;
+    for (let i = 0; i < raw.length; i++) {
+        const digit = hexDigit(raw.charCodeAt(i));
+        if (digit === -1) return null;
+        value = value * 16 + digit;
+    }
+    return value;
+}
+
+function hexDigit(code: number): number {
+    if (code >= 48 && code <= 57) return code - 48;
+    if (code >= 65 && code <= 70) return code - 55;
+    if (code >= 97 && code <= 102) return code - 87;
+    return -1;
+}
 
 export function isTsLikePath(filename: string): boolean {
     const length = filename.length;

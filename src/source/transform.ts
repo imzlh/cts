@@ -281,7 +281,9 @@ function sourceKind(filename: string, lang?: string): number {
             default: return KIND_OTHER;
         }
     }
-    const length = filename.length;
+    // Pack module local paths retain query/hash identity suffixes. They are
+    // not part of the language extension used by the fallback transformer.
+    const length = sourcePathLength(filename);
     if (length < 3) return KIND_OTHER;
     const last = filename.charCodeAt(length - 1);
     if (last === 115) {
@@ -314,6 +316,14 @@ function sourceKind(filename: string, lang?: string): number {
         return KIND_JSON;
     }
     return KIND_OTHER;
+}
+
+function sourcePathLength(filename: string): number {
+    if (!filename.startsWith('pack:')) return filename.length;
+    const query = filename.indexOf('?');
+    const hash = filename.indexOf('#');
+    if (query === -1) return hash === -1 ? filename.length : hash;
+    return hash === -1 ? query : Math.min(query, hash);
 }
 
 function oxcLang(kind: number): string {

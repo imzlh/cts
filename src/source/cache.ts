@@ -1,4 +1,4 @@
-import { dirname, joinPaths, ensureDir, log } from '../utils';
+import { dirname, joinPaths, ensureDir, log, canonicalizePath, normalizePath } from '../utils';
 import { getMemoryBytecode, hasActiveFileStore, hasMemoryFile } from '../utils/memfs';
 
 const fs = import.meta.use('fs');
@@ -14,6 +14,12 @@ function unlinkIfExists(path: string): void {
 function removeCacheFiles(paths: { jsc: string; mt: string }): void {
     unlinkIfExists(paths.jsc);
     unlinkIfExists(paths.mt);
+}
+
+const FRESHNESS_VERSION = 'jsc-v2';
+
+function memoryKey(localPath: string, moduleId?: string): string {
+    return `${localPath}\0${moduleId ?? ''}`;
 }
 
 export function isRemote(specPath: string): boolean {
@@ -35,9 +41,11 @@ export class JscCache {
     /** Optional owned L1 buffers (precompile); pack uses VFS bytecode() instead. */
     private readonly memory = new Map<string, ArrayBuffer>();
     private readonly localDir: string | null;
+    private readonly cacheRoot: string | null;
 
     constructor(cacheDir?: string) {
         this.localDir = cacheDir ? joinPaths(cacheDir, 'local') : null;
+        this.cacheRoot = cacheDir ? canonicalizePath(normalizePath(cacheDir)) : null;
     }
 
     // Local cache path: {cacheDir}/local/{hash[0:2]}/{hash}.jsc
@@ -58,23 +66,54 @@ export class JscCache {
         return { jsc, mt: jsc + '.mt' };
     }
 
-    private freshnessToken(localPath: string, cachedMtime?: number): string {
+    /** Keep adjacent remote bytecode inside the configured cache root. */
+    private isCacheOwnedPath(localPath: string): boolean {
+        // Direct JscCache consumers without a root historically used adjacent
+        // remote files; retain that behavior for backwards compatibility.
+        if (!this.cacheRoot) return true;
+        let root = this.cacheRoot;
+        let target = canonicalizePath(normalizePath(localPath));
+        try { root = canonicalizePath(normalizePath(fs.realpath(root))); } catch {}
+        try { target = canonicalizePath(normalizePath(fs.realpath(localPath))); } catch {}
+        return target === root || target.startsWith(root + '/');
+    }
+
+    /** Select adjacent remote storage or an isolated local hashed cache. */
+    private cachePaths(localPath: string, remote: boolean): { jsc: string; mt: string } | null {
+        if (remote && this.isCacheOwnedPath(localPath)) return this.remoteCachePaths(localPath);
+        return this.localCachePath(localPath);
+    }
+
+    private legacyFreshnessToken(localPath: string, cachedMtime?: number): string {
         const stat = fs.stat(localPath);
         return `${String(cachedMtime ?? stat.mtim)}:${stat.size}`;
     }
 
-    private isFreshMtime(localPath: string, mtPath: string, cachedMtime?: number): boolean {
+    /** Identity-aware sidecars reject legacy stamps instead of risking a stale graph. */
+    private freshnessToken(localPath: string, cachedMtime?: number, moduleId?: string): string {
+        const stamp = this.legacyFreshnessToken(localPath, cachedMtime);
+        return moduleId === undefined
+            ? stamp
+            : `${FRESHNESS_VERSION}\n${stamp}\n${encodeURIComponent(moduleId)}`;
+    }
+
+    private isFreshMtime(localPath: string, mtPath: string, cachedMtime?: number, moduleId?: string): boolean {
         try {
             const cachedMt = engine.decodeString(fs.readFile(mtPath));
-            return cachedMt === this.freshnessToken(localPath, cachedMtime);
+            return cachedMt === this.freshnessToken(localPath, cachedMtime, moduleId);
         } catch {
             return false;
         }
     }
 
-    private hasFreshFile(paths: { jsc: string; mt: string }, localPath: string, cachedMtime?: number): boolean {
+    private hasFreshFile(
+        paths: { jsc: string; mt: string },
+        localPath: string,
+        cachedMtime?: number,
+        moduleId?: string,
+    ): boolean {
         try {
-            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime)) return false;
+            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId)) return false;
             return !!fs.stat(paths.jsc);
         } catch {
             return false;
@@ -97,36 +136,42 @@ export class JscCache {
         }
     }
 
-    private writeMtime(localPath: string, mtPath: string): void {
-        fs.writeFile(mtPath, engine.encodeString(this.freshnessToken(localPath)));
+    private writeMtime(localPath: string, mtPath: string, moduleId?: string): void {
+        fs.writeFile(mtPath, engine.encodeString(this.freshnessToken(localPath, undefined, moduleId)));
     }
 
-    private writeCacheFile(paths: { jsc: string; mt: string }, localPath: string, bytecode: ArrayBuffer): void {
+    private writeCacheFile(
+        paths: { jsc: string; mt: string },
+        localPath: string,
+        bytecode: ArrayBuffer,
+        moduleId?: string,
+    ): void {
         ensureDir(dirname(paths.jsc));
         fs.writeFile(paths.jsc, bytecode);
-        this.writeMtime(localPath, paths.mt);
+        this.writeMtime(localPath, paths.mt, moduleId);
     }
 
-    load(localPath: string, remote: boolean, cachedMtime?: number): CModuleEngine.Module | null {
-        return this.loadRaw(localPath, remote, cachedMtime) as CModuleEngine.Module | null;
+    load(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): CModuleEngine.Module | null {
+        return this.loadRaw(localPath, remote, cachedMtime, moduleId) as CModuleEngine.Module | null;
     }
 
     /** load() for non-Module values (e.g. EVAL_COMPILE_ONLY); raw deserialize. */
-    loadCompiled(localPath: string, remote: boolean, cachedMtime?: number): unknown | null {
-        return this.loadRaw(localPath, remote, cachedMtime);
+    loadCompiled(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): unknown | null {
+        return this.loadRaw(localPath, remote, cachedMtime, moduleId);
     }
 
-    private loadRaw(localPath: string, remote: boolean, cachedMtime?: number): unknown | null {
+    private loadRaw(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): unknown | null {
         // L1a: owned buffers (precompile one-shot)
-        const bc = this.memory.get(localPath);
+        const key = memoryKey(localPath, moduleId);
+        const bc = this.memory.get(key);
         if (bc) {
             try {
                 const mod = engine.deserialize(new Uint8Array(bc));
-                this.memory.delete(localPath);
+                this.memory.delete(key);
                 return mod;
             } catch {
                 log.debug('jsc', () => `memory deserialize failed: ${localPath}`);
-                this.memory.delete(localPath);
+                this.memory.delete(key);
             }
         }
 
@@ -149,9 +194,9 @@ export class JscCache {
 
         // L2: on-disk only for real filesystem paths
         if (remote) {
-            const paths = this.remoteCachePaths(localPath);
+            const paths = this.cachePaths(localPath, remote);
             if (!paths) return null;
-            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime)) {
+            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId)) {
                 removeCacheFiles(paths);
                 return null;
             }
@@ -163,12 +208,12 @@ export class JscCache {
             }
         }
 
-        const paths = this.localCachePath(localPath);
+        const paths = this.cachePaths(localPath, remote);
         if (!paths) return null;
 
         try {
             const cachedMt = engine.decodeString(fs.readFile(paths.mt));
-            if (cachedMt !== this.freshnessToken(localPath, cachedMtime)) {
+            if (cachedMt !== this.freshnessToken(localPath, cachedMtime, moduleId)) {
                 removeCacheFiles(paths);
                 return null;
             }
@@ -187,10 +232,10 @@ export class JscCache {
     }
 
     /** On-disk .jsc bytes only (no deserialize); for pack. Null if not durable. */
-    loadRawBytes(localPath: string, remote: boolean, cachedMtime?: number): ArrayBuffer | null {
-        const paths = remote ? this.remoteCachePaths(localPath) : this.localCachePath(localPath);
+    loadRawBytes(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): ArrayBuffer | null {
+        const paths = this.cachePaths(localPath, remote);
         if (!paths) return null;
-        if (!this.hasFreshFile(paths, localPath, cachedMtime)) return null;
+        if (!this.hasFreshFile(paths, localPath, cachedMtime, moduleId)) return null;
         try {
             return fs.readFile(paths.jsc);
         } catch {
@@ -199,67 +244,55 @@ export class JscCache {
     }
 
     /** Freshness without deserializing (precache gate). */
-    hasFresh(localPath: string, remote: boolean, cachedMtime?: number): boolean {
-        if (remote) {
-            const paths = this.remoteCachePaths(localPath);
-            return paths ? this.hasFreshFile(paths, localPath, cachedMtime) : false;
-        }
-        const paths = this.localCachePath(localPath);
+    hasFresh(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): boolean {
+        const paths = this.cachePaths(localPath, remote);
         if (!paths) return false;
-        return this.hasFreshFile(paths, localPath, cachedMtime);
+        return this.hasFreshFile(paths, localPath, cachedMtime, moduleId);
     }
 
     clearMemory(): void {
         this.memory.clear();
     }
 
-    setMemory(localPath: string, bc: ArrayBuffer): void {
-        this.memory.set(localPath, bc);
+    setMemory(localPath: string, bc: ArrayBuffer, moduleId?: string): void {
+        this.memory.set(memoryKey(localPath, moduleId), bc);
     }
 
-    persistBytecode(localPath: string, bc: ArrayBuffer, remote: boolean): void {
-        if (remote) {
-            const paths = this.remoteCachePaths(localPath);
-            if (!paths) return;
-            try {
-                this.writeCacheFile(paths, localPath, bc);
-            } catch (e) { log.warn('jsc', `persist failed: ${paths.jsc}`, e); }
-            return;
-        }
-        const paths = this.localCachePath(localPath);
+    persistBytecode(localPath: string, bc: ArrayBuffer, remote: boolean, moduleId?: string): void {
+        const paths = this.cachePaths(localPath, remote);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, bc);
+            this.writeCacheFile(paths, localPath, bc, moduleId);
         } catch (e) { log.warn('jsc', `persistBytecode failed: ${paths.jsc}`, e); }
     }
 
-    persistMemory(localPath: string): void {
-        const bc = this.memory.get(localPath);
+    persistMemory(localPath: string, moduleId?: string): void {
+        const bc = this.memory.get(memoryKey(localPath, moduleId));
         if (!bc) return;
-        const paths = this.remoteCachePaths(localPath);
+        const paths = this.cachePaths(localPath, true);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, bc);
+            this.writeCacheFile(paths, localPath, bc, moduleId);
         } catch (e) {
             log.warn('jsc', `persist failed: ${paths.jsc}`, e);
         }
     }
 
-    persist(localPath: string, mod: CModuleEngine.Module): void {
-        const paths = this.remoteCachePaths(localPath);
+    persist(localPath: string, mod: CModuleEngine.Module, moduleId?: string): void {
+        const paths = this.cachePaths(localPath, true);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, mod.dump());
+            this.writeCacheFile(paths, localPath, mod.dump(), moduleId);
         } catch (e) {
             log.warn('jsc', `persist failed: ${paths.jsc}`, e);
         }
     }
 
-    persistLocal(localPath: string, mod: CModuleEngine.Module): void {
-        const paths = this.localCachePath(localPath);
+    persistLocal(localPath: string, mod: CModuleEngine.Module, moduleId?: string): void {
+        const paths = this.cachePaths(localPath, false);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, mod.dump());
+            this.writeCacheFile(paths, localPath, mod.dump(), moduleId);
             log.debug('jsc', () => `cached local: ${localPath}`);
         } catch (e) {
             log.warn('jsc', `persistLocal failed: ${paths.jsc}`, e);

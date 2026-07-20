@@ -18,9 +18,8 @@ export function parseShellCommand(input: string): CommandSegment[] {
     let i = 0;
 
     const flush = (op?: ShellOperator) => {
-        const trimmed = current.trim();
-        if (trimmed) {
-            const seg = parseSegment(trimmed);
+        if (current.trim()) {
+            const seg = parseSegment(current);
             if (op !== undefined) seg.op = op;
             segments.push(seg);
         }
@@ -30,14 +29,21 @@ export function parseShellCommand(input: string): CommandSegment[] {
     while (i < input.length) {
         const ch = input.charAt(i);
 
+        if (ch === '\\' && i + 1 < input.length) {
+            current += ch + input.charAt(i + 1);
+            i += 2;
+            continue;
+        }
+
         // Handle quoted strings — consume everything inside quotes without splitting
         if (ch === '"' || ch === "'") {
             const quote = ch;
             current += ch;
             i++;
             while (i < input.length && input[i] !== quote) {
-                // Handle escaped quote inside the string
-                if (input[i] === '\\' && i + 1 < input.length) {
+                // Backslashes are literal in single quotes. In double quotes,
+                // they can prevent a quote from ending the quoted token.
+                if (quote === '"' && input[i] === '\\' && i + 1 < input.length) {
                     current += input.charAt(i) + input.charAt(i + 1);
                     i += 2;
                 } else {
@@ -83,6 +89,7 @@ export function parseShellCommand(input: string): CommandSegment[] {
 function parseSegment(raw: string): CommandSegment {
     const parts: string[] = [];
     let current = '';
+    let tokenStarted = false;
     let i = 0;
 
     while (i < raw.length) {
@@ -90,11 +97,20 @@ function parseSegment(raw: string): CommandSegment {
 
         if (ch === '"' || ch === "'") {
             const quote = ch;
+            tokenStarted = true;
             i++; // skip opening quote
             while (i < raw.length && raw[i] !== quote) {
-                if (raw[i] === '\\' && i + 1 < raw.length) {
-                    current += raw.charAt(i + 1);
-                    i += 2;
+                if (quote === '"' && raw[i] === '\\' && i + 1 < raw.length) {
+                    const next = raw.charAt(i + 1);
+                    if (next === '"' || next === '\\' || next === '$' || next === '`') {
+                        current += next;
+                        i += 2;
+                    } else if (next === '\n') {
+                        i += 2;
+                    } else {
+                        current += '\\';
+                        i++;
+                    }
                 } else {
                     current += raw.charAt(i);
                     i++;
@@ -105,26 +121,82 @@ function parseSegment(raw: string): CommandSegment {
         }
 
         if (ch === '\\' && i + 1 < raw.length) {
+            tokenStarted = true;
             current += raw.charAt(i + 1);
             i += 2;
             continue;
         }
 
         if (/\s/.test(ch)) {
-            if (current) {
+            if (tokenStarted) {
                 parts.push(current);
                 current = '';
+                tokenStarted = false;
             }
             i++;
             continue;
         }
 
+        tokenStarted = true;
         current += ch;
         i++;
     }
-    if (current) parts.push(current);
+    if (tokenStarted) parts.push(current);
 
     return { bin: parts[0] || '', args: parts.slice(1) };
+}
+
+export function requiresShellEvaluation(input: string): boolean {
+    let quote: 'single' | 'double' | null = null;
+    let wordStart = true;
+
+    for (let i = 0; i < input.length; i++) {
+        const ch = input.charAt(i);
+        if (quote === 'single') {
+            if (ch === "'") quote = null;
+            continue;
+        }
+        if (quote === 'double') {
+            if (ch === '\\' && i + 1 < input.length) {
+                i++;
+                continue;
+            }
+            if (ch === '"') {
+                quote = null;
+                continue;
+            }
+            if (ch === '$' || ch === '`') return true;
+            continue;
+        }
+
+        if (ch === '\\' && i + 1 < input.length) {
+            i++;
+            wordStart = false;
+            continue;
+        }
+        if (ch === "'") {
+            quote = 'single';
+            wordStart = false;
+            continue;
+        }
+        if (ch === '"') {
+            quote = 'double';
+            wordStart = false;
+            continue;
+        }
+        if (ch === '$' || ch === '`' || ch === '<' || ch === '>' ||
+            ch === '*' || ch === '?' || ch === '[' || ch === '\n' || ch === '\r' ||
+            ch === '(' || ch === ')' || ch === '{' || ch === '}') {
+            return true;
+        }
+        if ((ch === '~' || ch === '#') && wordStart) return true;
+        if (/\s/.test(ch) || ch === ';' || ch === '|' || ch === '&') {
+            wordStart = true;
+        } else {
+            wordStart = false;
+        }
+    }
+    return false;
 }
 
 export function isShellOperator(token: string): boolean {

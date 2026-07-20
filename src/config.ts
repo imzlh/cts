@@ -1,5 +1,5 @@
 import type { RuntimeConfig, ConfigOptions } from './types';
-import { dirname, joinPaths, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier } from './utils';
+import { dirname, joinPaths, normalizePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier, isRelative } from './utils';
 import { err, ErrorKind } from './errors';
 
 const os = import.meta.use('os');
@@ -63,14 +63,45 @@ function env(k: string): string | null {
     }
 }
 
+function resolveImportMapTarget(target: string, baseDir?: string): string {
+    if (!baseDir || !isRelative(target)) return target;
+    const keepTrailingSlash = target.endsWith('/') || target.endsWith('\\');
+    let resolved = normalizePath(joinPaths(baseDir, toPosixPath(target)));
+    if (keepTrailingSlash && !resolved.endsWith('/')) resolved += '/';
+    return resolved;
+}
+
 /** Filter import map entries: keep only string-valued, non-# entries. */
-function filterImports(raw: unknown): Record<string, string> {
+function filterImports(raw: unknown, baseDir?: string): Record<string, string> {
     const out: Record<string, string> = {};
     if (!raw || typeof raw !== 'object') return out;
     for (const [k, v] of Object.entries(raw)) {
-        if (!k.startsWith('#') && typeof v === 'string') out[k] = v;
+        if (!k.startsWith('#') && typeof v === 'string') out[k] = resolveImportMapTarget(v, baseDir);
     }
     return out;
+}
+
+function filterImportMapScopes(raw: unknown, baseDir: string): Record<string, Record<string, string>> {
+    const out: Record<string, Record<string, string>> = {};
+    if (!raw || typeof raw !== 'object') return out;
+    for (const [scope, mappings] of Object.entries(raw)) {
+        const filtered = filterImports(mappings, baseDir);
+        if (Object.keys(filtered).length === 0) continue;
+        out[resolveImportMapTarget(scope, baseDir)] = filtered;
+    }
+    return out;
+}
+
+function mergeImportMapScopes(
+    current: Record<string, Record<string, string>> | undefined,
+    next: Record<string, Record<string, string>>,
+): Record<string, Record<string, string>> | undefined {
+    if (Object.keys(next).length === 0) return current;
+    const merged = { ...current };
+    for (const [scope, mappings] of Object.entries(next)) {
+        merged[scope] = { ...merged[scope], ...mappings };
+    }
+    return merged;
 }
 
 interface ConfigJson {
@@ -79,6 +110,7 @@ interface ConfigJson {
         baseUrl?: unknown;
     };
     imports?: unknown;
+    scopes?: unknown;
     importMap?: unknown;
     cts?: {
         nodeModulesMode?: unknown;
@@ -354,8 +386,12 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
                 break;
             }
             if (dc.imports) {
-                cfg.importMap = { ...cfg.importMap, ...filterImports(dc.imports) };
+                cfg.importMap = { ...cfg.importMap, ...filterImports(dc.imports, d) };
             }
+            cfg.importMapScopes = mergeImportMapScopes(
+                cfg.importMapScopes,
+                filterImportMapScopes(dc.scopes, d),
+            );
             const paths = filterPathAliases(dc.compilerOptions?.paths);
             if (paths) cfg.pathAliases = { ...cfg.pathAliases, ...paths };
             if (typeof dc.importMap === 'string') {
@@ -363,7 +399,13 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
                 if (fs.exists(mp)) {
                     const mj = readJson(mp);
                     if (mj?.imports) {
-                        cfg.importMap = { ...cfg.importMap, ...filterImports(mj.imports) };
+                        cfg.importMap = { ...cfg.importMap, ...filterImports(mj.imports, dirname(mp)) };
+                    }
+                    if (mj) {
+                        cfg.importMapScopes = mergeImportMapScopes(
+                            cfg.importMapScopes,
+                            filterImportMapScopes(mj.scopes, dirname(mp)),
+                        );
                     }
                 }
             }
@@ -377,7 +419,7 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             if (pkg) {
                 if (pkg.imports && typeof pkg.imports === 'object') {
                     // package.json imports use reversed merge priority (package > deno)
-                    cfg.importMap = { ...filterImports(pkg.imports), ...cfg.importMap };
+                    cfg.importMap = { ...filterImports(pkg.imports, d), ...cfg.importMap };
                 }
                 const nmm = pkg.cts?.nodeModulesMode;
                 if (nmm === 'normal' || nmm === 'soft' || nmm === 'hard') cfg.nodeModulesMode = nmm;

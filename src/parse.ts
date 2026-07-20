@@ -21,6 +21,7 @@ interface WorkerTask {
     /** Module runtime identity for Transformer.transform mapKey. */
     specPath?: string;
     lang?: string;
+    strict?: boolean;
 }
 
 interface WorkerResult {
@@ -98,12 +99,17 @@ function isWorkerTask(value: unknown): value is WorkerTask {
         && typeof value.id === 'number'
         && (value.kind === 'scan' || value.kind === 'transform')
         && typeof value.localPath === 'string'
-        && (value.lang === undefined || typeof value.lang === 'string');
+        && (value.lang === undefined || typeof value.lang === 'string')
+        && (value.strict === undefined || typeof value.strict === 'boolean');
 }
 
 function isWorkerResult(value: unknown): value is WorkerResult {
     return isRecord(value)
         && typeof value.id === 'number';
+}
+
+function isWorkerReady(value: unknown): boolean {
+    return isRecord(value) && value.__cts_parse_ready === true;
 }
 
 function availableParallelism(): number {
@@ -180,7 +186,7 @@ export async function runParseWorker(): Promise<void> {
 
         try {
             if (task.kind === 'scan') {
-                postResult({ id: task.id, deps: importScanner.scanBytes(bytes, task.localPath, task.lang) });
+                postResult({ id: task.id, deps: importScanner.scanBytes(bytes, task.localPath, task.lang, task.strict) });
                 return;
             }
             let result = transformer.transformCaptureBytes(bytes, task.localPath, task.lang, task.specPath);
@@ -225,12 +231,14 @@ export async function runParseWorker(): Promise<void> {
         queue.push(raw);
         void drain();
     };
+    pipe.postMessage({ __cts_parse_ready: true });
 }
 
 class TxWorker {
     readonly w: CModuleWorker.Worker;
     readonly pipe: CModuleWorker.MessagePipe;
     inFlight = 0;
+    ready = false;
     idx: number;
     private stopped = false;
     private termination: Promise<void> | null = null;
@@ -238,6 +246,7 @@ class TxWorker {
     constructor(
         idx: number,
         onResult: (r: WorkerResult) => void,
+        onReady: (workerIdx: number) => void,
         onError: (workerIdx: number, error: unknown) => void,
         enableOxc: boolean,
     ) {
@@ -245,6 +254,13 @@ class TxWorker {
         this.w = new worker.Worker({ __cts_role: 'parse', __cts_enable_oxc: enableOxc });
         this.pipe = this.w.messagePipe;
         this.pipe.onmessage = (data: unknown) => {
+            if (isWorkerReady(data)) {
+                if (!this.ready) {
+                    this.ready = true;
+                    onReady(this.idx);
+                }
+                return;
+            }
             if (isWorkerResult(data)) {
                 this.inFlight = Math.max(0, this.inFlight - 1);
                 onResult(data);
@@ -356,6 +372,7 @@ export class ParseDriver {
                 w = new TxWorker(
                     this.workers.length,
                     (r) => this.onWorkerResult(r),
+                    (workerIdx) => this.onWorkerReady(workerIdx),
                     (workerIdx, error) => this.onWorkerError(workerIdx, error),
                     this.oxc !== null,
                 );
@@ -382,18 +399,18 @@ export class ParseDriver {
      * small files and shows up as main-thread 100% (resolve + wait). Workers only
      * help when falling back to Sucrase (no oxc).
      */
-    async scanFile(localPath: string, lang?: string): Promise<string[]> {
+    async scanFile(localPath: string, lang?: string, strict = false): Promise<string[]> {
         if (this.closing) throw new ParseWorkerError('parse worker pool is closing');
         if (this.workerFailure) throw this.workerFailure;
         // Prefer main-thread oxc (or forced inline). Worker path is Sucrase-only.
         if (this.oxc || this.maxWorkers <= 0) {
-            const result = this.importScanner.scanFileResult(localPath, lang);
+            const result = this.importScanner.scanFileResult(localPath, lang, strict);
             if (result === null) throw new Error(`Could not read source for import scan: ${localPath}`);
             return result;
         }
 
         const id = this.nextId++;
-        const task: WorkerTask = { id, kind: 'scan', localPath, lang };
+        const task: WorkerTask = { id, kind: 'scan', localPath, lang, strict };
         return new Promise<string[]>((resolve, reject) => {
             this.scanCallbacks.set(id, { resolve, reject });
             this.scanQueue.push(task);
@@ -507,7 +524,8 @@ export class ParseDriver {
             try {
                 const source = readText(m.localPath);
                 const code = prepareForCache(transformer, source, m.localPath, m.format, m.lang, m.specPath);
-                const bc = compileForCache(code, m.specPath, m.format);
+                const identity = m.format === 'cjs' ? m.localPath : m.specPath;
+                const bc = compileForCache(code, identity, m.format);
                 if (onCompiled) onCompiled(m.localPath, bc, m.specPath);
                 else bytecodes.set(m.localPath, bc);
                 done++;
@@ -600,7 +618,7 @@ export class ParseDriver {
             if (m.format === 'cjs') {
                 // Always strip TS/JSX; .cts must not hit EVAL_COMPILE_ONLY raw.
                 const code = prepareForCache(transformer, readText(m.localPath), m.localPath, 'cjs', m.lang, m.specPath);
-                bc = compileForCache(code, m.specPath, 'cjs');
+                bc = compileForCache(code, m.localPath, 'cjs');
             } else {
                 const bytes = readBytes(m.localPath);
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
@@ -641,6 +659,11 @@ export class ParseDriver {
             const taken = this.takeTask(taskId);
             if (taken) this.retryTask(taken.task, reason);
         }
+        this.drain();
+    }
+
+    private onWorkerReady(workerIdx: number): void {
+        log.debug('precompile', () => `worker ${workerIdx} ready`);
         this.drain();
     }
 
@@ -700,7 +723,7 @@ export class ParseDriver {
         this.ensureWorkers();
 
         while (this.scanQueue.length > 0) {
-            const idle = this.workers.find(w => w.inFlight === 0 && !this.deadWorkers.has(w.idx));
+            const idle = this.workers.find(w => w.ready && w.inFlight === 0 && !this.deadWorkers.has(w.idx));
             if (!idle) break;
             const task = this.scanQueue.shift();
             if (!task) break;
@@ -709,7 +732,7 @@ export class ParseDriver {
 
         while (this.pending.length > 0) {
             const idle = this.workers.find(w =>
-                w.inFlight < ParseDriver.TRANSFORM_PREFETCH && !this.deadWorkers.has(w.idx));
+                w.ready && w.inFlight < ParseDriver.TRANSFORM_PREFETCH && !this.deadWorkers.has(w.idx));
             if (!idle) break;
             const task = this.pending.shift();
             if (!task) break;

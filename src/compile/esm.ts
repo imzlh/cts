@@ -13,7 +13,7 @@ function metaLang(meta: Record<string, unknown>): string | undefined {
 
 /** .ts / .mts / .cts / .tsx / .jsx — extension only (works for pack:/name.ts keys). */
 function isTransformSourcePath(path: string): boolean {
-    const length = path.length;
+    const length = sourcePathLength(path);
     if (length < 3) return false;
     const last = path.charCodeAt(length - 1);
     if (last === 115) {
@@ -34,12 +34,20 @@ function isTransformSourcePath(path: string): boolean {
 
 /** .js / .mjs — extension only. */
 function isCompiledSourcePath(path: string): boolean {
-    const length = path.length;
+    const length = sourcePathLength(path);
     if (length < 3 || path.charCodeAt(length - 1) !== 115 || path.charCodeAt(length - 2) !== 106) {
         return false;
     }
     const dot = path.charCodeAt(length - 3);
     return dot === 46 || (length >= 4 && dot === 109 && path.charCodeAt(length - 4) === 46);
+}
+
+function sourcePathLength(path: string): number {
+    if (!path.startsWith('pack:')) return path.length;
+    const query = path.indexOf('?');
+    const hash = path.indexOf('#');
+    if (query === -1) return hash === -1 ? path.length : hash;
+    return hash === -1 ? query : Math.min(query, hash);
 }
 
 export class EsmCompiler {
@@ -118,7 +126,8 @@ export class EsmCompiler {
     }
 
     private loadEsm(info: ModuleInfo, meta: Record<string, unknown>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
-        const cacheKey = this.cacheKey(info);
+        const moduleId = moduleRef(info);
+        const cacheKey = moduleId;
         const hit = this.esmCache.get(cacheKey);
         if (hit) {
             if (meta.main !== undefined) Reflect.set(hit.meta, 'main', meta.main);
@@ -147,6 +156,7 @@ export class EsmCompiler {
                 info.localPath,
                 remote && fileBacked,
                 fileBacked ? resolveMtime?.(info.localPath) : undefined,
+                moduleId,
             );
             if (cached) {
                 Object.assign(cached.meta, meta);
@@ -158,10 +168,10 @@ export class EsmCompiler {
         // VFS (pack) or fs → transform → compile
         this.esmLoading.add(cacheKey);
         const bytes = readBytes(info.localPath);
-        const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleRef(info));
+        const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleId);
         let mod: CModuleEngine.Module;
         try {
-            mod = this.compileEsm(code, moduleRef(info), info.localPath);
+            mod = this.compileEsm(code, moduleId, info.localPath);
         } catch (e) {
             this.esmLoading.delete(cacheKey);
             this.esmCache.delete(cacheKey);
@@ -181,8 +191,8 @@ export class EsmCompiler {
         }
 
         if (tryBytecode && fileBacked) {
-            if (remote) this.jsc.persist(info.localPath, mod);
-            else        this.jsc.persistLocal(info.localPath, mod);
+            if (remote) this.jsc.persist(info.localPath, mod, moduleId);
+            else        this.jsc.persistLocal(info.localPath, mod, moduleId);
         }
 
         Object.assign(mod.meta, meta);

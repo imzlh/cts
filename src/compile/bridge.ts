@@ -137,11 +137,11 @@ export function buildCjsDeps(
         },
 
         loadCjsCompiled(localPath: string): unknown | null {
-            return esm.jsc.loadCompiled(localPath, false);
+            return esm.jsc.loadCompiled(localPath, false, undefined, localPath);
         },
 
         persistCjsCompiled(localPath: string, bytes: ArrayBuffer): void {
-            esm.jsc.persistBytecode(localPath, bytes, false);
+            esm.jsc.persistBytecode(localPath, bytes, false, localPath);
         },
 
         runtimeParent(localPath: string): string | null {

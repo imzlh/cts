@@ -18,24 +18,25 @@ export class ImportScanner {
     constructor(private readonly oxc: OxcTranspiler | null) {}
 
     /** Sync scan of an on-disk file. Prefer this for oxc (no worker pool). */
-    scanFile(localPath: string, lang?: string): string[] {
-        return this.scanFileResult(localPath, lang) ?? [];
+    scanFile(localPath: string, lang?: string, strict = false): string[] {
+        return this.scanFileResult(localPath, lang, strict) ?? [];
     }
 
     /** Null means the file could not be read, so callers must not cache the result. */
-    scanFileResult(localPath: string, lang?: string): string[] | null {
+    scanFileResult(localPath: string, lang?: string, strict = false): string[] | null {
         try {
             // VFS-aware (pack: overlay); empty Uint8Array is a valid hit.
-            return this.scanBytes(readBytes(localPath), localPath, lang);
+            return this.scanBytes(readBytes(localPath), localPath, lang, strict);
         } catch (e) {
             log.debug('scan', () => `read fail ${localPath}: ${errMsg(e)}`);
+            if (strict) throw e;
             return null;
         }
     }
 
-    scanBytes(bytes: Uint8Array, localPath: string, lang?: string): string[] {
+    scanBytes(bytes: Uint8Array, localPath: string, lang?: string, strict = false): string[] {
         // WASM: import section module names are static deps (same as JS import specs).
-        if (isWasmPath(localPath)) return scanWasmImportModules(bytes);
+        if (isWasmPath(localPath)) return scanWasmImportModules(bytes, strict);
 
         if (this.oxc) {
             try {
@@ -55,12 +56,12 @@ export class ImportScanner {
                 this.fallbackLogged = true;
                 log.debug('oxc', () => `scan fallback to sucrase (first: ${localPath})`);
             }
-            return extractImports(engine.decodeString(bytes), isTypeScriptLanguage(lang, localPath));
+            return extractImports(engine.decodeString(bytes), isTypeScriptLanguage(lang, localPath), strict);
         }
-        return extractImports(engine.decodeString(bytes), isTypeScriptLanguage(lang, localPath));
+        return extractImports(engine.decodeString(bytes), isTypeScriptLanguage(lang, localPath), strict);
     }
 
-    scanSource(source: string, localPath: string, lang?: string): string[] {
+    scanSource(source: string, localPath: string, lang?: string, strict = false): string[] {
         if (this.oxc) {
             try {
                 const deps = this.oxc.scanImports(source, localPath);
@@ -73,7 +74,7 @@ export class ImportScanner {
                 log.debug('oxc', () => `scan fallback to sucrase (first: ${localPath})`);
             }
         }
-        return extractImports(source, isTypeScriptLanguage(lang, localPath));
+        return extractImports(source, isTypeScriptLanguage(lang, localPath), strict);
     }
 
     /** Text-path convenience used by tests / fallbacks. */

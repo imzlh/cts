@@ -9,6 +9,7 @@ import { isatty } from '../../utils/progress';
 import { err, ErrorKind } from '../../errors';
 
 const engine = import.meta.use('engine');
+const crypto = import.meta.use('crypto');
 
 const JSR = 'https://jsr.io';
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
@@ -35,6 +36,23 @@ function hasSemverPrefix(value: string): boolean {
         partDigits = 0;
     }
     return false;
+}
+
+function normalizeJsrFilePath(path: string): string {
+    const normalized = normalizePath(path);
+    if (!path || path.includes('\0') || normalized === '.' || normalized === '..' ||
+        normalized.startsWith('/') || normalized.startsWith('../') || /^[a-z]:\//i.test(normalized)) {
+        throw err(ErrorKind.InvalidSpecifier, `Unsafe JSR module path: ${path}`);
+    }
+    return normalized;
+}
+
+function matchesJsrChecksum(data: Uint8Array | ArrayBuffer, checksum: string): boolean {
+    const separator = checksum.indexOf('-');
+    if (separator <= 0 || checksum.slice(0, separator).toLowerCase() !== 'sha256') return false;
+    const expected = checksum.slice(separator + 1);
+    if (!/^[0-9a-f]{64}$/i.test(expected)) return false;
+    return crypto.hexEncode(crypto.sha256(data)).toLowerCase() === expected.toLowerCase();
 }
 
 export class JsrHandler implements ProtocolHandler {
@@ -67,8 +85,8 @@ export class JsrHandler implements ProtocolHandler {
 
         const version = parsed.version;
         if (!version) throw err(ErrorKind.VersionNotFound, `No resolved version for @${parsed.scope}/${parsed.name}`);
-        const filePath = yield* this.resolveFilePath(parsed);
-        const localPath = yield* this.download(parsed.scope, parsed.name, version, filePath, onProgress);
+        const { path: filePath, checksum } = yield* this.resolveFilePath(parsed);
+        const localPath = yield* this.download(parsed.scope, parsed.name, version, filePath, checksum, onProgress);
         const specPath = `jsr:@${parsed.scope}/${parsed.name}@${version}/${filePath}`;
         this.resolved.set(specPath, localPath);
         return { specPath, localPath, format: 'esm', fileKind: guessFileKind(localPath) };
@@ -80,7 +98,14 @@ export class JsrHandler implements ProtocolHandler {
         const p = this.parseSpec(specPath);
         if (!p.version) throw err(ErrorKind.InvalidSpecifier, `JSR specifier has no version: ${specPath}`);
         const file = (p.path.startsWith('/') ? p.path.slice(1) : p.path);
-        return joinPaths(this.cfg.cacheDir, 'jsr', p.scope, p.name, p.version, file);
+        return joinPaths(
+            this.cfg.cacheDir,
+            'jsr',
+            p.scope,
+            p.name,
+            p.version,
+            file ? normalizeJsrFilePath(file) : '',
+        );
     }
 
     private parseSpec(spec: string): ParsedJsrSpec {
@@ -129,21 +154,25 @@ export class JsrHandler implements ProtocolHandler {
         return resolved;
     }
 
-    private *resolveFilePath(p: ParsedJsrSpec): Flow<string> {
+    private *resolveFilePath(p: ParsedJsrSpec): Flow<{ path: string; checksum?: string }> {
         if (!p.version) throw err(ErrorKind.VersionNotFound, `No resolved version for @${p.scope}/${p.name}`);
         const meta = yield* this.versionMeta(p.scope, p.name, p.version);
+        const resolved = (path: string): { path: string; checksum?: string } => {
+            const normalized = normalizeJsrFilePath(path);
+            return { path: normalized, checksum: meta.manifest[`/${normalized}`]?.checksum };
+        };
         if (!p.path || p.path === '/' || p.path === '.') {
             const e = meta.exports?.['.'];
             if (!e) throw err(ErrorKind.ModuleNotFound, `No entry point in @${p.scope}/${p.name}@${p.version}`);
-            return e.startsWith('./') ? e.slice(2) : e;
+            return resolved(e.startsWith('./') ? e.slice(2) : e);
         }
         const norm = p.path.startsWith('/') ? p.path : '/' + p.path;
         const mapped = meta.exports?.['.' + norm];
-        if (mapped) return mapped.startsWith('./') ? mapped.slice(2) : mapped;
-        if (meta.manifest[norm]) return norm.slice(1);
+        if (mapped) return resolved(mapped.startsWith('./') ? mapped.slice(2) : mapped);
+        if (meta.manifest[norm]) return resolved(norm.slice(1));
         for (const ext of EXTS) {
             const w = norm + ext;
-            if (meta.manifest[w]) return w.slice(1);
+            if (meta.manifest[w]) return resolved(w.slice(1));
         }
         throw err(ErrorKind.FileNotFound, `File not found: ${p.path} in @${p.scope}/${p.name}@${p.version}`);
     }
@@ -156,7 +185,12 @@ export class JsrHandler implements ProtocolHandler {
             try {
                 const c = safeParse<CachedJsrPackageMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: file }));
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
+                if (this.cfg.cachedOnly) return c;
             } catch {}
+        }
+        if (this.cfg.cachedOnly) {
+            throw err(ErrorKind.ModuleNotFound,
+                `JSR package metadata not found in cache: @${scope}/${name}, --cached-only is specified.`);
         }
         const url = `${JSR}/@${scope}/${name}/meta.json`;
         log.debug('jsr', () => `fetch meta @${scope}/${name} <- ${url}`);
@@ -179,7 +213,12 @@ export class JsrHandler implements ProtocolHandler {
             try {
                 const c = safeParse<CachedJsrVersionMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: file }));
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
+                if (this.cfg.cachedOnly) return c;
             } catch {}
+        }
+        if (this.cfg.cachedOnly) {
+            throw err(ErrorKind.ModuleNotFound,
+                `JSR version metadata not found in cache: @${scope}/${name}@${ver}, --cached-only is specified.`);
         }
         const url = `${JSR}/@${scope}/${name}/${ver}_meta.json`;
         log.debug('jsr', () => `fetch version meta @${scope}/${name}@${ver} <- ${url}`);
@@ -193,10 +232,21 @@ export class JsrHandler implements ProtocolHandler {
         return meta;
     }
 
-    private *download(scope: string, name: string, ver: string, file: string, onProgress?: ProgressCallback): Flow<string> {
+    private *download(
+        scope: string,
+        name: string,
+        ver: string,
+        file: string,
+        checksum?: string,
+        onProgress?: ProgressCallback,
+    ): Flow<string> {
         const local = joinPaths(this.cfg.cacheDir, 'jsr', scope, name, ver, file);
         const exists = yield { type: StepType.FS_EXISTS, path: local };
         if (!exists) {
+            if (this.cfg.cachedOnly) {
+                throw err(ErrorKind.ModuleNotFound,
+                    `JSR module not found in cache: @${scope}/${name}@${ver}/${file}, --cached-only is specified.`);
+            }
             if (!this.cfg.silent && !isatty) log.download(`jsr:@${scope}/${name}@${ver}/${file}`);
             const url = `${JSR}/@${scope}/${name}/${ver}/${file}`;
             log.debug('jsr', () => `fetch file @${scope}/${name}@${ver}/${file} <- ${url}`);
@@ -204,6 +254,9 @@ export class JsrHandler implements ProtocolHandler {
             const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout, onProgress });
             if (res.status < 200 || res.status >= 300) {
                 throw err(ErrorKind.ModuleNotFound, `HTTP ${res.status} fetching ${url}`);
+            }
+            if (!checksum || !matchesJsrChecksum(res.body, checksum)) {
+                throw err(ErrorKind.NetworkError, `Integrity check failed for ${url}`);
             }
             yield { type: StepType.FS_WRITE_BYTES, path: local, data: res.body };
         }

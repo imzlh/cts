@@ -2,10 +2,10 @@ import type { ScanResult } from '../deps';
 import type { NodeModulesMode, PackageJson } from '../types';
 import {
     joinPaths, dirname, ensureDir, errMsg, npmNameVersion, isWindows,
-    hardlinkOrCopyDirRecursive, readText, safeParse, matchLatestVersion,
+    hardlinkOrCopyDirRecursive, readText, safeParse, matchLatestVersion, isValidNpmPackageName,
     yieldEventLoop,
 } from '../utils';
-import { getBinMap } from './pkg';
+import { getBinMap, resolvePackageBinPath } from './pkg';
 
 const fs = import.meta.use('fs');
 const asyncfs = import.meta.use('asyncfs');
@@ -509,6 +509,7 @@ function collectSeedPackages(
 ): Array<{ name: string; version: string; dir: string }> {
     const map = new Map<string, { name: string; version: string; dir: string }>();
     const add = (name: string, version: string) => {
+        if (!isValidNpmPackageName(name) || !isExactVersion(version)) return;
         const key = `${name}@${version}`;
         if (map.has(key)) return;
         const dir = joinPaths(storeRoot, `${name}@${version}`);
@@ -543,7 +544,7 @@ function collectDeclaredDeps(pkg: {
     const index = new Map<string, number>();
     // prefer: optionalDependencies overrides dependencies (npm semantics).
     const push = (name: string, range: string, optional: boolean, prefer = false) => {
-        if (!name) return;
+        if (!isValidNpmPackageName(name)) return;
         const i = index.get(name);
         if (i !== undefined) {
             if (prefer) out[i] = { name, range: range || '*', optional };
@@ -584,6 +585,7 @@ export function resolveStorePackage(
     range: string,
     parentDir?: string,
 ): string | null {
+    if (!isValidNpmPackageName(name)) return null;
     const norm = stripLeadingV(range.trim());
     const opaque = isOpaqueDepRange(norm || '');
 
@@ -628,6 +630,7 @@ export function resolveStorePackage(
 
 /** Absolute store (or package) dir currently linked as parent/node_modules/name. */
 function readExistingDepTarget(parentDir: string, depName: string): string | null {
+    if (!isValidNpmPackageName(depName)) return null;
     const target = joinPaths(parentDir, 'node_modules', depName);
     let st: ReturnType<typeof fs.lstat> | null = null;
     try {
@@ -681,6 +684,7 @@ function isOpaqueDepRange(range: string): boolean {
 }
 
 function listStoreVersions(storeRoot: string, name: string): string[] {
+    if (!isValidNpmPackageName(name)) return [];
     const versions: string[] = [];
     try {
         if (name.startsWith('@')) {
@@ -728,14 +732,16 @@ function packageIdFromDir(
         const rel = normDir.slice(normStore.length + 1);
         const at = rel.startsWith('@') ? rel.indexOf('@', 1) : rel.indexOf('@');
         if (at > 0) {
-            return { name: rel.slice(0, at), version: rel.slice(at + 1) };
+            const name = rel.slice(0, at);
+            const version = rel.slice(at + 1);
+            if (isValidNpmPackageName(name) && isExactVersion(version)) return { name, version };
         }
     }
     const pkg = readPkgJsonFull(depDir);
-    if (pkg?.name && pkg.version) {
+    if (pkg?.name && pkg.version && isValidNpmPackageName(pkg.name) && isExactVersion(String(pkg.version))) {
         return { name: pkg.name, version: String(pkg.version) };
     }
-    if (fallbackName) {
+    if (isValidNpmPackageName(fallbackName)) {
         return { name: fallbackName, version: '0.0.0' };
     }
     return null;
@@ -772,7 +778,7 @@ function isUrlTaggedStoreVersion(ver: string): boolean {
 function isExactVersion(range: string): boolean {
     // plain x.y.z with optional prerelease/build — no range operators
     if (/[<>*=|^~\s]/.test(range)) return false;
-    return /^\d+\.\d+\.\d+/.test(range);
+    return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(range);
 }
 
 /** Symlink each root package's bin entries into <project>/node_modules/.bin. */
@@ -792,10 +798,10 @@ function materializeProjectBins(
         for (const binName in binMap) {
             const rel = binMap[binName];
             if (!rel) continue;
-            const source = joinPaths(pkgDir, rel);
+            const source = resolvePackageBinPath(pkgDir, rel);
+            if (!source) continue;
             const target = joinPaths(binDir, binName);
             try {
-                if (!fs.exists(source)) continue;
                 let same = false;
                 try {
                     same = fs.realpath(target) === fs.realpath(source);
@@ -856,7 +862,7 @@ function edgeNames(edges: ScanEdge[]): string[] {
 }
 
 function resolveRootTargetDir(edge: ScanEdge, projectDir: string): string | null {
-    if (edge.parentSpecPath.startsWith('npm:')) return null;
+    if (edge.parentSpecPath.startsWith('npm:') || !isValidNpmPackageName(edge.name)) return null;
     return joinPaths(projectDir, 'node_modules', edge.name);
 }
 
@@ -932,7 +938,7 @@ function readProjectManifest(projectDir: string): string[] {
         const out: string[] = [];
         for (let i = 0; i < parsed.length; i++) {
             const value = parsed[i];
-            if (typeof value === 'string') out.push(value);
+            if (typeof value === 'string' && isValidNpmPackageName(value)) out.push(value);
         }
         return out;
     } catch {
@@ -947,7 +953,7 @@ function writeProjectManifest(projectDir: string, names: string[]): void {
     const unique = new Set<string>();
     for (let i = 0; i < names.length; i++) {
         const name = names[i];
-        if (name) unique.add(name);
+        if (isValidNpmPackageName(name)) unique.add(name);
     }
     const sorted: string[] = [];
     for (const name of unique) sorted.push(name);

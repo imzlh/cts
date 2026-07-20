@@ -1,4 +1,4 @@
-import type { RuntimeConfig, ModuleFormat } from './types';
+import type { RuntimeConfig, ModuleFormat, FileKind } from './types';
 import { ModuleResolver } from './resolve/index';
 import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative, isAbsolute, parentDirKey, yieldEventLoop } from './utils';
 import { isRemote } from './source/cache';
@@ -19,7 +19,13 @@ export interface ScanResult {
     visited: number;
     downloaded: number;
     errors: Array<{ spec: string; parent: string; error: string }>;
-    modules: Array<{ specPath: string; localPath: string; format: ModuleFormat; remote: boolean }>;
+    modules: Array<{
+        specPath: string;
+        localPath: string;
+        format: ModuleFormat;
+        fileKind?: FileKind;
+        remote: boolean;
+    }>;
     // node_modules edges (npm: child + eligible parent); see isEligibleParent().
     edges: Array<{ parentSpecPath: string; name: string; childSpecPath: string; childLocalPath: string }>;
     /** Complete resolver edges for consumers that need an offline module graph. */
@@ -33,6 +39,8 @@ export interface DepScannerOptions {
     reportSummary?: boolean;
     /** Resolve an edge but omit the matched module and its descendants. */
     excludeSpecPath?: (specPath: string) => boolean;
+    /** Caller-provided kind for modules with explicit language metadata. */
+    fileKindOverrides?: ReadonlyMap<string, FileKind>;
 }
 
 /** Parents worth recording node_modules edges for: real npm packages, and the
@@ -67,6 +75,11 @@ function shouldEnqueueScannedImport(parentSpecPath: string, spec: string, fullGr
     const childPackage = barePackageName(spec);
     if (!childPackage) return true;
     return childPackage === npmPackageName(parentSpecPath);
+}
+
+function isImportScannable(localPath: string, fileKind?: FileKind): boolean {
+    return fileKind === 'source' || fileKind === 'wasm' ||
+        isWasmPath(localPath) || isScannablePath(localPath);
 }
 
 export class DepScanner {
@@ -248,6 +261,7 @@ export class DepScanner {
                     });
                 }
                 if (this.options.excludeSpecPath?.(info.specPath) === true) return;
+                const fileKind = this.options.fileKindOverrides?.get(info.specPath) ?? info.fileKind;
 
                 // Always record edge (per-parent node_modules link). Use resolved npm: path.
                 if (info.specPath.startsWith('npm:') && isEligibleParent(item.parent)) {
@@ -270,13 +284,14 @@ export class DepScanner {
                         specPath: info.specPath,
                         localPath: info.localPath,
                         format: info.format,
+                        fileKind,
                         remote: isRemote(info.specPath),
                     });
 
                     // Sync ImportScanner when parseImports is null (oxc-main).
                     const children = syncScan
-                        ? this.parseOneSync(info.specPath, info.localPath)
-                        : await this.parseOne(info.specPath, info.localPath);
+                        ? this.parseOneSync(info.specPath, info.localPath, fileKind)
+                        : await this.parseOne(info.specPath, info.localPath, fileKind);
                     for (const child of children) enqueueEdge(child.spec, info.specPath);
                 }
             } catch (e) {
@@ -350,7 +365,11 @@ export class DepScanner {
     }
 
     /** Resolve import list: lock cache (precache) or scan callback / ImportScanner. */
-    private async loadImports(specPath: string, localPath: string): Promise<string[] | null> {
+    private async loadImports(
+        specPath: string,
+        localPath: string,
+        fileKind?: FileKind,
+    ): Promise<string[] | null> {
         const fullGraph = this.options.fullGraph === true;
         // Warm precache may reuse lock imports; pack/fullGraph always rescans.
         if (!fullGraph) {
@@ -358,14 +377,18 @@ export class DepScanner {
             if (cached !== undefined) return cached;
         }
         let imports: string[];
+        if (!isImportScannable(localPath, fileKind)) {
+            return [];
+        }
         if (this.parseImports) {
             imports = await this.parseImports(localPath);
-        } else if (isWasmPath(localPath) || isScannablePath(localPath)) {
-            const scanned = this.importScanner.scanFileResult(localPath);
-            if (scanned === null) return null;
-            imports = scanned;
         } else {
-            return [];
+            const scanned = this.importScanner.scanFileResult(localPath, undefined, fullGraph);
+            if (scanned === null) {
+                if (fullGraph) throw new Error(`Could not read source for full dependency scan: ${localPath}`);
+                return null;
+            }
+            imports = scanned;
         }
         if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
         return imports;
@@ -375,6 +398,7 @@ export class DepScanner {
     private parseOneSync(
         specPath: string,
         localPath: string,
+        fileKind?: FileKind,
     ): Array<{ spec: string; parent: string }> {
         try {
             const fullGraph = this.options.fullGraph === true;
@@ -384,14 +408,18 @@ export class DepScanner {
                 if (cached !== undefined) imports = cached;
             }
             if (imports === undefined) {
-                if (!(isWasmPath(localPath) || isScannablePath(localPath))) return [];
-                const scanned = this.importScanner.scanFileResult(localPath);
-                if (scanned === null) return [];
+                if (!isImportScannable(localPath, fileKind)) return [];
+                const scanned = this.importScanner.scanFileResult(localPath, undefined, fullGraph);
+                if (scanned === null) {
+                    if (fullGraph) throw new Error(`Could not read source for full dependency scan: ${localPath}`);
+                    return [];
+                }
                 imports = scanned;
                 if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
             }
             return this.filterImports(specPath, imports, fullGraph);
-        } catch {
+        } catch (e) {
+            if (this.options.fullGraph === true) throw e;
             return [];
         }
     }
@@ -399,14 +427,15 @@ export class DepScanner {
     private async parseOne(
         specPath: string,
         localPath: string,
+        fileKind?: FileKind,
     ): Promise<Array<{ spec: string; parent: string }>> {
         try {
-            const imports = await this.loadImports(specPath, localPath);
+            const imports = await this.loadImports(specPath, localPath, fileKind);
             if (imports === null) return [];
             return this.filterImports(specPath, imports, this.options.fullGraph === true);
         } catch (e) {
             // Worker scanner reports real file errors; infrastructure aborts the scan.
-            if (this.parseImports || isParseWorkerError(e)) throw e;
+            if (this.options.fullGraph === true || this.parseImports || isParseWorkerError(e)) throw e;
             return [];
         }
     }

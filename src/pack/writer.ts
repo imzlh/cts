@@ -1,9 +1,9 @@
 import type { TypeScriptRuntime } from '../runtime/index';
-import type { ModuleFormat } from '../types';
+import type { ModuleFormat, FileKind } from '../types';
 import { ParseDriver } from '../parse';
 import { DepScanner } from '../deps';
 import { guessFileKind } from '../resolve/protocols/base';
-import { hasImportAttributes, isScannablePath, isTsLikePath, isWasmPath } from '../scan';
+import { hasImportAttributes, isTsLikePath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { relativePath, dirname, basename, ensureDir, PrecacheProgress, log } from '../utils';
 import { err, ErrorKind } from '../errors';
@@ -73,7 +73,12 @@ function isTypeScriptLang(lang: string): boolean {
     return normalized === 'ts' || normalized === 'tsx' || normalized === 'cts' || normalized === 'mts';
 }
 
-interface ScanModule { specPath: string; localPath: string; format: ModuleFormat }
+interface ScanModule {
+    specPath: string;
+    localPath: string;
+    format: ModuleFormat;
+    fileKind?: FileKind;
+}
 
 interface ClassifiedModule {
     m: ScanModule;
@@ -143,14 +148,16 @@ export async function writePack(
         const parseImports = needsLangScan
             ? async (localPath: string): Promise<string[]> => {
                 const lang = localPath === entryInfo.localPath ? options.entryLang : undefined;
-                if (!(isScannablePath(localPath) || isWasmPath(localPath) || lang)) return [];
-                return parseDriver.scanFile(localPath, lang);
+                return parseDriver.scanFile(localPath, lang, true);
             }
             : null;
         const scanner = new DepScanner(runtime.resolver, runtime.config, prog, oxc, parseImports, {
             fullGraph: true,
             reportSummary: false,
             excludeSpecPath: specPath => specPath.startsWith('node:'),
+            fileKindOverrides: options.entryLang
+                ? new Map<string, FileKind>([[entryInfo.specPath, 'source']])
+                : undefined,
         });
         const scanResult = await scanner.scanFromSpecifiers([entrySpecifier], projectDir);
 
@@ -211,7 +218,9 @@ export async function writePack(
         const moduleById = new Map(classified.map(c => [c.id, c.m] as const));
         const fileKindById = new Map(classified.map(c => [
             c.id,
-            c.m.specPath === entryInfo.specPath && options.entryLang ? 'source' : guessFileKind(c.m.localPath),
+            c.m.specPath === entryInfo.specPath && options.entryLang
+                ? 'source'
+                : c.m.fileKind ?? guessFileKind(c.m.localPath),
         ] as const));
         const blob = new BlobBuilder();
         const modules: Record<string, PackModuleEntry> = Object.create(null);

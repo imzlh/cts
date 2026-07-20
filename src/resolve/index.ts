@@ -1,6 +1,6 @@
 import { moduleRef, moduleViewRef, type RuntimeConfig, type ModuleInfo, type NodeBuiltinResolver, type FileKind, type LifecycleScriptEntry } from '../types';
 import type { ProtocolHandler } from './protocols/base';
-import type { ProgressCallback } from '../flow';
+import type { Flow, ProgressCallback } from '../flow';
 import { err, ErrorKind } from '../errors';
 import { FileHandler } from './protocols/file';
 import { HttpHandler }  from './protocols/http';
@@ -70,8 +70,8 @@ function isFilesystemLocalPath(spec: string): boolean {
 
 // Strip URL query/fragment only. Absolute filesystem paths may contain a
 // real directory named "#" (es5-ext); never treat that as a fragment.
-function splitLocalSpecifier(spec: string): { path: string; suffix: string } {
-    if (isFilesystemLocalPath(spec)) return { path: spec, suffix: '' };
+function splitLocalSpecifier(spec: string, splitAbsoluteSuffix = false): { path: string; suffix: string } {
+    if (isFilesystemLocalPath(spec) && !splitAbsoluteSuffix) return { path: spec, suffix: '' };
     const query = spec.indexOf('?');
     const hash = spec.indexOf('#');
     const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
@@ -80,20 +80,70 @@ function splitLocalSpecifier(spec: string): { path: string; suffix: string } {
         : { path: spec.slice(0, cut), suffix: spec.slice(cut) };
 }
 
-interface ImportMapIndex {
+interface ImportMapMappingsIndex {
     exact:    Map<string, string>;
     prefixes: Array<[string, string]>; // [prefix/, target] longest-first
 }
 
-function buildImportMapIndex(map: Record<string, string>): ImportMapIndex {
+interface ImportMapIndex {
+    imports: ImportMapMappingsIndex;
+    scopes:  Array<[string, ImportMapMappingsIndex]>; // [scope prefix, mappings] longest-first
+}
+
+function buildImportMapMappingsIndex(map: Record<string, string> | undefined): ImportMapMappingsIndex {
     const exact    = new Map<string, string>();
     const prefixes: Array<[string, string]> = [];
-    for (const [k, v] of Object.entries(map)) {
+    for (const [k, v] of Object.entries(map ?? {})) {
         if (k.endsWith('/')) prefixes.push([k, v]);
         else exact.set(k, v);
     }
     prefixes.sort((a, b) => b[0].length - a[0].length);
     return { exact, prefixes };
+}
+
+function normalizeImportMapScopeRef(ref: string): string {
+    let normalized = ref;
+    if (ref.startsWith('file://')) {
+        const raw = ref.slice(7);
+        const query = raw.indexOf('?');
+        const hash = raw.indexOf('#');
+        const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
+        normalized = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
+        if (hasLeadingSlashDrive(normalized)) normalized = normalized.slice(1);
+    }
+    if (!isFilesystemLocalPath(normalized)) return normalized;
+    const keepTrailingSlash = normalized.endsWith('/');
+    normalized = canonicalizePath(normalizePath(normalized));
+    return keepTrailingSlash && !normalized.endsWith('/') ? normalized + '/' : normalized;
+}
+
+function buildImportMapIndex(
+    imports: Record<string, string> | undefined,
+    scopes: Record<string, Record<string, string>> | undefined,
+): ImportMapIndex | null {
+    if (!imports && !scopes) return null;
+    const scopeIndex: Array<[string, ImportMapMappingsIndex]> = [];
+    for (const [scope, mappings] of Object.entries(scopes ?? {})) {
+        scopeIndex.push([normalizeImportMapScopeRef(scope), buildImportMapMappingsIndex(mappings)]);
+    }
+    scopeIndex.sort((a, b) => b[0].length - a[0].length);
+    return { imports: buildImportMapMappingsIndex(imports), scopes: scopeIndex };
+}
+
+function matchImportMap(spec: string, idx: ImportMapMappingsIndex): string | undefined {
+    const exact = idx.exact.get(spec);
+    if (exact !== undefined) return exact;
+    for (const [prefix, target] of idx.prefixes) {
+        if (spec.startsWith(prefix)) return target + spec.slice(prefix.length);
+    }
+    // Preserve the legacy bare-specifier subpath fallback.
+    let slash = spec.lastIndexOf('/');
+    while (slash > 0) {
+        const mapped = idx.exact.get(spec.slice(0, slash));
+        if (mapped !== undefined) return `${mapped}/${spec.slice(slash + 1)}`;
+        slash = spec.lastIndexOf('/', slash - 1);
+    }
+    return undefined;
 }
 
 interface PathAliasEntry {
@@ -148,14 +198,15 @@ export class ModuleResolver {
     ) {
         this.lock        = new LockStore(lockDir ?? os.cwd, lockReadOnly, cfg.disableLock === true);
         cfg.lockStore = this.lock;
-        this.importIndex = cfg.importMap    ? buildImportMapIndex(cfg.importMap) : null;
+        this.importIndex = buildImportMapIndex(cfg.importMap, cfg.importMapScopes);
         this.aliasIndex  = cfg.pathAliases  ? buildAliasIndex(cfg.pathAliases, cfg.baseUrl) : [];
         this.lock.load();
 
         this.reg(new FileHandler(cfg));
         this.reg(new DataHandler(cfg));
         this.reg(new BlobHandler(cfg));
-        this.reg(new NpmHandler(cfg));
+        this.reg(new NpmHandler(cfg, (spec, parent, attr, onProgress) =>
+            this.resolvePackageImportTarget(spec, parent, attr, onProgress)));
 
         const flagged: Array<[ProtocolHandler, keyof RuntimeConfig]> = [
             [new HttpHandler(cfg), 'enableHttp'],
@@ -216,7 +267,7 @@ export class ModuleResolver {
             return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
         }
 
-        const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
+        const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec, parent);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
         if (sourceHit) {
@@ -257,7 +308,13 @@ export class ModuleResolver {
         }
 
         // L3 — dispatch async if handler supports it, else sync
-        const info = await this.dispatchAsync(mapped, parent, attr, onProgress);
+        const info = await this.dispatchAsync(
+            mapped,
+            parent,
+            attr,
+            onProgress,
+            mapped !== spec && isAbsolute(mapped),
+        );
         return this.publishResolved(requestSpec, mapped, parent, info, attr, {
             persistModule: true,
             persistSource: true,
@@ -265,7 +322,13 @@ export class ModuleResolver {
         });
     }
 
-    private async dispatchAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+    private async dispatchAsync(
+        spec: string,
+        parent: string,
+        attr?: Record<string, unknown>,
+        onProgress?: ProgressCallback,
+        splitAbsoluteSuffix = false,
+    ): Promise<ModuleInfo> {
         const proto = protoOf(spec);
         if (proto) {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
@@ -274,7 +337,7 @@ export class ModuleResolver {
             return runAsync(h.resolve(spec, parent, attr, onProgress));
         }
         if (isRelative(spec)) return this.resolveRelativeAsync(spec, parent, attr, onProgress);
-        if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
+        if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr, splitAbsoluteSuffix);
         return this.resolveBareAsync(spec, parent, attr, onProgress);
     }
 
@@ -331,7 +394,7 @@ export class ModuleResolver {
 
         // Import map: skip for relative and absolute paths (they don't need remapping).
         // Uses isAbsolute/isRelative from utils/path to handle Windows drive letters.
-        const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec);
+        const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec, parent);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
@@ -380,7 +443,7 @@ export class ModuleResolver {
                 `  Run \x1b[36mcts cache <entry>\x1b[0m to update the lock, then retry with --frozen.`
             );
         }
-        const info = this.dispatch(mapped, parent, attr);
+        const info = this.dispatch(mapped, parent, attr, mapped !== spec && isAbsolute(mapped));
         return this.publishResolved(requestSpec, mapped, parent, info, attr, {
             persistModule: true,
             persistSource: true,
@@ -466,7 +529,12 @@ export class ModuleResolver {
         return null;
     }
 
-    private dispatch(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
+    private dispatch(
+        spec: string,
+        parent: string,
+        attr?: Record<string, unknown>,
+        splitAbsoluteSuffix = false,
+    ): ModuleInfo {
         const proto = protoOf(spec);
         if (proto) {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
@@ -475,8 +543,29 @@ export class ModuleResolver {
             return runSync(h.resolve(spec, parent, attr));
         }
         if (isRelative(spec)) return this.resolveRelative(spec, parent, attr);
-        if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr);
+        if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr, splitAbsoluteSuffix);
         return this.resolveBare(spec, parent, attr);
+    }
+
+    private *resolvePackageImportTarget(
+        spec: string,
+        parent: string,
+        attr?: Record<string, unknown>,
+        onProgress?: ProgressCallback,
+    ): Flow<ModuleInfo> {
+        const target = spec.startsWith('@std/') ? `jsr:${spec}`
+            : isBuiltinSpecifier(spec) ? `node:${spec}`
+            : spec;
+        const proto = protoOf(target);
+        const handler = this.handlers.get(proto || 'npm');
+        if (proto && this.disabled.has(proto)) {
+            throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
+        }
+        if (!handler) {
+            throw err(ErrorKind.ProtocolDisabled,
+                proto ? `No handler for protocol "${proto}:"` : `Cannot resolve bare specifier: "${target}"`);
+        }
+        return yield* handler.resolve(target, parent, attr, onProgress);
     }
 
     private packHandler(): ProtocolHandler {
@@ -526,8 +615,12 @@ export class ModuleResolver {
         return this.resolveRelative(spec, parent, attr);
     }
 
-    private resolveAbsolute(spec: string, attr?: Record<string, unknown>): ModuleInfo {
-        const specParts = splitLocalSpecifier(spec);
+    private resolveAbsolute(
+        spec: string,
+        attr?: Record<string, unknown>,
+        splitAbsoluteSuffix = false,
+    ): ModuleInfo {
+        const specParts = splitLocalSpecifier(spec, splitAbsoluteSuffix);
         const aliased   = this.applyPathAlias(specParts.path);
         const localPath = resolveFile(aliased !== specParts.path ? aliased : specParts.path);
         const specPath  = localPath + specParts.suffix;
@@ -560,22 +653,16 @@ export class ModuleResolver {
 
     // Import map — precomputed O(1) exact + O(k) prefix
 
-    private applyImportMap(spec: string): string {
+    private applyImportMap(spec: string, parent: string): string {
         const idx = this.importIndex;
         if (!idx) return spec;
-        const exact = idx.exact.get(spec);
-        if (exact !== undefined) return exact;
-        for (const [prefix, target] of idx.prefixes) {
-            if (spec.startsWith(prefix)) return target + spec.slice(prefix.length);
+        const scopeParent = normalizeImportMapScopeRef(parent);
+        for (const [scope, mappings] of idx.scopes) {
+            if (!scopeParent.startsWith(scope)) continue;
+            const scoped = matchImportMap(spec, mappings);
+            if (scoped !== undefined) return scoped;
         }
-        // Bare specifier with subpath
-        let slash = spec.lastIndexOf('/');
-        while (slash > 0) {
-            const m = idx.exact.get(spec.slice(0, slash));
-            if (m !== undefined) return `${m}/${spec.slice(slash + 1)}`;
-            slash = spec.lastIndexOf('/', slash - 1);
-        }
-        return spec;
+        return matchImportMap(spec, idx.imports) ?? spec;
     }
 
     private applyPathAlias(spec: string): string {

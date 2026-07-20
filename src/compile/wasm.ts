@@ -55,6 +55,46 @@ function getObjectField(value: unknown, key: PropertyKey): unknown {
     return value && typeof value === 'object' ? Reflect.get(value, key) : undefined;
 }
 
+function pendingExportValue(values: Record<string, unknown>, name: string): unknown {
+    const value = values[name];
+    if (value === undefined) throw new LinkError(`Circular WASM export "${name}" is not initialized`);
+    return value;
+}
+
+function pendingObjectExport(values: Record<string, unknown>, name: string): object {
+    return new Proxy({}, {
+        get(_target, key) {
+            const value = pendingExportValue(values, name);
+            if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
+                throw new LinkError(`Circular WASM export "${name}" is not an object`);
+            }
+            const field = Reflect.get(value, key, value);
+            return typeof field === 'function' ? field.bind(value) : field;
+        },
+        set(_target, key, field) {
+            const value = pendingExportValue(values, name);
+            if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
+                throw new LinkError(`Circular WASM export "${name}" is not an object`);
+            }
+            return Reflect.set(value, key, field, value);
+        },
+    });
+}
+
+function pendingNamedExport(
+    values: Record<string, unknown>,
+    descriptor: CModuleWASM.ModuleExportDescriptor,
+): unknown {
+    if (descriptor.kind !== 'function') return pendingObjectExport(values, descriptor.name);
+    return (...args: unknown[]) => {
+        const value = pendingExportValue(values, descriptor.name);
+        if (typeof value !== 'function') {
+            throw new LinkError(`Circular WASM export "${descriptor.name}" is not callable`);
+        }
+        return Reflect.apply(value, undefined, args);
+    };
+}
+
 function resolveImportFunc(
     imp: CModuleWASM.ModuleImportDescriptor,
     parentPath: string,
@@ -335,10 +375,15 @@ function toWasmValue(v: unknown): CModuleWASM.WasmValue {
 type LoadFn = (info: ModuleInfo, meta: Record<string, unknown>) => CModuleEngine.Module;
 type ResolveFn = (spec: string, parent: string) => ModuleInfo;
 
+interface PendingWasmModule {
+    module: CModuleEngine.Module;
+    values: Record<string, unknown>;
+}
+
 export class WasmCompiler {
     private readonly wasmCache   = new Map<string, CModuleEngine.Module>();
     private readonly wasmLoading = new Set<string>();
-    private readonly pendingWasm = new Map<string, Record<string, unknown>>();
+    private readonly pendingWasm = new Map<string, PendingWasmModule>();
 
     load(
         info: ModuleInfo,
@@ -349,57 +394,67 @@ export class WasmCompiler {
         if (hit) return hit;
 
         if (this.wasmLoading.has(info.localPath)) {
-            // Circular dependency — return a placeholder that gains exports later
             log.debug('wasm', () => `cycle: ${info.specPath} -- returning placeholder`);
-            const shared: Record<string, unknown> = {};
+            const values: Record<string, unknown> = {};
             const placeholder = engine.Module.create(info.specPath);
-            placeholder.export('default', shared);
+            placeholder.export('default', values);
+            assert(wasm, 'WASM support not available in this build');
+            const descriptors = wasm.moduleExports(wasm.parseModule(readBytes(info.localPath)));
+            for (const descriptor of descriptors) {
+                if (descriptor.name === 'default' || descriptor.name === 'instance') continue;
+                placeholder.export(descriptor.name, pendingNamedExport(values, descriptor));
+            }
+            placeholder.export('instance', pendingObjectExport(values, 'instance'));
             this.wasmCache.set(info.localPath, placeholder);
-            this.pendingWasm.set(info.localPath, shared);
+            this.pendingWasm.set(info.localPath, { module: placeholder, values });
             return placeholder;
         }
 
         this.wasmLoading.add(info.localPath);
+        let loadedSuccessfully = false;
+        try {
+            const importSource: WasmImportSource = {
+                require: (spec: string, parentPath: string) => {
+                    const resolved = resolve(spec, parentPath);
+                    const loaded = loadModule(resolved, {});
+                    const evalResult = engine.promiseResult(loaded.eval());
+                    if (evalResult === null) {
+                        throw new Error(
+                            `Cannot load async ESM module '${resolved.specPath}' as a WASM dependency`
+                        );
+                    }
+                    const ns = loaded.namespace;
+                    log.debug('wasm', () => `import "${spec}" resolved -> ${resolved.specPath} (${Object.keys(ns).length} exports)`);
+                    return ns;
+                },
+            };
 
-        const importSource: WasmImportSource = {
-            require: (spec: string, parentPath: string) => {
-                const resolved = resolve(spec, parentPath);
-                const loaded = loadModule(resolved, {});
-                loaded.eval();
-                const ns = loaded.namespace;
-                log.debug('wasm', () => `import "${spec}" resolved -> ${resolved.specPath} (${Object.keys(ns).length} exports)`);
-                return ns;
-            },
-        };
+            const result = buildWasmModule(info, importSource);
+            if (!result) throw err(ErrorKind.Generic, `WASM load failed: ${info.localPath}`);
 
-        const result = buildWasmModule(info, importSource);
-        this.wasmLoading.delete(info.localPath);
+            // Populate placeholder if one was created during circular resolution
+            const pending = this.pendingWasm.get(info.localPath);
+            if (pending) {
+                const ns = result.mod.namespace;
+                Object.assign(pending.values, ns);
 
-        if (!result) throw err(ErrorKind.Generic, `WASM load failed: ${info.localPath}`);
-
-        // Populate placeholder if one was created during circular resolution
-        const pending = this.pendingWasm.get(info.localPath);
-        if (pending) {
-            const ns = result.mod.namespace;
-            Object.assign(pending, ns);
-
-            const placeholder = this.wasmCache.get(info.localPath);
-            if (!placeholder) throw err(ErrorKind.Generic, `WASM placeholder missing: ${info.localPath}`);
-            for (const key of Object.keys(ns)) {
-                try {
-                    placeholder.export(key, ns[key]);
-                } catch (e) {
-                    log.debug('wasm', () => `export "${key}" failed: ${errMsg(e)}`);
-                }
+                this.pendingWasm.delete(info.localPath);
+                log.debug('wasm', () =>
+                    `populated placeholder: ${info.specPath} (${Object.keys(pending.values).length} exports)`);
+                loadedSuccessfully = true;
+                return pending.module;
             }
 
-            this.pendingWasm.delete(info.localPath);
-            log.debug('wasm', () => `populated placeholder: ${info.specPath} (${Object.keys(pending).length} exports)`);
-            return placeholder;
+            this.wasmCache.set(info.localPath, result.mod);
+            loadedSuccessfully = true;
+            return result.mod;
+        } finally {
+            this.wasmLoading.delete(info.localPath);
+            if (!loadedSuccessfully) {
+                this.pendingWasm.delete(info.localPath);
+                this.wasmCache.delete(info.localPath);
+            }
         }
-
-        this.wasmCache.set(info.localPath, result.mod);
-        return result.mod;
     }
 
     clearCache(): void {
