@@ -3,7 +3,7 @@ export const BUILTINS = new Set([
     'crypto','dgram','diagnostics_channel','dns','domain','events','fs','http','http2','https','inspector',
     'module','net','os','path','perf_hooks','process','punycode',
     'querystring','readline','repl','sqlite','stream','string_decoder','test',
-    'sqlite3','timers','tls','trace_events','tty','url','util','v8','vm',
+    'timers','tls','trace_events','tty','url','util','v8','vm',
     'wasi','worker_threads','zlib',
 ]);
 

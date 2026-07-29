@@ -28,7 +28,9 @@ const ENV_MODULE: Record<string, (...args: number[]) => number> = {
     abs: Math.abs, sqrt: Math.sqrt, fmod: (a: number, b: number) => a % b,
     pow: Math.pow, exp: Math.exp, log: Math.log,
     sin: Math.sin, cos: Math.cos, tan: Math.tan,
-    min_f32: Math.fround, max_f32: Math.fround, memory: () => 0,
+    min_f32: (a: number, b: number) => Math.fround(Math.min(a, b)),
+    max_f32: (a: number, b: number) => Math.fround(Math.max(a, b)),
+    memory: () => 0,
     now: Date.now,
     emscripten_get_now: () => globalThis.performance?.now?.() ?? Date.now(),
 };

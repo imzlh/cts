@@ -11,10 +11,9 @@
         "moduleResolution": "bundler",
         "resolveJsonModule": true,
         "allowSyntheticDefaultImports": true,
-        // "types": [],
-        "typeRoots": [
-            "types/"
-        ],
+        // Empty typeRoots: do not auto-load @types/*. circu.js ambients come
+        // from the include below (there is no cts/types/ dir).
+        "typeRoots": [],
         // For nodejs:
         "lib": [
             "esnext"
@@ -54,5 +53,10 @@
         "out": "../api/",
         "disableSources": true
     },
+    "include": [
+        "main.ts",
+        "src/**/*.ts",
+        "../circu.js/types/*"
+    ],
     "exclude": ["deps/sucrase/**/*", "tests/**/*"]
 }

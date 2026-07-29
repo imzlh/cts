@@ -502,13 +502,17 @@ function findCachedBinInDeps(
 
 // All deno-specific flags that have no cts equivalent are dropped.
 
-// Flags that consume the next token as a value
+// Flags that consume the next token as a value (mandatory value)
 const DENO_VALUE_FLAGS = new Set([
-    '--config', '-c', '--import-map', '--lock', '--lock-write',
-    '--cert', '--inspect', '--inspect-brk', '--inspect-wait',
-    '--node-modules-dir', '--vendor', '--env-file',
-    '--reload', '-r', '--seed', '--v8-flags',
-    '--location', '--log-level',
+    '--config', '-c', '--import-map',
+    '--cert', '--seed', '--v8-flags',
+    '--location', '--log-level', '--watch-exclude',
+]);
+
+// Optional-value flags: only strip the inline `=value`, never a following token.
+const DENO_OPTIONAL_VALUE_FLAGS = new Set([
+    '--reload', '-r', '--inspect', '--inspect-brk', '--inspect-wait',
+    '--node-modules-dir', '--vendor', '--env-file', '--lock',
 ]);
 
 // Boolean flags to drop silently
@@ -520,7 +524,7 @@ const DENO_BOOL_FLAGS = new Set([
     '--no-check', '--check', '--no-lock', '--no-npm', '--no-remote',
     '--unstable', '--unstable-bare-node-builtins', '--unstable-byonm',
     '--unstable-sloppy-imports', '--unstable-workspaces',
-    '--quiet', '-q', '--watch', '--watch-exclude',
+    '--quiet', '-q', '--watch', '--lock-write',
     '--frozen',
 ]);
 
@@ -542,6 +546,8 @@ function stripDenoRunFlags(tokens: string[]): string[] {
         if (DENO_VALUE_FLAGS.has(flag)) {
             // Skip flag + value (unless already attached with =)
             if (eq === -1) i++;
+        } else if (DENO_OPTIONAL_VALUE_FLAGS.has(flag)) {
+            // Optional value — only strip inline `=value`; never consume next token.
         } else if (DENO_BOOL_FLAGS.has(flag)
                 || /^--unstable(-|$)/.test(flag)   // all --unstable-* variants
                 || /^--allow-/.test(flag)           // --allow-X not in the static list

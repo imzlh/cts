@@ -30,10 +30,13 @@ function isAsciiAlpha(c: number): boolean {
 }
 
 function isProtocolSpec(spec: string): boolean {
+    // Windows drive paths (C:/x) look like a single-letter scheme — not protocol specs.
+    if (isWindowsDrivePath(toPosixPath(spec))) return false;
     if (!isAsciiAlpha(spec.charCodeAt(0))) return false;
     for (let i = 1; i < spec.length; i++) {
         const c = spec.charCodeAt(i);
-        if (c === 58) return true;
+        // Require >= 2 chars before the ':' so single-letter (drive) schemes don't match.
+        if (c === 58) return i >= 2;
         if (isAsciiAlpha(c) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) continue;
         return false;
     }

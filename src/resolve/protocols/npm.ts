@@ -4,7 +4,7 @@ import { guessFileKind } from './base';
 import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
-import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, isValidNpmPackageName } from '../../utils/misc';
+import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, hasSupportedIntegrity, isValidNpmPackageName } from '../../utils/misc';
 import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, resolvePackageBinPath, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
@@ -221,7 +221,9 @@ interface NpmMeta {
 function verifyRegistryTarball(data: Uint8Array | ArrayBuffer, dist: NpmDist, name: string, ver: string): void {
     const integrity = typeof dist.integrity === 'string' ? dist.integrity.trim() : '';
     let valid = false;
-    if (integrity) {
+    // Only trust the SRI path when it carries a supported (sha256+) token —
+    // a sha1-only SRI must fall through to the shasum check, not fail outright.
+    if (integrity && hasSupportedIntegrity(integrity)) {
         valid = matchesIntegrity(data, integrity);
     } else if (typeof dist.shasum === 'string' && dist.shasum.trim()) {
         const expected = dist.shasum.trim().toLowerCase();
@@ -565,6 +567,47 @@ function packageScope(name: string): string | undefined {
     return slash === -1 ? name : name.slice(0, slash);
 }
 
+/** Drop the scheme, keeping the nerf-dart `//host/path` form npm tokens key on. */
+function stripUrlScheme(u: string): string {
+    const i = u.indexOf('://');
+    return i === -1 ? u : u.slice(i + 1);
+}
+
+/** True when `target` is the base registry itself or a path beneath it. */
+function urlUnderBase(target: string, base: string): boolean {
+    let b = base.endsWith('/') ? base.slice(0, -1) : base;
+    if (!target.startsWith(b)) return false;
+    const rest = target.slice(b.length);
+    return rest === '' || rest.charCodeAt(0) === 47;
+}
+
+/**
+ * Authorization header for a registry request — only when the URL targets a
+ * configured registry host. Scoped/registry tokens (nerf-dart keys) win; the
+ * default `authToken` applies solely to the configured default registry.
+ * Tokens are never sent to arbitrary third-party hosts.
+ */
+function npmAuthHeaders(url: string, cfg: NpmConfig): Record<string, string> {
+    const target = stripUrlScheme(url);
+    for (const key in cfg.scopeTokens) {
+        const suffix = key.endsWith(':_authToken') ? ':_authToken'
+            : key.endsWith(':authToken') ? ':authToken' : null;
+        if (!suffix) continue;
+        const ref = key.slice(0, -suffix.length);
+        if (!ref.startsWith('//')) continue;
+        if (urlUnderBase(target, ref)) {
+            return { Authorization: `Bearer ${cfg.scopeTokens[key]}` };
+        }
+    }
+    if (cfg.authToken) {
+        const base = stripUrlScheme(trimRegistry(cfg.registry));
+        if (urlUnderBase(target, base)) {
+            return { Authorization: `Bearer ${cfg.authToken}` };
+        }
+    }
+    return {};
+}
+
 function isWindowsDrivePath(path: string): boolean {
     return path.length >= 3 && isAsciiAlpha(path.charCodeAt(0)) && path.charCodeAt(1) === 58 && path.charCodeAt(2) === 47;
 }
@@ -573,7 +616,7 @@ function isVirtualProjectNodeModules(norm: string): boolean {
     if (norm.includes('/.pnpm/')) return false;
     let index = -1;
     while ((index = norm.indexOf('/node_modules/.', index + 1)) !== -1) {
-        const next = norm.charCodeAt(index + 16);
+        const next = norm.charCodeAt(index + 15);
         if (next !== 47 && !Number.isNaN(next)) return true;
     }
     return false;
@@ -889,9 +932,29 @@ export class NpmHandler implements ProtocolHandler {
         return `npm:${name}@${version}` + (subpath ? `/${subpath}` : '');
     }
 
-    private static canonicalSubpath(pkgDir: string, localPath: string): string {
-        const rel = normalizePath(localPath.slice(pkgDir.length + 1));
+    /** Package-relative subpath, or null when localPath escapes pkgDir. */
+    private static canonicalSubpath(pkgDir: string, localPath: string): string | null {
+        const root = normalizePath(pkgDir);
+        const norm = normalizePath(localPath);
+        if (norm === root) return '';
+        if (!norm.startsWith(root + '/')) return null;
+        const rel = norm.slice(root.length + 1);
         return rel === 'package.json' ? '' : rel;
+    }
+
+    /** Walk up from a store file to the `<cache>/<name>@<ver>` dir that owns it. */
+    private storeOwnerOf(localPath: string): { dir: string; name: string; version: string } | null {
+        const root = normalizePath(this.cacheDir);
+        let dir = normalizePath(localPath);
+        if (!dir.startsWith(root + '/')) return null;
+        while (dir.length > root.length) {
+            const id = this.storePackageId(dir);
+            if (id) return { dir, name: id.name, version: id.version };
+            const up = dirname(dir);
+            if (up === dir) break;
+            dir = normalizePath(up);
+        }
+        return null;
     }
 
     private *resolveRelative(spec: string, parent: string, forceCjs: boolean, onProgress?: ProgressCallback): Flow<ModuleInfo> {
@@ -1020,8 +1083,31 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private toPackageModuleInfo(name: string, version: string, pkgDir: string, resolved: ResolvedPath): ModuleInfo {
-        const baseSpecPath = NpmHandler.specPath(name, version, NpmHandler.canonicalSubpath(pkgDir, resolved.path));
-        const specPath = baseSpecPath + (resolved.specifierSuffix ?? '');
+        const subpath = NpmHandler.canonicalSubpath(pkgDir, resolved.path);
+        // Escaped pkgDir (e.g. `../../bar/index.js`): slicing by pkgDir.length
+        // would mint a subpath under the wrong package and poison the lock.
+        if (subpath === null) {
+            const real = this.storeOwnerOf(resolved.path);
+            if (real) {
+                const rel = NpmHandler.canonicalSubpath(real.dir, resolved.path);
+                if (rel !== null) return this.finishModuleInfo(real.name, real.version, rel, resolved);
+            }
+            // Outside the store (project/monorepo sibling): attribute to the
+            // package.json that actually owns the file, not the importer.
+            const ownerDir = this.findOwningPackageDir(resolved.path);
+            const ownerPkg = ownerDir ? readPkg(ownerDir) : null;
+            const rel = ownerDir ? NpmHandler.canonicalSubpath(ownerDir, resolved.path) : null;
+            if (!ownerDir || !ownerPkg?.name || rel === null) {
+                throw err(ErrorKind.ModuleNotFound,
+                    `Resolved path escapes package ${name}@${version}: ${resolved.path}`);
+            }
+            return this.finishModuleInfo(ownerPkg.name, ownerPkg.version ?? '0.0.0', rel, resolved);
+        }
+        return this.finishModuleInfo(name, version, subpath, resolved);
+    }
+
+    private finishModuleInfo(name: string, version: string, subpath: string, resolved: ResolvedPath): ModuleInfo {
+        const specPath = NpmHandler.specPath(name, version, subpath) + (resolved.specifierSuffix ?? '');
         this.specFormat.set(specPath, resolved.format);
         this.specLocalPath.set(specPath, resolved.path);
         return {
@@ -1495,6 +1581,7 @@ export class NpmHandler implements ProtocolHandler {
         const tarRes = expectFetch(yield {
             type: StepType.NET_FETCH,
             url,
+            headers: npmAuthHeaders(url, this.getNpmCfg()),
             timeout: this.cfg.requestTimeout,
             onProgress,
         });
@@ -1663,7 +1750,9 @@ export class NpmHandler implements ProtocolHandler {
         const cfg = this.getNpmCfg();
         const scope = packageScope(name);
         const registry = scope ? cfg.scopeRegistries[scope] ?? cfg.registry : cfg.registry;
-        const cacheFile = joinPaths(this.cacheDir, name, 'meta.json');
+        // Under .meta/: <cacheDir>/<name> is the alias symlink target, so writing
+        // meta there lands inside a store package body (or blocks the alias).
+        const cacheFile = joinPaths(this.cacheDir, '.meta', name, 'meta.json');
         const cacheTs = cacheFile + '.ts';
         const hasMeta = yield { type: StepType.FS_EXISTS, path: cacheFile };
         const hasTs = yield { type: StepType.FS_EXISTS, path: cacheTs };
@@ -1687,7 +1776,7 @@ export class NpmHandler implements ProtocolHandler {
         const metaRes = expectFetch(yield {
             type: StepType.NET_FETCH,
             url,
-            headers: { 'User-Agent': 'cts/' + version, Accept: 'application/json' },
+            headers: { 'User-Agent': 'cts/' + version, Accept: 'application/json', ...npmAuthHeaders(url, cfg) },
             timeout: this.cfg.requestTimeout,
             onProgress,
         });
@@ -1715,7 +1804,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
         log.debug('npm', () => `fetch tarball ${name}@${ver} <- ${tarball}`);
         const fetchStarted = Date.now();
-        const tarRes = expectFetch(yield { type: StepType.NET_FETCH, url: tarball, timeout: this.cfg.requestTimeout, onProgress });
+        const tarRes = expectFetch(yield { type: StepType.NET_FETCH, url: tarball, headers: npmAuthHeaders(tarball, this.getNpmCfg()), timeout: this.cfg.requestTimeout, onProgress });
         if (tarRes.status < 200 || tarRes.status >= 300) {
             throw err(ErrorKind.NetworkError, `HTTP ${tarRes.status} fetching tarball ${tarball}`);
         }
@@ -1885,7 +1974,11 @@ export class NpmHandler implements ProtocolHandler {
         if (!isValidNpmPackageName(name)) return;
         // Optional peers: only link if already in the store — never fetch new trees.
         if (optional) {
-            const local = this.findLocal(name, `npm:${parentName}@${parentVer}`)
+            // Store-scoped only: findLocal() would search cwd() and link a
+            // project's node_modules into the shared store. Range must match.
+            const linked = this.readLinkedDepDir(parentDir, name);
+            const pkg = linked ? readPkg(linked) : null;
+            const local = (linked && localPackageMatchesRange(pkg?.version, range) ? linked : null)
                 ?? this.findCachedPackageMatching(name, range);
             if (local) this.linkDependency(parentDir, name, local);
             return;

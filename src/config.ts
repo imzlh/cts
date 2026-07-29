@@ -47,12 +47,18 @@ const DEFAULT_STACK_SIZE = TIER_STACK_SIZE.normal;
 
 export function parseSize(s: string | undefined): number | undefined {
     if (!s) return undefined;
-    const m = s.match(/^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$/i);
+    const m = s.match(/^(\d+(?:\.\d+)?)\s*([KMGT]B?|B)?$/i);
     if (!m) throw err(ErrorKind.InvalidSpecifier, `Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
     const value = m[1];
     if (value === undefined) throw err(ErrorKind.InvalidSpecifier, `Invalid size "${s}" — use e.g. 256MB, 1GB, 4MB`);
-    const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024**2, GB: 1024**3, TB: 1024**4 };
-    return Math.floor(parseFloat(value) * (units[(m[2] ?? 'B').toUpperCase()] ?? 1));
+    const units: Record<string, number> = {
+        B: 1,
+        K: 1024, KB: 1024,
+        M: 1024**2, MB: 1024**2,
+        G: 1024**3, GB: 1024**3,
+        T: 1024**4, TB: 1024**4,
+    };
+    return Math.floor(parseFloat(value) * (units[(m[2] || 'B').toUpperCase()] ?? 1));
 }
 
 function env(k: string): string | null {
@@ -322,7 +328,7 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
         else log.warn('config', () => `invalid --npm-mode "${m}", ignoring`);
     }
     if (cli['memory-limit'] !== undefined)
-        cfg.memoryLimit = parseSize(cli['memory-limit'] || env('CTS_MEMORY_LIMIT') || '1g');
+        cfg.memoryLimit = parseSize(cli['memory-limit'] || env('CTS_MEMORY_LIMIT') || '1GB');
     if (cli['max-stack-size'] !== undefined)
         cfg.maxStackSize = parseSize(cli['max-stack-size'] || env('CTS_MAX_STACK_SIZE') || '0');
     if (cli['jsr-cache-ttl'] !== undefined)

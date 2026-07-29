@@ -338,7 +338,9 @@ async function materializeHardVirtual(
                 bump();
                 return;
             }
-            // Rebuild: drop stale body only (not whole virtual store).
+            // Rebuild: invalidate the stamp BEFORE dropping the body so an
+            // interrupted rebuild can't leave a partial body with a matching stamp.
+            removeIfExists(stampPath);
             removeIfExists(body);
             ensureDir(dirname(body));
             await hardlinkOrCopyDirRecursive(pkg.storeDir, body, {
@@ -346,6 +348,7 @@ async function materializeHardVirtual(
                 yieldEvery: 256,
                 yieldMs: 50,
             });
+            // Write the stamp only after the copy has completed successfully.
             writeBodyStamp(stampPath, pkg.storeDir);
             bump();
         } catch (e) {
@@ -819,7 +822,7 @@ function materializeProjectBins(
                 // Project .bin entries are files (Windows needs type=file).
                 if (isWindows) fs.symlink(source, target, 'file');
                 else fs.symlink(source, target);
-                try { fs.chmod(source, 0o755); } catch {}
+                // Bin is a symlink into the read-only store — never chmod the store source.
             } catch {
                 // Best-effort: missing bin must not fail the whole materialize.
             }

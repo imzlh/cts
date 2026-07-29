@@ -67,7 +67,7 @@ function nodeArgv(args: string[], exePath: string): string[] | null {
         return [exePath, 'eval', second, ...rest];
     }
     if (first?.startsWith('--eval=')) {
-        return [exePath, 'eval', first.slice('--eval='.length), ...rest];
+        return [exePath, 'eval', first.slice('--eval='.length), ...args.slice(1)];
     }
     if (!first) return null;
     return [exePath, 'run', ...args];

@@ -185,6 +185,25 @@ function normalizeCJSExport(obj: unknown): unknown {
     return obj;
 }
 
+/** require(esm) view for a namespace carrying `default`: adds __esModule like Node.
+ *  Getters keep bindings live; QuickJS namespaces are non-extensible so we cannot tag them. */
+function esmRequireView(ns: Record<string, unknown>): Record<string, unknown> {
+    const view: Record<string, unknown> = Object.create(null);
+    for (const k of Object.keys(ns)) {
+        if (k === '__esModule') continue;
+        Object.defineProperty(view, k, {
+            get: () => ns[k],
+            enumerable: true,
+            configurable: false,
+        });
+    }
+    Object.defineProperty(view, '__esModule', {
+        value: true, writable: true, enumerable: true, configurable: false,
+    });
+    Object.defineProperty(view, Symbol.toStringTag, { value: 'Module' });
+    return Object.preventExtensions(view);
+}
+
 function normalizeExecError(error: unknown, filename: string): Error {
     const e: ExecError = error instanceof Error ? error : new Error(String(error));
     if (e.kind === undefined) {
@@ -439,7 +458,10 @@ export class CjsLoader {
     }
 
     private execWithSource(mod: CjsModule, src: string): void {
-        if (src.startsWith('#!')) src = src.slice(src.indexOf('\n'));
+        if (src.startsWith('#!')) {
+            const nl = src.indexOf('\n');
+            src = nl === -1 ? '' : src.slice(nl);
+        }
 
         const filename = getInternalFilename(mod);
         const shouldPatchFunction = hasDynamicImportFunctionSource(src);
@@ -604,18 +626,20 @@ export class CjsLoader {
             ? this.deps.loadWasmSync(info)
             : this.deps.loadEsmSync(info);
         const mod = this.synth(path);
-        mod.exports = normalizeCJSExport(
-            'module.exports' in result
-                ? result['module.exports']
-                : 'default' in result
-                    ? result['default']
-                    : result
-        );
+        // Node returns the whole namespace, not the bare default: an explicit
+        // 'module.exports' export wins, otherwise keep every named export.
+        if ('module.exports' in result) {
+            mod.exports = normalizeCJSExport(result['module.exports']);
+        } else if ('default' in result) {
+            mod.exports = esmRequireView(result);
+        } else {
+            mod.exports = result;
+        }
         this.cache.set(path, mod);
         return mod.exports;
     }
 
-    /** Builtin via deps; ns.default same as requireEsm. */
+    /** Builtin via deps; default merged with named exports (not the require(esm) view). */
     private loadBuiltin(name: string, parent: string): CjsModule {
         const hit = this.builtinCache.get(name);
         if (hit) return hit;

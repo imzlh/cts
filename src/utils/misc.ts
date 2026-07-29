@@ -77,6 +77,17 @@ export function matchesIntegrity(data: Uint8Array | ArrayBuffer, integrity: stri
     return strongest > 0 && matched;
 }
 
+/** True when an SRI string carries at least one supported (sha256+) token. */
+export function hasSupportedIntegrity(integrity: string): boolean {
+    for (const token of integrity.trim().split(/\s+/)) {
+        const separator = token.indexOf('-');
+        if (separator <= 0) continue;
+        const algorithm = token.slice(0, separator).toLowerCase();
+        if (algorithm === 'sha256' || algorithm === 'sha384' || algorithm === 'sha512') return true;
+    }
+    return false;
+}
+
 export const isCacheExpired = (ts: number, ttl: number) => Date.now() - ts > ttl;
 
 export function fmtBytes(n: number): string {
@@ -260,8 +271,11 @@ function satisfies(ver: string, range: string, includePrerelease = rangeHasPrere
         return compareVersions(ver, base) >= 0 && compareVersions(ver, caretUpperBound(base)) < 0;
     }
     if (r.startsWith('~')) {
-        const [M, m, p] = pad(r.slice(1));
-        return compareVersions(ver, r.slice(1)) >= 0 && compareVersions(ver, `${M}.${m + 1}.0`) < 0;
+        const base = r.slice(1);
+        const [M, m] = pad(base);
+        // Major-only (`~1`) bumps the major; with a minor (`~1.2`) bump the minor.
+        const upper = numericRangeParts(base) < 2 ? `${M + 1}.0.0` : `${M}.${m + 1}.0`;
+        return compareVersions(ver, base) >= 0 && compareVersions(ver, upper) < 0;
     }
     if (hasWildcardRange(r)) {
         return wildcardVersionSatisfies(v, r);

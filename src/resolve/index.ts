@@ -223,6 +223,15 @@ export class ModuleResolver {
         for (const p of h.protocols) this.handlers.set(p, h);
     }
 
+    /**
+     * Release the lock store this resolver owns. Without it the SQLite handle
+     * stays open until process exit (LockStore.closeAll), so a caller cannot
+     * delete the lock dir in-process — on Windows unlink then fails EINVAL.
+     */
+    close(): void {
+        this.lock.close();
+    }
+
     /** Register a `pack:` handler for an active .jspack container run (see pack/reader.ts). */
     registerPackHandler(h: ProtocolHandler): void {
         this.reg(h);
