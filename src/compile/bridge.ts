@@ -10,6 +10,7 @@ const engine = import.meta.use('engine');
 
 const CTS_INTERNAL = Symbol.for('cts.internal');
 const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
+const IDENT_SAFE = /^[$_\p{ID_Start}][$\u200C\u200D\p{ID_Continue}]*$/u;
 let cjsBridgeId = 0;
 
 /** Package name end in npm body: after scope for @scope/name, else first /. */
@@ -33,9 +34,11 @@ function buildCjsEsmWrapper(specPath: string, exports: Record<string, unknown>):
     for (const key of Object.keys(exports)) {
         const local = `__cts_export_${index++}`;
         code += `const ${local} = __cts[${JSON.stringify(key)}];\n`;
-        code += key === 'default'
-            ? `export default ${local};\n`
-            : `export { ${local} as ${JSON.stringify(key)} };\n`;
+        if (key === 'default') {
+            code += `export default ${local};\n`;
+        } else if (IDENT_SAFE.test(key)) {
+            code += `export { ${local} as ${JSON.stringify(key)} };\n`;
+        }
     }
     code += `delete globalThis[${JSON.stringify(slot)}];\n`;
     return new engine.Module(code, specPath);
@@ -69,9 +72,6 @@ export function bridgeCjsToEsm(
             for (const k of Object.keys(exportRecord)) {
                 if (k !== 'default') out[k] = Reflect.get(exportRecord, k);
             }
-        }
-        if (!exportRecord || !Object.prototype.hasOwnProperty.call(exportRecord, 'module.exports')) {
-            out['module.exports'] = exports;
         }
         out.default = exports;
     }
