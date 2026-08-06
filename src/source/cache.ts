@@ -16,7 +16,41 @@ function removeCacheFiles(paths: { jsc: string; mt: string }): void {
     unlinkIfExists(paths.mt);
 }
 
-const FRESHNESS_VERSION = 'jsc-v2';
+const FRESHNESS_VERSION = 'jsc-v3';
+
+export interface SourceFreshness {
+    mtim: string;
+    size: number;
+    /** md5 of the exact source bytes the stamp describes (see sourceDigest). */
+    hash: string;
+}
+
+/**
+ * Full-precision mtime token.
+ *
+ * `String(date)` renders only whole seconds ("Sun Aug 02 2026 11:16:59 GMT+0800"),
+ * so a same-size edit landing in the same wall-clock second produced a stamp
+ * identical to the previous revision and stale bytecode was served. Epoch
+ * milliseconds keep every bit fs.stat reports. Plain numbers (resolver-supplied
+ * mtimes for remote entries) pass through unchanged.
+ */
+function mtimeToken(mtim: unknown): string {
+    const t = (mtim as Date | undefined)?.getTime?.();
+    return typeof t === 'number' && t === t ? String(t) : String(mtim);
+}
+
+/**
+ * md5 of the source bytes. mtime+size alone cannot detect a same-size edit that
+ * keeps (or restores, e.g. `touch -r`, `git checkout`, codegen) the mtime, so the
+ * content itself is the authority. Cheap: one small read plus a hash, only on the
+ * freshness check, versus a full transform+compile on a miss.
+ */
+function sourceDigest(bytes: ArrayBuffer): string {
+    return crypto.hexEncode(crypto.md5(bytes));
+}
+
+/** Deserialized value is valid but the wrong shape for this caller (see loadRaw). */
+const MISMATCH = Symbol('cts.jsc.shapeMismatch');
 
 function memoryKey(localPath: string, moduleId?: string): string {
     return `${localPath}\0${moduleId ?? ''}`;
@@ -44,8 +78,8 @@ export class JscCache {
     private readonly cacheRoot: string | null;
 
     constructor(cacheDir?: string) {
-        this.localDir = cacheDir ? joinPaths(cacheDir, 'local') : null;
         this.cacheRoot = cacheDir ? canonicalizePath(normalizePath(cacheDir)) : null;
+        this.localDir = this.cacheRoot ? joinPaths(this.cacheRoot, 'local') : null;
     }
 
     // Local cache path: {cacheDir}/local/{hash[0:2]}/{hash}.jsc
@@ -84,16 +118,34 @@ export class JscCache {
         return this.localCachePath(localPath);
     }
 
-    private legacyFreshnessToken(localPath: string, cachedMtime?: number): string {
-        const stat = fs.stat(localPath);
-        return `${String(cachedMtime ?? stat.mtim)}:${stat.size}`;
+    captureFreshness(localPath: string): SourceFreshness | undefined {
+        try {
+            const stat = fs.stat(localPath);
+            const bytes = fs.readFile(localPath);
+            // size comes from the hashed bytes so both fields describe one revision.
+            return { mtim: mtimeToken(stat.mtim), size: bytes.byteLength, hash: sourceDigest(bytes) };
+        } catch {
+            return undefined;
+        }
     }
 
-    /** Identity-aware sidecars reject legacy stamps instead of risking a stale graph. */
-    private freshnessToken(localPath: string, cachedMtime?: number, moduleId?: string): string {
-        const stamp = this.legacyFreshnessToken(localPath, cachedMtime);
+    private legacyFreshnessToken(localPath: string, cachedMtime?: number, source?: SourceFreshness): string {
+        if (source) return `${source.mtim}:${source.size}:${source.hash}`;
+        const stat = fs.stat(localPath);
+        const bytes = fs.readFile(localPath);
+        return `${mtimeToken(cachedMtime ?? stat.mtim)}:${bytes.byteLength}:${sourceDigest(bytes)}`;
+    }
+
+    /**
+     * Identity-aware sidecars reject legacy stamps instead of risking a stale graph.
+     * The version prefix is unconditional: a v2 stamp (second-granularity mtime, no
+     * content hash) must never satisfy a v3 check, so pre-upgrade entries recompile
+     * once rather than being trusted.
+     */
+    private freshnessToken(localPath: string, cachedMtime?: number, moduleId?: string, source?: SourceFreshness): string {
+        const stamp = this.legacyFreshnessToken(localPath, cachedMtime, source);
         return moduleId === undefined
-            ? stamp
+            ? `${FRESHNESS_VERSION}\n${stamp}`
             : `${FRESHNESS_VERSION}\n${stamp}\n${encodeURIComponent(moduleId)}`;
     }
 
@@ -136,8 +188,8 @@ export class JscCache {
         }
     }
 
-    private writeMtime(localPath: string, mtPath: string, moduleId?: string): void {
-        fs.writeFile(mtPath, engine.encodeString(this.freshnessToken(localPath, undefined, moduleId)));
+    private writeMtime(localPath: string, mtPath: string, moduleId?: string, source?: SourceFreshness): void {
+        fs.writeFile(mtPath, engine.encodeString(this.freshnessToken(localPath, undefined, moduleId, source)));
     }
 
     private writeCacheFile(
@@ -145,30 +197,38 @@ export class JscCache {
         localPath: string,
         bytecode: ArrayBuffer,
         moduleId?: string,
+        source?: SourceFreshness,
     ): void {
         ensureDir(dirname(paths.jsc));
         fs.writeFile(paths.jsc, bytecode);
-        this.writeMtime(localPath, paths.mt, moduleId);
+        this.writeMtime(localPath, paths.mt, moduleId, source);
     }
 
     load(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): CModuleEngine.Module | null {
-        return this.loadRaw(localPath, remote, cachedMtime, moduleId) as CModuleEngine.Module | null;
+        return this.loadRaw(localPath, remote, cachedMtime, moduleId, true) as CModuleEngine.Module | null;
     }
 
     /** load() for non-Module values (e.g. EVAL_COMPILE_ONLY); raw deserialize. */
     loadCompiled(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): unknown | null {
-        return this.loadRaw(localPath, remote, cachedMtime, moduleId);
+        return this.loadRaw(localPath, remote, cachedMtime, moduleId, false);
     }
 
-    private loadRaw(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): unknown | null {
+    private loadRaw(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string, wantModule = true): unknown | null {
+        // CJS-wrapper and ESM bytecode share one identity for a file loaded both
+        // ways (--require of an ESM-format .js); a shape mismatch is a cache miss.
+        // MISMATCH keeps the entry (it is valid for the other consumer); only a
+        // failed deserialize (corrupt / ABI change) clears the files.
+        const accept = (value: unknown): unknown =>
+            (value instanceof engine.Module) === wantModule ? value : MISMATCH;
+
         // L1a: owned buffers (precompile one-shot)
         const key = memoryKey(localPath, moduleId);
         const bc = this.memory.get(key);
         if (bc) {
             try {
-                const mod = engine.deserialize(new Uint8Array(bc));
+                const mod = accept(engine.deserialize(new Uint8Array(bc)));
                 this.memory.delete(key);
-                return mod;
+                if (mod !== MISMATCH) return mod;
             } catch {
                 log.debug('jsc', () => `memory deserialize failed: ${localPath}`);
                 this.memory.delete(key);
@@ -185,7 +245,8 @@ export class JscCache {
                 const bytes = buf instanceof ArrayBuffer
                     ? new Uint8Array(buf, view.byteOffset, view.byteLength)
                     : new Uint8Array(view);
-                return engine.deserialize(bytes);
+                const mod = accept(engine.deserialize(bytes));
+                if (mod !== MISMATCH) return mod;
             } catch {
                 log.debug('jsc', () => `vfs bytecode deserialize failed: ${localPath}`);
                 // Fall through: source recompile (ABI mismatch / corrupt blob).
@@ -201,11 +262,12 @@ export class JscCache {
                 return null;
             }
             try {
-                return engine.deserialize(new Uint8Array(fs.readFile(paths.jsc)));
-            } catch {
-                removeCacheFiles(paths);
+                const mod = accept(engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))));
+                if (mod !== MISMATCH) return mod;
                 return null;
-            }
+            } catch {}
+            removeCacheFiles(paths);
+            return null;
         }
 
         const paths = this.cachePaths(localPath, remote);
@@ -223,12 +285,14 @@ export class JscCache {
         }
 
         try {
-            return engine.deserialize(new Uint8Array(fs.readFile(paths.jsc)));
+            const mod = accept(engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))));
+            if (mod !== MISMATCH) return mod;
+            return null;
         } catch {
             log.debug('jsc', () => `disk deserialize failed: ${paths.jsc}`);
-            removeCacheFiles(paths);
-            return null;
         }
+        removeCacheFiles(paths);
+        return null;
     }
 
     /** On-disk .jsc bytes only (no deserialize); for pack. Null if not durable. */
@@ -258,11 +322,11 @@ export class JscCache {
         this.memory.set(memoryKey(localPath, moduleId), bc);
     }
 
-    persistBytecode(localPath: string, bc: ArrayBuffer, remote: boolean, moduleId?: string): void {
+    persistBytecode(localPath: string, bc: ArrayBuffer, remote: boolean, moduleId?: string, source?: SourceFreshness): void {
         const paths = this.cachePaths(localPath, remote);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, bc, moduleId);
+            this.writeCacheFile(paths, localPath, bc, moduleId, source);
         } catch (e) { log.warn('jsc', `persistBytecode failed: ${paths.jsc}`, e); }
     }
 
@@ -278,21 +342,21 @@ export class JscCache {
         }
     }
 
-    persist(localPath: string, mod: CModuleEngine.Module, moduleId?: string): void {
+    persist(localPath: string, mod: CModuleEngine.Module, moduleId?: string, source?: SourceFreshness): void {
         const paths = this.cachePaths(localPath, true);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, mod.dump(), moduleId);
+            this.writeCacheFile(paths, localPath, mod.dump(), moduleId, source);
         } catch (e) {
             log.warn('jsc', `persist failed: ${paths.jsc}`, e);
         }
     }
 
-    persistLocal(localPath: string, mod: CModuleEngine.Module, moduleId?: string): void {
+    persistLocal(localPath: string, mod: CModuleEngine.Module, moduleId?: string, source?: SourceFreshness): void {
         const paths = this.cachePaths(localPath, false);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, mod.dump(), moduleId);
+            this.writeCacheFile(paths, localPath, mod.dump(), moduleId, source);
             log.debug('jsc', () => `cached local: ${localPath}`);
         } catch (e) {
             log.warn('jsc', `persistLocal failed: ${paths.jsc}`, e);

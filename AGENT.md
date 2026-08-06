@@ -24,6 +24,8 @@ cts/
 │   ├── precompile.ts        # Thin re-export of parse.ts (ParseDriver / isParseWorker only)
 │   ├── shell.ts             # parseShellCommand(), isShellOperator(), resolveWinBinEntry(), resolveUnixBinEntry()
 │   ├── task.ts              # TaskRunner, BinResolver, loadTasks()
+│   ├── task-shell.ts        # shell/bin-wrapper resolution for the task runner
+│   ├── wasm-imports.ts      # WASM import-module extraction (pack graph edges)
 │   ├── oxc.ts               # OxcTranspiler, tryLoadOxc(), oxcExtPath()
 │   ├── deps.ts              # DepScanner class, ScanResult interface
 │   │
@@ -42,10 +44,9 @@ cts/
 │   │   ├── builtins.ts      # BUILTINS set, isBuiltinSpecifier()
 │   │   ├── linker.ts        # Project node_modules materialize (store read-only)
 │   │   ├── pkg.ts           # readPkg(), readPkgFresh(), clearPkgCache(), normalizeBinField(), getBinMap()
-│   │   ├── flow.ts          # I/O step types and runner (Step/StepResult protocol)
-│   │   ├── lock.ts          # LockStore (SQLite-backed module/source/import/bin tables)
-│   │   ├── deps.ts          # DepScanner — concurrent BFS dependency discovery
 │   │   └── protocols/       # Protocol handlers
+│   │   # NOTE: no resolve/flow.ts, resolve/lock.ts or resolve/deps.ts — those three
+│   │   # live at the TOP level (cts/src/flow.ts, cts/src/lock.ts, cts/src/deps.ts).
 │   │       ├── base.ts      # ProtocolHandler interface, guessFileKind()
 │   │       ├── blob.ts      # blob: handler
 │   │       ├── data.ts      # data: handler
@@ -61,19 +62,18 @@ cts/
 │   │   ├── hooks.ts         # EngineHookCallbacks, EngineHooks, installEngineHooks()
 │   │   ├── lifecycle.ts     # LifecyclePlan, LifecycleCommand, planLifecycleScript()
 │   │   ├── meta.ts          # fillMeta() — import.meta population
-│   │   ├── resources.ts     # ResourceManager, Cleanup, createResourceManager()
-│   │   ├── config.ts        # createConfig(), loadConfigFile(), CLI_TPL
-│   │   ├── errors.ts        # ErrorKind, err(), formatError(), fatal()
-│   │   └── task/            # Task execution
-│   │       ├── index.ts     # TaskRunner
-│   │       └── shell.ts     # parseShellCommand, bin-wrapper resolver
+│   │   ├── event-mux.ts     # engine event multiplexing
+│   │   └── resources.ts     # ResourceManager, Cleanup, createResourceManager()
+│   │   # NOTE: config.ts and errors.ts live at the TOP level (cts/src/), not here,
+│   │   # and there is no runtime/task/ — the task runner is cts/src/task.ts plus
+│   │   # cts/src/task-shell.ts.
 │   │
 │   ├── source/              # Source loading + transformation
 │   │   ├── index.ts         # readSource(), readSourceForCjs()
 │   │   ├── transform.ts     # Transformer class, TransformerOptions
-│   │   ├── cache.ts         # JscCache class, isRemote()
-│   │   ├── oxc.ts           # OxcTranspiler class, OxcModule, tryLoadOxc()
-│   │   └── scan.ts          # extractImports(), isTsLikePath(), isScannablePath(), isWasmPath()
+│   │   └── cache.ts         # JscCache class, isRemote()
+│   │   # NOTE: no source/oxc.ts or source/scan.ts — those live at the top level
+│   │   # (cts/src/oxc.ts, cts/src/scan.ts). source/ holds exactly these three.
 │   │
 │   ├── debug/               # Debugger integration
 │   │
@@ -196,8 +196,14 @@ Format-agnostic layer between resolve and compile. Reads files, transforms to JS
 | `index.ts` | `readSource()`, `readSourceForCjs()` | Read + transform source files |
 | `transform.ts` | `Transformer`, `TransformerOptions` | oxc (native) → sucrase (fallback) |
 | `cache.ts` | `JscCache`, `isRemote()` | L1 memory + L2 disk bytecode cache |
-| `oxc.ts` | `OxcTranspiler`, `tryLoadOxc()` | OXC native extension wrapper |
-| `scan.ts` | `extractImports()`, `isTsLikePath()` | Import specifier extraction |
+
+`source/` contains **only** those three files. Earlier revisions of this table also
+listed `source/oxc.ts` and `source/scan.ts`; **neither exists.** The real modules are
+top-level: `cts/src/oxc.ts` (`OxcTranspiler`, `OxcModule`, `isOxcModule()`,
+`oxcExtPath()`, `tryLoadOxc()`) and `cts/src/scan.ts` (`extractImports()`,
+`hasImportAttributes()`, `isTsLikePath()`, `isScannablePath()`, `isWasmPath()`) —
+both already listed in the top-level table above. `import-scanner.ts` imports them
+as `./oxc` and `./scan`, not `./source/…`.
 
 ### utils/ — Utilities
 No circular deps. Used everywhere.
@@ -225,7 +231,7 @@ No circular deps. Used everywhere.
 - **Flow**: protocol handlers `yield Step`; `runSync`/`runAsync` drive them — no direct I/O inside handlers
 - **LRU**: instantiate with capacity, use `get`/`set` — no manual eviction
 - **Module identity**: use `moduleRef(info)` (returns `info.moduleId ?? info.specPath`) as the QuickJS module name, not `localPath`
-- **Bytecode identity**: pass the effective QuickJS module identity through every `JscCache` load/freshness/write API; identity-aware sidecars reject legacy or mismatched stamps instead of reusing a bytecode graph compiled for another ref. Remote bytecode is adjacent only when the resolved file is inside the configured cache root; workspace/symlink targets use the hashed local cache.
+- **Bytecode identity**: pass the effective QuickJS module identity through every `JscCache` load/freshness/write API; identity-aware sidecars reject legacy or mismatched stamps instead of reusing a bytecode graph compiled for another ref. Capture `SourceFreshness` before reading a file and pass it to persistence, so edits during compilation cannot bless stale bytecode. If that snapshot fails, execute without persisting. Remote bytecode is adjacent only when the resolved file is inside the configured cache root; workspace/symlink targets use the hashed local cache. Cache roots are normalized in both `createConfig` and `JscCache`, so trailing/repeated separators cannot change ownership or cache keys; protocol specifiers remain untouched by filesystem normalization.
 - **Pack isolation**: do not resolve a missing manifest edge against disk/network; incomplete scans and compiles are fatal
 - **Attribute views**: use `moduleViewRef()`; do not encode view state in a user query/hash suffix
 - **Bytecode safety**: propagate `cacheBytecode: false` for `sourceOnly` pack entries so warm caches cannot erase import attributes

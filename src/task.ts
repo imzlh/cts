@@ -1,7 +1,7 @@
 import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows, hashString, ensureDir, isValidNpmPackageName } from './utils';
 import { parseShellCommand, requiresShellEvaluation, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { LockStore } from './lock';
-import { getBinMap, readPkgFresh, resolvePackageBinPath } from './resolve/pkg';
+import { getBinMap, getLookupBinMap, readPkgFresh, resolvePackageBinPath } from './resolve/pkg';
 import { createConfig } from './config';
 import { NpmHandler } from './resolve/protocols/npm';
 import { runAsync } from './flow';
@@ -136,7 +136,7 @@ export class BinResolver {
 
         const pkg = readPkgFresh(installedDir);
         if (!pkg) return `Package '${parsed.name}' is cached, but its package.json could not be read.`;
-        const binMap = getBinMap(pkg);
+        const binMap = getLookupBinMap(pkg);
         const bins = Object.keys(binMap);
         const version = String(pkg.version ?? parsed.version);
         if (!bins.length) {
@@ -178,7 +178,7 @@ export class BinResolver {
         const pkg = readPkgFresh(installedDir);
         if (!pkg) return null;
 
-        const binMap = getBinMap(pkg);
+        const binMap = getLookupBinMap(pkg);
         const binName = parsed.binName ?? defaultBinName(pkg.name ?? parsed.name, binMap);
         if (!binName) return null;
 
@@ -292,10 +292,13 @@ export class BinResolver {
         if (realBin.toLowerCase().endsWith('.js') || realBin.toLowerCase().endsWith('.mjs') || realBin.toLowerCase().endsWith('.cjs')) {
             return { entry: realBin, binPath, fallback: false, reason: 'direct-js' };
         }
-        if (!this.isWin) {
-            const entry = resolveUnixBinEntry(binPath);
-            if (entry) return { entry: realpathQuiet(entry), binPath, fallback: false, reason: 'direct-node-shebang' };
-        }
+        // Extensionless `#!/usr/bin/env node` scripts (typescript/bin/tsc, tape/bin/tape)
+        // are the norm for store bins. Windows cannot exec them, and the fallback below
+        // hands them to `cmd /c`, which reports "is not recognized as an internal or
+        // external command". Shebang parsing is pure text work, so run it on every
+        // platform — the node_modules/.bin branch above already does (see 'win-posix-shim-entry').
+        const entry = resolveUnixBinEntry(binPath);
+        if (entry) return { entry: realpathQuiet(entry), binPath, fallback: false, reason: 'direct-node-shebang' };
 
         // Unknown — run as-is, likely will fallback to cmd.exe or chmod
         return { entry: realBin, binPath, fallback: true, reason: 'unknown-non-js' };
@@ -370,7 +373,7 @@ function parseNpmExecSpec(raw: string): NpmExecSpec | null {
 
     if (!name || !version || binName === '' || !isValidNpmPackageName(name) ||
         version.includes('\\') || version.includes('\0') || version.includes(':') ||
-        (binName !== undefined && !isSafeBinCommandName(binName))) return null;
+        (binName !== undefined && !isNpmSpecBinName(binName))) return null;
     return { name, version, binName };
 }
 
@@ -386,9 +389,26 @@ function defaultBinName(pkgName: string, binMap: Record<string, string>): string
     return onlyName;
 }
 
+/**
+ * A bare command name typed by the user (`cno exec foo`). It is looked up on the
+ * filesystem via findLocalBin()/lock index, so path-ish characters are rejected.
+ */
 function isSafeBinCommandName(name: string): boolean {
     return !!name && name !== '.' && name !== '..' && !name.includes('/') &&
         !name.includes('\\') && !name.includes('\0') && !name.includes(':');
+}
+
+/**
+ * The `<bin>` half of `npm:pkg@ver/<bin>`. Unlike a bare command name this is
+ * only ever a key looked up in the package's own bin map, never a path, so a
+ * literal '\' or '"' is legal — npm permits such keys and the
+ * @denotest/special-chars-in-bin-name fixture declares `\foo"`. '/' stays
+ * rejected because it would mean a subpath, and ':' because it collides with
+ * specifier scheme parsing.
+ */
+function isNpmSpecBinName(name: string): boolean {
+    return !!name && name !== '.' && name !== '..' && !name.includes('/') &&
+        !name.includes('\0') && !name.includes(':');
 }
 
 function resolveCacheDir(override?: string): string {
@@ -492,7 +512,7 @@ function findCachedBinInDeps(
         if (!installedDir) continue;
         const cachedPkg = readPkgFresh(installedDir);
         if (!cachedPkg) continue;
-        const relPath = getBinMap(cachedPkg)[binName];
+        const relPath = getLookupBinMap(cachedPkg)[binName];
         if (!relPath) continue;
         const absPath = resolvePackageBinPath(installedDir, relPath);
         if (absPath) return absPath;

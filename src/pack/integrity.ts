@@ -37,10 +37,23 @@ function tempBeside(path: string): string {
     return `${path}.tmp-${pid}-${Date.now()}-${tempSeq++}`;
 }
 
+/** Parent dir of an unnormalized path; `-o dir\out.jspack` is valid on Windows. */
+function parentDir(path: string): string | null {
+    const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+    if (slash <= 0) return null;
+    // `-o D:/out.jspack`: the parent IS the drive root. Slicing the separator off
+    // leaves the drive-RELATIVE "D:", which does not exist as a directory —
+    // ensureDir then fails with "Failed to create directory: D:".
+    const c = path.charCodeAt(0);
+    const isDriveRoot = slash === 2 && path[1] === ':' &&
+        ((c >= 65 && c <= 90) || (c >= 97 && c <= 122));
+    return isDriveRoot ? `${path.slice(0, 2)}/` : path.slice(0, slash);
+}
+
 /** temp + fsync + rename; Windows: keep healthy dest or unlink+retry. */
 export function writeAtomically(path: string, bytes: Uint8Array, ensureParent: (dir: string) => void): void {
-    const slash = path.lastIndexOf('/');
-    if (slash > 0) ensureParent(path.slice(0, slash));
+    const dir = parentDir(path);
+    if (dir !== null) ensureParent(dir);
     const tempPath = tempBeside(path);
     let fd: number | null = null;
     try {
@@ -65,8 +78,8 @@ export function writeAtomicallyStreamed(
     ensureParent: (dir: string) => void,
     expectedFinal?: Uint8Array,
 ): void {
-    const slash = path.lastIndexOf('/');
-    if (slash > 0) ensureParent(path.slice(0, slash));
+    const dir = parentDir(path);
+    if (dir !== null) ensureParent(dir);
     const tempPath = tempBeside(path);
     let fd: number | null = null;
     try {
@@ -76,13 +89,12 @@ export function writeAtomicallyStreamed(
         fs.close(fd);
         fd = null;
         // For streamed pack outputs we do not re-read the full file for compare;
-        // rename rules still match extract (unlink+retry when dest exists).
+        // rename rules still match extract (move dest aside when it exists).
         try {
             fs.rename(tempPath, path);
         } catch {
             if (expectedFinal && hasExpectedContent(path, expectedFinal)) return;
-            try { fs.unlink(path); } catch { /* ignore */ }
-            fs.rename(tempPath, path);
+            swapOverExisting(tempPath, path);
         }
     } finally {
         if (fd !== null) {
@@ -90,6 +102,24 @@ export function writeAtomicallyStreamed(
         }
         try { fs.unlink(tempPath); } catch { /* ignore */ }
     }
+}
+
+/** Windows rename never clobbers: park the old file, swap, restore on failure. */
+function swapOverExisting(tempPath: string, path: string): void {
+    const backup = `${path}.old-${tempSeq++}`;
+    let parked = false;
+    try { fs.rename(path, backup); parked = true; } catch { /* fall back to unlink */ }
+    if (!parked) {
+        try { fs.unlink(path); } catch { /* ignore */ }
+    }
+    try {
+        fs.rename(tempPath, path);
+    } catch (e) {
+        // Put the previous artifact back rather than leaving no file at all.
+        if (parked) { try { fs.rename(backup, path); } catch { /* ignore */ } }
+        throw e;
+    }
+    if (parked) { try { fs.unlink(backup); } catch { /* ignore */ } }
 }
 
 function replaceWithTemp(tempPath: string, path: string, bytes: Uint8Array): void {

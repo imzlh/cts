@@ -5,11 +5,12 @@ import { DepScanner } from '../deps';
 import { guessFileKind } from '../resolve/protocols/base';
 import { hasImportAttributes, isTsLikePath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
-import { relativePath, dirname, basename, ensureDir, PrecacheProgress, log } from '../utils';
+import { relativePath, dirname, basename, canonicalizePath, ensureDir, PrecacheProgress, log } from '../utils';
 import { err, ErrorKind } from '../errors';
 import { encodePackHeader, type PackManifest, type PackModuleEntry } from './format';
 import { writeAll, writeAtomicallyStreamed } from './integrity';
 import { attributeViewId, specScheme } from './identity';
+import { stripSourceMappingURL } from './sourcemap';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -23,7 +24,11 @@ interface BlobChunk {
 interface BlobRange { offset: number; length: number }
 interface SourceSnapshot extends BlobRange {
     sourceOnly: boolean;
+    /** Digest of the ON-DISK bytes, for the pack-time change check. */
     digest: string;
+    /** Embedded text after sourceMappingURL stripping — also what is compiled,
+     *  so the bytecode cannot re-acquire the annotation the blob just lost. */
+    code: string;
 }
 
 class BlobBuilder {
@@ -110,6 +115,12 @@ function classifyModules(modules: ScanModule[], workspaceRoots: string[]): Class
                 ? `pack:${scheme}/${m.specPath.slice(scheme.length + 1)}`
                 : externalLocalId(m);
         }
+        // ModuleResolver canonicalizes every specifier before the manifest
+        // lookup, so an id that is not already in canonical form would produce
+        // an artifact whose modules are unreachable at run time. Sources feeding
+        // the ids above are canonical today; pin the invariant here so a future
+        // change fails as a pack-time id collision instead of a broken .jspack.
+        id = canonicalizePath(id);
 
         const existing = syntheticToReal.get(id);
         if (existing !== undefined && existing !== m.specPath) {
@@ -229,6 +240,7 @@ export async function writePack(
             localPath: string;
             format?: ModuleFormat;
             lang?: string;
+            identity?: string;
         }> = [];
         const rawRanges = new Map<string, BlobRange>();
         const sourceSnapshots = new Map<string, SourceSnapshot>();
@@ -251,28 +263,60 @@ export async function writePack(
             }
             let snapshot = sourceSnapshots.get(m.localPath);
             if (!snapshot) {
-                const source = new Uint8Array(fs.readFile(m.localPath));
+                const onDisk = new Uint8Array(fs.readFile(m.localPath));
+                // Strip `sourceMappingURL` before the bytes reach the artifact.
+                // An inline map carries the build machine's absolute paths and
+                // the full pre-build original in base64 — invisible to a grep of
+                // the .jspack. See ./sourcemap.ts for why this is unconditional.
+                const stripped = stripSourceMappingURL(engine.decodeString(onDisk));
+                const source = stripped.removed > 0 ? engine.encodeString(stripped.text) : onDisk;
+                if (stripped.removed > 0) {
+                    log.debug('pack', () => `stripped ${stripped.removed} sourceMappingURL annotation(s) from ${m.localPath}`);
+                }
                 const range = blob.push(source);
                 snapshot = {
                     ...range,
                     sourceOnly: hasImportAttributes(
-                        engine.decodeString(source),
+                        stripped.text,
                         options.entryLang && m.specPath === entryInfo.specPath
                             ? isTypeScriptLang(options.entryLang)
                             : isTsLikePath(m.localPath),
                     ),
-                    digest: contentDigest(source),
+                    // Change detection must hash what is ON DISK, not what was
+                    // embedded: the re-read below compares against the file, so
+                    // digesting the stripped bytes would report "source changed
+                    // while packing" for every module that had an annotation.
+                    digest: contentDigest(onDisk),
+                    code: stripped.text,
                 };
                 sourceSnapshots.set(m.localPath, snapshot);
-                rawRanges.set(m.localPath, range);
+                // Deliberately NOT registered in rawRanges. That map backs
+                // non-source (text/binary/json) views, whose contract is the
+                // file's verbatim bytes; aliasing them onto this stripped range
+                // would silently serve an asset the rewritten text. The cost is
+                // one duplicated blob range for a file imported both as source
+                // and as an asset, which validateBlobLayout allows as dedup.
             }
             sourceRanges.set(id, snapshot);
             // Compile under pack: ids; host .jsc is not portable (bakes npm:/file: identity).
+            // `identity` is the eval filename baked into the bytecode atom table: it must
+            // be the pack id, never localPath, or the artifact carries the pack-time
+            // absolute host path (CJS defaults to localPath for on-disk caches).
+            //
+            // `code` hands the compiler the STRIPPED text rather than letting it
+            // re-read the file. This is load-bearing for CJS specifically:
+            // QuickJS keeps the CJS wrapper's function source inside the
+            // bytecode, so a CJS module compiled from the on-disk text ships a
+            // second, independent copy of the inline source map inside its
+            // bytecode range — stripping only the source blob leaves that one in
+            // place, and it decodes to the same host paths.
             sourceModules.push({
                 specPath: id,
                 localPath: m.localPath,
                 format: m.format,
                 lang: m.specPath === entryInfo.specPath ? options.entryLang : undefined,
+                identity: id,
+                code: snapshot.code,
             });
         }
 

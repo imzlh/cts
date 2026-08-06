@@ -1,5 +1,5 @@
 export { createRuntime, TypeScriptRuntime } from '../runtime/index';
-export { createConfig, loadConfigFile, CLI_TPL } from '../config';
+export { createConfig, loadConfigFile, CLI_TPL, parseSize } from '../config';
 export { Transformer } from '../source/transform';
 export { loadTasks, BinResolver } from '../task';
 export { LockStore } from '../lock';

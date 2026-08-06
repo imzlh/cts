@@ -20,7 +20,13 @@ import {
     type LifecycleCommand,
     type LifecycleSession,
 } from './lifecycle';
-import { fillMeta } from './meta';
+import { clearImportMetaResolveCache, fillMeta } from './meta';
+import {
+    PRIORITY_DIAGNOSTICS,
+    installEventReceiver,
+    installNodeProcessRejectionBridge,
+    installWebApiCompatBridge,
+} from './event-mux';
 import { ResourceManager, createResourceManager } from './resources';
 
 const os = import.meta.use('os');
@@ -75,6 +81,41 @@ function runtimeErrorInfo(error: unknown): { name: string; message: string; stac
         };
     }
     return { name: 'Error', message: String(error) };
+}
+
+/**
+ * Slot published by the CLI entry (src/main.ts) so the runtime can ask for a
+ * nonzero process status WITHOUT stopping the event loop.
+ *
+ * A Symbol slot rather than an import because the dependency runs the wrong way:
+ * cts is a library and must not import the CLI entry, and only that entry owns
+ * the exit machinery. Absent slot = no-op, which is what a worker, a `cno test`
+ * child, and cts-embedded-as-a-library all want.
+ */
+const REQUEST_EXIT_CODE_SLOT = Symbol.for('cno.runtime.requestExitCode');
+
+/**
+ * Report "this run failed" to the host, non-fatally.
+ *
+ * Node's measured contract for an unhandled async error (v24.18.0): with no
+ * handler it prints the error, exits 1, and STOPS the loop — a `MARK` scheduled
+ * after the throw never prints. cno deliberately keeps the loop running and only
+ * takes the exit code, because the stop-the-loop version is implemented by
+ * returning `false` from this receiver, which reaches TJS_Stop (utils.c:180) and
+ * would kill a whole `cno test` file mid-suite on any async throw in any test.
+ *
+ * So the return values below are unchanged; only the status is taken. First
+ * nonzero wins and an already-set `process.exitCode` is never clobbered — both
+ * enforced on the host side in requestExitCode().
+ */
+function requestFailureExitCode(): void {
+    try {
+        const fn = (globalThis as unknown as Record<symbol, unknown>)[REQUEST_EXIT_CODE_SLOT];
+        if (typeof fn === 'function') (fn as (code: number) => void)(1);
+    } catch {
+        // No host machinery (worker, test child, library embedding): the
+        // diagnostic above is the whole of the reporting.
+    }
 }
 
 function envPathKey(env: Record<string, string>): string {
@@ -365,7 +406,19 @@ export class TypeScriptRuntime {
 
     private hookEvents(): void {
         const trace = new Set<unknown>();
-        engine.onEvent((name: number, data: unknown) => {
+
+        // The webapi bridge must be on the bus before diagnostics, so that a
+        // user's preventDefault() can suppress the "Uncaught" warning below.
+        // No-op once cno/src/webapi/index.ts registers under WEBAPI_ROLE.
+        installWebApiCompatBridge();
+
+        // EV_UNHANDLED_REJECTION was never bridged to node's `process`, so
+        // `process.on('unhandledRejection')` never fired while this receiver
+        // printed its warning. Registers above PRIORITY_DIAGNOSTICS so a
+        // delivered rejection can set ctx.handled and silence that warning.
+        installNodeProcessRejectionBridge();
+
+        installEventReceiver('cts-diagnostics', (name: number, data: unknown, ctx) => {
             const ET = engine.EventType;
             if (name === ET.UNHANDLED_REJECTION) {
                 const r = Array.isArray(data) ? data[1] : data;
@@ -384,10 +437,25 @@ export class TypeScriptRuntime {
                         return false;
                     }
                 }
+                // A listener called preventDefault(), or the node rejection
+                // bridge delivered to a `process.on('unhandledRejection')`
+                // handler: the rejection is handled, so neither the alarming
+                // diagnostic nor the nonzero status applies. Node agrees —
+                // with a handler present it prints nothing and exits 0
+                // (OBSERVED v24.18.0).
+                if (ctx.handled) return false;
                 if (trace.size > 20) trace.clear();
                 else if (trace.has(r)) return false;
                 trace.add(r);
                 log.warn('runtime', formatError(r, 'unhandled promise rejection'));
+                // Unhandled: node exits 1. Take the status but keep the loop
+                // alive (see requestFailureExitCode). Reached only after the
+                // ctx.handled and dedup guards above, so a handled rejection and
+                // a re-dispatch of the same one cannot request it.
+                requestFailureExitCode();
+                // POLARITY: vm.c:242 raises JS_EXCEPTION on any non-false, so
+                // `false` is "do not abort" for a rejection — inverted from
+                // JOB_EXCEPTION below. Unchanged by the status request.
                 return false;
             }
             if (name === ET.JOB_EXCEPTION) {
@@ -406,11 +474,37 @@ export class TypeScriptRuntime {
                         return true;
                     }
                 }
+                // A 'uncaughtException' handler dealt with it (process/mod.ts
+                // sets ctx.handled at PRIORITY_NODE_PROCESS, which dispatches
+                // before this receiver): node exits 0 in that case, so no status.
+                if (ctx.handled) return true;
                 log.warn('runtime', formatError(data, 'unhandled job exception'));
+                // Unhandled: node exits 1. Take the status only.
+                requestFailureExitCode();
+                // POLARITY: utils.c:180 calls TJS_Stop when this returns FALSE,
+                // and TJS_Stop itself forces exit_code 1 (vm.c:932-938) — which
+                // would match node exactly, loop-stop included. Deliberately NOT
+                // done: it would kill a whole `cno test` file mid-suite on any
+                // async throw. `true` = keep running.
                 return true;
             }
-            return false;
-        });
+            // Not ours. Return `undefined`, NOT `false`: dispatch is
+            // highest-priority-first and the LAST explicit boolean wins
+            // (event-mux.ts:159), so a `false` from this receiver — which sits at
+            // PRIORITY_DIAGNOSTICS (0), with only the REPL's PRIORITY_FALLBACK
+            // band below it — overwrites the opinion of every receiver above.
+            //
+            // Concretely reachable: EV_BEFORE_UNLOAD (private.h:172) is
+            // dispatched by the C (vm.c:851) and is absent from the mux's EV map,
+            // so it falls through to here. vm.c:863 treats only an explicit
+            // `true` as "cancelled, keep running", so a future beforeunload
+            // bridge returning `true` to cancel teardown would have that cancel
+            // silently converted into a proceed. EV_EXIT and EV_LOAD land here
+            // too; their return values are freed and ignored by the C, so those
+            // are harmless today — but this receiver should not claim events it
+            // has no opinion about either way.
+            return undefined;
+        }, PRIORITY_DIAGNOSTICS);
     }
 
     // Pre-cache: async parallel BFS, then full resource cleanup
@@ -454,174 +548,177 @@ export class TypeScriptRuntime {
             `transform=${oxc ? 'oxc+workers' : 'sucrase+workers'}, compile=main`);
 
         let result: ScanResult;
+        // One cleanup path for every exit. The post-scan flushLock() and the
+        // hasFresh() precompile gate below sat outside all cleanup: a throw there
+        // leaked the compile workers, held the libuv loop open, and hung
+        // `cno cache` instead of reporting the error. stop/terminate/release are
+        // each idempotent, so the removed per-branch calls are pure duplication.
         try {
-            log.debug('deps', () => 'scan begin');
-            const scanStarted = Date.now();
-            result = await scanFn(scanner);
-            log.debug('deps', () => `scan done in ${Date.now() - scanStarted}ms`);
-        } catch (e) {
             try {
-                this.resolver.flushLock();
-            } catch { }
-            prog?.stop();
-            this.resources.release();
-            await parseDriver.terminate();
-            throw e;
-        }
-
-        // pause not stop — precompile must be able to restart the spinner.
-        prog?.pause();
-
-        if (this.config.nodeModulesMode !== 'normal') {
-            const nodeModulesMode = this.config.nodeModulesMode;
-            // Import scan only installs packages it resolves. Materialize walks
-            // package.json deps/peers — fill those into the store first.
-            log.debug('precache', () => 'ensure install-graph begin');
-            try {
-                await this.resolver.ensureInstallGraph(collectInstallGraphSeeds(result.edges));
+                log.debug('deps', () => 'scan begin');
+                const scanStarted = Date.now();
+                result = await scanFn(scanner);
+                log.debug('deps', () => `scan done in ${Date.now() - scanStarted}ms`);
             } catch (e) {
-                // Soft: keep going; materialize still fail-closes on required misses.
-                log.debug('precache', () => `ensure install-graph: ${errMsg(e)}`);
+                try {
+                    this.resolver.flushLock();
+                } catch { }
+                throw e;
             }
-            log.debug('precache', () => 'ensure install-graph end');
-            log.debug('precache', () => 'materialize node_modules begin');
-            prog?.setActivity(`materialize node_modules (${nodeModulesMode})`);
-            try {
-                await materializeNodeModules(
-                    result.edges,
-                    nodeModulesMode,
-                    this.config.cacheDir,
-                    projectDir,
-                    (done, total) => prog?.setLinkProgress(done, total),
-                );
-                prog?.setActivity(null);
-            } catch (e) {
-                // Fail closed: --npm-mode=soft|hard promised real node_modules.
-                // Swallowing here printed "✔ N modules cached" after zero links.
-                prog?.clearForOutput();
-                log.warn('precache', () => `node_modules materialization failed: ${errMsg(e)}`);
-                prog?.stop();
-                this.resources.release();
-                await parseDriver.terminate();
-                throw e instanceof Error ? e : new Error(errMsg(e));
-            }
+
+            // pause not stop — precompile must be able to restart the spinner.
             prog?.pause();
-            log.debug('precache', () => 'materialize node_modules end');
-        }
 
-        // Run deferred npm lifecycle scripts
-        if (!this.config.ignoreScripts) {
-            log.debug('precache', () => 'lifecycle scripts begin');
-            try {
+            if (this.config.nodeModulesMode !== 'normal') {
+                const nodeModulesMode = this.config.nodeModulesMode;
+                // Import scan only installs packages it resolves. Materialize walks
+                // package.json deps/peers — fill those into the store first.
+                log.debug('precache', () => 'ensure install-graph begin');
+                try {
+                    await this.resolver.ensureInstallGraph(collectInstallGraphSeeds(result.edges));
+                } catch (e) {
+                    // Soft: keep going; materialize still fail-closes on required misses.
+                    log.debug('precache', () => `ensure install-graph: ${errMsg(e)}`);
+                }
+                log.debug('precache', () => 'ensure install-graph end');
+                log.debug('precache', () => 'materialize node_modules begin');
+                prog?.setActivity(`materialize node_modules (${nodeModulesMode})`);
+                try {
+                    await materializeNodeModules(
+                        result.edges,
+                        nodeModulesMode,
+                        this.config.cacheDir,
+                        projectDir,
+                        (done, total) => prog?.setLinkProgress(done, total),
+                    );
+                    prog?.setActivity(null);
+                } catch (e) {
+                    // Fail closed: --npm-mode=soft|hard promised real node_modules.
+                    // Swallowing here printed "✔ N modules cached" after zero links.
+                    prog?.clearForOutput();
+                    log.warn('precache', () => `node_modules materialization failed: ${errMsg(e)}`);
+                    throw e instanceof Error ? e : new Error(errMsg(e));
+                }
+                prog?.pause();
+                log.debug('precache', () => 'materialize node_modules end');
+            }
+
+            // Run deferred npm lifecycle scripts
+            if (!this.config.ignoreScripts) {
+                log.debug('precache', () => 'lifecycle scripts begin');
                 const count = await this.runLifecycleScripts(prog);
                 if (count > 0 && result.errors.length > 0) {
                     clearNegativeCache();
                     await this.retryScanErrors(result);
                 }
-            } catch (e) {
-                prog?.stop();
-                this.resources.release();
-                await parseDriver.terminate();
-                throw e;
+                prog?.pause();
+                log.debug('precache', () => 'lifecycle scripts end');
             }
-            prog?.pause();
-            log.debug('precache', () => 'lifecycle scripts end');
-        }
 
-        let softNpmErrors = 0;
-        const fatalErrors: ScanResult['errors'] = [];
-        for (const item of result.errors) {
-            if (item.parent.startsWith('npm:')) {
-                softNpmErrors++;
-                log.debug('deps', () => `ignored npm-internal "${item.spec}" from "${item.parent}": ${item.error}`);
-            } else {
-                fatalErrors.push(item);
-                prog?.clearForOutput();
-                log.warn('deps', () => `"${item.spec}" from "${item.parent}": ${item.error}`);
+            let softNpmErrors = 0;
+            const fatalErrors: ScanResult['errors'] = [];
+            for (const item of result.errors) {
+                if (item.parent.startsWith('npm:')) {
+                    softNpmErrors++;
+                    log.debug('deps', () => `ignored npm-internal "${item.spec}" from "${item.parent}": ${item.error}`);
+                } else {
+                    fatalErrors.push(item);
+                    prog?.clearForOutput();
+                    log.warn('deps', () => `"${item.spec}" from "${item.parent}": ${item.error}`);
+                }
             }
-        }
-        if (softNpmErrors > 0) {
-            prog?.clearForOutput();
-            log.warn('deps', () => `${softNpmErrors} npm-internal dependency error(s) ignored during precache`);
-        }
-        log.debug('precache', () => `scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
-        this.resolver.flushLock();
-        if (fatalErrors.length > 0) {
+            if (softNpmErrors > 0) {
+                prog?.clearForOutput();
+                log.warn('deps', () => `${softNpmErrors} npm-internal dependency error(s) ignored during precache`);
+            }
+            log.debug('precache', () => `scan complete: ${result.modules.length} modules, ${result.errors.length} errors`);
+            this.resolver.flushLock();
+            if (fatalErrors.length > 0) {
+                throw new Error(`Precache failed with ${fatalErrors.length} dependency error(s)`);
+            }
+
+            const scannableModules: ScanResult['modules'] = [];
+            const toCompile: ScanResult['modules'] = [];
+            // CJS bytecode always uses local hashed cache (no specPath at load).
+            const cacheRemote = (m: { format: ModuleFormat; specPath: string }) =>
+                m.format === 'cjs' ? false : isRemote(m.specPath);
+            const cacheIdentity = (m: { format: ModuleFormat; specPath: string; localPath: string }) =>
+                m.format === 'cjs' ? m.localPath : moduleRef(m);
+            for (const m of result.modules) {
+                if (!isPrecompilePath(m.localPath)) continue;
+                scannableModules.push(m);
+                if (!this.compiler.esm.jsc.hasFresh(m.localPath, cacheRemote(m), undefined, cacheIdentity(m))) {
+                    toCompile.push(m);
+                }
+            }
+
+            if (toCompile.length > 0) {
+                const sourceFreshness = new Map(toCompile.map(m => [
+                    m.localPath,
+                    this.compiler.esm.jsc.captureFreshness(m.localPath),
+                ]));
+                log.debug('precache', () => `precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
+                prog?.setCompileProgress(0, toCompile.length);
+                // Stream each bytecode straight to disk and drop it — never hold
+                // the whole graph's bytecode in memory (peak RSS bound).
+                const formatByLocalPath = new Map(toCompile.map(m => [m.localPath, m.format]));
+                let written = 0;
+                let fail = 0;
+                try {
+                    // Stub deps during precache compile so missing edges don't cascade.
+                    await this.withStubModuleLoader(precompileStubLoader(), () =>
+                        parseDriver.compileModules(
+                            toCompile,
+                            (done, total) => prog?.setCompileProgress(done, total),
+                            (localPath, bc, specPath) => {
+                                const format = formatByLocalPath.get(localPath);
+                                const remote = format === 'cjs' ? false : isRemote(specPath);
+                                const identity = format === 'cjs' ? localPath : specPath;
+                                const source = sourceFreshness.get(localPath);
+                                if (!source) {
+                                    fail++;
+                                    log.debug('precompile', () => `skip ${localPath}: source stat failed`);
+                                    return;
+                                }
+                                this.compiler.esm.jsc.persistBytecode(
+                                    localPath, bc, remote, identity, source,
+                                );
+                                written++;
+                            },
+                            (localPath, _specPath, error) => {
+                                fail++;
+                                log.debug('precompile', () => `skip ${localPath}: ${errMsg(error)}`);
+                            },
+                        ),
+                    );
+                } catch (e) {
+                    // Batch/driver failure is not "best effort cache warm" — surface it.
+                    // Per-module failures still report via onFailed without throwing.
+                    prog?.clearForOutput();
+                    log.warn('precompile', () => `batch failed: ${errMsg(e)}`);
+                    throw e instanceof Error ? e : new Error(errMsg(e));
+                }
+                log.debug('precache', () => `precompile end: ${written}/${toCompile.length} bytecodes` +
+                    (fail ? `, ${fail} fail` : ''));
+                if (fail > 0) {
+                    prog?.clearForOutput();
+                    log.warn('precompile', () =>
+                        `${fail}/${toCompile.length} module(s) failed to precompile (source path still used on demand)`);
+                }
+            } else if (scannableModules.length > 0) {
+                log.debug('precache', () => `precompile skipped: ${scannableModules.length} bytecodes fresh`);
+            }
+
+            return result;
+        } finally {
+            // Reached on every exit, including a throw from flushLock()/hasFresh().
+            // Leaking parseDriver here kept the libuv loop open and hung `cno cache`.
             prog?.stop();
-            this.resources.release();
+            log.debug('precache', () => 'worker terminate begin');
             await parseDriver.terminate();
-            throw new Error(`Precache failed with ${fatalErrors.length} dependency error(s)`);
+            log.debug('precache', () => 'worker terminate end');
+            this.resources.release();
         }
-
-        const scannableModules: ScanResult['modules'] = [];
-        const toCompile: ScanResult['modules'] = [];
-        // CJS bytecode always uses local hashed cache (no specPath at load).
-        const cacheRemote = (m: { format: ModuleFormat; specPath: string }) =>
-            m.format === 'cjs' ? false : isRemote(m.specPath);
-        const cacheIdentity = (m: { format: ModuleFormat; specPath: string; localPath: string }) =>
-            m.format === 'cjs' ? m.localPath : moduleRef(m);
-        for (const m of result.modules) {
-            if (!isPrecompilePath(m.localPath)) continue;
-            scannableModules.push(m);
-            if (!this.compiler.esm.jsc.hasFresh(m.localPath, cacheRemote(m), undefined, cacheIdentity(m))) {
-                toCompile.push(m);
-            }
-        }
-
-        if (toCompile.length > 0) {
-            log.debug('precache', () => `precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
-            prog?.setCompileProgress(0, toCompile.length);
-            // Stream each bytecode straight to disk and drop it — never hold
-            // the whole graph's bytecode in memory (peak RSS bound).
-            const formatByLocalPath = new Map(toCompile.map(m => [m.localPath, m.format]));
-            let written = 0;
-            let fail = 0;
-            try {
-                // Stub deps during precache compile so missing edges don't cascade.
-                await this.withStubModuleLoader(precompileStubLoader(), () =>
-                    parseDriver.compileModules(
-                        toCompile,
-                        (done, total) => prog?.setCompileProgress(done, total),
-                        (localPath, bc, specPath) => {
-                            const format = formatByLocalPath.get(localPath);
-                            const remote = format === 'cjs' ? false : isRemote(specPath);
-                            const identity = format === 'cjs' ? localPath : specPath;
-                            this.compiler.esm.jsc.persistBytecode(localPath, bc, remote, identity);
-                            written++;
-                        },
-                        (localPath, _specPath, error) => {
-                            fail++;
-                            log.debug('precompile', () => `skip ${localPath}: ${errMsg(error)}`);
-                        },
-                    ),
-                );
-            } catch (e) {
-                // Batch/driver failure is not "best effort cache warm" — surface it.
-                // Per-module failures still report via onFailed without throwing.
-                prog?.clearForOutput();
-                log.warn('precompile', () => `batch failed: ${errMsg(e)}`);
-                prog?.stop();
-                this.resources.release();
-                await parseDriver.terminate();
-                throw e instanceof Error ? e : new Error(errMsg(e));
-            }
-            log.debug('precache', () => `precompile end: ${written}/${toCompile.length} bytecodes` +
-                (fail ? `, ${fail} fail` : ''));
-            if (fail > 0) {
-                prog?.clearForOutput();
-                log.warn('precompile', () =>
-                    `${fail}/${toCompile.length} module(s) failed to precompile (source path still used on demand)`);
-            }
-        } else if (scannableModules.length > 0) {
-            log.debug('precache', () => `precompile skipped: ${scannableModules.length} bytecodes fresh`);
-        }
-
-        log.debug('precache', () => 'worker terminate begin');
-        await parseDriver.terminate();
-        log.debug('precache', () => 'worker terminate end');
-        prog?.stop();
-        this.resources.release();
-        return result;
     }
 
     private async retryScanErrors(result: ScanResult): Promise<void> {
@@ -815,7 +912,10 @@ export class TypeScriptRuntime {
     flushLock(): void { this.resolver.flushLock(); }
     get rtConfig(): RuntimeConfig { return this.config; }
 
-    /** Clean up runtime caches and loaded modules */
+    /**
+     * Terminal teardown: caches, loaded modules, and registered resources.
+     * `resources.release()` is one-shot, so the runtime is not reusable after this.
+     */
     cleanup(): void {
         if (this.compiler.hasPendingLoads()) {
             log.warn('runtime', () => 'cleanup() called while async loads are in-flight');
@@ -824,8 +924,14 @@ export class TypeScriptRuntime {
         this.compiler.clearLoadedModules();
         this.engineHooks.clearLoadedModules();
         this.compiler.esm.jsc.clearMemory();
+        clearImportMetaResolveCache();
         this.resolver.clearRuntimeCaches();
         this.resolver.clearHandlerCaches();
+        // clearRuntimeCaches() only clears five resolver maps. Without this, the
+        // four createResourceManager() registrations never ran on the `cno pack`
+        // path (its only caller), leaving connection pools open — pooled sockets
+        // can hold the libuv loop open and stall exit. Idempotent.
+        this.resources.release();
     }
 
     private reportSyntax(e: SyntaxError): never {

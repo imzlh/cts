@@ -8,6 +8,9 @@ import {
 import { TokenType as tt } from '../deps/sucrase/src/parser/tokenizer/types';
 import { ContextualKeyword } from '../deps/sucrase/src/parser/tokenizer/keywords';
 
+/** Per-statement window for hasImportAttributes (was 4000 — too small for minified bundles). */
+const STATEMENT_SCAN_CAP = 64 * 1024;
+
 export function extractImports(source: string, isTs = true, strict = false): string[] {
     let file: ReturnType<typeof parse>;
     try {
@@ -29,18 +32,25 @@ export function extractImports(source: string, isTs = true, strict = false): str
             const next = tokens[i + 1];
             if (!next) continue;
             if (next.type === tt.parenL) {
-                const specToken = tokens[i + 2];
-                const afterSpec = tokens[i + 3];
-                if (specToken && specToken.type === tt.string &&
-                    afterSpec && (afterSpec.type === tt.parenR || afterSpec.type === tt.comma)) {
+                const spec = callSpecifierAt(tokens, source, i + 1);
+                if (spec !== null) {
                     specs ??= new Set<string>();
-                    specs.add(decodeStringToken(source, specToken.start, specToken.end));
+                    specs.add(spec);
                 }
                 continue;
             }
             if (next.type === tt.string) {
                 specs ??= new Set<string>();
                 specs.add(decodeStringToken(source, next.start, next.end));
+                continue;
+            }
+            // `import x = require('y')` — TS import-equals. Sucrase leaves that
+            // `require` token without IdentifierRole.Access, so the generic
+            // require branch below never sees it.
+            const eqReq = importEqualsRequireSpec(tokens, source, i + 1);
+            if (eqReq !== null) {
+                specs ??= new Set<string>();
+                specs.add(eqReq);
                 continue;
             }
             // type-only import; `import type from '…'` is a value binding named type.
@@ -73,23 +83,53 @@ export function extractImports(source: string, isTs = true, strict = false): str
             continue;
         }
         const parenToken = tokens[i + 1];
-        const specToken = tokens[i + 2];
         if (tok.type === tt.name &&
             tok.identifierRole === IdentifierRole.Access &&
             isRequireToken(source, tok.start, tok.end) &&
             !isShadowedRequire(i, requireShadowScopes) &&
-            parenToken && parenToken.type === tt.parenL &&
-            specToken && specToken.type === tt.string &&
-            tokens[i + 3]?.type === tt.parenR)
+            parenToken && parenToken.type === tt.parenL)
         {
-            specs ??= new Set<string>();
-            specs.add(decodeStringToken(source, specToken.start, specToken.end));
+            const spec = callSpecifierAt(tokens, source, i + 1);
+            if (spec !== null) {
+                specs ??= new Set<string>();
+                specs.add(spec);
+            }
         }
     }
     return specs ? [...specs] : [];
 }
 
-/** Import attrs present? Linear scan only (no full TS parse). Prefer false+ for pack. */
+/** Skip whitespace and // or /* *\/ comments starting at idx. */
+function skipWsAndComments(source: string, idx: number, end: number): number {
+    let i = idx;
+    while (i < end) {
+        const c = source.charCodeAt(i);
+        if (isWs(c)) { i++; continue; }
+        if (c === 47 && i + 1 < end) {
+            const n1 = source.charCodeAt(i + 1);
+            if (n1 === 47) {
+                i += 2;
+                while (i < end && source.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (n1 === 42) {
+                i += 2;
+                while (i + 1 < end && !(source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+        }
+        break;
+    }
+    return i;
+}
+
+/**
+ * Import attrs present? Linear scan only (no full TS parse).
+ * False positives are safe (they only disable bytecode reuse); a false negative
+ * lets a warm .jsc erase attributes, so the per-statement scan window fails
+ * OPEN — hitting the cap reports true rather than missing a trailing `with`.
+ */
 export function hasImportAttributes(source: string, _isTs = true): boolean {
     const n = source.length;
     let i = 0;
@@ -124,11 +164,15 @@ export function hasImportAttributes(source: string, _isTs = true): boolean {
         }
         // import / export … with {  |  assert {
         if ((c === 105 || c === 101) && isWordAt(source, i, c === 105 ? 'import' : 'export')) {
-            const kwLen = c === 105 ? 6 : 6;
+            const kwLen = 6;
             if (!isIdentBoundary(source, i + kwLen)) { i++; continue; }
-            const end = Math.min(n, i + 4000);
+            // Long statements (minified bundles, huge named-import lists) used to
+            // truncate at 4000 chars and drop a trailing `with {…}`.
+            const capped = i + STATEMENT_SCAN_CAP;
+            const end = Math.min(n, capped);
             let j = i + kwLen;
             let depth = 0;
+            let sawEnd = false;
             while (j < end) {
                 const cj = source.charCodeAt(j);
                 if (cj === 34 || cj === 39 || cj === 96) {
@@ -140,20 +184,23 @@ export function hasImportAttributes(source: string, _isTs = true): boolean {
                         if (ch === q) { j++; break; }
                         j++;
                     }
-                    // After a string in an import/export, accept with/assert {
-                    while (j < end && isWs(source.charCodeAt(j))) j++;
+                    // After a string in an import/export, accept with/assert {.
+                    // Comments may sit between the specifier and the keyword.
+                    j = skipWsAndComments(source, j, end);
                     if (isWordAt(source, j, 'with') || isWordAt(source, j, 'assert')) {
                         let k = j + (source.charCodeAt(j) === 119 ? 4 : 6);
-                        while (k < end && isWs(source.charCodeAt(k))) k++;
+                        k = skipWsAndComments(source, k, end);
                         if (k < end && source.charCodeAt(k) === 123) return true;
                     }
                     continue;
                 }
                 if (cj === 123) depth++;
                 else if (cj === 125) depth = Math.max(0, depth - 1);
-                else if (cj === 59 && depth === 0) break;
+                else if (cj === 59 && depth === 0) { sawEnd = true; break; }
                 j++;
             }
+            // Statement longer than the cap: cannot prove there is no `with`.
+            if (!sawEnd && capped < n) return true;
             i = j;
             continue;
         }
@@ -447,6 +494,58 @@ function hasRuntimeExportSpecifier(tokens: Tokens, start: number, fromStringInde
         if (!t.isType) return true;
     }
     return !sawExportAccess;
+}
+
+/**
+ * `import(`./a.js`)` — index of the template token, or -1.
+ * Requires ` template ` then ) or , so a substitution (${ after the template)
+ * is excluded. Raw slice, so a token containing an escape is skipped instead of
+ * emitting a wrong specifier.
+ */
+function staticTemplateSpec(tokens: Tokens, source: string, start: number): number {
+    if (tokens[start]?.type !== tt.backQuote) return -1;
+    const spec = tokens[start + 1];
+    if (!spec || spec.type !== tt.template || spec.end <= spec.start) return -1;
+    if (tokens[start + 2]?.type !== tt.backQuote) return -1;
+    const after = tokens[start + 3];
+    if (!after || (after.type !== tt.parenR && after.type !== tt.comma)) return -1;
+    const escape = source.indexOf('\\', spec.start);
+    return escape === -1 || escape >= spec.end ? start + 1 : -1;
+}
+
+/**
+ * Specifier of a call whose `(` is at `parenIndex`, or null when not static.
+ * Accepts a string literal or a no-substitution template, then `)` or `,`
+ * (a second argument is import()'s attributes bag / a require() shim's).
+ */
+function callSpecifierAt(tokens: Tokens, source: string, parenIndex: number): string | null {
+    if (tokens[parenIndex]?.type !== tt.parenL) return null;
+    const specToken = tokens[parenIndex + 1];
+    const afterSpec = tokens[parenIndex + 2];
+    if (specToken && specToken.type === tt.string &&
+        afterSpec && (afterSpec.type === tt.parenR || afterSpec.type === tt.comma)) {
+        return decodeStringToken(source, specToken.start, specToken.end);
+    }
+    // import(`./a.js`): no-substitution template is as static as a string.
+    // Tokens are ` template ` — a substitution puts ${ after the template, so
+    // requiring backQuote here excludes dynamic ones.
+    const spec = staticTemplateSpec(tokens, source, parenIndex + 1);
+    if (spec === -1) return null;
+    const tok = tokens[spec]!;
+    return source.slice(tok.start, tok.end);
+}
+
+/**
+ * `import x = require('y')` — TS import-equals. `start` is the token after
+ * `import`. Sucrase does not give that `require` IdentifierRole.Access, so the
+ * generic require branch cannot see it. Returns the specifier, or null.
+ */
+function importEqualsRequireSpec(tokens: Tokens, source: string, start: number): string | null {
+    if (tokens[start]?.type !== tt.name) return null;
+    if (tokens[start + 1]?.type !== tt.eq) return null;
+    const req = tokens[start + 2];
+    if (!req || req.type !== tt.name || !isRequireToken(source, req.start, req.end)) return null;
+    return callSpecifierAt(tokens, source, start + 3);
 }
 
 function findFromString(

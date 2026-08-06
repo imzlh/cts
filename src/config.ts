@@ -1,5 +1,5 @@
 import type { RuntimeConfig, ConfigOptions } from './types';
-import { dirname, joinPaths, normalizePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier, isRelative } from './utils';
+import { dirname, joinPaths, normalizePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier, isRelative, isAbsolute } from './utils';
 import { err, ErrorKind } from './errors';
 
 const os = import.meta.use('os');
@@ -75,6 +75,12 @@ function resolveImportMapTarget(target: string, baseDir?: string): string {
     let resolved = normalizePath(joinPaths(baseDir, toPosixPath(target)));
     if (keepTrailingSlash && !resolved.endsWith('/')) resolved += '/';
     return resolved;
+}
+
+/** tsconfig `baseUrl` may already be absolute (`/opt/src`, `C:/proj/src`). */
+function resolveConfigDirOption(dir: string, value: string): string {
+    const p = toPosixPath(value);
+    return isAbsolute(p) ? normalizePath(p) : joinPaths(dir, p);
 }
 
 /** Filter import map entries: keep only string-valued, non-# entries. */
@@ -339,6 +345,7 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
     cfg._ = cli._; cfg._args = cli._args; cfg._offset = cli._offset;
 
     if (!cfg.cacheDir) cfg.cacheDir = defaultCacheDir();
+    cfg.cacheDir = normalizePath(toPosixPath(cfg.cacheDir));
     verifyCacheDir(cfg.cacheDir);
 
     // Apply tier defaults unless explicitly overridden by CLI or env.
@@ -376,7 +383,12 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             if (ts) {
                 const paths = filterPathAliases(ts.compilerOptions?.paths);
                 if (paths) cfg.pathAliases = paths;
-                if (typeof ts.compilerOptions?.baseUrl === 'string') cfg.baseUrl = joinPaths(d, ts.compilerOptions.baseUrl);
+                if (typeof ts.compilerOptions?.baseUrl === 'string') {
+                    cfg.baseUrl = resolveConfigDirOption(d, ts.compilerOptions.baseUrl);
+                } else if (paths && cfg.baseUrl === undefined) {
+                    // TS 4.1+: `paths` without `baseUrl` resolve from the config dir, not cwd.
+                    cfg.baseUrl = normalizePath(toPosixPath(d));
+                }
                 log.debug('config', () => `tsconfig: ${tsP}`);
                 foundTsconfig = true;
             }
@@ -399,7 +411,11 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
                 filterImportMapScopes(dc.scopes, d),
             );
             const paths = filterPathAliases(dc.compilerOptions?.paths);
-            if (paths) cfg.pathAliases = { ...cfg.pathAliases, ...paths };
+            if (paths) {
+                cfg.pathAliases = { ...cfg.pathAliases, ...paths };
+                // Same rule as tsconfig: relative alias targets resolve from the config dir.
+                if (cfg.baseUrl === undefined) cfg.baseUrl = normalizePath(toPosixPath(d));
+            }
             if (typeof dc.importMap === 'string') {
                 const mp = joinPaths(d, dc.importMap);
                 if (fs.exists(mp)) {

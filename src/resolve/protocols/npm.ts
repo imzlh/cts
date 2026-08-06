@@ -4,7 +4,7 @@ import { guessFileKind } from './base';
 import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
-import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, hasSupportedIntegrity, isValidNpmPackageName } from '../../utils/misc';
+import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, hasSupportedIntegrity, isValidNpmPackageName, npmDepTarget, parseNpmAliasDep } from '../../utils/misc';
 import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, resolvePackageBinPath, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
@@ -481,19 +481,23 @@ function collectInstallGraphDeps(pkg: {
     peerDependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     peerDependenciesMeta?: Record<string, { optional?: boolean }>;
-}): Array<{ name: string; range: string; optional: boolean }> {
-    const out: Array<{ name: string; range: string; optional: boolean }> = [];
+}): Array<{ name: string; linkName: string; range: string; optional: boolean }> {
+    const out: Array<{ name: string; linkName: string; range: string; optional: boolean }> = [];
     const index = new Map<string, number>();
-    const push = (name: string, range: string, optional: boolean, prefer = false) => {
-        if (!isValidNpmPackageName(name)) return;
-        const i = index.get(name);
+    // key = package.json key = the node_modules slot; two aliases of one package
+    // are two distinct slots, so dedup on the slot rather than the target name.
+    const push = (key: string, value: string, optional: boolean, prefer = false) => {
+        const t = npmDepTarget(key, value);
+        if (!isValidNpmPackageName(t.linkName) || !isValidNpmPackageName(t.name)) return;
+        const entry = { name: t.name, linkName: t.linkName, range: t.range || '*', optional };
+        const i = index.get(t.linkName);
         if (i !== undefined) {
             // npm: optionalDependencies wins over dependencies for same name.
-            if (prefer) out[i] = { name, range: range || '*', optional };
+            if (prefer) out[i] = entry;
             return;
         }
-        index.set(name, out.length);
-        out.push({ name, range: range || '*', optional });
+        index.set(t.linkName, out.length);
+        out.push(entry);
     };
     const deps = pkg.dependencies;
     if (deps) for (const n in deps) push(n, deps[n] ?? '*', false);
@@ -751,7 +755,7 @@ export class NpmHandler implements ProtocolHandler {
                 continue;
             }
             if (!child) continue;
-            this.linkDependency(dir, dep.name, child.dir);
+            this.linkDependency(dir, dep.linkName, child.dir);
             const childKey = `${dep.name}@${child.resolvedVer}`;
             if (!seen.has(childKey)) {
                 seen.add(childKey);
@@ -835,12 +839,17 @@ export class NpmHandler implements ProtocolHandler {
             }
             throw packageImportNotDefinedError(spec, pkgDir ?? '', parent);
         }
-        const { name, version: parsedRange, subpath } = parseNpmSpec(spec);
-        const selfRef = this.resolveSelfReference(parent, name, subpath, forceCjs);
+        const { name: specName, version: parsedRange, subpath } = parseNpmSpec(spec);
+        const selfRef = this.resolveSelfReference(parent, specName, subpath, forceCjs);
         if (selfRef) return selfRef;
-        const range = parsedRange === 'latest'
-            ? (yield* this.resolveParentRange(name, parent, onProgress)) ?? parsedRange
-            : parsedRange;
+        // A `latest` request defers to the parent's declared range. When that
+        // declaration is npm alias syntax the real package name comes from it too,
+        // so `name` must be re-bound — the store dir and specPath follow the target.
+        const declared = parsedRange === 'latest'
+            ? yield* this.resolveParentRange(specName, parent, onProgress)
+            : null;
+        const name = declared?.name ?? specName;
+        const range = declared?.range ?? parsedRange;
         const pkg = yield* this.ensureInstalled(name, range, parent, onProgress);
         return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
     }
@@ -1074,11 +1083,15 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private resolveSelfReference(parent: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo | null {
-        if (!parent || (!parent.startsWith('npm:') && !parent.includes(this.cacheDir))) return null;
+        if (!parent) return null;
+        // Node allows self-reference from any package that declares "exports";
+        // store parents keep the pre-exports behaviour (legacy main/index too).
+        const fromStore = parent.startsWith('npm:') || parent.includes(this.cacheDir);
         const parentPkgDir = this.findOwningPackageDir(parent);
         if (!parentPkgDir) return null;
         const parentPkg = readPkg(parentPkgDir);
         if (!parentPkg?.name || parentPkg.name !== name || !parentPkg.version) return null;
+        if (!fromStore && parentPkg.exports === undefined) return null;
         return this.resolvePkg(parentPkgDir, parentPkg.version, name, subpath, forceCjs);
     }
 
@@ -1359,7 +1372,7 @@ export class NpmHandler implements ProtocolHandler {
         return fs.exists(pkgPath) ? dir : null;
     }
 
-    private *resolveParentRange(name: string, parent: string, onProgress?: ProgressCallback): Flow<string | null> {
+    private *resolveParentRange(name: string, parent: string, onProgress?: ProgressCallback): Flow<{ name: string; range: string } | null> {
         let pkgDir = this.findOwningPackageDir(parent);
         if (!pkgDir && parent.startsWith('npm:')) {
             const parsed = parseNpmSpec(parent);
@@ -1369,11 +1382,19 @@ export class NpmHandler implements ProtocolHandler {
         if (!pkgDir) return null;
         const pkg = readPkg(pkgDir);
         if (!pkg) return null;
-        return pkg.dependencies?.[name]
+        const declared = pkg.dependencies?.[name]
             ?? (this.parentOrigin(parent) === 'project' ? pkg.devDependencies?.[name] : null)
             ?? pkg.optionalDependencies?.[name]
             ?? pkg.peerDependencies?.[name]
             ?? null;
+        if (declared === null) return null;
+        // `"<name>": "npm:<real>@<range>"` — the declared value is an alias, so the
+        // registry name comes from the value and only its version half is a range.
+        // Returning the raw value as a range asked the registry for
+        // `<name>@npm:<real>@<range>`, which can never match.
+        const alias = parseNpmAliasDep(declared);
+        if (alias) return { name: alias.name, range: alias.range };
+        return { name, range: declared };
     }
 
     private indexLocalBins(pkgDir: string, name: string): void {
@@ -1690,7 +1711,9 @@ export class NpmHandler implements ProtocolHandler {
         if (deps) {
             for (const depName in deps) {
                 if (optional && Object.prototype.hasOwnProperty.call(optional, depName)) continue;
-                if (!hasSatisfying(depName, deps[depName] ?? '*')) return false;
+                // Aliases live at node_modules/<key> but must satisfy the target's range.
+                const target = npmDepTarget(depName, deps[depName] ?? '*');
+                if (!hasSatisfying(target.linkName, target.range)) return false;
             }
         }
         const peers = pkg.peerDependencies;
@@ -1699,7 +1722,8 @@ export class NpmHandler implements ProtocolHandler {
                 .peerDependenciesMeta;
             for (const peerName in peers) {
                 if (meta?.[peerName]?.optional === true) continue;
-                if (!hasSatisfying(peerName, peers[peerName] ?? '*')) return false;
+                const target = npmDepTarget(peerName, peers[peerName] ?? '*');
+                if (!hasSatisfying(target.linkName, target.range)) return false;
             }
         }
         return true;
@@ -1781,6 +1805,14 @@ export class NpmHandler implements ProtocolHandler {
             onProgress,
         });
         if (metaRes.status < 200 || metaRes.status >= 300) {
+            // A registry 404/410 means "no such package" — that is a resolution
+            // miss, not a transport failure. Node reports MODULE_NOT_FOUND, and
+            // packages rely on `e.code === 'MODULE_NOT_FOUND'` to treat an
+            // optional dependency as absent. Every other status stays a
+            // NetworkError so compile/bridge.ts keeps rethrowing it.
+            if (metaRes.status === 404 || metaRes.status === 410) {
+                throw err(ErrorKind.ModuleNotFound, `npm package not found: "${name}" (HTTP ${metaRes.status} ${url})`);
+            }
             throw err(ErrorKind.NetworkError, `HTTP ${metaRes.status} fetching npm meta ${url}`);
         }
         const body = metaRes.body;
@@ -1898,7 +1930,11 @@ export class NpmHandler implements ProtocolHandler {
         log.debug('npm', () => `deps for ${key}: ${depNames}`);
         const flows: Flow<void>[] = [];
         for (const depName in required) {
-            flows.push(this.installDependency(dir, name, ver, depName, required[depName]!, onProgress, cyclePath));
+            // `"key": "npm:real@range"` installs `real`, but links under `key`.
+            const target = npmDepTarget(depName, required[depName]!);
+            flows.push(this.installDependency(
+                dir, name, ver, target.name, target.range, onProgress, cyclePath, target.linkName,
+            ));
         }
         yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
         // Only after a full successful walk — a mid-flight github: failure must retry.
@@ -1913,21 +1949,22 @@ export class NpmHandler implements ProtocolHandler {
         range: string,
         onProgress?: ProgressCallback,
         cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
+        linkName: string = name,
     ): Flow<void> {
         assertNpmPackageName(name);
         // Fast path: parent already has a satisfying link (prior install).
-        const existing = this.readLinkedDepDir(parentDir, name);
+        const existing = this.readLinkedDepDir(parentDir, linkName);
         if (existing) {
             const pkg = readPkg(existing);
             if (pkg && localPackageMatchesRange(pkg.version, range)) {
                 const ver = pkg.version ?? range;
                 yield* this.prepareInstalledPackage(name, ver, existing, onProgress, cyclePath);
-                this.linkDependency(parentDir, name, existing);
+                this.linkDependency(parentDir, linkName, existing);
                 return;
             }
         }
         const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress, cyclePath);
-        this.linkDependency(parentDir, name, dep.dir);
+        this.linkDependency(parentDir, linkName, dep.dir);
     }
 
     /**
@@ -1952,10 +1989,11 @@ export class NpmHandler implements ProtocolHandler {
         log.debug('npm', () => `peers for ${parentName}@${parentVer}: ${peerNames}`);
         const flows: Flow<void>[] = [];
         for (const peerName in peers) {
-            const range = peers[peerName]!;
+            const target = npmDepTarget(peerName, peers[peerName]!);
             const optional = meta?.[peerName]?.optional === true;
             flows.push(this.installPeerDependency(
-                dir, parentName, parentVer, peerName, range, optional, onProgress, cyclePath,
+                dir, parentName, parentVer, target.name, target.range, optional, onProgress, cyclePath,
+                target.linkName,
             ));
         }
         yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
@@ -1970,27 +2008,28 @@ export class NpmHandler implements ProtocolHandler {
         optional: boolean,
         onProgress?: ProgressCallback,
         cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
+        linkName: string = name,
     ): Flow<void> {
         if (!isValidNpmPackageName(name)) return;
         // Optional peers: only link if already in the store — never fetch new trees.
         if (optional) {
             // Store-scoped only: findLocal() would search cwd() and link a
             // project's node_modules into the shared store. Range must match.
-            const linked = this.readLinkedDepDir(parentDir, name);
+            const linked = this.readLinkedDepDir(parentDir, linkName);
             const pkg = linked ? readPkg(linked) : null;
             const local = (linked && localPackageMatchesRange(pkg?.version, range) ? linked : null)
                 ?? this.findCachedPackageMatching(name, range);
-            if (local) this.linkDependency(parentDir, name, local);
+            if (local) this.linkDependency(parentDir, linkName, local);
             return;
         }
         try {
             const dep = yield* this.ensureInstalled(name, range, `npm:${parentName}@${parentVer}`, onProgress, cyclePath);
-            this.linkDependency(parentDir, name, dep.dir);
+            this.linkDependency(parentDir, linkName, dep.dir);
         } catch (e) {
             // Unmet required peers are warnings in npm; do not fail the install tree.
             log.debug('npm', () => `peer skipped: ${name} (${e instanceof Error ? e.message : String(e)})`);
             const local = this.findCachedPackageMatching(name, range);
-            if (local) this.linkDependency(parentDir, name, local);
+            if (local) this.linkDependency(parentDir, linkName, local);
         }
     }
 
@@ -2132,9 +2171,10 @@ export class NpmHandler implements ProtocolHandler {
         const abiName = currentAbi();
         const flows: Flow<void>[] = [];
         for (const depName in opts) {
-            const depRange = opts[depName]!;
+            const target = npmDepTarget(depName, opts[depName]!);
             flows.push(this.installOptionalDependency(
-                dir, depName, depRange, osName, cpuName, abiName, onProgress, cyclePath,
+                dir, target.name, target.range, osName, cpuName, abiName, onProgress, cyclePath,
+                target.linkName,
             ));
         }
         yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
@@ -2149,6 +2189,7 @@ export class NpmHandler implements ProtocolHandler {
         abiName: string,
         onProgress?: ProgressCallback,
         cyclePath: ReadonlySet<string> = EMPTY_CYCLE,
+        linkName: string = name,
     ): Flow<void> {
         if (!isValidNpmPackageName(name)) return;
         try {
@@ -2173,7 +2214,7 @@ export class NpmHandler implements ProtocolHandler {
             } else {
                 yield* this.prepareInstalledPackage(name, ver, depDir, onProgress, cyclePath);
             }
-            this.linkDependency(parentDir, name, depDir);
+            this.linkDependency(parentDir, linkName, depDir);
         } catch (e) {
             log.debug('npm', () => `optional dep skipped: ${name} (${e instanceof Error ? e.message : String(e)})`);
         }

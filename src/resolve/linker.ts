@@ -3,7 +3,7 @@ import type { NodeModulesMode, PackageJson } from '../types';
 import {
     joinPaths, dirname, ensureDir, errMsg, npmNameVersion, isWindows,
     hardlinkOrCopyDirRecursive, readText, safeParse, matchLatestVersion, isValidNpmPackageName,
-    yieldEventLoop,
+    yieldEventLoop, toPosixPath,
 } from '../utils';
 import { getBinMap, resolvePackageBinPath } from './pkg';
 
@@ -619,9 +619,10 @@ export function resolveStorePackage(
         }
     }
 
-    // Alias symlink/dir: <store>/<name>
+    // Alias symlink/dir: <store>/<name> — only when it satisfies the range.
+    // The alias points at the last-written version, which may be unrelated.
     const alias = joinPaths(storeRoot, name);
-    if (pkgJsonExists(alias)) {
+    if (pkgJsonExists(alias) && packageSatisfiesRange(alias, norm || '*')) {
         try {
             return fs.realpath(alias);
         } catch {
@@ -644,10 +645,13 @@ function readExistingDepTarget(parentDir: string, depName: string): string | nul
     if (!st) return null;
     try {
         if (st.isSymbolicLink) {
-            const linked = fs.readlink(target);
+            // readlink/realpath return NATIVE separators; every consumer of this
+            // value (packageIdFromDir's storeRoot prefix match, linkSource) is
+            // posix, so normalize here or the store-identity branch is skipped.
+            const linked = toPosixPath(fs.readlink(target));
             // Prefer realpath so alias/relative links normalize to store path.
             try {
-                const real = fs.realpath(target);
+                const real = toPosixPath(fs.realpath(target));
                 if (pkgJsonExists(real)) return real;
             } catch {}
             if (pkgJsonExists(linked)) return linked;
@@ -655,7 +659,7 @@ function readExistingDepTarget(parentDir: string, depName: string): string | nul
         }
         if (st.isDirectory && pkgJsonExists(target)) {
             try {
-                return fs.realpath(target);
+                return toPosixPath(fs.realpath(target));
             } catch {
                 return target;
             }
@@ -901,8 +905,9 @@ async function placeSoftLink(linkSource: string, targetDir: string): Promise<voi
     } catch {}
     if (existing) {
         if (existing.isSymbolicLink) {
+            // readlink returns native separators; linkSource is posix.
             try {
-                if (fs.readlink(targetDir) === linkSource) return;
+                if (toPosixPath(fs.readlink(targetDir)) === toPosixPath(linkSource)) return;
             } catch {}
             try {
                 if (fs.realpath(targetDir) === fs.realpath(linkSource)) return;

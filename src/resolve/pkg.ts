@@ -59,19 +59,46 @@ export function normalizeBinField(pkgName: string, bin: string | Record<string, 
     return { [cmd || pkgName]: bin };
 }
 
+/**
+ * Bin map for sites that turn the bin KEY into a filesystem path — the
+ * node_modules/.bin symlink writer and the lock bin index. The key filter is
+ * load-bearing there: joinPaths(binDir, '..\\..\\evil') normalises to
+ * binDir/../../evil and escapes, and that call site has no pathWithin() check.
+ * Use getLookupBinMap() for read-only key lookups instead of loosening this.
+ */
 export function getBinMap(pkg: PackageJson): Record<string, string> {
+    return buildBinMap(pkg, isSafeBinName);
+}
+
+/**
+ * Bin map for read-only lookups (`npm:pkg@ver/<bin>` resolution and `explain`).
+ * A bin key is a name to match against the manifest, not a path: npm allows
+ * keys such as `\foo"` (the @denotest/special-chars-in-bin-name fixture), which
+ * are legal filenames on POSIX and carry no traversal meaning for a lookup.
+ * Containment is still enforced on the bin TARGET by resolvePackageBinPath(),
+ * so a hostile key can only ever select a value that stays inside the package.
+ * '/' stays rejected because in a specifier it means a subpath, not a bin.
+ */
+export function getLookupBinMap(pkg: PackageJson): Record<string, string> {
+    return buildBinMap(pkg, isLookupBinName);
+}
+
+function buildBinMap(pkg: PackageJson, nameOk: (name: string) => boolean): Record<string, string> {
     const raw = pkg.bin ? normalizeBinField(pkg.name || '', pkg.bin) : {};
     const out: Record<string, string> = Object.create(null);
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
     for (const [name, target] of Object.entries(raw)) {
-        if (isSafeBinName(name) && typeof target === 'string' && isSafeBinTarget(target)) out[name] = target;
+        if (nameOk(name) && typeof target === 'string' && isSafeBinTarget(target)) out[name] = target;
     }
     return out;
 }
 
 function isSafeBinName(name: string): boolean {
-    return !!name && name !== '.' && name !== '..' && !name.includes('/') &&
-        !name.includes('\\') && !name.includes('\0') && !name.includes(':');
+    return isLookupBinName(name) && !name.includes('\\') && !name.includes(':');
+}
+
+function isLookupBinName(name: string): boolean {
+    return !!name && name !== '.' && name !== '..' && !name.includes('/') && !name.includes('\0');
 }
 
 function normalizeBinTarget(target: string): string | null {
@@ -383,9 +410,29 @@ function tryPackageIndex(dir: string): string | null {
     return null;
 }
 
-function resolvePackageSubpath(base: string): string {
-    const exact = tryPackageFile(base);
-    if (exact) return exact;
+function isRegularFile(path: string): boolean {
+    try {
+        return fs.stat(path).isFile;
+    } catch {
+        return false;
+    }
+}
+
+function resolvePackageSubpath(base: string, ctx?: ResolveCtx): string {
+    // Node CJS order: exact file → base+ext → directory package.json "main" →
+    // directory index. `foo.js` must win over `foo/index.js`, so the directory
+    // probe runs after extension probing; `foo/package.json` main wins over
+    // `foo/index.js` (LOAD_PACKAGE_MAIN precedes LOAD_INDEX).
+    if (isRegularFile(base)) return base;
+    for (const ext of PACKAGE_SUBPATH_EXTS) {
+        if (isRegularFile(base + ext)) return base + ext;
+    }
+    if (ctx) {
+        const nested = resolveNestedPackageDir(ctx, base);
+        if (nested) return nested.path;
+    }
+    const dirIndex = tryPackageFile(base);
+    if (dirIndex) return dirIndex;
     for (const ext of PACKAGE_SUBPATH_EXTS) {
         const path = tryPackageFile(base + ext);
         if (path) return path;
@@ -595,7 +642,7 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
         return null;
     }
     try {
-        const path = resolvePackageSubpath(base);
+        const path = resolvePackageSubpath(base, ctx);
         if (!extname(path)) {
             return { path, format: preferredFormatForPath(ctx, path), fileKind: 'source' };
         }
@@ -609,7 +656,7 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
     const mainDir = dirname(main.path);
     if (mainDir === ctx.pkgDir) return null;
     try {
-        const path = resolvePackageSubpath(joinPaths(mainDir, norm.slice(2)));
+        const path = resolvePackageSubpath(joinPaths(mainDir, norm.slice(2)), ctx);
         if (!extname(path)) {
             return { path, format: preferredFormatForPath(ctx, path), fileKind: 'source' };
         }

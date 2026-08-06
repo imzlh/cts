@@ -376,6 +376,11 @@ function toWasmValue(v: unknown): CModuleWASM.WasmValue {
 
 type LoadFn = (info: ModuleInfo, meta: Record<string, unknown>) => CModuleEngine.Module;
 type ResolveFn = (spec: string, parent: string) => ModuleInfo;
+/** Evaluate a module loaded by LoadFn. Supplied by the caller so the evaluation
+ *  can be bracketed (ModuleCompiler.evalTracked) — a bare `mod.eval()` here lets
+ *  a JS dependency of a WASM module be require()d back mid-evaluation, which
+ *  .eval()s a JS_MODULE_STATUS_EVALUATING module and aborts the process. */
+type EvalFn = (mod: CModuleEngine.Module) => unknown;
 
 interface PendingWasmModule {
     module: CModuleEngine.Module;
@@ -391,6 +396,7 @@ export class WasmCompiler {
         info: ModuleInfo,
         resolve: ResolveFn,
         loadModule: LoadFn,
+        evalModule: EvalFn = (mod) => mod.eval(),
     ): CModuleEngine.Module {
         const hit = this.wasmCache.get(info.localPath);
         if (hit) return hit;
@@ -419,7 +425,12 @@ export class WasmCompiler {
                 require: (spec: string, parentPath: string) => {
                     const resolved = resolve(spec, parentPath);
                     const loaded = loadModule(resolved, {});
-                    const evalResult = engine.promiseResult(loaded.eval());
+                    // evalModule, not loaded.eval(): brackets the dependency's
+                    // evaluation so a require() back into it throws
+                    // ERR_REQUIRE_CYCLE_MODULE instead of aborting. See EvalFn.
+                    const evalResult = engine.promiseResult(
+                        evalModule(loaded) as ReturnType<CModuleEngine.Module['eval']>,
+                    );
                     if (evalResult === null) {
                         throw new Error(
                             `Cannot load async ESM module '${resolved.specPath}' as a WASM dependency`

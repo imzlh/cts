@@ -61,22 +61,6 @@ function markMissing(p: string): void { negCache.set(p, true); }
 /** Clear negative cache to allow re-checking paths */
 export function clearNegativeCache(): void { negCache.clear(); }
 
-function tryFile(p: string): string | null {
-    if (negCache.has(p)) return null;
-    try {
-        const st = fs.stat(p);
-        if (st.isFile) return p;
-        if (st.isDirectory) {
-            // For directory index lookup, always use full EXTS (not caller's exts)
-            const idx = tryIndex(joinPaths(p, 'index'), EXTS);
-            if (idx) return idx;
-        }
-    } catch {
-        markMissing(p);
-    }
-    return null;
-}
-
 function tryIndex(base: string, exts: string[]): string | null {
     for (const e of exts) {
         const p = base + e;
@@ -88,18 +72,40 @@ function tryIndex(base: string, exts: string[]): string | null {
     return null;
 }
 
-function _resolve(base: string, exts: string[]): string {
-    // Exact path / directory
-    const exact = tryFile(base);
-    if (exact) return exact;
-    // With extension
-    for (const e of exts) {
-        const r = tryFile(base + e);
-        if (r) return r;
+/** Single stat, classified. Directories are never added to negCache. */
+function statKind(p: string): 'file' | 'dir' | 'missing' {
+    if (negCache.has(p)) return 'missing';
+    try {
+        const st = fs.stat(p);
+        if (st.isFile) return 'file';
+        if (st.isDirectory) return 'dir';
+        return 'missing';
+    } catch {
+        markMissing(p);
+        return 'missing';
     }
-    // index.<ext> — always use full extension list for index files
-    const idx = tryIndex(joinPaths(base, 'index'), EXTS);
-    if (idx) return idx;
+}
+
+function _resolve(base: string, exts: string[]): string {
+    // Node LOAD_AS_FILE runs to completion before LOAD_AS_DIRECTORY, so a real
+    // file must beat a same-named directory's index: with both `x.js` and
+    // `x/index.js` on disk, `require('./x')` is `x.js`. Probing the directory
+    // first (the previous behaviour) silently returned the wrong module.
+    const dirCandidates: string[] = [];
+    const baseKind = statKind(base);
+    if (baseKind === 'file') return base;
+    if (baseKind === 'dir') dirCandidates.push(base);
+    for (const e of exts) {
+        const p = base + e;
+        const kind = statKind(p);
+        if (kind === 'file') return p;
+        if (kind === 'dir') dirCandidates.push(p);
+    }
+    // Node LOAD_AS_DIRECTORY: index.<ext> (always the full extension list).
+    for (const dir of dirCandidates) {
+        const idx = tryIndex(joinPaths(dir, 'index'), EXTS);
+        if (idx) return idx;
+    }
     markMissing(base);
     throw err(ErrorKind.FileNotFound, `Cannot resolve: ${base}`);
 }

@@ -34,6 +34,48 @@ export function isValidNpmPackageName(name: string): boolean {
     return true;
 }
 
+/** A dependency edge after npm alias syntax has been resolved. */
+export interface NpmDepTarget {
+    /** Name the parent imports/links the dep under — the package.json key. */
+    linkName: string;
+    /** Registry package name to fetch (differs from linkName only for aliases). */
+    name: string;
+    /** Version range to resolve against the registry. */
+    range: string;
+    /** True when the declared value used `npm:` alias syntax. */
+    aliased: boolean;
+}
+
+/**
+ * npm alias syntax: `"<localName>": "npm:<realName>[@<range>]"`. The KEY is a
+ * local rename, the VALUE names the real package and its range — so querying the
+ * registry for the key asks for a package that either does not exist or (worse)
+ * exists at unrelated versions.
+ *
+ * Returns null for every non-alias value so callers keep `(key, value)` verbatim.
+ * The leading `@` of a scoped target is not the version delimiter.
+ */
+export function parseNpmAliasDep(value: string): { name: string; range: string } | null {
+    if (!value.startsWith('npm:')) return null;
+    let rest = value.slice(4);
+    while (rest.startsWith('/')) rest = rest.slice(1);
+    if (!rest) return null;
+    // Scoped targets keep their leading '@'; search past it for the version '@'.
+    const at = rest.startsWith('@') ? rest.indexOf('@', 1) : rest.indexOf('@');
+    const name = at === -1 ? rest : rest.slice(0, at);
+    const range = at === -1 ? '' : rest.slice(at + 1);
+    // A malformed target must not change behaviour — let the caller fail as before.
+    if (!isValidNpmPackageName(name)) return null;
+    return { name, range: range || '*' };
+}
+
+/** Resolve one `dependencies` entry, honouring `npm:` alias syntax. */
+export function npmDepTarget(key: string, value: string): NpmDepTarget {
+    const alias = parseNpmAliasDep(value);
+    if (!alias) return { linkName: key, name: key, range: value, aliased: false };
+    return { linkName: key, name: alias.name, range: alias.range, aliased: true };
+}
+
 /** Build a stable cache filename from a URL; ext from path, hash includes query. */
 export function cacheFilename(url: string): string {
     try {

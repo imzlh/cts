@@ -50,9 +50,31 @@ function sourcePathLength(path: string): number {
     return hash === -1 ? query : Math.min(query, hash);
 }
 
+/** True once a loader has blamed a concrete file (cjs.ts sets .kind, .cause.path). */
+function isAttributedSyntaxError(e: SyntaxError): boolean {
+    if (e.kind !== undefined) return true;
+    const cause = Reflect.get(e, 'cause');
+    return !!cause && typeof cause === 'object' && typeof Reflect.get(cause, 'path') === 'string';
+}
+
 export class EsmCompiler {
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
     private readonly esmLoading  = new Set<string>();
+    // Modules whose *evaluation* is on the stack right now. Distinct from
+    // esmLoading, which only covers compile/link and is cleared at esm.ts's
+    // `esmLoading.delete` before evaluation ever starts. Without this window a
+    // CJS module reached during an ESM module's evaluation can require() that
+    // same ESM module back, and loadEsmSync would call .eval() on a module in
+    // JS_MODULE_STATUS_EVALUATING — which is not in js_link_module's status
+    // allow-list and aborts the process instead of throwing.
+    //
+    // Both in-flight sets are keyed by **localPath**, not by the moduleRef used
+    // for esmCache/esmLoading. require() reaches this class via
+    // infoFromLocalPath, where specPath === localPath, while the ESM graph may
+    // key the very same file under an npm:/file: spec or a moduleId. Keying the
+    // cycle check on moduleRef would silently miss those cycles.
+    private readonly esmInFlightPaths = new Set<string>();
+    private readonly esmEvaluating = new Set<string>();
     readonly transformer: Transformer;
     readonly jsc: JscCache;
 
@@ -117,6 +139,10 @@ export class EsmCompiler {
 
     private wrapSyntaxError(e: unknown, code: string | Uint8Array, localPath: string): unknown {
         if (!(e instanceof SyntaxError)) return e;
+        // A nested load hook (e.g. a CJS dependency instantiated by
+        // `new engine.Module`) throws through here already attributed to its own
+        // file. Re-wrapping would blame the importer and print its source.
+        if (isAttributedSyntaxError(e)) return e;
         const ne = err(ErrorKind.SyntaxError, `Syntax error in ${localPath}: ${e.message}`, e);
         // cause.code feeds the fail-<hash>.log code frame — decode bytes
         // here (error path only) so reportSyntax() always sees a string.
@@ -152,12 +178,24 @@ export class EsmCompiler {
         const tryBytecode = allowCache && (remote || needsTransform || needsCompile);
 
         if (tryBytecode) {
-            const cached = this.jsc.load(
-                info.localPath,
-                remote && fileBacked,
-                fileBacked ? resolveMtime?.(info.localPath) : undefined,
-                moduleId,
-            );
+            // In-flight for the bytecode read too: jsc.load() links the module,
+            // which runs a CJS dependency's body, and that body can require()
+            // back into this very module. Without the window isInFlight() is
+            // false there, so bridge.ts's require-esm guard misses and the cycle
+            // surfaces later as the opposite direction ("Cannot import CommonJS
+            // Module b.cjs" instead of "Cannot require() ES Module a.mjs").
+            this.esmInFlightPaths.add(info.localPath);
+            let cached: CModuleEngine.Module | null;
+            try {
+                cached = this.jsc.load(
+                    info.localPath,
+                    remote && fileBacked,
+                    fileBacked ? resolveMtime?.(info.localPath) : undefined,
+                    moduleId,
+                );
+            } finally {
+                this.esmInFlightPaths.delete(info.localPath);
+            }
             if (cached) {
                 Object.assign(cached.meta, meta);
                 this.esmCache.set(cacheKey, cached);
@@ -167,6 +205,12 @@ export class EsmCompiler {
 
         // VFS (pack) or fs → transform → compile
         this.esmLoading.add(cacheKey);
+        this.esmInFlightPaths.add(info.localPath);
+        // The sidecar must describe the bytes about to be compiled, not whatever
+        // revision happens to be on disk after compilation finishes.
+        const sourceFreshness = fileBacked && tryBytecode
+            ? this.jsc.captureFreshness(info.localPath)
+            : undefined;
         const bytes = readBytes(info.localPath);
         const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleId);
         let mod: CModuleEngine.Module;
@@ -174,10 +218,12 @@ export class EsmCompiler {
             mod = this.compileEsm(code, moduleId, info.localPath);
         } catch (e) {
             this.esmLoading.delete(cacheKey);
+            this.esmInFlightPaths.delete(info.localPath);
             this.esmCache.delete(cacheKey);
             throw e;
         }
         this.esmLoading.delete(cacheKey);
+        this.esmInFlightPaths.delete(info.localPath);
 
         // Populate placeholder if one was created during circular resolution
         const cached = this.esmCache.get(cacheKey);
@@ -190,9 +236,9 @@ export class EsmCompiler {
             return cached;
         }
 
-        if (tryBytecode && fileBacked) {
-            if (remote) this.jsc.persist(info.localPath, mod, moduleId);
-            else        this.jsc.persistLocal(info.localPath, mod, moduleId);
+        if (tryBytecode && fileBacked && sourceFreshness) {
+            if (remote) this.jsc.persist(info.localPath, mod, moduleId, sourceFreshness);
+            else        this.jsc.persistLocal(info.localPath, mod, moduleId, sourceFreshness);
         }
 
         Object.assign(mod.meta, meta);
@@ -243,6 +289,21 @@ export class EsmCompiler {
 
     clearLoadedModules(): void {
         this.esmCache.clear();
+    }
+
+    /** True while `localPath` is mid-compile or mid-evaluate — i.e. a require()
+     *  of it right now would close a cycle. Callers must throw rather than hand
+     *  back a placeholder namespace. Keyed by localPath: see esmInFlightPaths. */
+    isInFlight(localPath: string): boolean {
+        return this.esmInFlightPaths.has(localPath) || this.esmEvaluating.has(localPath);
+    }
+
+    /** Run `fn` with `localPath` marked as evaluating, so a CJS module reached
+     *  during evaluation cannot require() back into it. */
+    trackEvaluation<T>(localPath: string, fn: () => T): T {
+        this.esmEvaluating.add(localPath);
+        try { return fn(); }
+        finally { this.esmEvaluating.delete(localPath); }
     }
 
     hasPendingLoads(): boolean {

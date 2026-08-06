@@ -1,4 +1,4 @@
-import { uname } from './platform';
+import { isWindows, uname } from './platform';
 
 // Convention: all public functions normalise backslashes to '/' internally.
 
@@ -28,6 +28,57 @@ export function hasLeadingSlashDrive(p: string): boolean {
 /** Convert a Windows-style path to POSIX separators.  No-op on POSIX paths. */
 export function toPosixPath(p: string): string {
     return normalizeSlashes(p);
+}
+
+/**
+ * True for a scheme-qualified id ("pack:/0.js", "npm:foo", "https://x").
+ * Requires >= 2 scheme chars so a Windows drive ("C:") is never mistaken for a
+ * scheme -- the single-letter trap that made entryUrl() return a raw path.
+ */
+export function hasSchemeId(s: string): boolean {
+    const ci = s.indexOf(':');
+    if (ci < 2 || ci > 8) return false;
+    for (let i = 0; i < ci; i++) {
+        const c = s.charCodeAt(i);
+        // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+        const alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if (i === 0 ? !alpha : !(alpha || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) return false;
+    }
+    return true;
+}
+
+/**
+ * Denormalize a POSIX-internal path into a NATIVE host path on the way OUT to
+ * user code. This is the boundary half of the invariant in cts/AGENT.md:230 and
+ * AGENT.md:402 ("host paths on the boundary but POSIX internally"): everything
+ * inside cts compares and keys on POSIX, so every user-visible path value
+ * (__filename, __dirname, module.id/filename/path/paths, require.resolve(),
+ * import.meta.filename/dirname) must pass through here or Windows callers see
+ * "C:/x" where Node and Deno both return "C:\x".
+ *
+ * Measured on Windows 11, node v24.18.0 / deno 2.9.3:
+ *   node  -e process.stdout.write(__filename)   -> D:\tmp\agsep\cjs.cjs
+ *   deno: import.meta.filename                  -> D:\tmp\agsep\dn.ts
+ *
+ * Scheme-qualified ids are returned UNTOUCHED. "pack:/c.cjs" is a container id,
+ * not a filesystem path: its '/' is part of the id on every platform, so
+ * converting it yields "pack:\c.cjs", which no resolver accepts and which would
+ * differ between Windows and POSIX for the same .jspack artifact.
+ * No-op on POSIX.
+ */
+export function toHostPath(p: string): string {
+    if (!isWindows || hasSchemeId(p)) return p;
+    return p.indexOf('/') === -1 ? p : p.replace(/\//g, '\\');
+}
+
+/** toHostPath over an array; `undefined` holes become ''. */
+export function toHostPaths(paths: string[]): string[] {
+    const out = new Array<string>(paths.length);
+    for (let i = 0; i < paths.length; i++) {
+        const p = paths[i];
+        out[i] = p === undefined ? '' : toHostPath(p);
+    }
+    return out;
 }
 
 /** Posix-ish path + upper drive letter so Windows case doesn't split cache keys. */
@@ -116,13 +167,22 @@ export function joinPaths(...parts: string[]): string {
 export function normalizePath(p: string): string {
     // Normalize backslashes first so all subsequent checks work with '/'
     p = normalizeSlashes(p);
-    if (!p.includes('/.') && !p.includes('./')) return p;
+    if (!p) return '';
+    // Protocol specifiers are not filesystem paths: repeated slashes can be
+    // significant, and opaque forms such as node:fs must stay untouched.
+    const protocol = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(p);
+    const windowsDrive = /^[A-Za-z]:/.test(p);
+    if (protocol && !windowsDrive) return p;
     // Detect drive-letter prefix (e.g. "C:/") as the absolute root
     let prefix = '';
     let start = 0;
     if (p.length >= 3 && p[1] === ':' && p[2] === '/' && isAsciiAlpha(p.charCodeAt(0))) {
         prefix = p.slice(0, 3);
         start = 3;
+    } else if (isWindows && p.startsWith('//') && p.charCodeAt(2) !== 47 /* / */) {
+        // UNC root (\\server\share): the double slash is part of the path root.
+        prefix = '//';
+        start = 2;
     } else if (p.startsWith('/')) {
         prefix = '/';
         start = 1;

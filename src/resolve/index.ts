@@ -14,7 +14,7 @@ import { isBuiltinSpecifier } from './builtins';
 import { runAsync, runSync } from '../flow';
 import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, hasLeadingSlashDrive, parentDirKey, assert, LRU, log } from '../utils';
 import { detectFormat } from './pkg';
-import { guessFileKind, applyAttrType } from './protocols/base';
+import { guessFileKind, applyAttrType, validateAttrType } from './protocols/base';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -32,6 +32,31 @@ function protoOf(s: string): string {
         if (c < 97 || c > 122) return '';      // not a-z
     }
     return proto;
+}
+
+/**
+ * Node resolves ESM specifiers as URLs, so `./with%20space.mjs` refers to the
+ * file `with space.mjs`. Try the literal path first (a file may legitimately
+ * contain '%'), then the percent-decoded form.
+ */
+function resolveLocalFile(path: string): string {
+    try {
+        return resolveFile(path);
+    } catch (e) {
+        if (path.indexOf('%') === -1) throw e;
+        let decoded: string;
+        try {
+            decoded = normalizePath(decodeURIComponent(path));
+        } catch {
+            throw e;
+        }
+        if (decoded === path) throw e;
+        try {
+            return resolveFile(decoded);
+        } catch {
+            throw e;
+        }
+    }
 }
 
 /** Skip empty-prefix aliases when spec is already a real absolute/drive path. */
@@ -149,7 +174,7 @@ function matchImportMap(spec: string, idx: ImportMapMappingsIndex): string | und
 interface PathAliasEntry {
     prefix:   string;
     wildcard: boolean;
-    target:   string;
+    targets:  string[];
 }
 
 function isExternalAliasTarget(target: string): boolean {
@@ -164,12 +189,15 @@ function normalizeAliasTarget(target: string, baseUrl?: string): string {
 function buildAliasIndex(aliases: Record<string, string[]>, baseUrl?: string): PathAliasEntry[] {
     const entries: PathAliasEntry[] = [];
     for (const alias in aliases) {
-        const targets = aliases[alias];
-        const target = targets?.[0];
-        if (!target) continue;
+        // tsconfig `paths` values are an ordered fallback list — keep all of them.
+        const normalized: string[] = [];
+        for (const target of aliases[alias] ?? []) {
+            if (!target) continue;
+            normalized.push(normalizeAliasTarget(target.endsWith('/*') ? target.slice(0, -2) : target, baseUrl));
+        }
+        if (!normalized.length) continue;
         const wildcard = alias.endsWith('/*');
-        const normalizedTarget = normalizeAliasTarget(target.endsWith('/*') ? target.slice(0,-2) : target, baseUrl);
-        entries.push({ prefix: wildcard ? alias.slice(0,-2) : alias, wildcard, target: normalizedTarget });
+        entries.push({ prefix: wildcard ? alias.slice(0,-2) : alias, wildcard, targets: normalized });
     }
     return entries;
 }
@@ -343,34 +371,54 @@ export class ModuleResolver {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
             const h = this.handlers.get(proto);
             if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
-            return runAsync(h.resolve(spec, parent, attr, onProgress));
+            // `return await`, not a bare `return`, at every promise-returning
+            // tail call in this file's async resolve path.
+            //
+            // A bare `return p` resolves this function's promise WITH p, and the
+            // adoption that attaches a handler to p runs in a later
+            // PromiseResolveThenableJob. When p is *already rejected* at the
+            // moment of return — which is exactly what an async function or a
+            // runAsync(flow) that throws before its first await produces, e.g.
+            // parseNpmSpec rejecting "npm:@foo" in the flow's first .next() —
+            // the host rejection tracker's dispatch job runs BEFORE that
+            // adoption and sees a rejected promise with no handler. It then
+            // reports a spurious "unhandled promise rejection" and, since that
+            // path calls requestFailureExitCode(), turns a caught, recoverable
+            // resolve failure into rc=1. OBSERVED: `await import("npm:@foo")`
+            // inside try/catch printed the diagnostic and exited 1 under
+            // --precache/--reload while node exits 0.
+            //
+            // `await` attaches the handler in the same job, so the promise is
+            // already handled when the tracker's job re-checks. Reduced proof,
+            // no modules involved: `async function outer() { return inner(); }`
+            // reports; `return await inner()` does not.
+            //
+            // Safe here: none of these three methods has a try/catch/finally, so
+            // awaiting cannot reroute a rejection into a local handler. It costs
+            // one microtask and improves the async stack trace.
+            return await runAsync(h.resolve(spec, parent, attr, onProgress));
         }
-        if (isRelative(spec)) return this.resolveRelativeAsync(spec, parent, attr, onProgress);
+        if (isRelative(spec)) return await this.resolveRelativeAsync(spec, parent, attr, onProgress);
         if (isAbsolute(spec)) return this.resolveAbsolute(spec, attr, splitAbsoluteSuffix);
-        return this.resolveBareAsync(spec, parent, attr, onProgress);
+        return await this.resolveBareAsync(spec, parent, attr, onProgress);
     }
 
     private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
-        if (spec.startsWith('@std/')) return this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
-        if (isBuiltinSpecifier(spec)) return this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
+        if (spec.startsWith('@std/')) return await this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
+        if (isBuiltinSpecifier(spec)) return await this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
         // pack: bare imports are offline edges only (no project dir at run).
         if (protoOf(parent) === 'pack') {
             const handler = this.handlers.get('pack');
-            if (handler) return runAsync(handler.resolve(spec, parent, attr, onProgress));
+            if (handler) return await runAsync(handler.resolve(spec, parent, attr, onProgress));
         }
-        const aliased = this.applyPathAlias(spec);
-        if (aliased !== spec) {
-            try {
-                const localPath = resolveFile(aliased);
-                const specPath  = localPath;
-                return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
-            } catch (e) {
-                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`, e);
-            }
+        const alias = this.resolveAliasCandidates(spec);
+        if (alias) {
+            const { localPath } = alias;
+            return { specPath: localPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
         }
         const npm = this.handlers.get('npm');
         if (npm) {
-            return runAsync(npm.resolve(spec, parent, attr, onProgress));
+            return await runAsync(npm.resolve(spec, parent, attr, onProgress));
         }
         throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
@@ -608,7 +656,7 @@ export class ModuleResolver {
         base = dirname(base);
         const specParts = splitLocalSpecifier(spec);
         const joined = joinPaths(base, specParts.path);
-        const localPath = resolveFile(normalizePath(joined));
+        const localPath = resolveLocalFile(normalizePath(joined));
         const specPath = localPath + specParts.suffix;
         const localNpm = this.canonicalizeLocalNpmFile(localPath, attr);
         if (localNpm && !specParts.suffix) return localNpm;
@@ -619,7 +667,10 @@ export class ModuleResolver {
         const pp = protoOf(parent);
         if (pp && pp !== 'file') {
             const h = this.handlers.get(pp);
-            if (h) return runAsync(h.resolve(spec, parent, attr, onProgress));
+            // `return await`: see dispatchAsync. A flow that throws before its
+            // first yield hands back an already-rejected promise, and a bare
+            // return would let the tracker report it before adoption.
+            if (h) return await runAsync(h.resolve(spec, parent, attr, onProgress));
         }
         return this.resolveRelative(spec, parent, attr);
     }
@@ -630,8 +681,8 @@ export class ModuleResolver {
         splitAbsoluteSuffix = false,
     ): ModuleInfo {
         const specParts = splitLocalSpecifier(spec, splitAbsoluteSuffix);
-        const aliased   = this.applyPathAlias(specParts.path);
-        const localPath = resolveFile(aliased !== specParts.path ? aliased : specParts.path);
+        const alias     = this.resolveAliasCandidates(specParts.path);
+        const localPath = alias ? alias.localPath : resolveLocalFile(specParts.path);
         const specPath  = localPath + specParts.suffix;
         const localNpm = this.canonicalizeLocalNpmFile(localPath, attr);
         if (localNpm && !specParts.suffix) return localNpm;
@@ -645,15 +696,10 @@ export class ModuleResolver {
             const handler = this.handlers.get('pack');
             if (handler) return runSync(handler.resolve(spec, parent, attr));
         }
-        const aliased = this.applyPathAlias(spec);
-        if (aliased !== spec) {
-            try {
-                const localPath = resolveFile(aliased);
-                const specPath  = localPath;
-                return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
-            } catch (e) {
-                throw err(ErrorKind.ModuleNotFound, `Path alias "${spec}" → "${aliased}" does not resolve to an existing file: ${e instanceof Error ? e.message : e}`, e);
-            }
+        const alias = this.resolveAliasCandidates(spec);
+        if (alias) {
+            const { localPath } = alias;
+            return { specPath: localPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
         }
         const npm = this.handlers.get('npm');
         if (npm) return runSync(npm.resolve(spec, parent, attr));
@@ -674,20 +720,39 @@ export class ModuleResolver {
         return matchImportMap(spec, idx.imports) ?? spec;
     }
 
-    private applyPathAlias(spec: string): string {
+    /** Alias candidates in tsconfig order; [spec] when no alias matches. */
+    private aliasCandidates(spec: string): string[] {
         for (const e of this.aliasIndex) {
             if (e.wildcard) {
                 if (spec === e.prefix || spec.startsWith(e.prefix + '/')) {
                     // Empty prefix ("/*" → "./public/*") also matches real OS
                     // paths. Keep on-disk absolutes; remap short /asset imports.
-                    if (e.prefix === '' && isRealAbsolutePath(spec)) return spec;
-                    return e.target + spec.slice(e.prefix.length);
+                    if (e.prefix === '' && isRealAbsolutePath(spec)) return [spec];
+                    const rest = spec.slice(e.prefix.length);
+                    return e.targets.map(t => t + rest);
                 }
             } else if (spec === e.prefix) {
-                return e.target;
+                return [...e.targets];
             }
         }
-        return spec;
+        return [spec];
+    }
+
+    /** First alias candidate that exists on disk, or null when none match. */
+    private resolveAliasCandidates(spec: string): { aliased: string; localPath: string } | null {
+        const candidates = this.aliasCandidates(spec);
+        if (candidates.length === 1 && candidates[0] === spec) return null;
+        let lastError: unknown;
+        for (const aliased of candidates) {
+            try {
+                return { aliased, localPath: resolveFile(aliased) };
+            } catch (e) {
+                lastError = e;
+            }
+        }
+        throw err(ErrorKind.ModuleNotFound,
+            `Path alias "${spec}" → ${candidates.map(c => `"${c}"`).join(', ')} does not resolve to an existing file: ${lastError instanceof Error ? lastError.message : lastError}`,
+            lastError);
     }
 
     private tryResolveLocalNpm(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo | null {
@@ -728,8 +793,16 @@ export class ModuleResolver {
         this.rememberRuntimeInfo(resolved);
 
         const cacheLockEntry = protoOf(canonical.specPath) !== 'node';
-        if (!transient) {
+        // specPath → info must be recoverable by getInfo() even for transient
+        // (require) resolves: a local node_modules package gets an `npm:` specPath
+        // whose localPath cannot be recovered from the store layout alone, so
+        // require()-ing an ESM file there would fail with "Package not in cache".
+        // Transient fills only when absent — a real ESM resolve wins (conditions
+        // and format may differ) and overwrites.
+        if (!transient || !this.resolvedModules.has(canonical.specPath)) {
             this.resolvedModules.set(canonical.specPath, canonical);
+        }
+        if (!transient) {
             if (cacheLockEntry && opts?.persistModule) this.lock.setModule(canonical);
             if (cacheLockEntry && opts?.persistSource) this.lock.setSourceByKey(sourceKey, canonical.specPath);
             // mainEntry is set only by loadEntry / loadSourceEntry(main), not first resolve —
@@ -809,6 +882,7 @@ export class ModuleResolver {
     }
 
     private materializeRuntimeInfo(info: ModuleInfo, attr?: Record<string, unknown>): ModuleInfo {
+        validateAttrType(info.fileKind, attr, info.specPath);
         const fileKind = applyAttrType(info.fileKind, attr);
         if (fileKind === info.fileKind) return info;
         // Attribute views share the base file's localPath. JscCache is keyed by

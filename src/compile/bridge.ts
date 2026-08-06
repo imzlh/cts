@@ -1,8 +1,8 @@
-import type { ModuleInfo } from '../types';
+import { type ModuleInfo } from '../types';
 import type { CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
-import { isResolutionMiss } from '../errors';
+import { isResolutionMiss, requireCycleError } from '../errors';
 import { BUILTINS } from '../resolve/builtins';
 import { errMsg, log } from '../utils';
 
@@ -10,7 +10,6 @@ const engine = import.meta.use('engine');
 
 const CTS_INTERNAL = Symbol.for('cts.internal');
 const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
-const IDENT_SAFE = /^[$_\p{ID_Start}][$\u200C\u200D\p{ID_Continue}]*$/u;
 let cjsBridgeId = 0;
 
 /** Package name end in npm body: after scope for @scope/name, else first /. */
@@ -36,7 +35,8 @@ function buildCjsEsmWrapper(specPath: string, exports: Record<string, unknown>):
         code += `const ${local} = __cts[${JSON.stringify(key)}];\n`;
         if (key === 'default') {
             code += `export default ${local};\n`;
-        } else if (IDENT_SAFE.test(key)) {
+        } else {
+            // Arbitrary module export names (ES2022): reserved words, spaces, quotes.
             code += `export { ${local} as ${JSON.stringify(key)} };\n`;
         }
     }
@@ -58,20 +58,32 @@ export function bridgeCjsToEsm(
         ? exports
         : null;
 
-    if (exportRecord && Reflect.get(exportRecord, '__esModule') === true) {
-        // Babel/tsc transpiled: each key is a named export, default comes from exports.default
+    // Node adds a 'module.exports' named export to every CJS wrap; a real key of
+    // that name wins because the loops below run after this assignment.
+    out['module.exports'] = exports;
+
+    if (exportRecord
+        && Reflect.get(exportRecord, '__esModule') === true
+        && Object.prototype.hasOwnProperty.call(exportRecord, 'default')) {
+        // Babel/tsc transpiled with a real `default`: each key is a named export,
+        // default comes from exports.default (bundler-style interop unwrap).
+        // NOTE: real Node never unwraps — its `default` is always the whole
+        // module.exports. The unwrap is a deliberate cts divergence; only the
+        // no-`default` case below is aligned with Node.
         for (const k of Object.keys(exportRecord)) {
             if (k !== '__esModule') out[k] = Reflect.get(exportRecord, k);
         }
-        if (!Object.prototype.hasOwnProperty.call(exportRecord, 'default')) {
-            out.default = undefined;
-        }
+        out.__esModule = true;
     } else {
-        // True CJS: each key is a named export, default is the whole exports object
+        // True CJS (or __esModule with no `default` key): each key is a named
+        // export, default is the whole exports object — matches Node, which
+        // yields the exports object rather than undefined.
         if (exportRecord) {
             for (const k of Object.keys(exportRecord)) {
                 if (k !== 'default') out[k] = Reflect.get(exportRecord, k);
             }
+            // Node exposes __esModule as a named export when present.
+            if (Reflect.get(exportRecord, '__esModule') === true) out.__esModule = true;
         }
         out.default = exports;
     }
@@ -88,15 +100,30 @@ export function loadEsmSync(
     info: ModuleInfo,
     esm: EsmCompiler,
     resolveMtime?: (p: string) => number | undefined,
+    from = '<unknown>',
 ): Record<string, unknown> {
+    // Cycle: this ESM module is already mid-compile or mid-evaluate, so the
+    // require() that got us here closed a loop through it. Node throws
+    // ERR_REQUIRE_CYCLE_MODULE; returning the partial namespace instead would
+    // hand out a half-built module, and calling .eval() on a module in
+    // JS_MODULE_STATUS_EVALUATING aborts the process at the js_link_module
+    // status assertion. Check before esm.load(), which would return the
+    // placeholder and lose the fact that this was a cycle.
+    if (esm.isInFlight(info.localPath)) {
+        throw requireCycleError(info.localPath, from, 'require-esm');
+    }
+
     const mod = esm.load(info, {}, resolveMtime);
-    const result = engine.promiseResult(mod.eval());
+    const result = engine.promiseResult(esm.trackEvaluation(info.localPath, () => mod.eval()));
 
     // null = top-level await unresolved; do NOT weaken with namespace check (causes silent dead-lock)
     if (result === null) {
-        throw new Error(
+        // Node: ERR_REQUIRE_ASYNC_MODULE
+        const e = new Error(
             `Cannot require() async ESM module '${info.specPath}'; use dynamic import() instead`
-        );
+        ) as Error & { code?: string };
+        e.code = 'ERR_REQUIRE_ASYNC_MODULE';
+        throw e;
     }
 
     return mod.namespace;
@@ -115,8 +142,8 @@ export function buildCjsDeps(
             return resolver.resolve(`node:${name}`, parent);
         },
 
-        loadEsmSync(info: ModuleInfo): Record<string, unknown> {
-            return loadEsmSync(info, esm);
+        loadEsmSync(info: ModuleInfo, from?: string): Record<string, unknown> {
+            return loadEsmSync(info, esm, undefined, from);
         },
 
         loadWasmSync,
@@ -140,8 +167,12 @@ export function buildCjsDeps(
             return esm.jsc.loadCompiled(localPath, false, undefined, localPath);
         },
 
-        persistCjsCompiled(localPath: string, bytes: ArrayBuffer): void {
-            esm.jsc.persistBytecode(localPath, bytes, false, localPath);
+        persistCjsCompiled(localPath: string, bytes: ArrayBuffer, source): void {
+            esm.jsc.persistBytecode(localPath, bytes, false, localPath, source);
+        },
+
+        captureSourceFreshness(localPath: string) {
+            return esm.jsc.captureFreshness(localPath);
         },
 
         runtimeParent(localPath: string): string | null {

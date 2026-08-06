@@ -1,11 +1,12 @@
 import type { ModuleInfo } from '../types';
-import { dirname, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, hasLeadingSlashDrive, normalizePath, readText } from '../utils';
-import { err, ErrorKind } from '../errors';
+import { dirname, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, hasLeadingSlashDrive, normalizePath, readText, toHostPath as sharedToHostPath, toHostPaths as sharedToHostPaths } from '../utils';
+import { err, ErrorKind, requireCycleError } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { guessFileKind } from '../resolve/protocols/base';
 import { createCtx, detectFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
 import { URL } from '../utils/url';
 import { buildCjsWrapperSource, cjsContextSlot, type CjsContext } from './cjs-wrap';
+import type { SourceFreshness } from '../source/cache';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -27,8 +28,9 @@ export interface CjsRequireFn {
 export interface CjsDeps {
     /** Resolve a node builtin to its concrete module info. */
     resolveBuiltin(name: string, parent: string): ModuleInfo;
-    /** Sync ESM load for require(); returns namespace via promiseResult. */
-    loadEsmSync(info: ModuleInfo): Record<string, unknown>;
+    /** Sync ESM load for require(); returns namespace via promiseResult.
+     *  `from` is the requiring file, used for cycle error attribution. */
+    loadEsmSync(info: ModuleInfo, from?: string): Record<string, unknown>;
     /** Load a wasm module synchronously for CJS require(.wasm). */
     loadWasmSync?(info: ModuleInfo): Record<string, unknown>;
     /** Resolve any external specifier → concrete module info. */
@@ -38,7 +40,8 @@ export interface CjsDeps {
     /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. */
     loadCjsCompiled?(localPath: string): unknown | null;
     /** Persist freshly compiled CJS bytecode (already engine.serialize()'d). */
-    persistCjsCompiled?(localPath: string, bytes: ArrayBuffer): void;
+    persistCjsCompiled?(localPath: string, bytes: ArrayBuffer, source?: SourceFreshness): void;
+    captureSourceFreshness?(localPath: string): SourceFreshness | undefined;
     /** Synthetic runtime parent for materialized container files, if any. */
     runtimeParent?(localPath: string): string | null;
 }
@@ -52,10 +55,16 @@ interface ResolvedCjsRequest {
 
 const INTERNAL_ID = Symbol('cts.cjs.id');
 const INTERNAL_FILENAME = Symbol('cts.cjs.filename');
+/** Marks a cache entry that only exists to be some child's `module.parent`.
+ *  preRegister() synthesizes one for an ESM importer, and synth() stamps it
+ *  `loaded: true` — so without this flag it is indistinguishable from a fully
+ *  loaded module and its empty `exports` satisfies a require() of that path. */
+const PARENT_STUB = Symbol('cts.cjs.parentStub');
 
 type InternalCjsModule = CjsModule & {
     [INTERNAL_ID]: string;
     [INTERNAL_FILENAME]: string;
+    [PARENT_STUB]?: boolean;
     path?: string;
 };
 
@@ -87,7 +96,11 @@ function splitBarePackageId(id: string): { name: string; subpath: string } | nul
     };
 }
 
-/** True for a scheme-qualified id like "pack:///0.js" — mirrors resolve/index.ts's protoOf(). */
+/**
+ * True for a scheme-qualified id like "pack:///0.js" — mirrors resolve/index.ts's protoOf().
+ * Kept for parity with protoOf()'s lowercase-only rule; the boundary conversion
+ * itself uses hasSchemeId() from utils/path.
+ */
 function hasProtocolScheme(s: string): boolean {
     const ci = s.indexOf(':');
     if (ci < 2 || ci > 8) return false;
@@ -99,30 +112,11 @@ function hasProtocolScheme(s: string): boolean {
 }
 
 function toHostPath(path: string): string {
-    return isWindows ? toWindowsHostPath(path) : path;
-}
-
-function toWindowsHostPath(path: string): string {
-    const first = path.indexOf('/');
-    if (first === -1) return path;
-
-    let out = '';
-    let start = 0;
-    for (let i = first; i < path.length; i++) {
-        if (path.charCodeAt(i) !== 47) continue;
-        out += path.slice(start, i) + '\\';
-        start = i + 1;
-    }
-    return out + path.slice(start);
+    return sharedToHostPath(path);
 }
 
 function toHostPaths(paths: string[]): string[] {
-    const out = new Array<string>(paths.length);
-    for (let i = 0; i < paths.length; i++) {
-        const path = paths[i];
-        out[i] = path === undefined ? '' : toHostPath(path);
-    }
-    return out;
+    return sharedToHostPaths(paths);
 }
 
 function getInternalFilename(mod: CjsModule): string {
@@ -293,28 +287,100 @@ function stringifyFunctionParams(args: unknown[]): string[] {
 export class CjsLoader {
     // filename → module (includes in-progress modules for circular dep detection)
     readonly cache        = new Map<string, CjsModule>();
+    // Modules whose body is on the stack right now. A cache entry alone cannot
+    // say this: preRegister() also stores never-executed stubs, and both have
+    // loaded === false.
+    private readonly executing = new Set<string>();
+    // CJS localPath → the ESM module whose static import last resolved it.
+    // Only used for "(from X)" attribution in an import-cjs cycle error, where
+    // the requirer is an ESM module and so is absent from `executing`.
+    // Bounded by the number of distinct CJS files reached from ESM.
+    private readonly esmImporters = new Map<string, string>();
     private readonly builtinCache = new Map<string, CjsModule>();
     private mainModule: CjsModule | null = null;
     // require.cache is a plain object; internal store stays a Map.
+    // Keys arrive as host paths (require.resolve / module.filename); the store is POSIX.
     private readonly cacheView: Record<string, CjsModule> = new Proxy(Object.create(null), {
-        has: (_t, key) => typeof key === 'string' && this.cache.has(key),
-        get: (_t, key) => typeof key === 'string' ? this.cache.get(key) : undefined,
-        set: (_t, key, value) => { if (typeof key === 'string') this.cache.set(key, value); return true; },
-        deleteProperty: (_t, key) => { if (typeof key === 'string') this.cache.delete(key); return true; },
-        ownKeys: () => [...this.cache.keys()],
+        has: (_t, key) => typeof key === 'string' && this.cache.has(normalizePath(key)),
+        get: (_t, key) => typeof key === 'string' ? this.cache.get(normalizePath(key)) : undefined,
+        set: (_t, key, value) => { if (typeof key === 'string') this.cache.set(normalizePath(key), value); return true; },
+        deleteProperty: (_t, key) => { if (typeof key === 'string') this.cache.delete(normalizePath(key)); return true; },
+        ownKeys: () => toHostPaths([...this.cache.keys()]),
         getOwnPropertyDescriptor: (_t, key) => {
-            if (typeof key !== 'string' || !this.cache.has(key)) return undefined;
-            return { value: this.cache.get(key), writable: true, enumerable: true, configurable: true };
+            if (typeof key !== 'string') return undefined;
+            const mod = this.cache.get(normalizePath(key));
+            if (!mod) return undefined;
+            return { value: mod, writable: true, enumerable: true, configurable: true };
         },
     });
 
     constructor(private readonly deps: CjsDeps) {}
 
+    /** True while `filename`'s body is on the stack. An ESM module that imports
+     *  such a file is closing a require()-crossed cycle: Node throws
+     *  ERR_REQUIRE_CYCLE_MODULE rather than bridging the partial exports. */
+    isExecuting(filename: string): boolean {
+        return this.executing.has(normalizePath(filename));
+    }
+
+    /** Most recently entered still-executing CJS file, for cycle attribution.
+     *  A Set preserves insertion order, so the last entry is the innermost
+     *  frame — the module whose require() closed the loop. */
+    innermostExecuting(): string | null {
+        let last: string | null = null;
+        for (const f of this.executing) last = f;
+        return last;
+    }
+
+    /** The ERR_REQUIRE_CYCLE_MODULE an ESM importer must throw for `filename`,
+     *  or null when importing it is legitimate.
+     *
+     *  Non-null exactly when the file's body is on the stack: the ESM module
+     *  being compiled right now imports a CJS module that is mid-require of it,
+     *  so bridging `mod.exports` would hand out the pre-require() half. Node
+     *  refuses instead. Lives here rather than inline in ModuleCompiler.load so
+     *  the decision is reachable without constructing a resolver.
+     *
+     *  A cached-but-never-executed stub (preRegister) is NOT a cycle — it also
+     *  has loaded === false, which is why `executing` exists separately. */
+    importCycleError(filename: string): Error | null {
+        if (!this.isExecuting(filename)) return null;
+        return requireCycleError(normalizePath(filename), this.importCycleFrom(filename), 'import-cjs');
+    }
+
+    /** Who to blame in the "(from X)" suffix for an import-cjs cycle.
+     *
+     *  Node names the *ESM module whose import closed the loop* — measured on
+     *  v24.18.0: "Cannot import CommonJS Module ./a.cjs in a cycle. (from
+     *  .../b.mjs)". innermostExecuting() structurally cannot produce that: it
+     *  only tracks CJS bodies, and the importer is ESM, so it returned the
+     *  innermost CJS frame — which in the simple cycle is `filename` itself, i.e.
+     *  the module blamed for importing itself.
+     *
+     *  esmImporters is written by preRegister on every static-ESM resolve of a
+     *  CJS file, and QuickJS resolves a module's specifiers immediately before
+     *  linking them, so the last writer is the import being linked right now.
+     *  Falls back to the old behaviour when nothing was recorded (a cycle reached
+     *  without going through the resolve hook). */
+    private importCycleFrom(filename: string): string {
+        return this.esmImporters.get(normalizePath(filename))
+            ?? this.innermostExecuting()
+            ?? '<unknown>';
+    }
+
     loadAndGet(filename: string, parentPath?: string, isMain = false): CjsModule {
         filename = normalizePath(filename);
         if (parentPath) parentPath = normalizePath(parentPath);
-        const cached = this.cache.get(filename);
-        if (cached?.loaded) {
+        const found = this.cache.get(filename);
+        // A parent stub carries `loaded: true` but its body has never run and its
+        // `require` is the uninitialized placeholder, so it can neither be handed
+        // back nor executed in place — drop it and build a real module below.
+        const cached = found && (found as InternalCjsModule)[PARENT_STUB] ? undefined : found;
+        // In-progress = cycle (ESM importing a CJS module that is requiring it
+        // back). Re-running the body would double every side effect and re-enter
+        // the ESM module currently being instantiated; Node hands back the
+        // partial exports instead.
+        if (cached && (cached.loaded || this.executing.has(filename))) {
             if (isMain) this.setMain(cached);
             return cached;
         }
@@ -323,8 +389,16 @@ export class CjsLoader {
         const mod    = cached ?? this.make(filename, parent);
         if (!cached) this.cache.set(filename, mod);
         if (isMain) this.setMain(mod);
-        this.exec(mod);
+        this.execTracked(mod);
         return mod;
+    }
+
+    /** exec(), marking the module as on-stack so cycles do not re-enter it. */
+    private execTracked(mod: CjsModule): void {
+        const filename = getInternalFilename(mod);
+        this.executing.add(filename);
+        try { this.exec(mod); }
+        finally { this.executing.delete(filename); }
     }
 
     /** Load CJS source code from a string (for -e / --eval). */
@@ -332,13 +406,15 @@ export class CjsLoader {
         filename = normalizePath(filename);
         if (parentPath) parentPath = normalizePath(parentPath);
         const cached = this.cache.get(filename);
-        if (cached?.loaded) return cached;
+        if (cached && (cached.loaded || this.executing.has(filename))) return cached;
 
         const parent = parentPath ? (this.cache.get(parentPath) ?? null) : null;
         const mod    = cached ?? this.make(filename, parent);
         if (!cached) this.cache.set(filename, mod);
 
-        this.execWithSource(mod, code);
+        this.executing.add(filename);
+        try { this.execWithSource(mod, code); }
+        finally { this.executing.delete(filename); }
         return mod;
     }
 
@@ -346,10 +422,21 @@ export class CjsLoader {
     preRegister(filename: string, parentPath: string): void {
         filename = normalizePath(filename);
         parentPath = normalizePath(parentPath);
+        // Record the ESM importer BEFORE the cache-hit return. In the cycle case
+        // the file is *already* cached (a CJS require() put it there and its body
+        // is on the stack), so anything after the early return never runs — and
+        // that is exactly when importCycleError needs the importer's name.
+        this.esmImporters.set(filename, parentPath);
         if (this.cache.has(filename)) return;
         let parent = this.cache.get(parentPath);
         if (!parent) {
+            // The importer is ESM (only engine.onModule.resolve reaches here, and
+            // it fires for static ESM imports), so this stub stands in for a
+            // module the CJS loader never owns. Flag it: requireEsm() must not
+            // mistake its empty exports for a loaded module and skip the cycle
+            // guard — that returned {} where Node throws ERR_REQUIRE_CYCLE_MODULE.
             parent = this.synth(parentPath);
+            (parent as InternalCjsModule)[PARENT_STUB] = true;
             this.cache.set(parentPath, parent);
         }
         this.cache.set(filename, this.make(filename, parent));
@@ -448,16 +535,17 @@ export class CjsLoader {
     }
 
     private execJsFresh(mod: CjsModule, filename: string): void {
+        const sourceFreshness = this.deps.captureSourceFreshness?.(filename);
         let src = readText(filename);
         // Transform TS/ESM source for CJS execution if a transformer is available
         if (this.deps.prepareSource) {
             const transformed = this.deps.prepareSource(src, filename);
             if (transformed !== null) src = transformed;
         }
-        this.execWithSource(mod, src);
+        this.execWithSource(mod, src, sourceFreshness);
     }
 
-    private execWithSource(mod: CjsModule, src: string): void {
+    private execWithSource(mod: CjsModule, src: string, sourceFreshness?: SourceFreshness): void {
         if (src.startsWith('#!')) {
             const nl = src.indexOf('\n');
             src = nl === -1 ? '' : src.slice(nl);
@@ -476,9 +564,9 @@ export class CjsLoader {
             throw normalizeExecError(e, filename);
         }
 
-        if (this.deps.persistCjsCompiled) {
+        if (this.deps.persistCjsCompiled && sourceFreshness) {
             try {
-                this.deps.persistCjsCompiled(filename, engine.serialize(compiled).buffer);
+                this.deps.persistCjsCompiled(filename, engine.serialize(compiled).buffer, sourceFreshness);
             } catch (e) {
                 log.debug('cjs', () => `persist compiled failed: ${filename}`, e);
             }
@@ -614,7 +702,9 @@ export class CjsLoader {
     private requireEsm(info: ModuleInfo, parentPath: string): unknown {
         const path = info.localPath;
         const hit = this.cache.get(path);
-        if (hit) return hit.exports;
+        // A parent stub is not a load result: fall through so loadEsmSync can run
+        // its in-flight check (throw on a cycle) or genuinely load the module.
+        if (hit && !(hit as InternalCjsModule)[PARENT_STUB]) return hit.exports;
 
         // Native addons (.node) must go through CJS exec path, not ESM compile
         if (extname(path) === '.node') {
@@ -624,7 +714,7 @@ export class CjsLoader {
 
         const result = info.fileKind === 'wasm' && this.deps.loadWasmSync
             ? this.deps.loadWasmSync(info)
-            : this.deps.loadEsmSync(info);
+            : this.deps.loadEsmSync(info, parentPath);
         const mod = this.synth(path);
         // Node returns the whole namespace, not the bare default: an explicit
         // 'module.exports' export wins, otherwise keep every named export.
@@ -645,7 +735,10 @@ export class CjsLoader {
         if (hit) return hit;
 
         const info = this.deps.resolveBuiltin(name, parent);
-        const ns = this.deps.loadEsmSync(info);
+        // `parent` is passed through for cycle attribution: loadEsmSync's
+        // isInFlight check DOES run for builtins (bridge.ts:112), but without a
+        // `from` the resulting ERR_REQUIRE_CYCLE_MODULE reads "<unknown>".
+        const ns = this.deps.loadEsmSync(info, parent);
 
         const mod = this.synth(info.localPath);
         const copyMissingExports = (target: object) => {
@@ -686,7 +779,7 @@ export class CjsLoader {
         const mod = this.make(path, parent);
         this.cache.set(path, mod);
         try {
-            this.exec(mod);
+            this.execTracked(mod);
             return mod;
         } catch (e) {
             this.cache.delete(path);

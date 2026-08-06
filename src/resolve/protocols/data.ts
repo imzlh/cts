@@ -18,7 +18,8 @@ function parseDataUrl(url: string): DataParsed {
     if (ci === -1) throw err(ErrorKind.InvalidSpecifier, `Invalid data URL: ${url}`);
     const meta = rest.slice(0, ci), data = rest.slice(ci + 1);
     const isBase64 = meta.endsWith(';base64');
-    const mime = isBase64 ? meta.slice(0, -7) : (meta || 'text/plain');
+    // RFC 2397: an omitted media type defaults to text/plain, base64 or not.
+    const mime = (isBase64 ? meta.slice(0, -7) : meta) || 'text/plain';
     return { mime, isBase64, data };
 }
 

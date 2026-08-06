@@ -10,6 +10,13 @@ export class ResourceManager {
     private done = false;
 
     register(fn: Cleanup): void {
+        // Already released (e.g. precache finished): run now instead of
+        // queueing into a list that will never be drained again.
+        if (this.done) {
+            try { fn(); }
+            catch (e) { log.debug('resources', 'late cleanup error', e); }
+            return;
+        }
         this.cleanups.push(fn);
     }
 

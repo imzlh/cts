@@ -40,14 +40,14 @@ export class ImportScanner {
 
         if (this.oxc) {
             try {
-                const deps = this.oxc.scanImportsBytes(bytes, localPath);
+                const deps = this.oxc.scanImportsBytes(bytes, localPath, lang);
                 if (deps !== null) return deps;
             } catch (e) {
                 log.debug('oxc', () => `scanImportsBytes ${localPath}: ${errMsg(e)}`);
             }
             try {
                 const source = engine.decodeString(bytes);
-                const deps = this.oxc.scanImports(source, localPath);
+                const deps = this.oxc.scanImports(source, localPath, lang);
                 if (deps !== null) return deps;
             } catch (e) {
                 log.debug('oxc', () => `scanImports ${localPath}: ${errMsg(e)}`);
@@ -64,7 +64,7 @@ export class ImportScanner {
     scanSource(source: string, localPath: string, lang?: string, strict = false): string[] {
         if (this.oxc) {
             try {
-                const deps = this.oxc.scanImports(source, localPath);
+                const deps = this.oxc.scanImports(source, localPath, lang);
                 if (deps !== null) return deps;
             } catch (e) {
                 log.debug('oxc', () => `scanImports ${localPath}: ${errMsg(e)}`);

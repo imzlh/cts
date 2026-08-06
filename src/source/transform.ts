@@ -132,6 +132,7 @@ export class Transformer {
                     log.debug('transformer', () => `oxc bytes: ${filename}`);
                     return this.sourceMaps ? result : { code: result.code };
                 }
+                rejectNonUtf8(bytes, filename);
                 return null;
             default:
                 return null;
@@ -159,6 +160,7 @@ export class Transformer {
                         }
                         return result.code;
                     }
+                    rejectNonUtf8(bytes, filename);
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
                 return this.run(
@@ -342,4 +344,69 @@ function stripShebang(code: string): string {
     }
     const newlineIndex = code.indexOf('\n');
     return newlineIndex === -1 ? '' : code.slice(newlineIndex);
+}
+
+/**
+ * Throw a located TransformError when `bytes` is not valid UTF-8.
+ *
+ * Called only on the oxc-declined path, so well-formed sources are unaffected.
+ */
+function rejectNonUtf8(bytes: Uint8Array, filename: string): void {
+    const bad = firstInvalidUtf8(bytes);
+    if (bad < 0) return;
+    let line = 1;
+    let column = 0;
+    for (let i = 0; i < bad; i++) {
+        if (bytes[i] === 10) { line++; column = 0; } else { column++; }
+    }
+    const hex = bytes[bad].toString(16).padStart(2, '0');
+    throw new TransformError(
+        `source is not valid UTF-8 (byte 0x${hex} at offset ${bad}); `
+        + 'save the file as UTF-8',
+        filename, line, column,
+    );
+}
+
+/**
+ * Byte offset of the first invalid UTF-8 sequence, or -1 when the input is
+ * well-formed.
+ *
+ * Exported for direct unit testing: the call sites below only reach this when
+ * oxc has already declined, so a false positive here (flagging valid UTF-8)
+ * would silently convert a working Sucrase fallback into a hard error, and
+ * end-to-end tests cannot observe that. Test it directly instead.
+ *
+ * The native oxc transpiler rejects non-UTF-8 input outright
+ * (`std::str::from_utf8` in ext-oxc/src/lib.rs), and OxcTranspiler collapses
+ * that failure into `null` — indistinguishable from "oxc declined". Falling
+ * back to Sucrase on such a file is not safe: Sucrase silently erases
+ * `namespace` bodies and decorated classes, so a single stray byte turns into
+ * wrong runtime behaviour with exit code 0. Detect the condition here and
+ * fail loudly instead.
+ */
+export function firstInvalidUtf8(bytes: Uint8Array): number {
+    const len = bytes.byteLength;
+    let i = 0;
+    while (i < len) {
+        const b = bytes[i];
+        if (b < 0x80) { i++; continue; }
+        let need: number;
+        let min: number;
+        if (b >= 0xc2 && b <= 0xdf) { need = 1; min = 0x80; }
+        else if (b >= 0xe0 && b <= 0xef) { need = 2; min = 0x800; }
+        else if (b >= 0xf0 && b <= 0xf4) { need = 3; min = 0x10000; }
+        else return i; // 0x80-0xc1 continuation/overlong lead, or 0xf5-0xff
+        if (i + need > len - 1) return i;                // truncated sequence
+        let cp = b & (need === 1 ? 0x1f : need === 2 ? 0x0f : 0x07);
+        for (let k = 1; k <= need; k++) {
+            const c = bytes[i + k];
+            if ((c & 0xc0) !== 0x80) return i;
+            cp = (cp << 6) | (c & 0x3f);
+        }
+        if (cp < min) return i;                          // overlong
+        if (cp >= 0xd800 && cp <= 0xdfff) return i;      // surrogate half
+        if (cp > 0x10ffff) return i;                     // out of range
+        i += need + 1;
+    }
+    return -1;
 }

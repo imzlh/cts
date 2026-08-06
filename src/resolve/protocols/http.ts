@@ -60,8 +60,12 @@ export class HttpHandler implements ProtocolHandler {
     }
 
     private cachePath(url: string): string {
-        const { hostname } = new URL(url);
+        const parsed = new URL(url);
         const name = cacheFilename(url);
-        return joinPaths(this.cfg.cacheDir, 'http', hostname, name.slice(0, 2), name);
+        // cacheFilename hashes path+query only, so scheme and port must be part
+        // of the directory: http://h:3000/m.js and http://h:4000/m.js differ.
+        const scheme = parsed.protocol === 'http:' ? 'http' : 'https';
+        const host = parsed.port ? `${parsed.hostname}_${parsed.port}` : parsed.hostname;
+        return joinPaths(this.cfg.cacheDir, 'http', scheme, host, name.slice(0, 2), name);
     }
 }

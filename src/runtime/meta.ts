@@ -1,8 +1,13 @@
 import type { ModuleInfo } from '../types';
 import type { ModuleResolver } from '../resolve/index';
-import { dirname, isAbsolute, toPosixPath } from '../utils';
+import { dirname, isAbsolute, toHostPath, toPosixPath } from '../utils';
 
 const importMetaResolveCache = new Map<string, (s: string, p?: string, a?: Record<string, unknown>) => string>();
+
+/** Closures capture the resolver; a new runtime must not reuse the old one's. */
+export function clearImportMetaResolveCache(): void {
+    importMetaResolveCache.clear();
+}
 
 // Encode # etc. in file URLs (es5-ext uses a real "#" directory).
 function encodeFileUrlPath(path: string): string {
@@ -69,21 +74,30 @@ export function fillMeta(
     resolver: ModuleResolver,
 ): void {
     meta.url      = toImportMetaUrl(info);
-    meta.filename = info.localPath;
-    meta.dirname  = dirname(info.localPath);
+    // localPath is POSIX-internal (cts/AGENT.md:230). filename/dirname are
+    // user-visible, so they cross the boundary and must be NATIVE, matching
+    // node v24.18.0 and deno 2.9.3 measured on Windows 11:
+    //   deno: import.meta.filename -> D:\tmp\agsep\dn.ts   (not D:/tmp/...)
+    //   node: import.meta.dirname  -> D:\tmp\agsep
+    // meta.url stays a file:// URL with '/' — only these two denormalize.
+    // toHostPath leaves scheme ids ("pack:/e.mjs") alone.
+    meta.filename = toHostPath(info.localPath);
+    meta.dirname  = toHostPath(dirname(info.localPath));
     meta.main     = info.specPath === resolver.entry;
     meta.use      = import.meta.use;
     meta.register = import.meta.register;
     // Pack/extensionless: keep lang for transform on source-only recompile.
     if (info.lang !== undefined && meta.lang === undefined) meta.lang = info.lang;
 
-    // import.meta.resolve → localPath (not npm:/jsr: specPath); cache per specPath.
+    // import.meta.resolve returns a URL string (Node / lib.deno.d.ts), not a host
+    // path: file:// for disk modules, scheme kept for node:/http:/pack:. Same
+    // mapping as meta.url so both agree. Cache per specPath.
     let fn = importMetaResolveCache.get(info.specPath);
     if (!fn) {
         const self = info.specPath;
         fn = (s: string, p?: string, a?: Record<string, unknown>) => {
             const resolved = resolver.resolve(s, p ?? self, a);
-            return resolved.localPath;
+            return toImportMetaUrl(resolved);
         };
         importMetaResolveCache.set(info.specPath, fn);
     }

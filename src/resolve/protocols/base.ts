@@ -33,6 +33,22 @@ export function applyAttrType(kind: FileKind, attr?: Record<string, unknown>): F
     return kind;
 }
 
+/** Validate the standard type import attribute against the resolved module. */
+export function validateAttrType(kind: FileKind, attr: Record<string, unknown> | undefined, specPath: string): void {
+    const type = attr?.type;
+    if (type === undefined || type === 'text' || type === 'bytes') return;
+    if (type !== 'json') {
+        const error = new TypeError(`Import attribute "type" with value "${String(type)}" is not supported in ${specPath}`);
+        Object.defineProperty(error, 'code', { value: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED' });
+        throw error;
+    }
+    if (kind !== 'json') {
+        const error = new TypeError(`Module "${specPath}" is not of type "json"`);
+        Object.defineProperty(error, 'code', { value: 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE' });
+        throw error;
+    }
+}
+
 /** Check if a path is a TypeScript type declaration file (.d.ts, .d.mts, .d.cts) */
 export function isTypeDecl(localPath: string): boolean {
     return localPath.endsWith('.d.ts') || localPath.endsWith('.d.mts') || localPath.endsWith('.d.cts');

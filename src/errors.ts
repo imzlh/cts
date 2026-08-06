@@ -117,6 +117,28 @@ export function err(kind: ErrorKind, msg: string, source?: unknown): Error {
     return e;
 }
 
+/** ERR_REQUIRE_CYCLE_MODULE, as Node throws for a require()-crossed ESM/CJS cycle.
+ *  Node refuses these outright rather than handing out a partially-initialized
+ *  module. Two message shapes, matching upstream:
+ *    require(esm) where the ESM is already in flight   → "Cannot require() ES Module X in a cycle."
+ *    import cjs   where the CJS body is on the stack   → "Cannot import CommonJS Module X in a cycle."
+ *  Throwing (rather than returning a partial) is also what keeps the QuickJS
+ *  module machinery safe: re-entering a module that is mid-link/mid-eval trips
+ *  the js_link_module status assertion (an abort, not an exception). */
+export function requireCycleError(target: string, from: string, kind: 'require-esm' | 'import-cjs'): Error {
+    const what = kind === 'require-esm'
+        ? `Cannot require() ES Module ${target} in a cycle.`
+        : `Cannot import CommonJS Module ${target} in a cycle.`;
+    const e = err(ErrorKind.Generic, `${what} (from ${from})`);
+    Object.defineProperty(e, 'code', {
+        value: 'ERR_REQUIRE_CYCLE_MODULE',
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
+    return e;
+}
+
 /** Resolution miss (continue CJS walk). Non-miss kinds must rethrow. */
 export function isResolutionMiss(e: unknown): boolean {
     if (!(e instanceof Error)) return false;

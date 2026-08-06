@@ -145,9 +145,9 @@ export class OxcTranspiler {
     }
 
     /** Extract import specifiers without full codegen. */
-    scanImports(source: string, filename: string): string[] | null {
+    scanImports(source: string, filename: string, lang?: string): string[] | null {
         try {
-            const kind = kindFromFilename(filename);
+            const kind = kindFromFilename(filename, lang);
             const deps = this.scanImportsFast
                 ? this.scanImportsFast(source, kind)
                 : this.mod.scanImports(source, scanOptionsForKind(kind));
@@ -162,10 +162,10 @@ export class OxcTranspiler {
         }
     }
 
-    scanImportsBytes(source: Uint8Array, filename: string): string[] | null {
+    scanImportsBytes(source: Uint8Array, filename: string, lang?: string): string[] | null {
         if (!this.scanImportsBytesFn) return null;
         try {
-            const deps = this.scanImportsBytesFn(source, kindFromFilename(filename));
+            const deps = this.scanImportsBytesFn(source, kindFromFilename(filename, lang));
             if (!this.scanLogged) {
                 this.scanLogged = true;
                 log.debug('oxc', () => `scan active: ${filename}`);

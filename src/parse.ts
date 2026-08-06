@@ -55,6 +55,23 @@ export function isParseWorkerError(error: unknown): error is ParseWorkerError {
     return error instanceof ParseWorkerError;
 }
 
+export interface CompileTarget {
+    specPath: string;
+    localPath: string;
+    format?: ModuleFormat;
+    lang?: string;
+    /** Eval filename to bake into the bytecode; defaults to the runtime identity. */
+    identity?: string;
+}
+
+// The eval filename is baked into the bytecode atom table, so it must equal the
+// filename the runtime would use compiling the same module fresh: CjsLoader evals
+// under the host localPath, ESM under specPath. Pack overrides both with its
+// `pack:` id — a host path there leaks the build machine's directory layout into
+// every distributed container.
+const compileIdentity = (m: CompileTarget): string =>
+    m.identity ?? (m.format === 'cjs' ? m.localPath : m.specPath);
+
 // Bytecode: CJS via cjs-wrap; ESM via Module.dump() under stub onModule (no dep cascade).
 // CJS must strip TS/JSX first — workers only run ESM transform; .cts is main-thread.
 function compileForCache(code: string | Uint8Array, specPath: string, format: ModuleFormat | undefined): ArrayBuffer {
@@ -314,7 +331,7 @@ export class ParseDriver {
     private scanQueue: WorkerTask[] = [];
     private scanCallbacks = new Map<number, ScanCallback>();
     /** id → {specPath, format} for in-flight transform tasks */
-    private specMap = new Map<number, { specPath: string; format: ModuleFormat | undefined }>();
+    private specMap = new Map<number, { specPath: string; identity: string; format: ModuleFormat | undefined }>();
     private bytecodes = new Map<string, ArrayBuffer>();
     private onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void;
     private onFailed?: (localPath: string, specPath: string, error: unknown) => void;
@@ -419,7 +436,7 @@ export class ParseDriver {
     }
 
     async compileModules(
-        modules: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }>,
+        modules: CompileTarget[],
         onProgress?: (done: number, total: number) => void,
         onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
         onFailed?: (localPath: string, specPath: string, error: unknown) => void,
@@ -439,7 +456,7 @@ export class ParseDriver {
 
         const tasks: WorkerTask[] = [];
         // CJS (+ plain passthrough) stay on main: transformForCjs is not worker-side.
-        const mainThread: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }> = [];
+        const mainThread: CompileTarget[] = [];
         for (const m of modules) {
             if (m.format === 'cjs' || (isPassthroughSource(m.localPath) && !m.lang)) {
                 mainThread.push(m);
@@ -447,7 +464,7 @@ export class ParseDriver {
             }
             const id = this.nextId++;
             tasks.push({ id, kind: 'transform', localPath: m.localPath, specPath: m.specPath, lang: m.lang });
-            this.specMap.set(id, { specPath: m.specPath, format: m.format });
+            this.specMap.set(id, { specPath: m.specPath, identity: compileIdentity(m), format: m.format });
         }
 
         this.taskTotal = modules.length;
@@ -499,7 +516,7 @@ export class ParseDriver {
     }
 
     async precompile(
-        modules: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }>,
+        modules: CompileTarget[],
         onProgress?: (done: number, total: number) => void,
         onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
         onFailed?: (localPath: string, specPath: string, error: unknown) => void,
@@ -508,7 +525,7 @@ export class ParseDriver {
     }
 
     private async compileModulesInline(
-        modules: Array<{ specPath: string; localPath: string; format?: ModuleFormat; lang?: string }>,
+        modules: CompileTarget[],
         onProgress?: (done: number, total: number) => void,
         onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
         onFailed?: (localPath: string, specPath: string, error: unknown) => void,
@@ -524,8 +541,7 @@ export class ParseDriver {
             try {
                 const source = readText(m.localPath);
                 const code = prepareForCache(transformer, source, m.localPath, m.format, m.lang, m.specPath);
-                const identity = m.format === 'cjs' ? m.localPath : m.specPath;
-                const bc = compileForCache(code, identity, m.format);
+                const bc = compileForCache(code, compileIdentity(m), m.format);
                 if (onCompiled) onCompiled(m.localPath, bc, m.specPath);
                 else bytecodes.set(m.localPath, bc);
                 done++;
@@ -582,7 +598,7 @@ export class ParseDriver {
         if (entry) this.specMap.delete(r.id);
         this.taskRetries.delete(task.id);
         if (r.code && entry) {
-            const { specPath, format } = entry;
+            const { specPath, identity, format } = entry;
             try {
                 if (r.sourceMap) {
                     try {
@@ -590,7 +606,7 @@ export class ParseDriver {
                         else smap.load(specPath, r.sourceMap);
                     } catch (e) { log.debug('precompile', () => `smap relay: ${task.localPath}: ${errMsg(e)}`); }
                 }
-                const bc = compileForCache(r.code, specPath, format);
+                const bc = compileForCache(r.code, identity, format);
                 if (this.onCompiled) this.onCompiled(task.localPath, bc, specPath);
                 else this.bytecodes.set(task.localPath, bc);
             } catch (e) {
@@ -611,26 +627,27 @@ export class ParseDriver {
     }
 
     /** Main-thread compile: CJS (transformForCjs) or plain JS passthrough. */
-    private compileOnMain(m: { specPath: string; localPath: string; format?: ModuleFormat; lang?: string }): void {
+    private compileOnMain(m: CompileTarget): void {
         try {
             const transformer = this.getInlineTransformer();
+            const identity = compileIdentity(m);
             let bc: ArrayBuffer;
             if (m.format === 'cjs') {
                 // Always strip TS/JSX; .cts must not hit EVAL_COMPILE_ONLY raw.
                 const code = prepareForCache(transformer, readText(m.localPath), m.localPath, 'cjs', m.lang, m.specPath);
-                bc = compileForCache(code, m.localPath, 'cjs');
+                bc = compileForCache(code, identity, 'cjs');
             } else {
                 const bytes = readBytes(m.localPath);
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
                     const code = prepareForCache(
                         transformer, engine.decodeString(bytes), m.localPath, m.format, m.lang, m.specPath);
-                    bc = compileForCache(code, m.specPath, m.format);
+                    bc = compileForCache(code, identity, m.format);
                 } else {
                     try {
-                        bc = compileForCache(bytes, m.specPath, m.format);
+                        bc = compileForCache(bytes, identity, m.format);
                     } catch (e) {
                         try {
-                            bc = compileForCache(engine.decodeString(bytes), m.specPath, m.format);
+                            bc = compileForCache(engine.decodeString(bytes), identity, m.format);
                         } catch {
                             throw e;
                         }

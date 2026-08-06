@@ -20,6 +20,12 @@ function unknownAttrNames(attr: Record<string, unknown>): string {
     return out;
 }
 
+function unsupportedAttribute(name: string, value: unknown): TypeError {
+    const error = new TypeError(`Import attribute "${name}" with value "${String(value)}" is not supported`);
+    Object.defineProperty(error, 'code', { value: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED' });
+    return error;
+}
+
 export interface EngineHookCallbacks {
     onInitHook?: (specPath: string, info: ModuleInfo) => void;
     onSyntaxError?: (e: SyntaxError) => never;
@@ -59,6 +65,9 @@ export function installEngineHooks(
                 }
                 return moduleRef(info);
             } catch (e) {
+                const code = e instanceof Error ? Reflect.get(e, 'code') : undefined;
+                if (code === 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED'
+                    || code === 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE') throw e;
                 // Preserve LockFrozen / ProtocolDisabled / NetworkError / … —
                 // rewriting everything as ModuleNotFound hid real failure kinds.
                 // Reject non-enum .kind (garbage numbers would poison formatError).
@@ -101,7 +110,9 @@ export function installEngineHooks(
 
         attrchk(attr: Record<string, unknown>): void {
             const unknown = unknownAttrNames(attr);
-            if (unknown) log.debug('runtime', () => `unknown attrs: ${unknown}`);
+            if (!unknown) return;
+            const name = unknown.split(', ')[0]!;
+            throw unsupportedAttribute(name, attr[name]);
         },
     });
 
