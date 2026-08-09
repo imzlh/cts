@@ -10,7 +10,7 @@ export {
     runParseWorker,
 } from '../parse';
 export { ImportScanner } from '../import-scanner';
-export { fatal, formatError, err, ErrorKind, TransformError, isErrorKind, isResolutionMiss } from '../errors';
+export { fatal, formatError, err, ErrorKind, TransformError, isErrorKind, isResolutionMiss, codeForKind, setErrorCode } from '../errors';
 export {
     log, errMsg, fmtBytes, uname, isWindows, stripJsonc,
     dirname, normalizePath, isAbsolute, joinPaths, cwd, toPosixPath,
@@ -24,11 +24,13 @@ export type { LoadedPack, PackLoadStats } from '../pack/reader';
 export {
     encodePack,
     encodePackHeader,
+    completePackManifest,
+    blobSourceFromBytes,
     decodePack,
     readBlob,
     readSourceBlob,
 } from '../pack/format';
-export type { PackManifest, PackModuleEntry, PackContainer } from '../pack/format';
+export type { PackManifest, PackModuleEntry, PackContainer, PackBlobSource } from '../pack/format';
 export { sizeBucketForModule, summarizePackSizes } from '../pack/size';
 export type { PackSizeRow, PackSizeSummary } from '../pack/size';
 // Integrity primitives used by pack write and unit tests (full-byte verify).

@@ -8,9 +8,28 @@ const engine = import.meta.use('engine');
 // pkg 512 / format 2048 / formatDir 512 / exports 1024
 
 const _NO_PKG = Symbol('no.pkg');
+
+/**
+ * How the module being classified was reached. A bare `.js` file with no
+ * manifest anywhere up the tree resolves to a DIFFERENT format per context
+ * (see detectFormat), so every format query has to declare its context.
+ */
+export type ResolveKind = 'require' | 'import';
+
+/**
+ * `'unresolved'` = the directory walk reached the root without finding a
+ * package.json or deno.json. It is deliberately NOT a ModuleFormat: the caches
+ * store this *reason* rather than a final answer, because the answer depends on
+ * the ResolveKind of the caller and the same directory is legitimately CJS via
+ * require() and ESM via import. Caching the reason keeps both caches keyed on
+ * path alone and makes cross-context poisoning structurally impossible.
+ */
+const NO_MANIFEST = 'unresolved';
+type DirFormat = ModuleFormat | typeof NO_MANIFEST;
+
 const pkgCache      = new LRU<string, { pkg: PackageJson | typeof _NO_PKG; at: number }>(512);
-const formatCache   = new LRU<string, ModuleFormat>(2048);
-const formatDirCache = new LRU<string, ModuleFormat>(512);
+const formatCache   = new LRU<string, DirFormat>(2048);
+const formatDirCache = new LRU<string, DirFormat>(512);
 const exportsCache = new LRU<string, ResolvedPath | null>(1024);
 
 const PKG_TTL = 5 * 60 * 1000;
@@ -140,9 +159,42 @@ export function resolvePackageBinPath(pkgDir: string, relPath: string): string |
 
 // Format detection — two-level bounded cache
 
-export function detectFormat(localPath: string): ModuleFormat {
+/**
+ * Classify `localPath`. `kind` is the context that reached the file and is
+ * load-bearing for exactly one case: a `.js` file with no package.json and no
+ * deno.json anywhere up the tree.
+ *
+ *   require() → 'cjs'   import → 'esm'
+ *
+ * Those two lines must NOT be merged. They are different rules, not an
+ * inconsistency to tidy up:
+ *
+ *  - `require()` is node's ecosystem. Node's rule for a `.js` file whose
+ *    nearest package.json has no "type" — including the case where there is no
+ *    package.json at all — is CommonJS. Defaulting to ESM here makes
+ *    `require('./child.js')` evaluate the child as a module, where `module` and
+ *    `exports` are not bound, so a plain `module.exports = …` child dies with
+ *    "ReferenceError: module is not defined" on its first line. Measured
+ *    against node v24: require of a no-manifest `.js` is CJS unconditionally.
+ *  - `import` with no manifest at all is the Deno-style single-file case, which
+ *    has no package.json by design and is ESM. That default is intentional;
+ *    inverting it would break running a loose `.js` script as a module.
+ *
+ * A package.json that exists but lacks "type" still resolves to CJS through the
+ * manifest branch below, in both contexts, matching node.
+ */
+export function detectFormat(localPath: string, kind: ResolveKind = 'import'): ModuleFormat {
+    return resolveDirFormat(cachedDirFormat(localPath), kind);
+}
+
+function resolveDirFormat(format: DirFormat, kind: ResolveKind): ModuleFormat {
+    if (format !== NO_MANIFEST) return format;
+    return kind === 'require' ? 'cjs' : 'esm';
+}
+
+function cachedDirFormat(localPath: string): DirFormat {
     const hit = formatCache.get(localPath);
-    if (hit) return hit;
+    if (hit !== undefined) return hit;
     const result = _detectFormat(localPath);
     formatCache.set(localPath, result);
     return result;
@@ -165,7 +217,8 @@ export function detectPackageJsonFormat(localPath: string): ModuleFormat | null 
     return null;
 }
 
-function _detectFormat(localPath: string): ModuleFormat {
+/** Returns NO_MANIFEST for the no-package.json `.js` case; see detectFormat. */
+function _detectFormat(localPath: string): DirFormat {
     const ext = extname(localPath);
     if (ext === '.mjs' || ext === '.mts' || ext === '.ts' || ext === '.tsx' || ext === '.jsx') return 'esm';
     if (ext === '.cjs' || ext === '.cts' || ext === '.node') return 'cjs';
@@ -198,10 +251,12 @@ function _detectFormat(localPath: string): ModuleFormat {
         if (up === dir) break;
         dir = up;
     }
-    // No package.json found — Deno-style local .js defaults to ESM. Packages
-    // without a "type" field still stay CJS through the package.json branch.
-    for (const v of visited) formatDirCache.set(v, 'esm');
-    return 'esm';
+    // No manifest found. The answer is context-dependent, so cache the reason
+    // and let detectFormat() map it: require → CJS (node), import → ESM (Deno
+    // single file). Caching 'esm' here would hand a require() caller the ESM
+    // default and reintroduce "module is not defined".
+    for (const v of visited) formatDirCache.set(v, NO_MANIFEST);
+    return NO_MANIFEST;
 }
 
 export interface ResolveCtx { pkgDir: string; pkg: PackageJson; forceCjs?: boolean; conditions?: string[] }
@@ -324,6 +379,11 @@ function conditionSet(ctx: ResolveCtx): Set<string> {
     ]);
 }
 
+/** ctx.forceCjs is set when the resolve was driven by require(); see detectFormat. */
+function kindOf(ctx: ResolveCtx): ResolveKind {
+    return ctx.forceCjs ? 'require' : 'import';
+}
+
 function preferredFormatForPath(ctx: ResolveCtx, path: string, preferred?: ModuleFormat): ModuleFormat {
     const ext = extname(path);
     if (ext === '.cjs' || ext === '.cts' || ext === '.node') return 'cjs';
@@ -332,7 +392,7 @@ function preferredFormatForPath(ctx: ResolveCtx, path: string, preferred?: Modul
     if (preferred) return preferred;
     // Ambiguous exports target same as "module" field → treat as ESM.
     if (ctx.pkg.module && resolveLegacyPath(ctx, ctx.pkg.module) === path) return 'esm';
-    return detectPackageJsonFormat(path) ?? detectFormat(path);
+    return detectPackageJsonFormat(path) ?? detectFormat(path, kindOf(ctx));
 }
 
 function packageLocalPath(ctx: ResolveCtx, path: string): string | null {
@@ -601,7 +661,7 @@ export function resolveMain(ctx: ResolveCtx): ResolvedPath | null {
         : ['index.js', 'index.mjs', 'index.cjs', 'index.ts'];
     for (const f of fallbacks) {
         const p = joinPaths(ctx.pkgDir, f);
-        if (fs.exists(p)) return { path: p, format: detectFormat(p) };
+        if (fs.exists(p)) return { path: p, format: detectFormat(p, kindOf(ctx)) };
     }
     return null;
 }
@@ -631,7 +691,7 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
                 if (!extname(base)) {
                     return { path: base, format: preferredFormatForPath(ctx, base), fileKind: 'source' };
                 }
-                return { path: base, format: detectFormat(base) };
+                return { path: base, format: detectFormat(base, kindOf(ctx)) };
             }
         } catch {}
         // react-remove-scroll-bar/constants etc. — folder package, no exports field
@@ -646,7 +706,7 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
         if (!extname(path)) {
             return { path, format: preferredFormatForPath(ctx, path), fileKind: 'source' };
         }
-        return { path, format: detectFormat(path) };
+        return { path, format: detectFormat(path, kindOf(ctx)) };
     } catch {
         if (ctx.pkg.exports) return null;
     }
@@ -660,7 +720,7 @@ export function resolveSubpath(ctx: ResolveCtx, sub: string): ResolvedPath | nul
         if (!extname(path)) {
             return { path, format: preferredFormatForPath(ctx, path), fileKind: 'source' };
         }
-        return { path, format: detectFormat(path) };
+        return { path, format: detectFormat(path, kindOf(ctx)) };
     } catch {
         return null;
     }

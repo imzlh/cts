@@ -82,7 +82,13 @@ export const log = {
         nativeError(`[${category}] ${resolve(msg)}`, ...rest);
     },
 
+    /**
+     * Download progress is DIAGNOSTIC, not program output, so it belongs on
+     * stderr. On stdout it corrupted redirected output: `cno run build.js > out.js`
+     * embedded "✨ pkg@ver..." in out.js. Every call site is already gated on
+     * `!cfg.silent && !isatty`, so this only moves the stream.
+     */
     download(url: string): void {
-        nativeLog(`✨ ${url}...`);
+        nativeError(`✨ ${url}...`);
     }
 };

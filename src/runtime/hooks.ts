@@ -1,9 +1,10 @@
 import { moduleRef, type ModuleInfo } from '../types';
 import type { ModuleResolver } from '../resolve/index';
 import type { ModuleCompiler } from '../compile/index';
-import { fillMeta } from './meta';
-import { errMsg, log } from '../utils';
-import { err, ErrorKind, isErrorKind } from '../errors';
+import { fillMeta, isProtocolSpec, toFileUrl } from './meta';
+import { errMsg, isRelative, joinPaths, dirname, log } from '../utils';
+import { URL } from '../utils/url';
+import { err, ErrorKind, isErrorKind, setErrorCode } from '../errors';
 
 const engine = import.meta.use('engine');
 
@@ -40,6 +41,66 @@ function hasSyntaxSourceCause(error: SyntaxError): boolean {
     return !!cause && typeof cause === 'object' && Reflect.get(cause, 'source') instanceof SyntaxError;
 }
 
+/** The URL node reports on a failed `import()`, or undefined when node omits it.
+ *
+ *  Measured against node v24.18.0: `url` is present exactly when the specifier
+ *  named a *location* — an absolute file URL, or a relative path resolved
+ *  against the importer — and absent when it named a *package*:
+ *
+ *    import('file:///D:/no/such/x.mjs')  → url 'file:///D:/no/such/x.mjs'
+ *    import('./missing.mjs')            → url of the resolved absolute path
+ *    import('no-such-pkg')              → no url ("Cannot find package …")
+ *
+ *  So a bare specifier returns undefined here rather than a fabricated URL. */
+function importUrlFor(spec: string, parent: string): string | undefined {
+    // Already a URL (file:, http:, data:, npm:, pack:, …) — node echoes it back.
+    if (spec.includes('://') || isProtocolSpec(spec)) return spec;
+    if (isRelative(spec)) {
+        // Resolve against the importer, which may itself be a URL or a path.
+        if (parent.includes('://') || isProtocolSpec(parent)) {
+            try { return new URL(spec, parent).toString(); } catch { return undefined; }
+        }
+        if (!parent) return undefined;
+        return toFileUrl(joinPaths(dirname(parent), spec));
+    }
+    // Absolute path (no scheme) — still a location, not a package.
+    if (spec.startsWith('/') || /^[A-Za-z]:[/\\]/.test(spec)) return toFileUrl(spec);
+    // Bare specifier: node sets no url.
+    return undefined;
+}
+
+/** Give a failed `import()` the shape node gives it: ERR_MODULE_NOT_FOUND plus
+ *  a `url`. Node uses two different codes for the same miss depending on the
+ *  loader — `require()` reports MODULE_NOT_FOUND (which is what codeForKind
+ *  hands out, and what cno already got right), while `import()` reports
+ *  ERR_MODULE_NOT_FOUND. This is the import side, so it upgrades.
+ *
+ *  A more specific code already on the inner error wins: pkg.ts raises
+ *  ERR_PACKAGE_PATH_NOT_EXPORTED and resolve/protocols/node.ts raises
+ *  ERR_UNKNOWN_BUILTIN_MODULE, both of which node also reports in preference to
+ *  a generic not-found. Only the two default resolution-miss codes get
+ *  overwritten, so anything ERR_-prefixed is treated as deliberate.
+ *
+ *  Exported for tests/cts/import-error-code.test.ts — cts/src is baked into the
+ *  binary, so the unit is the only layer where this is verifiable pre-rebuild. */
+export function esmResolveError(spec: string, parent: string, cause: unknown, kind: ErrorKind): Error {
+    const inner = cause instanceof Error ? Reflect.get(cause, 'code') : undefined;
+    const specific = typeof inner === 'string' && inner.startsWith('ERR_') ? inner : undefined;
+    const isMiss = kind === ErrorKind.ModuleNotFound || kind === ErrorKind.FileNotFound;
+    const e = err(kind, `Cannot resolve "${spec}" from "${parent}": ${errMsg(cause)}`, cause);
+    if (specific) setErrorCode(e, specific);
+    else if (isMiss) setErrorCode(e, 'ERR_MODULE_NOT_FOUND');
+    if (isMiss && !specific) {
+        const url = importUrlFor(spec, parent);
+        if (url !== undefined) {
+            Object.defineProperty(e, 'url', {
+                value: url, writable: true, enumerable: true, configurable: true,
+            });
+        }
+    }
+    return e;
+}
+
 /** Install onModule hooks (C layer replaces; re-install warns). */
 export function installEngineHooks(
     resolver: ModuleResolver,
@@ -74,8 +135,7 @@ export function installEngineHooks(
                 const kind = e instanceof Error && isErrorKind(e.kind)
                     ? e.kind
                     : ErrorKind.ModuleNotFound;
-                throw err(kind,
-                    `Cannot resolve "${spec}" from "${parent}": ${errMsg(e)}`, e);
+                throw esmResolveError(spec, parent, e, kind);
             }
         },
 

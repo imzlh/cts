@@ -20,7 +20,11 @@ export interface CjsModule {
 
 export interface CjsRequireFn {
     (id: string): unknown;
-    resolve: (id: string, opts?: { paths?: string[] }) => string;
+    resolve: {
+        (id: string, opts?: { paths?: string[] }): string;
+        /** Node's require.resolve.paths — null for builtins. */
+        paths(id: string): string[] | null;
+    };
     cache: Record<string, CjsModule>; main: CjsModule | null;
     extensions: Record<string, (m: CjsModule, f: string) => void>;
 }
@@ -35,6 +39,10 @@ export interface CjsDeps {
     loadWasmSync?(info: ModuleInfo): Record<string, unknown>;
     /** Resolve any external specifier → concrete module info. */
     resolveExternal(req: string, parent: string): ModuleInfo | null;
+    /** Inspection-only resolve for require.resolve(): local/store/lock, never
+     *  fetches or installs. Optional — a deps object without it falls back to
+     *  resolveExternal, which keeps hand-built test doubles working. */
+    resolveExternalCached?(req: string, parent: string): ModuleInfo | null;
     /** Prepare source for CJS execution (e.g. strip TS/JSX syntax). */
     prepareSource?(code: string, filePath: string): string | null;
     /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. */
@@ -172,6 +180,24 @@ function normalizeRequireResolvePaths(paths: string[]): string[] {
     return out;
 }
 
+/**
+ * Node's require.resolve() failure, byte-for-byte in shape (measured v24.18.0):
+ *   message    "Cannot find module 'x'\nRequire stack:\n- <parent>"
+ *   code       'MODULE_NOT_FOUND'
+ *   requireStack  ['<parent>']
+ * The old message here was "Cannot resolve module 'x'" with no requireStack,
+ * so consumers that match on node's wording (bundlers, error reporters) missed.
+ */
+function moduleNotFoundError(id: string, parentPath: string): Error {
+    const stack = parentPath ? [toHostPath(parentPath)] : [];
+    const suffix = stack.length ? `\nRequire stack:\n- ${stack.join('\n- ')}` : '';
+    const e = err(ErrorKind.ModuleNotFound, `Cannot find module '${id}'${suffix}`);
+    Object.defineProperty(e, 'requireStack', {
+        value: stack, writable: true, enumerable: false, configurable: true,
+    });
+    return e;
+}
+
 function normalizeCJSExport(obj: unknown): unknown {
     if (obj !== null && typeof obj === 'object' && !Object.getPrototypeOf(obj)) {
         return { ...obj };
@@ -212,14 +238,17 @@ function normalizeExecError(error: unknown, filename: string): Error {
 function createUninitializedRequire(): CjsRequireFn {
     const cache: Record<string, CjsModule> = Object.create(null);
     const extensions: Record<string, (m: CjsModule, f: string) => void> = Object.create(null);
+    const uninitialized = (): never => {
+        throw new Error('CommonJS require.resolve() used before initialization');
+    };
+    const resolve = ((_id: string): string => uninitialized()) as CjsRequireFn['resolve'];
+    resolve.paths = (_id: string): string[] | null => uninitialized();
     const requireFn = Object.assign(
         (_id: string): never => {
             throw new Error('CommonJS require() used before initialization');
         },
         {
-            resolve(_id: string): string {
-                throw new Error('CommonJS require.resolve() used before initialization');
-            },
+            resolve,
             cache,
             main: null as CjsModule | null,
             extensions,
@@ -497,13 +526,22 @@ export class CjsLoader {
         const filename = getInternalFilename(mod);
         try {
             if (!napi) {
-                throw err(ErrorKind.Generic, 'Node-API native addons are unavailable in this runtime context');
+                throw err(ErrorKind.Generic, 'Node-API native addons are unavailable in this runtime context',
+                    undefined, 'ERR_DLOPEN_FAILED');
             }
             mod.exports = napi.dlopen(filename);
             mod.loaded = true;
         } catch (e) {
             this.cache.delete(filename);
-            throw err(ErrorKind.Generic, `Error loading native addon '${filename}': ${e}`, e);
+            // ERR_DLOPEN_FAILED is node's code for a .node that won't load
+            // (measured: process.dlopen and require() of a bad addon both set
+            // it). This is the error sharp collects per load attempt and then
+            // reads `.code` off — see the note on codeForKind in errors.ts.
+            // Codeless, it crashed sharp's own message builder with
+            // "cannot read property 'endsWith' of undefined" and hid which of
+            // its ~10 attempts failed.
+            throw err(ErrorKind.Generic, `Error loading native addon '${filename}': ${e}`, e,
+                'ERR_DLOPEN_FAILED');
         }
     }
 
@@ -649,14 +687,33 @@ export class CjsLoader {
             return self.requireFrom(id, parentPath, parentMod);
         }
 
-        require.resolve = function(id: string, opts?: { paths?: string[] }): string {
+        // `inspect: true` on resolveId is the fix for require.resolve() doing
+        // network I/O — see ModuleResolver.resolveForInspection for the full
+        // reasoning. require() above deliberately keeps the fetching path: only
+        // this inspection API changes.
+        const resolve = ((id: string, opts?: { paths?: string[] }): string => {
+            // Node returns the specifier verbatim for builtins, not a path
+            // (measured v24.18.0: resolve('fs') === 'fs',
+            // resolve('node:fs') === 'node:fs'). Returning cache/node/fs/index.ts
+            // instead made bundlers treat builtins as bundleable files.
+            // node:module's _resolveFilename already did this; the global CJS
+            // require did not.
+            if (isBuiltinSpecifier(id)) return id;
             const searchIn = opts?.paths ? normalizeRequireResolvePaths(opts.paths) : [parentPath];
             for (const p of searchIn) {
-                const r = self.resolveId(id, p);
+                const r = self.resolveId(id, p, true);
                 if (r) return toHostPath(r.info.localPath);
             }
-            throw err(ErrorKind.ModuleNotFound, `Cannot resolve module '${id}'`);
+            throw moduleNotFoundError(id, parentPath);
+        }) as CjsRequireFn['resolve'];
+        // Node exposes require.resolve.paths; it was absent here (measured
+        // undefined against v24.18.0's function). Returns null for builtins.
+        resolve.paths = (id: string): string[] | null => {
+            if (isBuiltinSpecifier(id)) return null;
+            if (isRelative(id) || isAbsolute(id) || id === '.') return toHostPaths([dirname(parentPath)]);
+            return toHostPaths(buildPaths(dirname(parentPath)));
         };
+        require.resolve = resolve;
         require.cache      = self.cacheView;
         require.main       = self.mainModule;
         require.extensions = {
@@ -787,14 +844,23 @@ export class CjsLoader {
         }
     }
 
-    private resolveId(id: string, parentPath: string): ResolvedCjsRequest | null {
+    private resolveId(id: string, parentPath: string, inspect = false): ResolvedCjsRequest | null {
+        // require.resolve() must not fetch/install (see resolveForInspection).
+        // Falls back to resolveExternal when a caller supplied a deps object
+        // without the cached twin, so behaviour degrades to "as before" rather
+        // than to "resolves nothing".
+        const external = (req: string, parent: string): ModuleInfo | null =>
+            inspect && this.deps.resolveExternalCached
+                ? this.deps.resolveExternalCached(req, parent)
+                : this.deps.resolveExternal(req, parent);
+
         // pack:/ctsview: parents have no FS base — full resolver; plain paths stay local-first.
         const runtimeParent = hasProtocolScheme(parentPath)
             ? parentPath
             : this.deps.runtimeParent?.(parentPath) ?? null;
         if (runtimeParent) {
             // resolveExternal rethrows non-miss; do not wrap in empty catch.
-            const ext = this.deps.resolveExternal(id, runtimeParent);
+            const ext = external(id, runtimeParent);
             if (ext) return { info: ext, isCjs: ext.format === 'cjs' || ext.fileKind === 'json' };
             return null;
         }
@@ -807,7 +873,7 @@ export class CjsLoader {
 
         // External resolver first (covers npm, jsr, http, aliases, import map).
         // Non-miss errors (ProtocolDisabled, Network, …) propagate from resolveExternal.
-        const ext = this.deps.resolveExternal(id, parentPath);
+        const ext = external(id, parentPath);
         if (ext) {
             return {
                 info: ext,
@@ -847,7 +913,11 @@ export class CjsLoader {
         try {
             const path = normalizePath(resolveFile(normalizePath(candidate)));
             // .node always CJS; .js uses package type / extension (no source scan).
-            const format = extname(path) === '.node' ? 'cjs' : detectFormat(path);
+            // 'require' is load-bearing: every path through here is a require()
+            // (or createRequire()) edge, and node classifies a no-manifest `.js`
+            // as CJS. Dropping it hands back the import-side ESM default and the
+            // child dies on "module is not defined". See detectFormat in pkg.ts.
+            const format = extname(path) === '.node' ? 'cjs' : detectFormat(path, 'require');
             const fileKind = guessFileKind(path);
             return this.infoFromLocalPath(path, format, fileKind);
         } catch {
@@ -855,7 +925,7 @@ export class CjsLoader {
         }
     }
 
-    private infoFromLocalPath(path: string, format = detectFormat(path), fileKind = guessFileKind(path)): ResolvedCjsRequest {
+    private infoFromLocalPath(path: string, format = detectFormat(path, 'require'), fileKind = guessFileKind(path)): ResolvedCjsRequest {
         const info: ModuleInfo = {
             specPath: path,
             localPath: path,

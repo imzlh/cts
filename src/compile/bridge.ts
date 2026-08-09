@@ -159,6 +159,27 @@ export function buildCjsDeps(
             }
         },
 
+        /**
+         * Inspection-only twin of resolveExternal, for require.resolve().
+         * Never fetches or installs — see ModuleResolver.resolveForInspection
+         * for the full reasoning and the measurements behind it.
+         *
+         * Miss handling differs from resolveExternal on purpose: under no-fetch,
+         * a store miss surfaces as the cachedOnly-specific ModuleNotFound
+         * ("npm package not found in cache: …, --cached-only is specified"),
+         * which IS the right answer for an inspection and must become a plain
+         * miss so require.resolve() reports node's MODULE_NOT_FOUND rather than
+         * leaking a --cached-only message the user never opted into.
+         */
+        resolveExternalCached(req: string, parent: string): ModuleInfo | null {
+            try {
+                return resolver.resolveForInspection(req, parent, { cjs: true });
+            } catch (e) {
+                if (isResolutionMiss(e)) return null;
+                throw e;
+            }
+        },
+
         prepareSource(code: string, filePath: string): string | null {
             return esm.transformer.transformForCjs(code, filePath);
         },

@@ -88,18 +88,85 @@ function locationFromStack(source: Error | undefined): { line: number; col: numb
 
 // Helper: create an Error with .kind attached
 
-/** Error with .kind for formatError. */
-export function err(kind: ErrorKind, msg: string, source?: unknown): Error {
+/** Attach a node-style `.code` string. Enumerable + configurable so a more
+ *  specific call site (see pkg.ts `codedError`) can override the default. */
+export function setErrorCode(e: Error, code: string): void {
+    Object.defineProperty(e, 'code', {
+        value: code,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
+}
+
+/** Default node-style `.code` for an ErrorKind, or undefined for the kinds node
+ *  itself leaves codeless.
+ *
+ *  WHY THIS EXISTS — do not delete it as cosmetic. Real packages *branch* on
+ *  `err.code`, and they assume it is a string whenever a load fails. An error
+ *  with no `code` does not merely print less detail; it crashes the consumer
+ *  somewhere unrelated and destroys the diagnostic. The measured case:
+ *
+ *      require('sharp')
+ *        → TypeError: cannot read property 'endsWith' of undefined
+ *          at sharp/dist/sharp.cjs:115
+ *            errors.forEach((err) => {
+ *              if (!err.code.endsWith("MODULE_NOT_FOUND")) ...
+ *
+ *  sharp collects an error per load attempt (~10 of them) and builds a
+ *  diagnostic message at the end. With `.code` undefined, that builder throws
+ *  and the user sees a TypeError inside sharp instead of *which* attempt failed
+ *  and why. Before this table only ErrorKind.ModuleNotFound carried a code, so
+ *  every other kind — including the addon-load failure that is sharp's actual
+ *  problem — arrived codeless.
+ *
+ *  Codes are the ones node produces for the same situation, measured against
+ *  node v24.18.0 rather than assumed. Two kinds deliberately get NO code
+ *  because node also leaves them undefined: a module that fails to parse throws
+ *  a bare SyntaxError (`import()` of a file with a syntax error, and of a
+ *  malformed `data:` URL, both give code === undefined). Inventing a code there
+ *  would be worse than none — a parse failure reported as ERR_MODULE_NOT_FOUND
+ *  sends a consumer down the "install the package" path for a source bug.
+ *
+ *  CONSTRAINT: no kind other than ModuleNotFound/FileNotFound may map to
+ *  'MODULE_NOT_FOUND' or 'ENOENT'. `isResolutionMiss` treats those two codes as
+ *  "keep walking the CJS resolution chain", so handing them to e.g. LockFrozen
+ *  or PermissionError would silently swallow a real failure as a miss.
+ *  tests/cts/resolve-miss.test.ts pins that boundary. */
+export function codeForKind(kind: ErrorKind): string | undefined {
+    switch (kind) {
+        // require()'s value. ESM upgrades this to ERR_MODULE_NOT_FOUND at the
+        // import boundary (runtime/hooks.ts) — node uses a different code for
+        // the two loaders. isResolutionMiss and the npm optional-dependency
+        // path both key off this exact string.
+        case ErrorKind.ModuleNotFound:   return 'MODULE_NOT_FOUND';
+        case ErrorKind.FileNotFound:     return 'ENOENT';
+        // Node throws exactly this for a scheme its ESM loader won't take
+        // (measured: import('gopher://…')).
+        case ErrorKind.ProtocolDisabled: return 'ERR_UNSUPPORTED_ESM_URL_SCHEME';
+        case ErrorKind.InvalidSpecifier: return 'ERR_INVALID_MODULE_SPECIFIER';
+        case ErrorKind.PermissionError:  return 'EACCES';
+        // cno-specific: no node equivalent exists, because node has neither a
+        // lockfile nor a task runner nor registry version selection. Named in
+        // node's ERR_* style so consumers can at least match on them.
+        case ErrorKind.NetworkError:     return 'ERR_MODULE_FETCH_FAILED';
+        case ErrorKind.VersionNotFound:  return 'ERR_VERSION_NOT_FOUND';
+        case ErrorKind.LockFrozen:       return 'ERR_LOCK_FROZEN';
+        case ErrorKind.TaskNotFound:     return 'ERR_TASK_NOT_FOUND';
+        case ErrorKind.Generic:          return 'ERR_GENERIC';
+        // No code, matching node: these are parse failures.
+        case ErrorKind.SyntaxError:
+        case ErrorKind.TransformError:
+        default:                         return undefined;
+    }
+}
+
+/** Error with .kind for formatError. `code` overrides the kind's default. */
+export function err(kind: ErrorKind, msg: string, source?: unknown, code?: string): Error {
     const e = new Error(msg);
     e.kind = kind;
-    if (kind === ErrorKind.ModuleNotFound) {
-        Object.defineProperty(e, 'code', {
-            value: 'MODULE_NOT_FOUND',
-            writable: true,
-            enumerable: true,
-            configurable: true,
-        });
-    }
+    const finalCode = code ?? codeForKind(kind);
+    if (finalCode !== undefined) setErrorCode(e, finalCode);
     if (source !== undefined) {
         Object.defineProperty(e, 'cause', {
             value: source,
@@ -129,13 +196,7 @@ export function requireCycleError(target: string, from: string, kind: 'require-e
     const what = kind === 'require-esm'
         ? `Cannot require() ES Module ${target} in a cycle.`
         : `Cannot import CommonJS Module ${target} in a cycle.`;
-    const e = err(ErrorKind.Generic, `${what} (from ${from})`);
-    Object.defineProperty(e, 'code', {
-        value: 'ERR_REQUIRE_CYCLE_MODULE',
-        writable: true,
-        enumerable: true,
-        configurable: true,
-    });
+    const e = err(ErrorKind.Generic, `${what} (from ${from})`, undefined, 'ERR_REQUIRE_CYCLE_MODULE');
     return e;
 }
 

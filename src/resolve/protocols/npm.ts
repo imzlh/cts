@@ -4,7 +4,7 @@ import { guessFileKind } from './base';
 import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
-import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, hasSupportedIntegrity, isValidNpmPackageName, npmDepTarget, parseNpmAliasDep } from '../../utils/misc';
+import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, hasSupportedIntegrity, isValidNpmPackageName, npmDepTarget, parseNpmAliasDep, errMsg } from '../../utils/misc';
 import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, resolvePackageBinPath, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
@@ -381,6 +381,17 @@ function canUseLocalPackageForRange(range: string): boolean {
     return !range || range === 'latest' || range === '*';
 }
 
+/**
+ * `''` / `latest` / `*` — the caller stated no version, so *the registry*
+ * decides what "latest" means, not whatever happens to sit in the store.
+ * Same predicate as canUseLocalPackageForRange(); named separately because the
+ * version-selection policy in resolveUnconstrainedVersion() turns on it and a
+ * reader should not have to infer that from a function about local packages.
+ */
+function isUnconstrainedRange(range: string): boolean {
+    return canUseLocalPackageForRange(range);
+}
+
 /** package.json dep values like https://cdn…/pkg-1.0.0.tgz (npm/yarn/pnpm). */
 function isTarballUrl(range: string): boolean {
     if (!(range.startsWith('https://') || range.startsWith('http://'))) return false;
@@ -654,6 +665,8 @@ export class NpmHandler implements ProtocolHandler {
     private readonly queuedLifecycle = new Set<string>();
     /** Flat-store version lists per package name (avoids readdir thrash). */
     private readonly storeVersionsCache = new Map<string, string[]>();
+    /** Packages already warned about an unattested/stale store fallback (once each). */
+    private readonly warnedStoreFallback = new Set<string>();
     /** One readdir of cacheDir / scope dirs for listStoreVersions. */
     private storeRootListing: string[] | null = null;
     private readonly storeScopeListing = new Map<string, string[]>();
@@ -676,6 +689,7 @@ export class NpmHandler implements ProtocolHandler {
         this.packagesPrepared.clear();
         this.metaMem.clear();
         this.storeVersionsCache.clear();
+        this.warnedStoreFallback.clear();
         this.storeRootListing = null;
         this.storeScopeListing.clear();
         this.npmCfg = null;
@@ -784,23 +798,41 @@ export class NpmHandler implements ProtocolHandler {
                 return null;
             }
         }
-        const hit = this.findCachedPackageMatching(name, range);
+        const hit = this.findCachedPackageMatching(name, range, false);
         if (hit) {
             const pkg = readPkg(hit);
             const ver = pkg?.version ?? stripLeadingV(range);
             return { dir: hit, resolvedVer: ver };
         }
         // Not in store (or hollow without package.json): resolve + install body.
-        if (this.cfg.cachedOnly) return null;
         const exactRange = stripLeadingV(range);
         let exactVer: string;
-        if (isExactSemver(exactRange)) {
+        if (isUnconstrainedRange(range)) {
+            // Deliberately ahead of the cachedOnly bail below: tiers 2/3 of the
+            // unconstrained policy are local-only (store listing + on-disk
+            // meta, no network), so under --cached-only this can still answer
+            // from attested store contents instead of the graph node being
+            // silently skipped.
+            try {
+                exactVer = yield* this.resolveUnconstrainedVersion(name, range, onProgress);
+            } catch (e) {
+                // This function's contract is null-on-miss, not throw.
+                if (!this.cfg.cachedOnly) throw e;
+                log.debug('npm', () => `unconstrained resolve failed under cached-only: ${name}: ${errMsg(e)}`);
+                return null;
+            }
+        } else if (this.cfg.cachedOnly) {
+            return null;
+        } else if (isExactSemver(exactRange)) {
             exactVer = exactRange;
         } else {
             exactVer = yield* this.resolveVersion(name, range, onProgress);
         }
         const pkgDir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         if (!fs.exists(joinPaths(pkgDir, 'package.json'))) {
+            // Reachable under cachedOnly only via the unconstrained branch
+            // above, where tier 1 may name a version that is not in the store.
+            if (this.cfg.cachedOnly) return null;
             if (!this.cfg.silent && !isatty) log.download(`${name}@${exactVer}`);
             // Body-only FLOW (same key as installOnce) — no dep walk under the key.
             yield {
@@ -977,7 +1009,14 @@ export class NpmHandler implements ProtocolHandler {
         if (!subpath || subpath === '.' || subpath === './') {
             baseDir = pkg.dir;
         } else {
-            let parentLocal: string | null = resolveSubpath(ctx, subpath)?.path ?? null;
+            // Node never applies "exports" to a package's own internal relative imports,
+            // so the parent's path is just its subpath. Trust it when it is a real file.
+            let parentLocal: string | null = null;
+            const direct = normalizePath(joinPaths(pkg.dir, subpath));
+            try {
+                if (fs.stat(direct).isFile) parentLocal = direct;
+            } catch { /* not a plain file; fall through */ }
+            if (!parentLocal) parentLocal = resolveSubpath(ctx, subpath)?.path ?? null;
             if (!parentLocal) {
                 const targetName = lastPathSegment(subpath);
                 if (!targetName) throw err(ErrorKind.ModuleNotFound, `Cannot resolve parent "${subpath}" in ${name}@${pkg.resolvedVer}`);
@@ -1060,16 +1099,20 @@ export class NpmHandler implements ProtocolHandler {
             } catch {
                 return;
             }
+            // Test files at this level before descending, so a shallower match wins
+            // over a same-named file in a subdirectory that sorts earlier.
+            const dirs: string[] = [];
             for (const e of entries) {
                 const p = joinPaths(d, e);
                 try {
                     if (fs.stat(p).isDirectory) {
-                        if (e !== 'node_modules') walk(p);
+                        if (e !== 'node_modules') dirs.push(p);
                     } else if (e === basename) {
                         results.push(p);
                     }
                 } catch {}
             }
+            for (const p of dirs) walk(p);
         };
         walk(dir);
         if (!results.length) return null;
@@ -1468,10 +1511,16 @@ export class NpmHandler implements ProtocolHandler {
                 return { dir: local, resolvedVer: exactRange };
             }
         }
-        // Warm store hit for ranges (^/~/*): use already-extracted name@version
-        // without registry meta. Re-cache of large trees was stuck minutes on
-        // resolve npm:foo@^x while foo@y sat in ~/.cts/npm.
-        const storeHit = this.findCachedPackageMatching(name, version);
+        // Warm store hit for CONSTRAINED ranges (^/~/exact): use an
+        // already-extracted name@version without registry meta. Re-cache of
+        // large trees was stuck minutes on resolve npm:foo@^x while foo@y sat
+        // in ~/.cts/npm — do not remove this fast path.
+        //
+        // `false` excludes the UNCONSTRAINED ('' / latest / *) case, which must
+        // not be answered from store contents; resolveUnconstrainedVersion()
+        // below owns that and documents why. For a constrained range the flag
+        // is inert, so the optimisation above is unaffected.
+        const storeHit = this.findCachedPackageMatching(name, version, false);
         if (storeHit) {
             const hitPkg = readPkg(storeHit);
             const hitVer = hitPkg?.version ?? exactRange;
@@ -1479,7 +1528,9 @@ export class NpmHandler implements ProtocolHandler {
             this.verCache.set(`${name}@${exactRange}`, hitVer);
             return { dir: storeHit, resolvedVer: hitVer };
         }
-        const exactVer = yield* this.resolveVersion(name, version, onProgress);
+        const exactVer = isUnconstrainedRange(version)
+            ? yield* this.resolveUnconstrainedVersion(name, version, onProgress)
+            : yield* this.resolveVersion(name, version, onProgress);
         const pkgDir = joinPaths(this.cacheDir, `${name}@${exactVer}`);
         const exists = yield { type: StepType.FS_EXISTS, path: joinPaths(pkgDir, 'package.json') };
         if (!exists) {
@@ -1755,6 +1806,136 @@ export class NpmHandler implements ProtocolHandler {
         return resolved;
     }
 
+    /**
+     * Version policy for an UNCONSTRAINED range (`''` / `latest` / `*`).
+     *
+     * DO NOT "simplify" this back into a bare findCachedPackageMatching() hit.
+     * That is the exact shape of the defect this replaced: ensureInstalled()
+     * returned from the warm-store fast path *before* resolveVersion() — the
+     * only reader of `dist-tags` — ever ran, so an unversioned `npm:foo`
+     * resolved to `latestVersion(<whatever foo@* happened to sit in the
+     * store>)`. Measured: a planted `commander@99.0.0`, a version published by
+     * no registry, won a top-level `import('npm:commander')` while metadata
+     * with a fresh marker and `dist-tags.latest = 15.0.0` sat readable on
+     * disk. Store contents are sticky — once something lands it is preferred
+     * forever — so that is a supply-chain hazard, not merely a wrong answer.
+     *
+     * A CONSTRAINED range (`^1`, `~1.2`, `1.2.3`) is the caller's own stated
+     * intent, so a store answer is legitimate and deliberately keeps the fast
+     * path (see the comment above the findCachedPackageMatching() call in
+     * ensureInstalled()). Only the unconstrained case delegates the choice,
+     * because only the registry knows what "latest" currently means.
+     *
+     * Requiring metadata outright was REJECTED: it turns every unversioned
+     * `npm:` import red offline, which is worse than the bug. Instead the store
+     * may still answer, but only for versions the registry has ATTESTED:
+     *
+     *   tier 1  metadata fresh on disk (<24h) or fetchable -> `dist-tags.latest`.
+     *           Authoritative, and matches npm. If that version is not in the
+     *           store and cannot be fetched, the error stands rather than
+     *           silently substituting a different version — deno's `--cached-only`
+     *           refuses here too, and a loud miss beats a quiet downgrade.
+     *   tier 2  metadata on disk at ANY age -> highest store version that is
+     *           present in `meta.versions`, preferring a still-present
+     *           `dist-tags.latest`. This asymmetry is the crux: the `latest`
+     *           POINTER drifts and so needs the 24h gate, but MEMBERSHIP in
+     *           `meta.versions` is an immutable historical fact — 92h-old
+     *           metadata still proves `99.0.0` was never published. Attestation
+     *           therefore survives staleness, which is what lets this stay
+     *           useful offline without trusting arbitrary store contents.
+     *   tier 3  no metadata at all -> highest store version, with a warning.
+     *           The store *is* the cache, so refusing here would break offline
+     *           first-run for no safety gain over warning; but the answer is
+     *           unverified, so it must not be silent.
+     */
+    private *resolveUnconstrainedVersion(
+        name: string,
+        range: string,
+        onProgress?: ProgressCallback,
+    ): Flow<string> {
+        try {
+            return yield* this.resolveVersion(name, range, onProgress);
+        } catch (e) {
+            // Offline / cachedOnly / unpublished-from-registry: fall back only
+            // as far as the evidence on disk actually supports.
+            const fallback = yield* this.attestedStoreVersion(name, e);
+            if (fallback) return fallback;
+            throw e;
+        }
+    }
+
+    /**
+     * Tiers 2 and 3 of the unconstrained policy — see resolveUnconstrainedVersion().
+     * Purely local: reads only the store listing and any on-disk metadata, never
+     * the network, so it is safe under `--cached-only`.
+     */
+    private *attestedStoreVersion(name: string, cause: unknown): Flow<string | null> {
+        const store = this.listStoreVersions(name).filter(v => !isUrlStoreVersion(v));
+        if (store.length === 0) return null;
+        const meta = yield* this.readMetaFromDiskAnyAge(name);
+        if (meta) {
+            // tier 2 — attested by metadata of any age.
+            const attested = store.filter(v => !!meta.versions[v]);
+            if (attested.length > 0) {
+                const tagged = (meta['dist-tags'] ?? {}).latest;
+                const pick = tagged && attested.includes(tagged) ? tagged : latestVersion(attested);
+                if (pick) {
+                    const rejected = store.length - attested.length;
+                    log.debug('npm', () =>
+                        `${name}: registry meta unavailable (${errMsg(cause)}); using stale-attested ` +
+                        `${pick}${rejected > 0 ? ` (${rejected} store version(s) absent from metadata ignored)` : ''}`);
+                    // A version the metadata does not know about losing to one it
+                    // does is the whole point of the fix — say so, once, because
+                    // the user asked for "latest" and did not get the registry's.
+                    if (rejected > 0) this.warnStoreFallback(name, () =>
+                        `${name}: "latest" resolved offline to ${pick} from cached metadata; ` +
+                        `${rejected} store version(s) not present in that metadata were ignored`);
+                    return pick;
+                }
+            }
+        }
+        // tier 3 — nothing attests anything; the store is all we have.
+        const pick = latestVersion(store);
+        if (!pick) return null;
+        this.warnStoreFallback(name, () =>
+            `${name}: no registry metadata available (${errMsg(cause)}); resolved "latest" to ${pick} ` +
+            `from cache contents alone — version NOT confirmed against a registry`);
+        return pick;
+    }
+
+    /**
+     * Correctness advisory, not progress chatter: emitted regardless of
+     * `silent` (which gates log.download/progress only, matching every other
+     * log.warn in cts), on stderr via console.warn so it cannot corrupt stdout
+     * data. Deduplicated per package so a large offline tree warns once each
+     * instead of once per edge.
+     */
+    private warnStoreFallback(name: string, msg: () => string): void {
+        if (this.warnedStoreFallback.has(name)) return;
+        this.warnedStoreFallback.add(name);
+        log.warn('npm', msg);
+    }
+
+    /**
+     * Registry meta from disk at ANY age, without network. Deliberately does
+     * NOT populate metaMem: that cache feeds tier 1, and seeding it with stale
+     * bytes would let a later resolve treat an expired `dist-tags.latest` as
+     * authoritative.
+     */
+    private *readMetaFromDiskAnyAge(name: string): Flow<NpmMeta | null> {
+        const mem = this.metaMem.get(name);
+        if (mem) return mem;
+        const { cacheFile } = this.metaCachePaths(name);
+        const has = yield { type: StepType.FS_EXISTS, path: cacheFile };
+        if (!has) return null;
+        try {
+            const meta = safeParse<NpmMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: cacheFile }));
+            return meta && meta.versions ? meta : null;
+        } catch {
+            return null;
+        }
+    }
+
     private *fetchMeta(name: string, onProgress?: ProgressCallback): Flow<NpmMeta> {
         const mem = this.metaMem.get(name);
         if (mem) return mem;
@@ -1769,15 +1950,22 @@ export class NpmHandler implements ProtocolHandler {
         return after;
     }
 
+    /**
+     * On-disk registry meta location. Under `.meta/` because `<cacheDir>/<name>`
+     * is the alias symlink target — writing meta there lands inside a store
+     * package body (or blocks the alias).
+     */
+    private metaCachePaths(name: string): { cacheFile: string; cacheTs: string } {
+        const cacheFile = joinPaths(this.cacheDir, '.meta', name, 'meta.json');
+        return { cacheFile, cacheTs: cacheFile + '.ts' };
+    }
+
     private *fetchMetaBody(name: string, onProgress?: ProgressCallback): Flow<void> {
         if (this.metaMem.has(name)) return;
         const cfg = this.getNpmCfg();
         const scope = packageScope(name);
         const registry = scope ? cfg.scopeRegistries[scope] ?? cfg.registry : cfg.registry;
-        // Under .meta/: <cacheDir>/<name> is the alias symlink target, so writing
-        // meta there lands inside a store package body (or blocks the alias).
-        const cacheFile = joinPaths(this.cacheDir, '.meta', name, 'meta.json');
-        const cacheTs = cacheFile + '.ts';
+        const { cacheFile, cacheTs } = this.metaCachePaths(name);
         const hasMeta = yield { type: StepType.FS_EXISTS, path: cacheFile };
         const hasTs = yield { type: StepType.FS_EXISTS, path: cacheTs };
         if (hasMeta && hasTs) {
@@ -2033,11 +2221,24 @@ export class NpmHandler implements ProtocolHandler {
         }
     }
 
-    /** Prefer an already-extracted store package that satisfies `range`. */
-    private findCachedPackageMatching(name: string, range: string): string | null {
+    /**
+     * Prefer an already-extracted store package that satisfies `range`.
+     *
+     * `allowUnconstrainedStoreHit` (default true) governs ONLY the `''`/`latest`/`*`
+     * case. It is false at the two version-resolution entry points, because
+     * "highest thing in the store" is not a valid answer to "give me latest" —
+     * see resolveUnconstrainedVersion(). It stays true for the peer/optional
+     * callers, which are explicitly store-only link-if-present paths where the
+     * alternative is not a better version but a missing link. For a constrained
+     * range the flag is inert, so the warm fast path is untouched.
+     */
+    private findCachedPackageMatching(name: string, range: string, allowUnconstrainedStoreHit = true): string | null {
         if (!isValidNpmPackageName(name)) return null;
         // URL/github ranges pin a dist; only ensureInstalledFromTarballUrl may hit them.
         if (isOpaqueVersionRange(range)) return null;
+        const unconstrained = isUnconstrainedRange(range);
+        // A lock entry is a prior *resolved* decision, i.e. the user's pinned
+        // intent — it outranks dist-tags and is not gated here.
         const locked = this.lockedVersionForRange(name, range);
         if (locked && !isUrlStoreVersion(locked)) {
             const dir = joinPaths(this.cacheDir, `${name}@${locked}`);
@@ -2052,14 +2253,18 @@ export class NpmHandler implements ProtocolHandler {
         // Skip URL-tagged dirs so a github pin cannot satisfy ^1.0.0 by accident.
         const versions = this.listStoreVersions(name).filter(v => !isUrlStoreVersion(v));
         if (versions.length > 0) {
-            const matched = (!norm || norm === 'latest' || norm === '*')
-                ? latestVersion(versions)
+            const matched = unconstrained
+                ? (allowUnconstrainedStoreHit ? latestVersion(versions) : null)
                 : (matchLatestVersion(versions, norm) ?? (versions.includes(norm) ? norm : null));
             if (matched) {
                 const dir = joinPaths(this.cacheDir, `${name}@${matched}`);
                 if (fs.exists(joinPaths(dir, 'package.json'))) return dir;
             }
         }
+        // The bare `<cacheDir>/<name>` alias is also store contents, and
+        // localPackageMatchesRange() accepts ANY version for an unconstrained
+        // range — so it needs the same gate or it reopens the same hole.
+        if (unconstrained && !allowUnconstrainedStoreHit) return null;
         const alias = joinPaths(this.cacheDir, name);
         try {
             if (fs.exists(joinPaths(alias, 'package.json'))) {

@@ -7,7 +7,7 @@ import { hasImportAttributes, isTsLikePath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { relativePath, dirname, basename, canonicalizePath, ensureDir, PrecacheProgress, log } from '../utils';
 import { err, ErrorKind } from '../errors';
-import { encodePackHeader, type PackManifest, type PackModuleEntry } from './format';
+import { encodePackHeader, completePackManifest, type PackBlobSource, type PackManifest, type PackModuleEntry } from './format';
 import { writeAll, writeAtomicallyStreamed } from './integrity';
 import { attributeViewId, specScheme } from './identity';
 import { stripSourceMappingURL } from './sourcemap';
@@ -26,13 +26,21 @@ interface SourceSnapshot extends BlobRange {
     sourceOnly: boolean;
     /** Digest of the ON-DISK bytes, for the pack-time change check. */
     digest: string;
-    /** Embedded text after sourceMappingURL stripping — also what is compiled,
-     *  so the bytecode cannot re-acquire the annotation the blob just lost. */
+    /** Embedded text after sourceMappingURL stripping.
+     *
+     *  Currently UNUSED at the compile step, and kept deliberately: it is exactly
+     *  the text that has to reach the compiler to close the bytecode-sourcemap
+     *  gap documented at the sourceModules.push below. Nothing reads it today, so
+     *  do not treat its presence as evidence the gap is closed. */
     code: string;
 }
 
-class BlobBuilder {
+class BlobBuilder implements PackBlobSource {
     private readonly chunks: BlobChunk[] = [];
+    /** offset -> chunk bytes, for serving digest reads without materializing the
+     *  whole blob. Zero-length chunks are excluded: they address no bytes, so
+     *  several can share an offset and none needs a lookup. */
+    private readonly byOffset = new Map<number, Uint8Array>();
     private cursor = 0;
 
     push(bytes: Uint8Array): { offset: number; length: number } {
@@ -40,11 +48,28 @@ class BlobBuilder {
         const next = offset + bytes.byteLength;
         if (!Number.isSafeInteger(next)) throw new Error('pack blob is too large');
         this.chunks.push({ bytes, offset });
+        if (bytes.byteLength > 0) this.byOffset.set(offset, bytes);
         this.cursor = next;
         return { offset, length: bytes.byteLength };
     }
 
     get byteLength(): number { return this.cursor; }
+
+    /** Exact bytes of one appended chunk. Only whole chunks are addressable,
+     *  which is precisely what the manifest declares: every range in it came
+     *  from one push() above. A partial or straddling range means the manifest
+     *  and the builder have desynced, so refuse rather than silently hash the
+     *  wrong bytes. */
+    range(offset: number, length: number): Uint8Array {
+        if (length === 0) return new Uint8Array(0);
+        const chunk = this.byOffset.get(offset);
+        if (chunk === undefined || chunk.byteLength !== length) {
+            throw new Error(
+                `pack blob range ${offset}+${length} does not match an appended chunk ` +
+                `(manifest and blob builder disagree)`);
+        }
+        return chunk;
+    }
 
     writeTo(fd: number): void {
         let offset = 0;
@@ -209,9 +234,9 @@ export async function writePack(
                 let bucket = edges[parentId];
                 if (!bucket) {
                     bucket = Object.create(null);
-                    edges[parentId] = bucket;
+                    edges[parentId] = bucket!;
                 }
-                bucket[edge.specifier] = childId;
+                bucket![edge.specifier] = childId;
             } else if (!edge.childSpecPath.startsWith('node:')) {
                 throw err(ErrorKind.Generic,
                     `pack: resolved edge target was not included: "${edge.specifier}" from "${edge.parentSpecPath}" -> "${edge.childSpecPath}"`);
@@ -303,20 +328,30 @@ export async function writePack(
             // be the pack id, never localPath, or the artifact carries the pack-time
             // absolute host path (CJS defaults to localPath for on-disk caches).
             //
-            // `code` hands the compiler the STRIPPED text rather than letting it
-            // re-read the file. This is load-bearing for CJS specifically:
-            // QuickJS keeps the CJS wrapper's function source inside the
-            // bytecode, so a CJS module compiled from the on-disk text ships a
-            // second, independent copy of the inline source map inside its
-            // bytecode range — stripping only the source blob leaves that one in
-            // place, and it decodes to the same host paths.
+            // KNOWN GAP, measured — do not read the stripping below as complete.
+            // `stripSourceMappingURL` cleans the bytes that go into the *source*
+            // blob range, and that part works. It does NOT clean bytecode:
+            // ParseDriver re-reads the file from disk to compile (parse.ts:637 for
+            // CJS, :542 inline), and QuickJS keeps the CJS wrapper's function
+            // source inside the bytecode, so a CJS module that had an inline map
+            // ships a second copy of it inside its bytecode range — build-machine
+            // absolute paths and the base64 pre-build original included.
+            //
+            // Measured on a two-module CJS fixture: the embedded source ranges
+            // were clean, and `pack:/lib.cjs`'s BYTECODE range still contained the
+            // annotation, decoding to the build path. Closing it means plumbing
+            // the stripped text through CompileTarget (parse.ts:58, which has no
+            // `code` member) into both compile paths. A `code: snapshot.code`
+            // property used to be passed here for exactly that purpose, but
+            // nothing ever read it — it was silently dropped as an unknown
+            // property, which is what the long-standing tsc error on this call
+            // was reporting.
             sourceModules.push({
                 specPath: id,
                 localPath: m.localPath,
                 format: m.format,
                 lang: m.specPath === entryInfo.specPath ? options.entryLang : undefined,
                 identity: id,
-                code: snapshot.code,
             });
         }
 
@@ -434,8 +469,11 @@ export async function writePack(
             edges: orderedEdges,
             bytecodeVersion: engine.versions.quickjs,
         };
-        writeAtomically(outPath, manifest, blob);
-        return manifest;
+        // Return what actually went on disk, digests included, rather than the
+        // pre-digest draft: callers report on this object (the `cno pack` size
+        // table) and it should not disagree with the artifact.
+        const written = writeAtomically(outPath, manifest, blob);
+        return written;
     } finally {
         // Stop progress producer before closing UI.
         try {
@@ -446,10 +484,22 @@ export async function writePack(
     }
 }
 
-function writeAtomically(outPath: string, manifest: PackManifest, blob: BlobBuilder): void {
-    const header = encodePackHeader(manifest, blob.byteLength);
+/** Write the container and return the manifest as it was serialized, with
+ *  blobLength and per-module digests filled in by completePackManifest.
+ *
+ *  Ordering constraint: writeAtomicallyStreamed emits the header before the
+ *  blob, and the header carries the manifest digest, which covers the manifest
+ *  including every per-module digest. So all blob digests must exist before the
+ *  first byte is written. BlobBuilder holds its chunks in memory and serves them
+ *  through PackBlobSource.range, so the pre-pass is a hash over buffers already
+ *  in hand — no extra I/O, and the blob is still streamed rather than
+ *  concatenated. */
+function writeAtomically(outPath: string, manifest: PackManifest, blob: BlobBuilder): PackManifest {
+    const completed = completePackManifest(manifest, blob);
+    const header = encodePackHeader(completed, blob);
     writeAtomicallyStreamed(outPath, (fd) => {
         writeAll(fd, header);
         blob.writeTo(fd);
     }, ensureDir);
+    return completed;
 }

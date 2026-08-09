@@ -52,7 +52,15 @@ export class NodeHandler implements ProtocolHandler {
             ? joinPaths(nodeDir, `${bare}.ts`)
             : joinPaths(nodeDir, bare, 'index.ts');
         const exists = yield { type: StepType.FS_EXISTS, path: localPath };
-        if (!exists) throw err(ErrorKind.FileNotFound, `Node.js builtin "${bare}" has no polyfill at ${localPath}`);
+        // ERR_UNKNOWN_BUILTIN_MODULE is what node reports for an unknown
+        // `node:` specifier (measured on v24.18.0, both import and require).
+        // It survives the ESM boundary's ERR_MODULE_NOT_FOUND upgrade because
+        // that only overwrites the generic resolution-miss codes.
+        if (!exists) {
+            throw err(ErrorKind.FileNotFound,
+                `Node.js builtin "${bare}" has no polyfill at ${localPath}`,
+                undefined, 'ERR_UNKNOWN_BUILTIN_MODULE');
+        }
         return localPath;
     }
 }

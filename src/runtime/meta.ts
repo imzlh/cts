@@ -23,7 +23,9 @@ function encodeFileUrlPath(path: string): string {
     return out;
 }
 
-function toFileUrl(path: string): string {
+/** Path → file: URL. Exported for runtime/hooks.ts, which needs the same
+ *  encoding to build the `url` property node puts on ERR_MODULE_NOT_FOUND. */
+export function toFileUrl(path: string): string {
     const normalized = toPosixPath(path);
     if (isWindowsDrivePath(normalized)) return `file:///${encodeFileUrlPath(normalized)}`;
     if (normalized.startsWith('//')) return `file:${encodeFileUrlPath(normalized)}`;
@@ -34,7 +36,9 @@ function isAsciiAlpha(c: number): boolean {
     return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 }
 
-function isProtocolSpec(spec: string): boolean {
+/** True when spec carries its own scheme (http:, npm:, data:, file:, …).
+ *  Exported for runtime/hooks.ts. */
+export function isProtocolSpec(spec: string): boolean {
     // Windows drive paths (C:/x) look like a single-letter scheme — not protocol specs.
     if (isWindowsDrivePath(toPosixPath(spec))) return false;
     if (!isAsciiAlpha(spec.charCodeAt(0))) return false;

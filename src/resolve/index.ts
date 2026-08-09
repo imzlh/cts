@@ -423,6 +423,81 @@ export class ModuleResolver {
         throw err(ErrorKind.ModuleNotFound, `Cannot resolve bare specifier: "${spec}"`);
     }
 
+    /**
+     * Resolve for INSPECTION only: answer from what is already local (project
+     * node_modules, flat store, lock) and never fetch, install, or materialize.
+     *
+     * ── WHY THIS EXISTS — DO NOT COLLAPSE IT BACK INTO resolve() ──────────────
+     * `require.resolve()` is a synchronous *inspection* API. The universal
+     * ecosystem idiom is
+     *     try { require.resolve('x') } catch { use a fallback }
+     * used for optional deps, plugin discovery and "is X available?" probes.
+     * Routing that through the normal resolve() made it install-on-demand, with
+     * two measured consequences:
+     *
+     *  1. Every such probe took the WRONG BRANCH. resolve() succeeds for any
+     *     name the *upstream registry* has, i.e. essentially every name, so the
+     *     `catch` was unreachable. Measured: eslint's loadFormatter('json') does
+     *     exactly this probe; under node it falls back to its own bundled
+     *     formatter, under cno the probe "succeeded" and it silently loaded a
+     *     different, older eslint-formatter-json@9.0.1 (plus 9 transitive deps).
+     *  2. require.resolve() became NETWORK I/O that fetches registry code, from
+     *     a call the caller believes is a pure local lookup — including from
+     *     inside a `catch` block. Measured with NPM_CONFIG_REGISTRY pointed at
+     *     127.0.0.1:1: `require.resolve('left-pad')` in a project that does not
+     *     depend on left-pad returned
+     *     "Failed to connect to 127.0.0.1:1 after 2050 ms" — i.e. it really did
+     *     open a connection, and against a working registry it returns a path
+     *     where node throws MODULE_NOT_FOUND.
+     *
+     * NOT node-identical, deliberately: a package ALREADY in the local store
+     * still resolves here, where node would throw. That is required for
+     * internal consistency, not laziness — `require('picocolors')` for an
+     * undeclared store package *succeeds* under cno (measured, --cached-only,
+     * no node_modules). Since require.resolve()'s contract is "the path
+     * require() would load", throwing here while require() succeeds would be a
+     * new defect in the opposite direction: `try{resolve}catch{fallback}` would
+     * take the fallback for a package that demonstrably loads. The residual
+     * divergence is bounded by what the user has already downloaded, whereas
+     * fetching is unbounded over the whole registry. Narrowing it further is
+     * node-modules-mode / declared-deps policy, not this function's business.
+     *
+     * Declared-but-not-yet-downloaded deps are NOT materialized here either.
+     * Rejected on purpose: it would make "does this probe block on the network"
+     * depend on the manifest, unauditable from the call site, inside a
+     * synchronous call that can stall for cfg.requestTimeout (120s default).
+     * Materializing declared deps is the install/precache graph's job, which
+     * runs ahead of time. The rule has to stay one sentence long to survive:
+     * **inspection never fetches.**
+     *
+     * Mechanism: `cachedOnly` is already honoured at every download site
+     * (npm.ts, jsr.ts, http.ts), so it is flipped for the duration of the call
+     * rather than threading a second flag through every handler. Safe because
+     * resolve() is fully synchronous — runSync/executeSync never pump
+     * microtasks, so nothing else can observe the flipped flag.
+     *
+     * `inspect: true` rides along in `attr` purely to SEGREGATE the memo caches
+     * (attrSignature folds unknown attr keys into the sourceInfoCache key, and
+     * rememberExact early-returns when attr is set). Without it a no-fetch
+     * answer — which may legitimately pick a different, store-local version —
+     * could be handed to a later real require(). Handlers ignore the key; only
+     * `attr.cjs` and `attr.type` are ever read.
+     *
+     * Relation to --cached-only: NOT redundant either way. --cached-only is
+     * global (require/import/install all stop fetching) and, measured, does not
+     * fix consequence 1 at all — an undeclared store package still resolved
+     * under it. This is narrower: only the inspection path, always on.
+     */
+    resolveForInspection(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
+        const prevCachedOnly = this.cfg.cachedOnly;
+        this.cfg.cachedOnly = true;
+        try {
+            return this.resolve(spec, parent, { ...attr, inspect: true });
+        } finally {
+            this.cfg.cachedOnly = prevCachedOnly;
+        }
+    }
+
     // Main resolution — three-level cache
 
     resolve(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
