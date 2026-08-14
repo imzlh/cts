@@ -40,6 +40,31 @@ function protoOf(s: string): string {
  * contain '%'), then the percent-decoded form.
  */
 function resolveLocalFile(path: string): string {
+    // ESM specifiers are URLs: encoded separators are invalid even when a file
+    // with the literal `%2F`/`%5C` spelling exists. Encoded dot segments would
+    // otherwise become `..` after decoding below and escape the importer's
+    // directory. Reject those forms before trying the literal path.
+    if (path.includes('%')) {
+        if (/%(?:2f|5c)/i.test(path)) {
+            throw err(ErrorKind.InvalidSpecifier,
+                `Invalid module specifier: encoded path separator in "${path}"`);
+        }
+        for (const segment of path.split('/')) {
+            // Only ENCODED dot segments are rejected. A literal `..` is legal here:
+            // resolveRelative normalises it away before calling, and resolveAbsolute
+            // passes an already-absolute path. Testing segments without a '%' would
+            // reject any path that merely contains '%' elsewhere (`/dir%20x/../y`).
+            if (!segment.includes('%')) continue;
+            if (!/(?:%2e|\.){1,2}$/i.test(segment)) continue;
+            let decoded: string;
+            try { decoded = decodeURIComponent(segment); }
+            catch { continue; }
+            if (decoded === '.' || decoded === '..') {
+                throw err(ErrorKind.InvalidSpecifier,
+                    `Invalid module specifier: encoded dot segment in "${path}"`);
+            }
+        }
+    }
     try {
         return resolveFile(path);
     } catch (e) {

@@ -1,6 +1,6 @@
 import { moduleRef, type RuntimeConfig, type ModuleInfo } from '../types';
 import { Transformer } from '../source/transform';
-import { JscCache, isRemote, isFileBackedPath } from '../source/cache';
+import { JscCache, isRemote, isFileBackedPath, type SourceFreshness } from '../source/cache';
 import { readText, readBytes, log } from '../utils';
 import { err, ErrorKind } from '../errors';
 import type { OxcTranspiler } from '../oxc';
@@ -206,24 +206,28 @@ export class EsmCompiler {
         // VFS (pack) or fs → transform → compile
         this.esmLoading.add(cacheKey);
         this.esmInFlightPaths.add(info.localPath);
-        // The sidecar must describe the bytes about to be compiled, not whatever
-        // revision happens to be on disk after compilation finishes.
-        const sourceFreshness = fileBacked && tryBytecode
-            ? this.jsc.captureFreshness(info.localPath)
-            : undefined;
-        const bytes = readBytes(info.localPath);
-        const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleId);
+        let sourceFreshness: SourceFreshness | undefined;
         let mod: CModuleEngine.Module;
         try {
+            // The sidecar must describe the bytes about to be compiled, not whatever
+            // revision happens to be on disk after compilation finishes.
+            sourceFreshness = fileBacked && tryBytecode
+                ? this.jsc.captureFreshness(info.localPath)
+                : undefined;
+            const bytes = readBytes(info.localPath);
+            const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleId);
             mod = this.compileEsm(code, moduleId, info.localPath);
         } catch (e) {
-            this.esmLoading.delete(cacheKey);
-            this.esmInFlightPaths.delete(info.localPath);
             this.esmCache.delete(cacheKey);
             throw e;
+        } finally {
+            // Reads and transforms can fail before compileEsm's own error wrapper
+            // runs. Never strand a failed module in either in-flight set: doing so
+            // turns the next import into a permanent empty placeholder and keeps
+            // Runtime.cleanup() from releasing the compiler.
+            this.esmLoading.delete(cacheKey);
+            this.esmInFlightPaths.delete(info.localPath);
         }
-        this.esmLoading.delete(cacheKey);
-        this.esmInFlightPaths.delete(info.localPath);
 
         // Populate placeholder if one was created during circular resolution
         const cached = this.esmCache.get(cacheKey);

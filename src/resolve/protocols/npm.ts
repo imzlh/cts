@@ -637,6 +637,20 @@ function isVirtualProjectNodeModules(norm: string): boolean {
     return false;
 }
 
+/**
+ * A dotted store slot (`node_modules/.deno/…`, `node_modules/.cts/…`) rather
+ * than a package body. Slot dirs (`.deno/vite@7.3.6`) hold no package.json;
+ * the body one level down (`.deno/vite@7.3.6/node_modules/vite`) is a real
+ * package root, so only the *last* node_modules hop decides. Disqualifying the
+ * body too made an owner walk skip it and attribute the file to an unrelated
+ * ancestor package.json.
+ */
+function isDotNodeModulesSlot(norm: string): boolean {
+    const index = norm.lastIndexOf('/node_modules/');
+    if (index === -1) return false;
+    return norm.charCodeAt(index + 14) === 46;
+}
+
 type PackageImportResolver = (
     spec: string,
     parent: string,
@@ -1406,7 +1420,10 @@ export class NpmHandler implements ProtocolHandler {
         const root = pathRoot(dir);
         while (dir && dir !== root) {
             const pkgPath = joinPaths(dir, 'package.json');
-            if (!this.isVirtualProjectNodeModulesPath(dir) && fs.exists(pkgPath)) return dir;
+            // Only a dotted store slot itself is disqualified (`.vite/deps`,
+            // `.deno/vite@7.3.6`); the package body one hop below it owns its
+            // files like any other node_modules package.
+            if (!isDotNodeModulesSlot(dir) && fs.exists(pkgPath)) return dir;
             const up = dirname(dir);
             if (up === dir) break;
             dir = up;

@@ -1,5 +1,6 @@
-import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows, hashString, ensureDir, isValidNpmPackageName } from './utils';
+import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows, hashString, isValidNpmPackageName } from './utils';
 import { parseShellCommand, requiresShellEvaluation, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
+import { expandArgv, expandRedirectTarget, parseTaskScript, type TaskCommand, type TaskPipeline } from './task-shell';
 import { LockStore } from './lock';
 import { getBinMap, getLookupBinMap, readPkgFresh, resolvePackageBinPath } from './resolve/pkg';
 import { createConfig } from './config';
@@ -11,6 +12,7 @@ const console = import.meta.use('console');
 const fs = import.meta.use('fs');
 const process = import.meta.use('process');
 const signals = import.meta.use('signals');
+const engine = import.meta.use('engine');
 
 const taskTerminalSignalNames = [
     'SIGINT', 'SIGQUIT', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU',
@@ -21,36 +23,6 @@ interface TaskPackageMetadata {
     name?: string;
     version?: string;
     config?: unknown;
-}
-
-// Shell syntax can hide runtime commands behind assignments, `env`, or a
-// nested shell.  A process-local PATH shim keeps those on cno as well.
-let taskRuntimeShimDir: string | null | undefined;
-
-function ensureTaskRuntimeShim(): string | null {
-    if (taskRuntimeShimDir !== undefined) return taskRuntimeShimDir;
-    taskRuntimeShimDir = null;
-    try {
-        const dir = joinPaths(toPosixPath(os.tmpDir), `cno-task-bin-${os.pid}`);
-        ensureDir(dir);
-        const names = isWindows ? ['node.exe', 'deno.exe'] : ['node', 'deno'];
-        let complete = true;
-        for (const name of names) {
-            const link = joinPaths(dir, name);
-            try { fs.unlink(link); } catch { /* fresh or stale */ }
-            try {
-                if (isWindows) fs.symlink(os.exePath, link, 'file');
-                else fs.symlink(os.exePath, link);
-            } catch {
-                try { fs.link(os.exePath, link); } catch { /* checked below */ }
-            }
-            if (!fs.exists(link)) complete = false;
-        }
-        if (complete) taskRuntimeShimDir = dir;
-    } catch {
-        // Direct node/deno rewriting still works if the temp directory is unavailable.
-    }
-    return taskRuntimeShimDir;
 }
 
 // deno.json task schema
@@ -582,12 +554,12 @@ function stripDenoRunFlags(tokens: string[]): string[] {
     return out;
 }
 
-function nodeTaskArgv(args: string[], forwardedArgs: string[]): string[] | null {
+function nodeTaskArgv(args: string[], forwardedArgs: string[]): string[] {
     const first = args[0];
     if (first === undefined) return [os.exePath, ...forwardedArgs];
     if (first === '-e' || first === '--eval') {
         const source = args[1];
-        if (source === undefined) return null;
+        if (source === undefined) return [os.exePath, ...forwardedArgs, 'eval'];
         return [os.exePath, ...forwardedArgs, 'eval', source, ...args.slice(2)];
     }
     if (first.startsWith('--eval=')) {
@@ -595,7 +567,7 @@ function nodeTaskArgv(args: string[], forwardedArgs: string[]): string[] | null 
     }
     if (first === '-p' || first === '--print') {
         const source = args[1];
-        if (source === undefined) return null;
+        if (source === undefined) return [os.exePath, ...forwardedArgs, '--print'];
         return [os.exePath, ...forwardedArgs, '--print', source, ...args.slice(2)];
     }
     if (first === '-v' || first === '--version') return [os.exePath, '--version'];
@@ -603,7 +575,11 @@ function nodeTaskArgv(args: string[], forwardedArgs: string[]): string[] | null 
     if (first === '--') return args.length > 1
         ? [os.exePath, ...forwardedArgs, 'run', ...args.slice(1)]
         : [os.exePath, ...forwardedArgs];
-    if (first.startsWith('-')) return null;
+    // Keep node flags on cno instead of falling back to PATH.  The task
+    // contract is that a `node` token is always the current runtime; an
+    // unsupported flag may still be understood by cno (for example
+    // --require/--inspect), and otherwise cno can report it directly.
+    if (first.startsWith('-')) return [os.exePath, ...forwardedArgs, ...args];
     return [os.exePath, ...forwardedArgs, 'run', ...args];
 }
 
@@ -650,8 +626,11 @@ export function taskShellEnv(env: Record<string, string>, cwd: string): Record<s
         }
     }
     const sep = isWindows ? ';' : ':';
-    // Keep runtime aliases before project bins, then walk up like npm for tools.
-    let pathPrefix = ensureTaskRuntimeShim() ?? '';
+    // Keep project bins before the inherited PATH, like npm.  `node` and `deno`
+    // are rewritten from parsed task commands; they must not be emulated with
+    // PATH links because the link's directory is also used by Windows DLL
+    // search and can hide the runtime's native dependencies.
+    let pathPrefix = '';
     let dir = toPosixPath(cwd);
     const root = pathRoot(dir);
     while (true) {
@@ -674,6 +653,249 @@ export function taskShellArgv(script: string): string[] {
     const trapSignals = signalNumbers.length ? signalNumbers.join(' ') : 'INT QUIT TSTP';
     const runtime = quoteShellArg(os.exePath);
     return ['sh', '-c', `trap ':' ${trapSignals}\nnode() { ${runtime} "$@"; }\ndeno() { ${runtime} "$@"; }\n${script}`];
+}
+
+interface InternalTaskSession {
+    cwd: string;
+    env: Record<string, string>;
+}
+
+interface InternalCommandResult {
+    code: number;
+    stdout?: Uint8Array;
+}
+
+function taskOutput(bytes: Uint8Array, redirectFd?: number): void {
+    if (bytes.byteLength === 0) return;
+    fs.write(redirectFd ?? os.STDOUT_FILENO, bytes);
+}
+
+function taskRedirectPath(cwd: string, target: string): string {
+    if (target.startsWith('/') || target.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(target)) {
+        return normalizePath(target);
+    }
+    return joinPaths(cwd, target);
+}
+
+function openTaskRedirect(command: TaskCommand, session: InternalTaskSession): number | undefined | null {
+    if (!command.redirect) return undefined;
+    const target = expandRedirectTarget(command.redirect, session.env);
+    if (target === null) return null;
+    const flags = fs.OPEN_WRONLY | fs.OPEN_CREAT |
+        (command.redirect.op === '>>' ? fs.OPEN_APPEND : fs.OPEN_TRUNC);
+    return fs.open(taskRedirectPath(session.cwd, target), flags, 0o666);
+}
+
+function splitTaskAssignments(argv: string[]): { assignments: Record<string, string>; argv: string[] } {
+    const assignments: Record<string, string> = {};
+    let index = 0;
+    while (index < argv.length) {
+        const word = argv[index] ?? '';
+        const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(word);
+        if (!match) break;
+        assignments[match[1] ?? ''] = match[2] ?? '';
+        index++;
+    }
+    return { assignments, argv: argv.slice(index) };
+}
+
+function resolveInternalTaskArgv(
+    argv: string[],
+    resolver: BinResolver,
+    session: InternalTaskSession,
+    forwardedArgs: string[],
+): string[] {
+    const bin = argv[0] ?? '';
+    const args = argv.slice(1);
+    if (bin === 'node') return nodeTaskArgv(args, forwardedArgs);
+    if (bin === 'deno' && args[0] === 'run') {
+        const stripped = stripDenoRunFlags(args.slice(1));
+        return [os.exePath, ...forwardedArgs, 'run', ...stripped];
+    }
+    if (bin === 'deno' && args[0] === 'task') {
+        return [os.exePath, ...forwardedArgs, 'task', ...args.slice(1)];
+    }
+    // Other Deno subcommands (for example `deno serve`) are runtime CLI
+    // commands too. Resolve the command name directly instead of letting the
+    // child search PATH, where it could select a host Deno or a shim.
+    if (bin === 'deno') return [os.exePath, ...forwardedArgs, ...args];
+    const resolved = resolver.resolve(bin, session.cwd);
+    if (!resolved) return argv;
+    if (resolved.fallback) {
+        return isWindows
+            ? [env('ComSpec') ?? env('COMSPEC') ?? 'cmd.exe', '/d', '/s', '/c', resolved.binPath, ...args]
+            : [resolved.binPath, ...args];
+    }
+    return [os.exePath, 'run', `--lock-dir=${session.cwd}`, resolved.entry, ...args];
+}
+
+function concatTaskChunks(chunks: Uint8Array[], total: number): Uint8Array {
+    if (chunks.length === 1) return chunks[0] ?? new Uint8Array(0);
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        output.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return output;
+}
+
+async function readTaskPipe(pipe: CModuleProcess.Pipe): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
+    const buffer = new Uint8Array(64 * 1024);
+    let total = 0;
+    for (;;) {
+        const count = await pipe.read(buffer);
+        if (count === 0) break;
+        const chunk = buffer.slice(0, count);
+        chunks.push(chunk);
+        total += chunk.byteLength;
+    }
+    return concatTaskChunks(chunks, total);
+}
+
+function runInternalTaskBuiltin(
+    argv: string[],
+    session: InternalTaskSession,
+): { code: number; output: Uint8Array } | null {
+    const bin = argv[0];
+    if (bin === 'true') return { code: 0, output: new Uint8Array(0) };
+    if (bin === 'false') return { code: 1, output: new Uint8Array(0) };
+    if (bin === 'exit') {
+        const code = argv[1] === undefined ? 0 : Number(argv[1]);
+        return { code: Number.isInteger(code) ? code & 0xff : 2, output: new Uint8Array(0) };
+    }
+    if (bin === 'pwd') return { code: 0, output: engine.encodeString(session.cwd + '\n') };
+    if (bin === 'echo') {
+        const noNewline = argv[1] === '-n';
+        const start = noNewline ? 2 : 1;
+        return { code: 0, output: engine.encodeString(argv.slice(start).join(' ') + (noNewline ? '' : '\n')) };
+    }
+    if (bin === 'cd') {
+        const target = argv[1] ?? env('USERPROFILE') ?? env('HOMEPATH') ?? session.cwd;
+        const next = taskRedirectPath(session.cwd, target);
+        try {
+            if (!fs.stat(next).isDirectory) return { code: 1, output: new Uint8Array(0) };
+            session.cwd = next;
+            session.env.PWD = next;
+            return { code: 0, output: new Uint8Array(0) };
+        } catch {
+            return { code: 1, output: new Uint8Array(0) };
+        }
+    }
+    if (bin === 'export') {
+        for (const assignment of argv.slice(1)) {
+            const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?$/.exec(assignment);
+            if (!match) return { code: 1, output: new Uint8Array(0) };
+            session.env[match[1] ?? ''] = match[2] ?? session.env[match[1] ?? ''] ?? '';
+        }
+        return { code: 0, output: new Uint8Array(0) };
+    }
+    if (bin === 'unset') {
+        for (const name of argv.slice(1)) delete session.env[name];
+        return { code: 0, output: new Uint8Array(0) };
+    }
+    return null;
+}
+
+async function executeInternalTaskCommand(
+    command: TaskCommand,
+    input: Uint8Array | undefined,
+    capture: boolean,
+    session: InternalTaskSession,
+    resolver: BinResolver,
+    forwardedArgs: string[],
+): Promise<InternalCommandResult> {
+    const expanded = expandArgv(command, session.env);
+    const { assignments, argv } = splitTaskAssignments(expanded);
+    if (argv.length === 0) {
+        Object.assign(session.env, assignments);
+        return { code: 0, stdout: capture ? new Uint8Array(0) : undefined };
+    }
+
+    const redirectFd = openTaskRedirect(command, session);
+    if (redirectFd === null) return { code: 1 };
+    // A redirect consumes this command's stdout even when the command is an
+    // intermediate pipeline stage.  In that case the next stage receives EOF;
+    // there is no pipe-backed child.stdout to read.
+    const captureOutput = capture && redirectFd === undefined;
+    const builtin = runInternalTaskBuiltin(argv, session);
+    if (builtin) {
+        try {
+            if (captureOutput) return { code: builtin.code, stdout: builtin.output };
+            taskOutput(builtin.output, redirectFd);
+            return { code: builtin.code, stdout: capture ? new Uint8Array(0) : undefined };
+        } finally {
+            if (redirectFd !== undefined) fs.close(redirectFd);
+        }
+    }
+
+    const childEnv = { ...session.env, ...assignments };
+    const concrete = resolveInternalTaskArgv(argv, resolver, session, forwardedArgs);
+    try {
+        const child = process.spawn(concrete, {
+            stdin: input === undefined ? 'inherit' : 'pipe',
+            stdout: captureOutput ? 'pipe' : redirectFd ?? 'inherit',
+            stderr: 'inherit',
+            env: childEnv,
+            cwd: session.cwd,
+        });
+        const inputDone = input === undefined
+            ? Promise.resolve()
+            : child.stdin.write(input).then(() => child.stdin.shutdown());
+        const output = captureOutput
+            ? readTaskPipe(child.stdout)
+            : Promise.resolve(capture ? new Uint8Array(0) : undefined);
+        const [info, stdout] = await Promise.all([child.wait(), output, inputDone]).then(([info, stdout]) => [info, stdout] as const);
+        return { code: taskExitCode(info), stdout };
+    } catch (e) {
+        console.error(`[task] Failed to spawn: ${concrete.join(' ')}\n  ${errMsg(e)}`);
+        return { code: 1 };
+    } finally {
+        if (redirectFd !== undefined) fs.close(redirectFd);
+    }
+}
+
+async function executeInternalTaskPipeline(
+    pipeline: TaskPipeline,
+    session: InternalTaskSession,
+    resolver: BinResolver,
+    forwardedArgs: string[],
+): Promise<number> {
+    let input: Uint8Array | undefined;
+    let code = 0;
+    for (let i = 0; i < pipeline.commands.length; i++) {
+        const capture = i + 1 < pipeline.commands.length;
+        const result = await executeInternalTaskCommand(
+            pipeline.commands[i]!, input, capture, session, resolver, forwardedArgs,
+        );
+        code = result.code;
+        input = result.stdout;
+    }
+    return code;
+}
+
+async function executeInternalTaskShell(
+    pipelines: TaskPipeline[],
+    envOverrides: Record<string, string>,
+    cwd: string,
+    resolver: BinResolver,
+    forwardedArgs: string[],
+): Promise<number> {
+    const session: InternalTaskSession = {
+        cwd,
+        env: { ...os.environ(), ...taskShellEnv(envOverrides, cwd), PWD: cwd },
+    };
+    let code = 0;
+    let previousOp: TaskPipeline['op'];
+    for (const pipeline of pipelines) {
+        const shouldRun = previousOp === undefined || previousOp === ';'
+            || (previousOp === '&&' && code === 0)
+            || (previousOp === '||' && code !== 0);
+        if (shouldRun) code = await executeInternalTaskPipeline(pipeline, session, resolver, forwardedArgs);
+        previousOp = pipeline.op;
+    }
+    return code;
 }
 
 function availableTaskSignalNumbers(
@@ -711,11 +933,15 @@ async function execCommand(
     resolver: BinResolver,
     forwardedArgs: string[] = [],
 ): Promise<number> {
+    const fullScript = shellCommand(cmd, extraArgs);
+    if (isWindows) {
+        const internal = parseTaskScript(fullScript);
+        if (internal) return executeInternalTaskShell(internal, env, cwd, resolver, forwardedArgs);
+    }
     const segments = parseShellCommand(cmd);
     if (!segments.length) return 0;
     if (requiresShellEvaluation(cmd) || hasShellOnlySyntax(segments)) {
-        const script = shellCommand(cmd, extraArgs);
-        return rawExec(taskShellArgv(script), taskShellEnv(env, cwd), cwd);
+        return rawExec(taskShellArgv(fullScript), taskShellEnv(env, cwd), cwd);
     }
 
     // Single-command shortcuts
@@ -740,9 +966,13 @@ async function execCommand(
             return execTask([...seg.args.slice(1), ...extraArgs], env, cwd, forwardedArgs);
         }
 
+        if (seg.bin === 'deno') {
+            return rawExec([os.exePath, ...forwardedArgs, ...allArgs], taskShellEnv(env, cwd), cwd);
+        }
+
         if (seg.bin === 'node') {
             const argv = nodeTaskArgv(allArgs, forwardedArgs);
-            if (argv) return rawExec(argv, taskShellEnv(env, cwd), cwd);
+            return rawExec(argv, taskShellEnv(env, cwd), cwd);
         }
 
         const resolved = resolver.resolve(seg.bin, cwd);
@@ -779,11 +1009,11 @@ async function execCommand(
             }
         } else if (seg.bin === 'deno' && seg.args[0] === 'task') {
             prevCode = await execTask(isLast ? [...seg.args.slice(1), ...extraArgs] : seg.args.slice(1), env, cwd, forwardedArgs);
+        } else if (seg.bin === 'deno') {
+            prevCode = await rawExec([os.exePath, ...forwardedArgs, ...segArgs], taskShellEnv(env, cwd), cwd);
         } else if (seg.bin === 'node') {
             const argv = nodeTaskArgv(segArgs, forwardedArgs);
-            prevCode = argv
-                ? await rawExec(argv, taskShellEnv(env, cwd), cwd)
-                : await rawExec(taskShellArgv(segmentCommand(seg.bin, segArgs)), taskShellEnv(env, cwd), cwd);
+            prevCode = await rawExec(argv, taskShellEnv(env, cwd), cwd);
         } else {
             const resolved = resolver.resolve(seg.bin, cwd);
             if (!resolved) {

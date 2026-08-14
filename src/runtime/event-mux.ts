@@ -35,6 +35,9 @@ export const EV = {
     EXIT: numericEvent('EXIT', 2),
     LOAD: numericEvent('LOAD', 3),
     BEFORE_UNLOAD: numericEvent('BEFORE_UNLOAD', 4),
+    /* Node's 'beforeExit'. vm.c dispatches it from tjs__lifecycle_drain() before
+     * BEFORE_UNLOAD and re-dispatches while a listener keeps queueing work. */
+    BEFORE_EXIT: numericEvent('BEFORE_EXIT', 5),
 } as const;
 
 function numericEvent(name: string, fallback: number): number {
@@ -186,7 +189,15 @@ function createMux(): MuxInternal {
                     // Deliberately narrow. For every other id, containment is
                     // still right: a broken diagnostics receiver must not become
                     // fatal, and must not change the native return value.
-                    if (name === EV.BEFORE_UNLOAD) throw e;
+                    //
+                    // BEFORE_EXIT joins it for the same reason: node reports a
+                    // throwing 'beforeExit' listener as an uncaught error and
+                    // exits 1 (OBSERVED v24.18.0), and the C implements that only
+                    // if the exception reaches it — vm.c checks JS_IsException on
+                    // the dispatch result, forces exit_code 1 and still fires
+                    // 'exit'. Swallowing here would make the throw vanish and the
+                    // run exit 0.
+                    if (name === EV.BEFORE_UNLOAD || name === EV.BEFORE_EXIT) throw e;
                     continue;
                 }
                 if (typeof r === 'boolean') {

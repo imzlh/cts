@@ -857,7 +857,12 @@ export class TypeScriptRuntime {
         const meta: Record<string, unknown> = {};
         fillMeta(meta, info, this.resolver);
         meta.polyfill = true;
-        await this.compiler.load(info, meta).eval();
+        // Keep the same evaluation guard as entry/run paths.  A polyfill can
+        // synchronously reach a CJS module which requires the polyfill back;
+        // evaluating the same QuickJS Module again while it is EVALUATING is
+        // a native assertion, whereas evalTracked turns it into Node's
+        // ERR_REQUIRE_CYCLE_MODULE and reliably clears the in-flight marker.
+        await this.compiler.evalTracked(this.compiler.load(info, meta));
         log.debug('runtime', () => `polyfill: ${specPath}`);
     }
 

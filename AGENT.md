@@ -242,6 +242,7 @@ No circular deps. Used everywhere.
 - **Import graph cache**: warm precache may reuse `imports`; pack/fullGraph callbacks must scan their current source
 - **Workers**: ParseDriver grows lazily for scan/transform; transport failures retry on replacement workers, never degrade to main; always `terminate()` when done
 - **Module format**: never infer ESM/CJS from source contents; use extensions, package metadata/conditions, or an explicit caller format
+- **CJS failure cleanup**: remove a failed module from both cache and its original parent's `children`; capture the parent before user code can mutate `module.parent`
 - **Header comments**: removed — responsibilities documented here, not in-file
 
 ## Pack Verification

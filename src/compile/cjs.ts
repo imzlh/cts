@@ -425,8 +425,13 @@ export class CjsLoader {
     /** exec(), marking the module as on-stack so cycles do not re-enter it. */
     private execTracked(mod: CjsModule): void {
         const filename = getInternalFilename(mod);
+        const parent = mod.parent;
         this.executing.add(filename);
         try { this.exec(mod); }
+        catch (e) {
+            this.removeFailedModule(mod, parent);
+            throw e;
+        }
         finally { this.executing.delete(filename); }
     }
 
@@ -443,6 +448,10 @@ export class CjsLoader {
 
         this.executing.add(filename);
         try { this.execWithSource(mod, code); }
+        catch (e) {
+            this.removeFailedModule(mod, parent);
+            throw e;
+        }
         finally { this.executing.delete(filename); }
         return mod;
     }
@@ -509,6 +518,14 @@ export class CjsLoader {
         mod.require.main = mod;
     }
 
+    private removeFailedModule(mod: CjsModule, parent = mod.parent): void {
+        const filename = getInternalFilename(mod);
+        this.cache.delete(filename);
+        if (!parent) return;
+        const index = parent.children.indexOf(mod);
+        if (index !== -1) parent.children.splice(index, 1);
+    }
+
     private exec(mod: CjsModule): void {
         const ext = extname(getInternalFilename(mod));
         if (ext === '.json') {
@@ -532,7 +549,7 @@ export class CjsLoader {
             mod.exports = napi.dlopen(filename);
             mod.loaded = true;
         } catch (e) {
-            this.cache.delete(filename);
+            this.removeFailedModule(mod);
             // ERR_DLOPEN_FAILED is node's code for a .node that won't load
             // (measured: process.dlopen and require() of a bad addon both set
             // it). This is the error sharp collects per load attempt and then
@@ -551,7 +568,7 @@ export class CjsLoader {
             mod.exports = safeParse(readText(filename));
             mod.loaded  = true;
         } catch (e) {
-            this.cache.delete(filename);
+            this.removeFailedModule(mod);
             throw err(ErrorKind.SyntaxError, `JSON parse error in '${filename}': ${e}`, e);
         }
     }
@@ -597,7 +614,7 @@ export class CjsLoader {
             compiled = engine.eval(buildCjsWrapperSource(src), filename,
                 engine.EVAL_GLOBAL | engine.EVAL_COMPILE_ONLY | engine.EVAL_NEW_BACKTRACE);
         } catch (e) {
-            this.cache.delete(filename);
+            this.removeFailedModule(mod);
             log.debug('cjs', () => `compile error: ${filename}`, e);
             throw normalizeExecError(e, filename);
         }
@@ -634,7 +651,7 @@ export class CjsLoader {
             engine.evalCompiled(compiled);
             mod.loaded = true;
         } catch (e) {
-            this.cache.delete(filename);
+            this.removeFailedModule(mod);
             log.debug('cjs', () => `eval error: ${filename}`, e);
             throw normalizeExecError(e, filename);
         } finally {
@@ -808,8 +825,12 @@ export class CjsLoader {
                 } catch {}
             }
         };
-        // Builtins should preserve the prototype of their default export when one exists,
-        // otherwise CommonJS consumers observe a null-prototype object unlike Node.js.
+        // CJS gets its own mutable copy. Builtins use `export * as default` which
+        // produces a sealed namespace exotic object; even if we changed them to
+        // `export default {...mod}` (extensible), giving require() the actual ESM
+        // default would let CJS patches mutate the namespace that ESM consumers
+        // see. Always copying keeps the two worlds isolated: the require copy is
+        // extensible, patchable, and cached independently of the ESM namespace.
         const defaultExport = ns.default;
         if ('default' in ns && defaultExport) {
             if (typeof defaultExport === 'function') {
@@ -817,9 +838,7 @@ export class CjsLoader {
                 copyMissingExports(target);
                 mod.exports = target;
             } else if (typeof defaultExport === 'object') {
-                const target = Object.isExtensible(defaultExport)
-                    ? defaultExport
-                    : Object.assign({}, defaultExport);
+                const target = Object.assign({}, defaultExport);
                 copyMissingExports(target);
                 mod.exports = target;
             } else {
