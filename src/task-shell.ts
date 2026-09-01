@@ -1,33 +1,6 @@
 /**
- * Internal task shell — parity with `deno task` (deno_task_shell), not with a
- * POSIX shell and not with cmd.exe.
- *
- * Why this exists: `taskShellArgv()` used to hand the whole task script to
- * `cmd.exe /c` on Windows. That is wrong twice over.
- *   1. cmd.exe does not strip POSIX quotes and does not expand `$VAR`
- *      (it expands `%VAR%`), so `echo "hi"` printed `"hi"` and `echo $FOO`
- *      printed `$FOO`.
- *   2. Handing a script containing `"` to cmd.exe through an argv-based spawn
- *      API applies MSVCRT quoting, which cmd.exe does not parse — the string
- *      arrives with backslashes that were never in the source. Verified: real
- *      deno's own spawn does the same, which is precisely why deno never
- *      delegates task scripts to cmd.exe.
- *
- * Scope is deliberately bounded to the subset below. Anything outside it makes
- * `parseTaskScript` return null so the caller keeps its previous cmd.exe/sh
- * behaviour — this never regresses a script that used to work.
- *
- * SUPPORTED: single quotes (fully literal), double quotes (`$VAR` expands,
- *   `\"` `\\` `\$` escape), unquoted words (`\x` escapes, `$VAR` expands and
- *   word-splits), adjacent-part concatenation (`a"b"c` -> `abc`),
- *   operators `&&` `||` `;` `|`, redirections `>` `>>`.
- * NOT SUPPORTED (-> null, fall back): `$(...)`, backticks, globs `* ? [`,
- *   leading `~`, background `&`, input redirection `<`, fd-qualified
- *   redirection such as `2>`.
- *
- * Matches deno on purpose: `${FOO}` is NOT expanded (deno leaves it literal),
- * an unset variable expands to the empty string, and `''` stays a real empty
- * argument.
+ * Internal shell for the supported `deno task` syntax, not a POSIX shell or cmd.exe.
+ * Unsupported syntax returns `null` so the caller retains its existing platform-shell behavior.
  */
 
 export type TaskOperator = '&&' | '||' | ';';

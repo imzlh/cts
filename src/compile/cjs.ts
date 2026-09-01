@@ -1,12 +1,12 @@
 import type { ModuleInfo } from '../types';
-import { dirname, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, hasLeadingSlashDrive, normalizePath, readText, toHostPath as sharedToHostPath, toHostPaths as sharedToHostPaths } from '../utils';
+import { dirname, fileUrlToPath, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, normalizePath, readText, toHostPath as sharedToHostPath, toHostPaths as sharedToHostPaths, hasSchemeId, schemeId } from '../utils';
 import { err, ErrorKind, requireCycleError } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { guessFileKind } from '../resolve/protocols/base';
 import { createCtx, detectFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
-import { URL } from '../utils/url';
 import { buildCjsWrapperSource, cjsContextSlot, type CjsContext } from './cjs-wrap';
-import type { SourceFreshness } from '../source/cache';
+import { getNodeModuleInterop } from './node-interop';
+import type { SourceFreshness, SourceSnapshot } from '../source/cache';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -16,6 +16,8 @@ const NativeFunction = globalThis.Function;
 export interface CjsModule {
     id: string; filename: string; loaded: boolean; exports: unknown;
     require: CjsRequireFn; children: CjsModule[]; parent: CjsModule | null; paths: string[];
+    /** CommonJS extension handlers (pirates/ts-node) call this entry point. */
+    _compile?: (code: string, filename: string) => unknown;
 }
 
 export interface CjsRequireFn {
@@ -47,6 +49,8 @@ export interface CjsDeps {
     prepareSource?(code: string, filePath: string): string | null;
     /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. */
     loadCjsCompiled?(localPath: string): unknown | null;
+    /** Source snapshot retained by a preceding bytecode-cache miss. */
+    takeSourceSnapshot?(localPath: string): SourceSnapshot | undefined;
     /** Persist freshly compiled CJS bytecode (already engine.serialize()'d). */
     persistCjsCompiled?(localPath: string, bytes: ArrayBuffer, source?: SourceFreshness): void;
     captureSourceFreshness?(localPath: string): SourceFreshness | undefined;
@@ -104,19 +108,9 @@ function splitBarePackageId(id: string): { name: string; subpath: string } | nul
     };
 }
 
-/**
- * True for a scheme-qualified id like "pack:///0.js" — mirrors resolve/index.ts's protoOf().
- * Kept for parity with protoOf()'s lowercase-only rule; the boundary conversion
- * itself uses hasSchemeId() from utils/path.
- */
+/** True for a scheme-qualified module identity, excluding Windows drives. */
 function hasProtocolScheme(s: string): boolean {
-    const ci = s.indexOf(':');
-    if (ci < 2 || ci > 8) return false;
-    for (let i = 0; i < ci; i++) {
-        const c = s.charCodeAt(i);
-        if (c < 97 || c > 122) return false;
-    }
-    return true;
+    return hasSchemeId(s);
 }
 
 function toHostPath(path: string): string {
@@ -158,16 +152,8 @@ export function clearDirPathsCache(): void {
     _dirPaths.clear();
 }
 
-function fileUrlToPath(url: string): string {
-    const u = new URL(url);
-    if (u.protocol !== 'file:') return url;
-    let path = decodeURIComponent(u.pathname);
-    if (hasLeadingSlashDrive(path)) path = path.slice(1);
-    return path;
-}
-
 function normalizeRequireResolvePath(path: string): string {
-    const local = path.startsWith('file:') ? fileUrlToPath(path) : path;
+    const local = schemeId(path) === 'file' ? fileUrlToPath(path) : path;
     return joinPaths(local, '<require.resolve>');
 }
 
@@ -180,14 +166,7 @@ function normalizeRequireResolvePaths(paths: string[]): string[] {
     return out;
 }
 
-/**
- * Node's require.resolve() failure, byte-for-byte in shape (measured v24.18.0):
- *   message    "Cannot find module 'x'\nRequire stack:\n- <parent>"
- *   code       'MODULE_NOT_FOUND'
- *   requireStack  ['<parent>']
- * The old message here was "Cannot resolve module 'x'" with no requireStack,
- * so consumers that match on node's wording (bundlers, error reporters) missed.
- */
+/** Build Node's MODULE_NOT_FOUND error with a non-enumerable requireStack. */
 function moduleNotFoundError(id: string, parentPath: string): Error {
     const stack = parentPath ? [toHostPath(parentPath)] : [];
     const suffix = stack.length ? `\nRequire stack:\n- ${stack.join('\n- ')}` : '';
@@ -313,37 +292,287 @@ function stringifyFunctionParams(args: unknown[]): string[] {
     return params;
 }
 
+/** Map-like cache surface shared with the Node module bridge. */
+export interface CjsCacheStore {
+    readonly size: number;
+    get(key: string): CjsModule | undefined;
+    has(key: string): boolean;
+    set(key: string, value: CjsModule): CjsCacheStore;
+    delete(key: string): boolean;
+    clear(): void;
+    keys(): IterableIterator<string>;
+}
+
+/**
+ * The CJS cache has one backing store.  The normal store is keyed by CTS'
+ * POSIX paths; a Node replacement is used directly and receives host paths at
+ * the boundary so `delete require.cache[require.resolve(x)]` remains live.
+ */
+export class CjsCacheAdapter implements CjsCacheStore {
+    private readonly store = new Map<string, CjsModule>();
+    private external: Record<string, CjsModule> | undefined;
+    private readonly defaultTarget = Object.create(null) as Record<string, CjsModule>;
+    private defaultViewDetached = false;
+    private readonly defaultView: Record<string, CjsModule>;
+
+    constructor() {
+        const self = this;
+        this.defaultView = new Proxy(this.defaultTarget, {
+            has: (target, key) => {
+                if (typeof key !== 'string') return Reflect.has(target, key);
+                return self.defaultViewDetached
+                    ? Reflect.has(target, key)
+                    : self.store.has(self.normalized(key));
+            },
+            get: (target, key, receiver) => {
+                if (typeof key !== 'string') return Reflect.get(target, key, receiver);
+                return self.defaultViewDetached
+                    ? Reflect.get(target, key, receiver)
+                    : self.store.get(self.normalized(key));
+            },
+            set: (target, key, value) => {
+                if (typeof key !== 'string') return Reflect.set(target, key, value);
+                if (self.defaultViewDetached) return Reflect.set(target, key, value);
+                self.store.set(self.normalized(key), value as CjsModule);
+                return true;
+            },
+            deleteProperty: (target, key) => {
+                if (typeof key !== 'string') return Reflect.deleteProperty(target, key);
+                if (self.defaultViewDetached) return Reflect.deleteProperty(target, key);
+                self.store.delete(self.normalized(key));
+                return true;
+            },
+            ownKeys: (target) => {
+                if (self.defaultViewDetached) return Reflect.ownKeys(target);
+                const keys: string[] = [];
+                for (const key of self.store.keys()) keys.push(toHostPath(key));
+                return keys;
+            },
+            getOwnPropertyDescriptor: (target, key) => {
+                if (typeof key !== 'string') return Reflect.getOwnPropertyDescriptor(target, key);
+                if (self.defaultViewDetached) return Reflect.getOwnPropertyDescriptor(target, key);
+                const value = self.store.get(self.normalized(key));
+                if (value === undefined) return undefined;
+                return { value, writable: true, enumerable: true, configurable: true };
+            },
+        });
+    }
+
+    /** Public object for standalone CTS consumers; Node may supply its own view. */
+    view(): Record<string, CjsModule> {
+        return this.external ?? this.defaultView;
+    }
+
+    /** Switch to a user-owned object without copying entries into a second map. */
+    replace(value: Record<string, CjsModule>): void {
+        if (value === this.defaultView) {
+            this.external = undefined;
+            this.restoreDefaultView();
+            return;
+        }
+        if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+            throw new TypeError('require.cache must be an object');
+        }
+        if (!this.external) this.detachDefaultView();
+        this.external = value;
+    }
+
+    /** Restore the default store, optionally with a detached default view's entries. */
+    reset(value?: Record<string, CjsModule>): void {
+        this.external = undefined;
+        this.restoreDefaultView(value);
+    }
+
+    get size(): number {
+        return this.external ? Object.keys(this.external).length : this.store.size;
+    }
+
+    private normalized(key: string): string {
+        return normalizePath(key);
+    }
+
+    private hostKey(key: string): string {
+        return toHostPath(this.normalized(key));
+    }
+
+    /** Keep a saved default cache object independent after replacement. */
+    private detachDefaultView(): void {
+        if (this.defaultViewDetached) return;
+        for (const key of Reflect.ownKeys(this.defaultTarget)) {
+            Reflect.deleteProperty(this.defaultTarget, key);
+        }
+        for (const [key, value] of this.store) {
+            Reflect.set(this.defaultTarget, toHostPath(key), value);
+        }
+        this.defaultViewDetached = true;
+    }
+
+    private restoreDefaultView(value?: Record<string, CjsModule>): void {
+        const source = value ?? (this.defaultViewDetached ? this.defaultTarget : undefined);
+        if (source) {
+            this.store.clear();
+            for (const key of Object.keys(source)) {
+                this.store.set(this.normalized(key), Reflect.get(source, key) as CjsModule);
+            }
+        }
+        this.defaultViewDetached = false;
+    }
+
+    private externalValue(key: string): CjsModule | undefined {
+        const host = this.hostKey(key);
+        const value = Reflect.get(this.external!, host) as CjsModule | undefined;
+        if (value !== undefined || host === this.normalized(key)) return value;
+        return Reflect.get(this.external!, this.normalized(key)) as CjsModule | undefined;
+    }
+
+    get(key: string): CjsModule | undefined {
+        const normalized = this.normalized(key);
+        return this.external ? this.externalValue(normalized) : this.store.get(normalized);
+    }
+
+    has(key: string): boolean {
+        const normalized = this.normalized(key);
+        if (!this.external) return this.store.has(normalized);
+        const host = this.hostKey(normalized);
+        return Reflect.has(this.external, host)
+            || (host !== normalized && Reflect.has(this.external, normalized));
+    }
+
+    set(key: string, value: CjsModule): CjsCacheStore {
+        const normalized = this.normalized(key);
+        if (!this.external) {
+            this.store.set(normalized, value);
+            return this;
+        }
+        const host = this.hostKey(normalized);
+        if (!Reflect.set(this.external, host, value)) {
+            throw new TypeError(`Cannot set require.cache['${host}']`);
+        }
+        return this;
+    }
+
+    delete(key: string): boolean {
+        const normalized = this.normalized(key);
+        if (!this.external) return this.store.delete(normalized);
+        const host = this.hostKey(normalized);
+        let removed = false;
+        if (Reflect.has(this.external, host)) {
+            if (!Reflect.deleteProperty(this.external, host)) {
+                throw new TypeError(`Cannot delete require.cache['${host}']`);
+            }
+            removed = true;
+        }
+        if (host !== normalized && Reflect.has(this.external, normalized)) {
+            if (!Reflect.deleteProperty(this.external, normalized)) {
+                throw new TypeError(`Cannot delete require.cache['${normalized}']`);
+            }
+            removed = true;
+        }
+        return removed;
+    }
+
+    clear(): void {
+        if (!this.external) {
+            this.store.clear();
+            return;
+        }
+        for (const key of Object.keys(this.external)) {
+            if (!Reflect.deleteProperty(this.external, key)) {
+                throw new TypeError(`Cannot clear require.cache['${key}']`);
+            }
+        }
+    }
+
+    keys(): IterableIterator<string> {
+        if (!this.external) return this.store.keys();
+        const keys = new Set<string>();
+        for (const key of Object.keys(this.external)) keys.add(this.normalized(key));
+        return keys.values();
+    }
+}
+
+class CjsExtensionsAdapter {
+    private replacement: Record<string, ((m: CjsModule, f: string) => unknown) | undefined> | undefined;
+
+    constructor(private readonly fallback: Record<string, ((m: CjsModule, f: string) => unknown) | undefined>) {}
+
+    current(): Record<string, ((m: CjsModule, f: string) => unknown) | undefined> {
+        const node = getNodeModuleInterop()?.getExtensions?.();
+        return (node as Record<string, ((m: CjsModule, f: string) => unknown) | undefined> | undefined)
+            ?? this.replacement
+            ?? this.fallback;
+    }
+
+    replace(value: Record<string, ((m: CjsModule, f: string) => unknown) | undefined>): void {
+        if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+            throw new TypeError('require.extensions must be an object');
+        }
+        this.replacement = value;
+    }
+
+    reset(): void {
+        this.replacement = undefined;
+    }
+}
+
 export class CjsLoader {
     // filename → module (includes in-progress modules for circular dep detection)
-    readonly cache        = new Map<string, CjsModule>();
-    // Modules whose body is on the stack right now. A cache entry alone cannot
-    // say this: preRegister() also stores never-executed stubs, and both have
-    // loaded === false.
+    readonly cache        = new CjsCacheAdapter();
+    // Cache stubs and executing modules both have loaded === false.
     private readonly executing = new Set<string>();
-    // CJS localPath → the ESM module whose static import last resolved it.
-    // Only used for "(from X)" attribution in an import-cjs cycle error, where
-    // the requirer is an ESM module and so is absent from `executing`.
-    // Bounded by the number of distinct CJS files reached from ESM.
+    // Tracks ESM importers for CJS cycle error attribution.
     private readonly esmImporters = new Map<string, string>();
     private readonly builtinCache = new Map<string, CjsModule>();
     private mainModule: CjsModule | null = null;
-    // require.cache is a plain object; internal store stays a Map.
-    // Keys arrive as host paths (require.resolve / module.filename); the store is POSIX.
-    private readonly cacheView: Record<string, CjsModule> = new Proxy(Object.create(null), {
-        has: (_t, key) => typeof key === 'string' && this.cache.has(normalizePath(key)),
-        get: (_t, key) => typeof key === 'string' ? this.cache.get(normalizePath(key)) : undefined,
-        set: (_t, key, value) => { if (typeof key === 'string') this.cache.set(normalizePath(key), value); return true; },
-        deleteProperty: (_t, key) => { if (typeof key === 'string') this.cache.delete(normalizePath(key)); return true; },
-        ownKeys: () => toHostPaths([...this.cache.keys()]),
-        getOwnPropertyDescriptor: (_t, key) => {
-            if (typeof key !== 'string') return undefined;
-            const mod = this.cache.get(normalizePath(key));
-            if (!mod) return undefined;
-            return { value: mod, writable: true, enumerable: true, configurable: true };
-        },
-    });
+    /**
+     * Fallback table used when the Node polyfill has not been loaded (for
+     * embedded CTS and isolated compiler tests).  Once node:module registers
+     * its table, `currentExtensions()` below switches every require to that
+     * exact object by identity.
+     */
+    private readonly fallbackExtensions: Record<string, (m: CjsModule, f: string) => unknown> = Object.create(null);
+    private readonly extensions: CjsExtensionsAdapter;
 
-    constructor(private readonly deps: CjsDeps) {}
+    constructor(private readonly deps: CjsDeps) {
+        this.fallbackExtensions['.js'] = (m) => this.execJs(m);
+        this.fallbackExtensions['.json'] = (m) => this.execJson(m);
+        this.fallbackExtensions['.node'] = (m) => this.execNodeAddon(m);
+        this.extensions = new CjsExtensionsAdapter(this.fallbackExtensions);
+    }
+
+    /**
+     * Drop every module-owned reference held by this loader.
+     *
+     * CJS modules are retained in both the public require.cache map and the
+     * private builtin/cycle tables.  A TypeScriptRuntime is terminal after
+     * cleanup(), so retaining those objects serves no cache contract and can
+     * keep complete export graphs alive for the lifetime of an embedding.
+     */
+    clearLoadedModules(): void {
+        this.cache.clear();
+        this.builtinCache.clear();
+        this.executing.clear();
+        this.esmImporters.clear();
+        this.mainModule = null;
+    }
+
+    private currentCacheView(): Record<string, CjsModule> {
+        const external = getNodeModuleInterop()?.getCache?.();
+        return (external as Record<string, CjsModule> | undefined) ?? this.cache.view();
+    }
+
+    private currentExtensions(): Record<string, ((m: CjsModule, f: string) => unknown) | undefined> {
+        return this.extensions.current();
+    }
+
+    replaceCache(value: Record<string, unknown>): void { this.cache.replace(value as Record<string, CjsModule>); }
+    resetCache(value?: Record<string, unknown>): void {
+        this.cache.reset(value as Record<string, CjsModule> | undefined);
+    }
+    replaceExtensions(value: Record<string, unknown>): void {
+        this.extensions.replace(value as Record<string, (m: CjsModule, f: string) => unknown>);
+    }
+    resetExtensions(): void { this.extensions.reset(); }
 
     /** True while `filename`'s body is on the stack. An ESM module that imports
      *  such a file is closing a require()-crossed cycle: Node throws
@@ -377,20 +606,7 @@ export class CjsLoader {
         return requireCycleError(normalizePath(filename), this.importCycleFrom(filename), 'import-cjs');
     }
 
-    /** Who to blame in the "(from X)" suffix for an import-cjs cycle.
-     *
-     *  Node names the *ESM module whose import closed the loop* — measured on
-     *  v24.18.0: "Cannot import CommonJS Module ./a.cjs in a cycle. (from
-     *  .../b.mjs)". innermostExecuting() structurally cannot produce that: it
-     *  only tracks CJS bodies, and the importer is ESM, so it returned the
-     *  innermost CJS frame — which in the simple cycle is `filename` itself, i.e.
-     *  the module blamed for importing itself.
-     *
-     *  esmImporters is written by preRegister on every static-ESM resolve of a
-     *  CJS file, and QuickJS resolves a module's specifiers immediately before
-     *  linking them, so the last writer is the import being linked right now.
-     *  Falls back to the old behaviour when nothing was recorded (a cycle reached
-     *  without going through the resolve hook). */
+    /** Attribute import-CJS cycles to the ESM importer that closed the loop. */
     private importCycleFrom(filename: string): string {
         return this.esmImporters.get(normalizePath(filename))
             ?? this.innermostExecuting()
@@ -401,14 +617,9 @@ export class CjsLoader {
         filename = normalizePath(filename);
         if (parentPath) parentPath = normalizePath(parentPath);
         const found = this.cache.get(filename);
-        // A parent stub carries `loaded: true` but its body has never run and its
-        // `require` is the uninitialized placeholder, so it can neither be handed
-        // back nor executed in place — drop it and build a real module below.
+        // Replace a pre-registered parent stub before executing its body.
         const cached = found && (found as InternalCjsModule)[PARENT_STUB] ? undefined : found;
-        // In-progress = cycle (ESM importing a CJS module that is requiring it
-        // back). Re-running the body would double every side effect and re-enter
-        // the ESM module currently being instantiated; Node hands back the
-        // partial exports instead.
+        // Cycles observe partial exports without re-running the module body.
         if (cached && (cached.loaded || this.executing.has(filename))) {
             if (isMain) this.setMain(cached);
             return cached;
@@ -460,19 +671,12 @@ export class CjsLoader {
     preRegister(filename: string, parentPath: string): void {
         filename = normalizePath(filename);
         parentPath = normalizePath(parentPath);
-        // Record the ESM importer BEFORE the cache-hit return. In the cycle case
-        // the file is *already* cached (a CJS require() put it there and its body
-        // is on the stack), so anything after the early return never runs — and
-        // that is exactly when importCycleError needs the importer's name.
+        // Record importers before the cache-hit path for cycle attribution.
         this.esmImporters.set(filename, parentPath);
         if (this.cache.has(filename)) return;
         let parent = this.cache.get(parentPath);
         if (!parent) {
-            // The importer is ESM (only engine.onModule.resolve reaches here, and
-            // it fires for static ESM imports), so this stub stands in for a
-            // module the CJS loader never owns. Flag it: requireEsm() must not
-            // mistake its empty exports for a loaded module and skip the cycle
-            // guard — that returned {} where Node throws ERR_REQUIRE_CYCLE_MODULE.
+            // Mark ESM-owned stubs so requireEsm still applies its cycle guard.
             parent = this.synth(parentPath);
             (parent as InternalCjsModule)[PARENT_STUB] = true;
             this.cache.set(parentPath, parent);
@@ -494,6 +698,8 @@ export class CjsLoader {
             [INTERNAL_FILENAME]: filename,
             path: toHostPath(dir),
         };
+        // Node-compatible extension handlers enter through module._compile.
+        mod._compile = (code: string, file: string) => this.compileExtensionSource(mod, code, file);
         mod.require = this.mkRequire(filename, mod);
         if (parent) parent.children.push(mod);
         return mod;
@@ -527,16 +733,49 @@ export class CjsLoader {
     }
 
     private exec(mod: CjsModule): void {
-        const ext = extname(getInternalFilename(mod));
-        if (ext === '.json') {
+        const filename = getInternalFilename(mod);
+        const ext = extname(filename);
+        const table = this.currentExtensions();
+        // Node falls back to the `.js` handler for `.cjs` and other source
+        // extensions; `.json`/`.node` remain exact-match extensions.
+        const direct = table[ext];
+        const handler = typeof direct === 'function'
+            ? direct
+            : ext !== '.json' && ext !== '.node' ? table['.js'] : undefined;
+        const defaults = getNodeModuleInterop()?.defaultExtensions;
+
+        // Default handlers retain CTS cache and virtual-source fast paths.
+        if (handler === defaults?.['.js'] || handler === this.fallbackExtensions['.js']) {
+            this.execJs(mod);
+            return;
+        }
+        if (handler === defaults?.['.json'] || handler === this.fallbackExtensions['.json']) {
             this.execJson(mod);
             return;
         }
-        if (ext === '.node') {
+        // Default .node handlers stay direct to avoid cache recursion.
+        if (ext === '.node' && (!handler || handler === defaults?.['.node'] || handler === this.fallbackExtensions['.node'])) {
             this.execNodeAddon(mod);
             return;
         }
+        if (typeof handler === 'function') {
+            handler(mod, toHostPath(filename));
+            mod.loaded = true;
+            return;
+        }
         this.execJs(mod);
+    }
+
+    /** Source entry used by Node-compatible `.js` extension handlers. */
+    private compileExtensionSource(mod: CjsModule, code: string, filename: string): void {
+        const localPath = normalizePath(filename || getInternalFilename(mod));
+        let src = code;
+        if (this.deps.prepareSource) {
+            const transformed = this.deps.prepareSource(src, localPath);
+            if (transformed !== null) src = transformed;
+        }
+        // User-rewritten source must not enter the original bytecode cache.
+        this.execWithSource(mod, src);
     }
 
     private execNodeAddon(mod: CjsModule): void {
@@ -550,13 +789,7 @@ export class CjsLoader {
             mod.loaded = true;
         } catch (e) {
             this.removeFailedModule(mod);
-            // ERR_DLOPEN_FAILED is node's code for a .node that won't load
-            // (measured: process.dlopen and require() of a bad addon both set
-            // it). This is the error sharp collects per load attempt and then
-            // reads `.code` off — see the note on codeForKind in errors.ts.
-            // Codeless, it crashed sharp's own message builder with
-            // "cannot read property 'endsWith' of undefined" and hid which of
-            // its ~10 attempts failed.
+            // Native addon failures require Node's ERR_DLOPEN_FAILED code.
             throw err(ErrorKind.Generic, `Error loading native addon '${filename}': ${e}`, e,
                 'ERR_DLOPEN_FAILED');
         }
@@ -586,12 +819,12 @@ export class CjsLoader {
             return;
         }
 
-        this.execJsFresh(mod, filename);
+        this.execJsFresh(mod, filename, this.deps.takeSourceSnapshot?.(filename));
     }
 
-    private execJsFresh(mod: CjsModule, filename: string): void {
-        const sourceFreshness = this.deps.captureSourceFreshness?.(filename);
-        let src = readText(filename);
+    private execJsFresh(mod: CjsModule, filename: string, snapshot?: SourceSnapshot): void {
+        const sourceFreshness = snapshot?.freshness ?? this.deps.captureSourceFreshness?.(filename);
+        let src = snapshot ? engine.decodeString(snapshot.bytes) : readText(filename);
         // Transform TS/ESM source for CJS execution if a transformer is available
         if (this.deps.prepareSource) {
             const transformed = this.deps.prepareSource(src, filename);
@@ -704,17 +937,9 @@ export class CjsLoader {
             return self.requireFrom(id, parentPath, parentMod);
         }
 
-        // `inspect: true` on resolveId is the fix for require.resolve() doing
-        // network I/O — see ModuleResolver.resolveForInspection for the full
-        // reasoning. require() above deliberately keeps the fetching path: only
-        // this inspection API changes.
+        // require.resolve inspects cached resolution without fetching.
         const resolve = ((id: string, opts?: { paths?: string[] }): string => {
-            // Node returns the specifier verbatim for builtins, not a path
-            // (measured v24.18.0: resolve('fs') === 'fs',
-            // resolve('node:fs') === 'node:fs'). Returning cache/node/fs/index.ts
-            // instead made bundlers treat builtins as bundleable files.
-            // node:module's _resolveFilename already did this; the global CJS
-            // require did not.
+            // Builtins resolve to the original specifier, not a cache path.
             if (isBuiltinSpecifier(id)) return id;
             const searchIn = opts?.paths ? normalizeRequireResolvePaths(opts.paths) : [parentPath];
             for (const p of searchIn) {
@@ -723,21 +948,34 @@ export class CjsLoader {
             }
             throw moduleNotFoundError(id, parentPath);
         }) as CjsRequireFn['resolve'];
-        // Node exposes require.resolve.paths; it was absent here (measured
-        // undefined against v24.18.0's function). Returns null for builtins.
+        // Builtins have no filesystem search paths.
         resolve.paths = (id: string): string[] | null => {
             if (isBuiltinSpecifier(id)) return null;
             if (isRelative(id) || isAbsolute(id) || id === '.') return toHostPaths([dirname(parentPath)]);
             return toHostPaths(buildPaths(dirname(parentPath)));
         };
         require.resolve = resolve;
-        require.cache      = self.cacheView;
+        Object.defineProperty(require, 'cache', {
+            get: () => self.currentCacheView(),
+            set: (value: Record<string, CjsModule>) => {
+                const interop = getNodeModuleInterop();
+                if (interop?.setCache) interop.setCache(value);
+                else self.replaceCache(value);
+            },
+            enumerable: true,
+            configurable: true,
+        });
         require.main       = self.mainModule;
-        require.extensions = {
-            '.js':   (m: CjsModule) => self.execJs(m),
-            '.json': (m: CjsModule) => self.execJson(m),
-            '.node': (m: CjsModule) => self.execNodeAddon(m),
-        };
+        Object.defineProperty(require, 'extensions', {
+            get: () => self.currentExtensions(),
+            set: (value: Record<string, (m: CjsModule, f: string) => unknown>) => {
+                const interop = getNodeModuleInterop();
+                if (interop?.setExtensions) interop.setExtensions(value);
+                else self.replaceExtensions(value);
+            },
+            enumerable: true,
+            configurable: true,
+        });
         return require as CjsRequireFn;
     }
 
@@ -809,9 +1047,7 @@ export class CjsLoader {
         if (hit) return hit;
 
         const info = this.deps.resolveBuiltin(name, parent);
-        // `parent` is passed through for cycle attribution: loadEsmSync's
-        // isInFlight check DOES run for builtins (bridge.ts:112), but without a
-        // `from` the resulting ERR_REQUIRE_CYCLE_MODULE reads "<unknown>".
+        // Preserve the parent for builtin cycle attribution.
         const ns = this.deps.loadEsmSync(info, parent);
 
         const mod = this.synth(info.localPath);
@@ -825,12 +1061,7 @@ export class CjsLoader {
                 } catch {}
             }
         };
-        // CJS gets its own mutable copy. Builtins use `export * as default` which
-        // produces a sealed namespace exotic object; even if we changed them to
-        // `export default {...mod}` (extensible), giving require() the actual ESM
-        // default would let CJS patches mutate the namespace that ESM consumers
-        // see. Always copying keeps the two worlds isolated: the require copy is
-        // extensible, patchable, and cached independently of the ESM namespace.
+        // CJS receives a mutable copy isolated from the ESM namespace.
         const defaultExport = ns.default;
         if ('default' in ns && defaultExport) {
             if (typeof defaultExport === 'function') {
@@ -864,10 +1095,7 @@ export class CjsLoader {
     }
 
     private resolveId(id: string, parentPath: string, inspect = false): ResolvedCjsRequest | null {
-        // require.resolve() must not fetch/install (see resolveForInspection).
-        // Falls back to resolveExternal when a caller supplied a deps object
-        // without the cached twin, so behaviour degrades to "as before" rather
-        // than to "resolves nothing".
+        // Older dependency objects fall back to the fetching resolver.
         const external = (req: string, parent: string): ModuleInfo | null =>
             inspect && this.deps.resolveExternalCached
                 ? this.deps.resolveExternalCached(req, parent)
@@ -884,14 +1112,10 @@ export class CjsLoader {
             return null;
         }
 
-        // CJS relative/absolute require() is anchored to the requiring file.
-        // Try the local filesystem path before the generic resolver.
-        if (isAbsolute(id)) return this.resolveLocalPath(id);
-        if (isRelative(id)) return this.resolveLocalPath(joinPaths(dirname(parentPath), id));
-        if (id === '.') return this.resolveLocalPath(dirname(parentPath));
-
-        // External resolver first (covers npm, jsr, http, aliases, import map).
-        // Non-miss errors (ProtocolDisabled, Network, …) propagate from resolveExternal.
+        // Let the runtime resolver classify relative and absolute requests first.
+        // It has package/source context needed to distinguish local JavaScript ESM
+        // from CommonJS. The filesystem fallback below remains for createRequire()
+        // contexts that bypass the resolver.
         const ext = external(id, parentPath);
         if (ext) {
             return {
@@ -931,11 +1155,7 @@ export class CjsLoader {
     private resolveLocalPath(candidate: string): ResolvedCjsRequest | null {
         try {
             const path = normalizePath(resolveFile(normalizePath(candidate)));
-            // .node always CJS; .js uses package type / extension (no source scan).
-            // 'require' is load-bearing: every path through here is a require()
-            // (or createRequire()) edge, and node classifies a no-manifest `.js`
-            // as CJS. Dropping it hands back the import-side ESM default and the
-            // child dies on "module is not defined". See detectFormat in pkg.ts.
+            // Require edges classify manifest-less .js as CJS without scanning.
             const format = extname(path) === '.node' ? 'cjs' : detectFormat(path, 'require');
             const fileKind = guessFileKind(path);
             return this.infoFromLocalPath(path, format, fileKind);

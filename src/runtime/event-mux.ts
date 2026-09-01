@@ -1,29 +1,10 @@
 /**
- * Global engine-event multiplexer.
+ * Process-wide owner of engine.onEvent's single native receiver.
  *
- * `engine.onEvent()` (native `tjs__set_event_receiver`, circu.js/src/mod_engine.c:871)
- * is a SINGLE-SLOT setter: it frees the previously registered receiver. Every
- * module that called it directly therefore silently displaced the others. The
- * observed casualty was `cno/src/webapi/index.ts`, whose EV_LOAD/EV_EXIT ->
- * 'load'/'unload' bridge was overwritten by the cts diagnostics receiver, so
- * `addEventListener('unload'|'load'|'unhandledrejection')` registered fine and
- * never fired.
- *
- * This module owns the one native registration. Everything else registers here.
- *
- * Order independence: the registry lives on a `Symbol.for()` slot on
- * `globalThis`, not in module scope. Whichever module loads first creates it;
- * later modules find the same object. That also survives the case where two
- * *copies* of this file are live at once (cts is baked into cno.exe, but a
- * relative-path import of the same source loads a second instance from disk).
- *
- * Native return-value contract, per the C dispatch sites — the polarity is NOT
- * uniform, so the mux must not invent a single rule:
- *   EV_UNHANDLED_REJECTION (0)  vm.c:242    ret !== false  -> JS_EXCEPTION (abort)
- *   EV_JOB_EXCEPTION       (1)  utils.c:180 ret === false  -> TJS_Stop (fatal)
- *   EV_EXIT                (2)  return value freed, ignored
- *   EV_LOAD                (3)  return value freed, ignored
- *   EV_BEFORE_UNLOAD       (4)  vm.c:863    ret === JS_TRUE -> cancelled, re-dispatch
+ * The `Symbol.for()` registry keeps baked and disk-loaded CTS copies on one
+ * bus. Native return polarity differs by event: `false` continues an
+ * unhandled rejection but stops a job exception, and only `true` cancels
+ * beforeunload. Do not normalize those return values.
  */
 
 const engine = import.meta.use('engine');
@@ -49,28 +30,13 @@ function numericEvent(name: string, fallback: number): number {
     }
 }
 
-/**
- * Per-dispatch scratchpad shared by all receivers for one native event.
- *
- * This is how a user-facing receiver tells the diagnostics receiver to stay
- * quiet, without either one needing a reference to the other. It is the reason
- * `preventDefault()` on 'unhandledrejection' can suppress the "Uncaught"
- * warning even though the two live in different modules.
- */
+/** Per-dispatch state shared by all receivers for one native event. */
 export interface EventContext {
     /** User code cancelled the default action (`preventDefault()`). */
     handled: boolean;
     /** Someone already dispatched this event to the global EventTarget. */
     dispatched: boolean;
-    /**
-     * A receiver already emitted node's 'unhandledRejection' on `process`.
-     *
-     * Two receivers can own that emit — the bridge below, and a future rejection
-     * arm in process/mod.ts under NODE_PROCESS_ROLE — and the user must not see
-     * the handler fire twice. Optional so the existing `{handled, dispatched}`
-     * literals in other modules (which cannot import this type across the node/
-     * boundary) still satisfy the shape.
-     */
+    /** Avoid duplicate Node rejection delivery without importing node/. */
     rejectionEmitted?: boolean;
 }
 
@@ -103,12 +69,8 @@ interface MuxInternal extends EventMux {
     entries: Entry[];
     seq: number;
     native: boolean;
-    /**
-     * Lifecycle once-flags. They live on the mux (a `Symbol.for()` global), not
-     * in module scope, so the baked copy of this file and a disk-loaded copy
-     * share them — otherwise each copy would fire 'load' once and the user would
-     * see it twice.
-     */
+    dispatchDepth: number;
+    /** Shared so separate CTS copies cannot each fire lifecycle events once. */
     loadFired: boolean;
     unloadFired: boolean;
 }
@@ -118,13 +80,7 @@ const SLOT = Symbol.for('cno.engine.eventMux.v1');
 /** Default native return per event, matching pre-mux behaviour exactly. */
 function defaultReturn(name: number): boolean {
     if (name === EV.JOB_EXCEPTION) return true;   // false would TJS_Stop
-    // EV_BEFORE_UNLOAD deliberately falls here too. vm.c:863 treats ONLY an
-    // explicit JS `true` as "cancelled, give the loop another pass", so `false`
-    // means "proceed with teardown" — the safe default. Returning `true` here
-    // instead would make every natural drain re-dispatch forever and NO run
-    // would ever exit; the C comment at vm.c:828-839 picked its polarity around
-    // this exact value. Do not change it without changing vm.c in the same
-    // commit.
+    // Only `true` cancels BEFORE_UNLOAD, so its default must remain false.
     return false;                                  // rejection: false = do not abort
 }
 
@@ -134,6 +90,7 @@ function createMux(): MuxInternal {
         entries: [],
         seq: 0,
         native: false,
+        dispatchDepth: 0,
         loadFired: false,
         unloadFired: false,
 
@@ -165,74 +122,40 @@ function createMux(): MuxInternal {
         },
 
         dispatch(name: number, data: unknown): boolean {
-            const ctx: EventContext = { handled: false, dispatched: false, rejectionEmitted: false };
-            let ret: boolean | undefined;
+            mux.dispatchDepth++;
+            try {
+                const ctx: EventContext = { handled: false, dispatched: false, rejectionEmitted: false };
+                let ret: boolean | undefined;
 
-            // Snapshot: a receiver may install/uninstall during dispatch.
-            for (const entry of mux.entries.slice()) {
-                let r: boolean | undefined;
-                try {
-                    r = entry.fn(name, data, ctx);
-                } catch (e) {
-                    // EV_BEFORE_UNLOAD is the one event whose thrown exception is
-                    // part of the contract rather than a receiver bug to contain.
-                    //
-                    // Deno 2.9.3: a throwing 'beforeunload' listener is an
-                    // uncaught error — rc=1, later listeners skipped, 'unload'
-                    // never fires (OBSERVED). The C already implements exactly
-                    // that, but only if it SEES the exception: vm.c:852 checks
-                    // JS_IsException(bu), dumps, forces exit_code 1, sets
-                    // unload_dispatched and stops looping. Swallowing here made
-                    // JS_IsException unreachable, so the throw vanished and the
-                    // run exited 0.
-                    //
-                    // Deliberately narrow. For every other id, containment is
-                    // still right: a broken diagnostics receiver must not become
-                    // fatal, and must not change the native return value.
-                    //
-                    // BEFORE_EXIT joins it for the same reason: node reports a
-                    // throwing 'beforeExit' listener as an uncaught error and
-                    // exits 1 (OBSERVED v24.18.0), and the C implements that only
-                    // if the exception reaches it — vm.c checks JS_IsException on
-                    // the dispatch result, forces exit_code 1 and still fires
-                    // 'exit'. Swallowing here would make the throw vanish and the
-                    // run exit 0.
-                    if (name === EV.BEFORE_UNLOAD || name === EV.BEFORE_EXIT) throw e;
-                    continue;
+                // Snapshot: a receiver may install/uninstall during dispatch.
+                for (const entry of mux.entries.slice()) {
+                    let r: boolean | undefined;
+                    try {
+                        r = entry.fn(name, data, ctx);
+                    } catch (e) {
+                        // Let native lifecycle handling observe listener failures.
+                        if (name === EV.BEFORE_UNLOAD || name === EV.BEFORE_EXIT) throw e;
+                        continue;
+                    }
+                    if (typeof r === 'boolean') {
+                        // beforeunload cancellation is sticky; other events are last-wins.
+                        if (name === EV.BEFORE_UNLOAD) ret = ret === true || r;
+                        else ret = r;
+                    }
                 }
-                if (typeof r === 'boolean') {
-                    // EV_BEFORE_UNLOAD composes as a VETO, not last-writer-wins.
-                    //
-                    // "The last explicit boolean decides" is right for the abort
-                    // /continue events, where one authority should have the final
-                    // say. For a cancel probe it is wrong and silently so: the
-                    // question is "did ANYONE cancel?", a disjunction. Under
-                    // last-wins, a receiver that returns a boolean for an id it
-                    // does not care about discards a user's preventDefault().
-                    //
-                    // OBSERVED, not hypothetical: with a cancelling receiver at
-                    // priority 200 the cancel was dropped and teardown proceeded
-                    // (`bu 1 | unload n=1`), while the identical receiver at -50
-                    // re-dispatched correctly (`bu 1 | work 1 | bu 2 | unload
-                    // n=2`). Bisecting the priority put the culprit at exactly 0
-                    // — PRIORITY_DIAGNOSTICS, whose baked receiver returned
-                    // `false` for every id it did not recognise. Sticky-OR makes
-                    // the cancel independent of receiver order and of any other
-                    // receiver's opinion.
-                    if (name === EV.BEFORE_UNLOAD) ret = ret === true || r;
-                    else ret = r;
-                }
+
+                return typeof ret === 'boolean' ? ret : defaultReturn(name);
+            } finally {
+                mux.dispatchDepth--;
             }
-
-            return typeof ret === 'boolean' ? ret : defaultReturn(name);
         },
     };
 
     return mux;
 }
 
-function ensureNative(mux: MuxInternal): void {
-    if (mux.native) return;
+function ensureNative(mux: MuxInternal, reassert = false): void {
+    if (mux.dispatchDepth > 0 || (mux.native && !reassert)) return;
     try {
         engine.onEvent((name: number, data: unknown) => mux.dispatch(name, data));
         mux.native = true;
@@ -252,7 +175,7 @@ export function getEventMux(): EventMux {
     } else {
         // A prior instance may have lost the native slot to a direct
         // engine.onEvent() call by some other module; re-assert it.
-        ensureNative(mux);
+        ensureNative(mux, true);
     }
     return mux;
 }
@@ -281,19 +204,10 @@ export const NODE_PROCESS_REJECTION_ROLE = 'node-process-rejection';
 
 /** Priority band: user-visible dispatch must run before diagnostics. */
 export const PRIORITY_WEBAPI = 100;
-/**
- * Band for the node `process` bridges: below webapi so the web ErrorEvent still
- * dispatches first, above diagnostics so setting `ctx.handled` can suppress the
- * "Uncaught" warning. `process/mod.ts` installs at exactly this value.
- */
+/** Between webapi and diagnostics. */
 export const PRIORITY_NODE_PROCESS = 50;
 export const PRIORITY_DIAGNOSTICS = 0;
-/**
- * Below diagnostics. Entries are dispatched highest-priority-first and the
- * *last* explicit boolean wins the native return value, so a receiver in this
- * band has the final say on abort/continue. Used by the REPL, which must stay
- * alive no matter what any other receiver returns.
- */
+/** Runs last; its explicit return value wins for non-beforeunload events. */
 export const PRIORITY_FALLBACK = -100;
 
 function globalCtor(name: string): (new (...args: never[]) => unknown) | null {
@@ -318,14 +232,7 @@ function wasPrevented(event: unknown): boolean {
     return !!(event as { defaultPrevented?: boolean } | null)?.defaultPrevented;
 }
 
-/**
- * Dispatch without the try/catch, for EV_BEFORE_UNLOAD only.
- *
- * `dispatchGlobal` returning false on a throw is right for events whose listener
- * errors must not become fatal. 'beforeunload' is the opposite: Deno makes a
- * throwing listener an uncaught error (rc=1, no 'unload'), and the C reproduces
- * that only if the exception reaches it (vm.c:852). Swallowing here would exit 0.
- */
+/** beforeunload listener errors must reach native lifecycle handling. */
 function dispatchGlobalPropagating(event: unknown): boolean {
     const dispatchEvent = (globalThis as unknown as {
         dispatchEvent?: (e: unknown) => boolean;
@@ -335,20 +242,7 @@ function dispatchGlobalPropagating(event: unknown): boolean {
     return true;
 }
 
-/**
- * Bridges native events to the global EventTarget, so
- * `addEventListener('unload'|'unhandledrejection')` actually fires.
- *
- * This duplicates what `cno/src/webapi/index.ts` does, because that file is
- * baked into cno.exe and its receiver was already destroyed by the single-slot
- * setter before this code runs — there is no native getter, so the displaced
- * receiver cannot be recovered and chained to. It therefore has to be
- * reproduced here.
- *
- * Once webapi registers through the mux under `WEBAPI_ROLE`, this bridge steps
- * aside (both the role check and `ctx.dispatched` guard against double
- * dispatch), which is what keeps the two order-independent.
- */
+/** Fallback until webapi registers; role and context prevent double dispatch. */
 export function installWebApiCompatBridge(): () => void {
     return installEventReceiver(WEBAPI_COMPAT_ROLE, (name, data, ctx) => {
         // webapi itself is on the bus: it owns the dispatch.
@@ -372,8 +266,6 @@ export function installWebApiCompatBridge(): () => void {
             if (!dispatchGlobal(event)) return undefined;
             ctx.dispatched = true;
             if (wasPrevented(event)) ctx.handled = true;
-            // Native polarity: false = do not abort. Keep cts's non-fatal
-            // behaviour either way; `handled` only silences the diagnostic.
             return undefined;
         }
 
@@ -387,23 +279,11 @@ export function installWebApiCompatBridge(): () => void {
                     { cancelable: true },
                 );
             } catch {
-                // Could not even build the event: say nothing, so defaultReturn's
-                // `false` lets teardown proceed. Never return `true` here — that
-                // is the hang.
                 return undefined;
             }
-            // Not dispatchGlobal(): a throwing listener must propagate so the C
-            // sees JS_EXCEPTION and reproduces Deno's rc=1/no-unload semantics.
+            // A beforeunload listener error is fatal, unlike other event errors.
             if (!dispatchGlobalPropagating(event)) return undefined;
-            // NOT ctx.dispatched: that flag guards the 'unload'/'exit' pair from a
-            // double dispatch, and EV_BEFORE_UNLOAD is a separate event that is
-            // followed by EV_EXIT in the same teardown. Setting it here would make
-            // the EXIT arm stand down and 'unload' would never fire.
-            //
-            // POLARITY: vm.c:863 cancels on an explicit `true` and nothing else.
-            // Return the cancel decision only, so `return false` from a listener —
-            // which does NOT cancel under Deno (OBSERVED) — cannot be mistaken for
-            // one, and an uncancelled drain yields `false` and exits.
+            // EXIT must still emit unload, so this event does not set dispatched.
             return wasPrevented(event) ? true : false;
         }
 
@@ -411,7 +291,6 @@ export function installWebApiCompatBridge(): () => void {
             const Ev = globalCtor('Event');
             if (!Ev) return undefined;
             try {
-                // Deno fires only 'unload' for an explicit exit (measured).
                 dispatchGlobal(new (Ev as new (t: string) => unknown)('unload'));
                 dispatchGlobal(new (Ev as new (t: string) => unknown)('exit'));
             } catch {
@@ -444,14 +323,7 @@ export const LIFECYCLE_GUARD_ROLE = 'lifecycle-guard';
  * EV_UNHANDLED_REJECTION -> process 'unhandledRejection'
  * ------------------------------------------------------------------ */
 
-/**
- * The `process` object published on a well-known slot by
- * cno/src/node/process/mod.ts (its PROCESS_DEFAULT_SINGLETON). Reached through
- * the slot rather than an import: cts must not import across the node/ boundary,
- * and node/ is copied to the polyfill cache dir where `../../../cts` does not
- * exist — the same reason process/mod.ts reaches the mux through a Symbol slot
- * instead of importing it.
- */
+/** Node modules cannot import CTS after cache installation, so use a slot. */
 const PROCESS_SLOT = Symbol.for('cno.node.process.default');
 
 interface ProcessEmitterLike {
@@ -473,30 +345,8 @@ function processEmitter(): ProcessEmitterLike | null {
 }
 
 /**
- * Bridge EV_UNHANDLED_REJECTION to `process.on('unhandledRejection')`.
- *
- * It was not bridged at all: the cts diagnostics receiver printed its warning
- * and nothing ever emitted on `process`, so a registered
- * `process.on('unhandledRejection')` handler never fired (Node fires it —
- * OBSERVED against v24.18.0: handler runs, reason and promise both delivered,
- * rc=0). `process/mod.ts` bridges EV_EXIT and EV_JOB_EXCEPTION under
- * NODE_PROCESS_ROLE but has no rejection arm, so this fills that gap from the
- * cts side under its own role.
- *
- * RETURN-VALUE POLARITY — inverted relative to job exceptions, and getting it
- * backwards is fatal rather than merely wrong:
- *   EV_UNHANDLED_REJECTION  vm.c:242  `!JS_IsEqual(ret, JS_FALSE)` -> JS_EXCEPTION
- *   EV_JOB_EXCEPTION        utils.c:180 `JS_IsEqual(ret, JS_FALSE)` -> TJS_Stop
- * So for a rejection, `false` means "handled, do not abort" and any other value
- * (including `true` and `undefined`) requests the abort — the exact opposite of
- * JOB_EXCEPTION, where `true` means continue. That inversion was already shipped
- * as a real bug once, in webapi's bridge, where a `preventDefault()` on
- * 'unhandledrejection' returned `true` and thereby asked for a process abort.
- *
- * This bridge returns `false` when it delivered to a handler, and `undefined`
- * when it did not — never `true`. `undefined` leaves defaultReturn(), which is
- * also `false` for this event, so the non-fatal behaviour is preserved either
- * way; the explicit `false` documents the claim.
+ * Bridge rejections to process when a handler exists. For this native event,
+ * `false` means continue (opposite JOB_EXCEPTION); never return `true`.
  */
 export function installNodeProcessRejectionBridge(): () => void {
     return installEventReceiver(NODE_PROCESS_REJECTION_ROLE, (name, data, ctx) => {
@@ -505,67 +355,31 @@ export function installNodeProcessRejectionBridge(): () => void {
         const proc = processEmitter();
         if (!proc) return undefined;
 
-        // If process/mod.ts ever grows its own rejection arm under
-        // NODE_PROCESS_ROLE, this bridge must stand down or the user sees the
-        // handler fire twice. Checked at dispatch time, not install time, because
-        // the roles register in either order.
+        // Roles may register in either order; never emit the same rejection twice.
         if (getEventMux().has(NODE_PROCESS_ROLE) && ctx.rejectionEmitted) return undefined;
 
         const [promise, reason] = Array.isArray(data) ? data : [undefined, data];
 
-        // Node's monitor-style ordering: emit even with no handler is WRONG for
-        // this event (there is no 'unhandledRejectionMonitor'), so count first.
-        // Zero handlers must leave the outcome untouched, diagnostic included.
+        // Without a handler, leave diagnostics and native handling untouched.
         if (proc.listenerCount('unhandledRejection') === 0) return undefined;
 
         ctx.rejectionEmitted = true;
         try {
-            // Node's argument order is (reason, promise).
             proc.emit('unhandledRejection', reason, promise);
-        } catch {
-            // A throw from inside the handler must not become a native abort.
-            // The mux would swallow it anyway (dispatch() try/catch), but that
-            // path also discards this receiver's return value, which would let
-            // defaultReturn() stand — harmless here since it is also `false`.
-            // Catching locally keeps the claim below reachable and explicit.
-        }
+        } catch { /* handler errors are not native aborts */ }
 
-        // The program dealt with it: silence the cts "unhandled promise
-        // rejection" diagnostic, matching Node (which prints nothing when a
-        // handler is present — OBSERVED).
         ctx.handled = true;
-
-        // POLARITY: false = "do not abort" for a rejection (vm.c:242 raises
-        // JS_EXCEPTION on any non-false). Returning true here would kill the
-        // process on precisely the rejections the program handled.
         return false;
     }, PRIORITY_NODE_PROCESS);
 }
 
-/**
- * Observe native EV_EXIT so an explicit dispatchUnloadEvent() afterwards is a
- * no-op.
- *
- * webapi's bridge fires 'unload' on EV_EXIT unconditionally and has no way to
- * consult a flag (it is baked and its receiver is verified). So instead of
- * trying to suppress it, the mux *records* that it happened. That keeps the
- * exactly-once property in the order that actually occurs: a test suite calling
- * Deno.exit() gets webapi's unload, and the explicit post-suite dispatch stands
- * down.
- *
- * Registered below diagnostics so it runs after webapi has dispatched, and
- * returns `undefined` throughout — it must never influence the native return.
- */
+/** Record native exit so synthetic unload remains exactly-once. */
 function ensureLifecycleGuard(mux: MuxInternal): void {
-    // Keyed off the registry itself rather than a boolean, so it re-arms if the
-    // bus is drained (which tests do) instead of being permanently absent.
+    // The registry check lets tests remove and reinstall the guard.
     if (mux.has(LIFECYCLE_GUARD_ROLE)) return;
     mux.install(LIFECYCLE_GUARD_ROLE, (name) => {
         if (name === EV.EXIT) mux.unloadFired = true;
-        // Native EV_LOAD is deliberately NOT recorded: it fires for cno's own
-        // bootstrap module before any user entry exists (utils.c:469), so
-        // treating it as "the load event already happened" would suppress the
-        // only dispatch a user can actually observe.
+        // Native EV_LOAD precedes user entry, so it must not satisfy this guard.
         return undefined;
     }, PRIORITY_FALLBACK);
 }
@@ -584,41 +398,21 @@ export function unloadEventFired(): boolean {
     return internalMux().unloadFired;
 }
 
-/**
- * Clear the lifecycle once-flags.
- *
- * Test-only. The flags exist to make 'load'/'unload' fire at most once per
- * process, which by design cannot be undone in a real run — so a test that
- * asserts the once behaviour needs a way back to the initial state.
- */
+/** Test-only reset for lifecycle once-flags. */
 export function resetLifecycleFlagsForTest(): void {
     const mux = internalMux();
     mux.loadFired = false;
     mux.unloadFired = false;
 }
 
-/**
- * Fire the global 'load' event. Idempotent: at most once per process.
- *
- * The native EV_LOAD is dispatched by TJS_EvalModuleContent (utils.c:469) for
- * the C-level main module, which is cno's own bootstrap — it happens before a
- * user entry exists, so a user's addEventListener('load') can never see it
- * (OBSERVED: a raw receiver installed at the top of a `cno run` entry logs
- * EV 0 and 2 but never 3). Deno fires 'load' after the *user* entry module
- * evaluates, so that has to be synthesised at the entry-eval point.
- *
- * Call sites: src/commands/run.ts (after the entry evaluates) and
- * cno/src/deno/index.ts startTest (before the suite runs). The once-guard is
- * what lets both call unconditionally — `cno test` goes through both.
- */
+/** Fire the user-visible load event once after entry evaluation. */
 export function dispatchLoadEvent(): boolean {
     const mux = internalMux();
     ensureLifecycleGuard(mux);
     if (mux.loadFired) return false;
     const Ev = globalCtor('Event');
     if (!Ev) return false;
-    // Set before dispatching: a listener that throws must not leave the flag
-    // clear and permit a second dispatch.
+    // Set before dispatch so a throwing listener cannot enable a second event.
     mux.loadFired = true;
     try {
         return dispatchGlobal(new (Ev as new (t: string) => unknown)('load'));
@@ -627,13 +421,7 @@ export function dispatchLoadEvent(): boolean {
     }
 }
 
-/**
- * Fire the global 'unload' event. Idempotent, and stands down if a native
- * EV_EXIT already drove webapi's own 'unload' dispatch.
- *
- * Deno fires 'unload' exactly once, after the suite under `deno test` and after
- * loop drain under `deno run` (both measured against 2.9.3).
- */
+/** Fire unload once unless native exit already did. */
 export function dispatchUnloadEvent(): boolean {
     const mux = internalMux();
     ensureLifecycleGuard(mux);

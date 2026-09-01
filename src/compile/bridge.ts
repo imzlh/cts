@@ -1,10 +1,18 @@
 import { type ModuleInfo } from '../types';
-import type { CjsDeps, CjsRequireFn } from './cjs';
+import type { CjsCacheStore, CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
 import { isResolutionMiss, requireCycleError } from '../errors';
 import { BUILTINS } from '../resolve/builtins';
 import { errMsg, log } from '../utils';
+import type { NodeModuleInteropBridge } from './node-interop';
+import {
+    hasModuleLoadHooks,
+    hasModuleResolveHooks,
+    registerModuleHooks,
+    runModuleLoadHooks,
+    runModuleResolveHooks,
+} from '../module-hooks';
 
 const engine = import.meta.use('engine');
 
@@ -65,19 +73,13 @@ export function bridgeCjsToEsm(
     if (exportRecord
         && Reflect.get(exportRecord, '__esModule') === true
         && Object.prototype.hasOwnProperty.call(exportRecord, 'default')) {
-        // Babel/tsc transpiled with a real `default`: each key is a named export,
-        // default comes from exports.default (bundler-style interop unwrap).
-        // NOTE: real Node never unwraps — its `default` is always the whole
-        // module.exports. The unwrap is a deliberate cts divergence; only the
-        // no-`default` case below is aligned with Node.
+        // CTS deliberately unwraps transpiler-created default exports.
         for (const k of Object.keys(exportRecord)) {
             if (k !== '__esModule') out[k] = Reflect.get(exportRecord, k);
         }
         out.__esModule = true;
     } else {
-        // True CJS (or __esModule with no `default` key): each key is a named
-        // export, default is the whole exports object — matches Node, which
-        // yields the exports object rather than undefined.
+        // True CJS defaults to the complete exports object.
         if (exportRecord) {
             for (const k of Object.keys(exportRecord)) {
                 if (k !== 'default') out[k] = Reflect.get(exportRecord, k);
@@ -102,13 +104,7 @@ export function loadEsmSync(
     resolveMtime?: (p: string) => number | undefined,
     from = '<unknown>',
 ): Record<string, unknown> {
-    // Cycle: this ESM module is already mid-compile or mid-evaluate, so the
-    // require() that got us here closed a loop through it. Node throws
-    // ERR_REQUIRE_CYCLE_MODULE; returning the partial namespace instead would
-    // hand out a half-built module, and calling .eval() on a module in
-    // JS_MODULE_STATUS_EVALUATING aborts the process at the js_link_module
-    // status assertion. Check before esm.load(), which would return the
-    // placeholder and lose the fact that this was a cycle.
+    // Never expose or evaluate a partial in-flight ESM namespace to require().
     if (esm.isInFlight(info.localPath)) {
         throw requireCycleError(info.localPath, from, 'require-esm');
     }
@@ -186,6 +182,10 @@ export function buildCjsDeps(
 
         loadCjsCompiled(localPath: string): unknown | null {
             return esm.jsc.loadCompiled(localPath, false, undefined, localPath);
+        },
+
+        takeSourceSnapshot(localPath: string) {
+            return esm.jsc.takeSourceSnapshot(localPath, localPath);
         },
 
         persistCjsCompiled(localPath: string, bytes: ArrayBuffer, source): void {
@@ -272,14 +272,49 @@ export function installGlobalRequire(
 export function installInternalBridge(
     mkRequire: (parentPath: string) => CjsRequireFn,
     preloadModule: (id: string, parentPath: string) => unknown,
-    cache: Map<string, unknown>,
+    cache: CjsCacheStore,
     resolver: ModuleResolver,
+    cacheControl?: {
+        replaceCache(value: Record<string, unknown>): void;
+        resetCache(value?: Record<string, unknown>): void;
+        replaceExtensions(value: Record<string, unknown>): void;
+        resetExtensions(): void;
+    },
 ): void {
+    const existingDesc = Object.getOwnPropertyDescriptor(globalThis, CTS_INTERNAL);
+    const existingValue = existingDesc && 'value' in existingDesc && existingDesc.value &&
+        typeof existingDesc.value === 'object'
+        ? existingDesc.value as { nodeModuleInterop?: NodeModuleInteropBridge }
+        : undefined;
+    // Cached node:module copies retain this identity across runtime installs.
+    const nodeModuleInterop = existingValue?.nodeModuleInterop ?? {};
+    if (cacheControl) {
+        nodeModuleInterop.replaceCache = cacheControl.replaceCache;
+        nodeModuleInterop.resetCache = cacheControl.resetCache;
+        nodeModuleInterop.replaceExtensions = cacheControl.replaceExtensions;
+        nodeModuleInterop.resetExtensions = cacheControl.resetExtensions;
+        const nodeCache = nodeModuleInterop.getCache?.();
+        if (nodeCache !== undefined) {
+            if (nodeModuleInterop.cacheIsDefault?.()) cacheControl.resetCache();
+            else cacheControl.replaceCache(nodeCache);
+        }
+        const nodeExtensions = nodeModuleInterop.getExtensions?.();
+        if (nodeExtensions !== undefined) {
+            if (nodeModuleInterop.extensionsAreDefault?.()) cacheControl.resetExtensions();
+            else cacheControl.replaceExtensions(nodeExtensions);
+        }
+    }
     const value = {
         mkRequire,
         preloadModule,
         builtinModules: [...BUILTINS],
         cache,
+        registerModuleHooks,
+        hasModuleResolveHooks,
+        hasModuleLoadHooks,
+        runModuleResolveHooks,
+        runModuleLoadHooks,
+        nodeModuleInterop,
         specToLocalPath(specPath: string): string | null {
             const normalized = normalizeNpmSpec(specPath);
             try {
@@ -288,7 +323,7 @@ export function installInternalBridge(
             } catch { return null; }
         },
     };
-    const desc = Object.getOwnPropertyDescriptor(globalThis, CTS_INTERNAL);
+    const desc = existingDesc;
     if (!desc) {
         Object.defineProperty(globalThis, CTS_INTERNAL, {
             value, writable: false, enumerable: false, configurable: false,

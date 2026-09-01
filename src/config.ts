@@ -36,8 +36,9 @@ const TIER_MEM_LIMIT: Record<string, number> = {
 
 const TIER_STACK_SIZE: Record<string, number> = {
     low:     2 * 1024 * 1024,  // 2 MB
-    normal:  4 * 1024 * 1024,  // 4 MB
-    high:    6 * 1024 * 1024,  // 6 MB
+    // Windows stack usage is higher than linux, expand to avoid panic
+    normal: (isWindows ? 12 : 4) * 1024 * 1024,
+    high:   (isWindows ? 12 : 6) * 1024 * 1024,
 };
 
 const DEFAULT_MEM_LIMIT = TIER_MEM_LIMIT.normal;

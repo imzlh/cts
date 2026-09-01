@@ -2,17 +2,11 @@
 
 import { moduleViewRef, type FileKind } from '../types';
 import { guessFileKind } from '../resolve/protocols/base';
+import { schemeId } from '../utils/path';
 
-/** Same scheme rule as ModuleResolver's private protoOf — 2–8 lowercase alpha. */
+/** Extract the normalized scheme from a module identity. */
 export function specScheme(specPath: string): string | null {
-    const ci = specPath.indexOf(':');
-    if (ci < 2 || ci > 8) return null;
-    const scheme = specPath.slice(0, ci);
-    for (let i = 0; i < scheme.length; i++) {
-        const c = scheme.charCodeAt(i);
-        if (c < 97 || c > 122) return null;
-    }
-    return scheme;
+    return schemeId(specPath);
 }
 
 /** Map import-attribute type onto a ctsview: identity when it differs from base. */

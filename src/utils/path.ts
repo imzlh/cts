@@ -1,4 +1,5 @@
 import { isWindows, uname } from './platform';
+import { URL } from './url';
 
 // Convention: all public functions normalise backslashes to '/' internally.
 
@@ -30,41 +31,133 @@ export function toPosixPath(p: string): string {
     return normalizeSlashes(p);
 }
 
+function invalidFileUrlPath(pathname: string): never {
+    const error = new TypeError(`Invalid file URL path: ${pathname}`);
+    Object.defineProperty(error, 'code', { value: 'ERR_INVALID_FILE_URL_PATH', enumerable: true });
+    throw error;
+}
+
+/** Convert a file URL to a normalized CTS POSIX-internal filesystem path. */
+export function fileUrlToPath(value: string): string {
+    let pathname: string;
+    let hostname = '';
+    // Older CNO callers formed `file://${windowsPath}`, producing
+    // `file://C:/...` or `file://C:\...` instead of the canonical triple slash
+    // form. Keep accepting that spelling at this boundary.
+    const legacy = value.startsWith('file://') ? value.slice(7) : '';
+    if (/^[A-Za-z]:[\\/]/.test(legacy)) {
+        const query = legacy.indexOf('?');
+        const hash = legacy.indexOf('#');
+        const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
+        pathname = (cut === -1 ? legacy : legacy.slice(0, cut)).replace(/\\/g, '/');
+    } else {
+        const url = new URL(value);
+        if (url.protocol !== 'file:') throw new TypeError('Must be a file URL');
+        pathname = url.pathname;
+        hostname = url.hostname;
+    }
+    // A decoded separator would change the URL path structure and is rejected
+    // by Node's file URL conversion on Windows. `%5C` is a filename character
+    // on POSIX, while `%2F` is always a path separator.
+    if (/%2f/i.test(pathname) || (isWindows && /%5c/i.test(pathname))) {
+        invalidFileUrlPath(pathname);
+    }
+    let path = decodeURIComponent(pathname);
+    if (!isWindows && hostname && hostname !== 'localhost') {
+        throw new TypeError('File URL host must be empty or localhost');
+    }
+    if (isWindows) {
+        if (hostname && hostname !== 'localhost') {
+            // Accept the legacy `file://C:/path` spelling used by older CNO
+            // callers as well as the canonical `file:///C:/path` form.
+            path = /^[A-Za-z]$/.test(hostname)
+                ? `${hostname.toUpperCase()}:${path}`
+                : `//${hostname}${path}`;
+        }
+        else if (hasLeadingSlashDrive(path)) path = path.slice(1);
+    }
+    const trailingSlash = path.endsWith('/');
+    const normalized = normalizeDecodedFilePath(path);
+    return trailingSlash && normalized !== '/' && !normalized.endsWith('/')
+        ? `${normalized}/`
+        : normalized;
+}
+
+function encodeFileUrlPath(path: string): string {
+    return encodeURI(path).replace(/[?#]/g, (char) => char === '#' ? '%23' : '%3F');
+}
+
+function normalizeDecodedFilePath(path: string): string {
+    // On POSIX, a decoded `\\` is a filename character, not a separator.
+    // Keep it opaque while still collapsing URL path dot-segments.
+    if (isWindows) {
+        return normalizePath(path);
+    }
+    const absolute = path.startsWith('/');
+    const trailingSlash = path.endsWith('/');
+    const parts: string[] = [];
+    for (const part of path.split('/')) {
+        if (!part || part === '.') continue;
+        if (part === '..') {
+            if (parts.length && parts[parts.length - 1] !== '..') parts.pop();
+            else if (!absolute) parts.push('..');
+            continue;
+        }
+        parts.push(part);
+    }
+    let normalized = `${absolute ? '/' : ''}${parts.join('/')}`;
+    if (!normalized) normalized = absolute ? '/' : '.';
+    if (trailingSlash && normalized !== '/' && !normalized.endsWith('/')) normalized += '/';
+    return normalized;
+}
+
+/** Convert a filesystem path to a file URL while retaining CTS path spelling. */
+export function toFileUrl(path: string): string {
+    const normalized = toPosixPath(path);
+    if (isWindows && normalized.startsWith('//?/UNC/')) {
+        return `file:${encodeFileUrlPath(`//${normalized.slice('//?/UNC/'.length)}`)}`;
+    }
+    if (isWindows && normalized.startsWith('//?/')) {
+        return `file:///${encodeFileUrlPath(normalized.slice('//?/'.length))}`;
+    }
+    if (isWindows && normalized.startsWith('//./')) {
+        return `file:${encodeFileUrlPath(normalized)}`;
+    }
+    if (isWindows && /^[A-Za-z]:\//.test(normalized)) {
+        return `file:///${encodeFileUrlPath(normalized)}`;
+    }
+    if (isWindows && /^\/\/[^/]+\/[^/]+/.test(normalized)
+        && !normalized.startsWith('//?/') && !normalized.startsWith('//./')) {
+        return `file:${encodeFileUrlPath(normalized)}`;
+    }
+    return normalized.startsWith('/') ? `file://${encodeFileUrlPath(normalized)}` : normalized;
+}
+
 /**
  * True for a scheme-qualified id ("pack:/0.js", "npm:foo", "https://x").
  * Requires >= 2 scheme chars so a Windows drive ("C:") is never mistaken for a
  * scheme -- the single-letter trap that made entryUrl() return a raw path.
  */
 export function hasSchemeId(s: string): boolean {
+    return schemeId(s) !== null;
+}
+
+/** Return a normalized scheme name, or null for a filesystem/relative path. */
+export function schemeId(s: string): string | null {
     const ci = s.indexOf(':');
-    if (ci < 2 || ci > 8) return false;
+    if (ci < 2) return null;
     for (let i = 0; i < ci; i++) {
         const c = s.charCodeAt(i);
         // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
         const alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-        if (i === 0 ? !alpha : !(alpha || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) return false;
+        if (i === 0 ? !alpha : !(alpha || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) return null;
     }
-    return true;
+    return s.slice(0, ci).toLowerCase();
 }
 
 /**
- * Denormalize a POSIX-internal path into a NATIVE host path on the way OUT to
- * user code. This is the boundary half of the invariant in cts/AGENT.md:230 and
- * AGENT.md:402 ("host paths on the boundary but POSIX internally"): everything
- * inside cts compares and keys on POSIX, so every user-visible path value
- * (__filename, __dirname, module.id/filename/path/paths, require.resolve(),
- * import.meta.filename/dirname) must pass through here or Windows callers see
- * "C:/x" where Node and Deno both return "C:\x".
- *
- * Measured on Windows 11, node v24.18.0 / deno 2.9.3:
- *   node  -e process.stdout.write(__filename)   -> D:\tmp\agsep\cjs.cjs
- *   deno: import.meta.filename                  -> D:\tmp\agsep\dn.ts
- *
- * Scheme-qualified ids are returned UNTOUCHED. "pack:/c.cjs" is a container id,
- * not a filesystem path: its '/' is part of the id on every platform, so
- * converting it yields "pack:\c.cjs", which no resolver accepts and which would
- * differ between Windows and POSIX for the same .jspack artifact.
- * No-op on POSIX.
+ * Convert CTS's POSIX-internal paths to native paths at public boundaries.
+ * Scheme-qualified IDs stay unchanged because their slashes are identifier syntax, not path separators.
  */
 export function toHostPath(p: string): string {
     if (!isWindows || hasSchemeId(p)) return p;
@@ -103,6 +196,18 @@ export function pathRoot(p: string): string {
     if (s.length >= 3 && s[1] === ':' && s[2] === '/' && isAsciiAlpha(s.charCodeAt(0))) {
         return s.slice(0, 2) + '/';
     }
+    if (isWindows && s.startsWith('//')) {
+        // UNC shares are the filesystem root for upward searches. Treat
+        // extended UNC and extended drive paths separately from //./pipe/*.
+        const deviceNamespace = /^\/\/[?.]\/?$/.exec(s);
+        if (deviceNamespace) return deviceNamespace[0].endsWith('/') ? deviceNamespace[0] : `${deviceNamespace[0]}/`;
+        const verbatimUnc = /^\/\/[?.]\/UNC\/[^/]+\/[^/]+/i.exec(s);
+        if (verbatimUnc) return verbatimUnc[0];
+        const verbatimDrive = /^\/\/[?.]\/[A-Za-z]:/i.exec(s);
+        if (verbatimDrive) return verbatimDrive[0];
+        const unc = /^\/\/[^/]+\/[^/]+/.exec(s);
+        if (unc) return unc[0];
+    }
     return '/';
 }
 
@@ -116,6 +221,12 @@ export function basename(p: string, ext?: string): string {
 
 export function dirname(p: string): string {
     const s = normalizeSlashes(p);
+    if (isWindows && /^\/\/[?.]\/?$/.test(s)) return s.endsWith('/') ? s : `${s}/`;
+    if (isWindows && s.startsWith('//')) {
+        const root = pathRoot(s);
+        const withoutTrailingSlash = s.replace(/\/+$/, '');
+        if (withoutTrailingSlash === root) return root;
+    }
     const i = s.lastIndexOf('/');
     if (i <= 0) return i === 0 ? '/' : '.';
     const dir = s.slice(0, i);
@@ -149,7 +260,19 @@ export function joinPaths(...parts: string[]): string {
     for (let p of parts) {
         if (!p) continue;
         p = normalizeSlashes(p);
+        // A Windows drive path starts a new path boundary. Rooted POSIX-style
+        // components retain join semantics, so joinPaths('/a', '/b') is '/a/b'.
+        const isDriveAbsolute = isWindows && p.length >= 3 && p[1] === ':' && p[2] === '/' &&
+            isAsciiAlpha(p.charCodeAt(0));
+        if (isDriveAbsolute) {
+            out = p;
+            continue;
+        }
         if (!out) { out = p; continue;
+        }
+        if (isWindows && p.startsWith('//')) {
+            out = p;
+            continue;
         }
         const outSlash = out.endsWith('/');
         const pSlash = p.startsWith('/');
@@ -173,19 +296,49 @@ export function normalizePath(p: string): string {
     const protocol = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(p);
     const windowsDrive = /^[A-Za-z]:/.test(p);
     if (protocol && !windowsDrive) return p;
-    // Detect drive-letter prefix (e.g. "C:/") as the absolute root
+    // Keep the complete Windows root outside the dot-segment stack. In
+    // particular, the UNC share is a root just like a drive, and device paths
+    // have either a drive root, an extended UNC share, or a device namespace.
     let prefix = '';
     let start = 0;
-    if (p.length >= 3 && p[1] === ':' && p[2] === '/' && isAsciiAlpha(p.charCodeAt(0))) {
-        prefix = p.slice(0, 3);
-        start = 3;
-    } else if (isWindows && p.startsWith('//') && p.charCodeAt(2) !== 47 /* / */) {
-        // UNC root (\\server\share): the double slash is part of the path root.
-        prefix = '//';
-        start = 2;
-    } else if (p.startsWith('/')) {
+    if (isWindows) {
+        const verbatimUnc = p.match(/^\/\/[?.]\/UNC\/[^/]+\/[^/]+(?=\/|$)/i);
+        const verbatimDrive = p.match(/^\/\/[?.]\/[A-Za-z]:/);
+        const deviceNamespace = p.match(/^\/\/[?.]\//);
+        const deviceRoot = p.match(/^\/\/[?.]\/[^/]+(?=\/|$)/);
+        const unc = p.match(/^\/\/[^/]+\/[^/]+(?=\/|$)/);
+        if (verbatimUnc) {
+            prefix = verbatimUnc[0];
+            start = prefix.length;
+        } else if (verbatimDrive) {
+            prefix = verbatimDrive[0];
+            start = prefix.length;
+        } else if (deviceRoot) {
+            // The namespace's first component is itself a root for paths such
+            // as \\.\pipe\name and \\?\GLOBALROOT\Device\...; .. must not
+            // walk back through the namespace prefix.
+            prefix = deviceRoot[0];
+            start = prefix.length;
+        } else if (deviceNamespace) {
+            prefix = deviceNamespace[0];
+            start = prefix.length;
+        } else if (unc) {
+            prefix = unc[0];
+            start = prefix.length;
+        } else if (p.length >= 3 && p[1] === ':' && p[2] === '/' && isAsciiAlpha(p.charCodeAt(0))) {
+            prefix = p.slice(0, 2);
+            start = 3;
+        }
+    }
+    if (!prefix && p.startsWith('/')) {
         prefix = '/';
         start = 1;
+    } else if (!prefix && p.length >= 3 && p[1] === ':' && p[2] === '/' && isAsciiAlpha(p.charCodeAt(0))) {
+        // POSIX hosts still need to leave a Windows-looking path untouched as
+        // a relative name; this branch is only reachable on non-Windows hosts
+        // when the input was already classified as a rooted drive path.
+        prefix = p.slice(0, 3);
+        start = 3;
     }
     const abs = prefix.length > 0;
     const out: string[] = [];
@@ -206,7 +359,11 @@ export function normalizePath(p: string): string {
         }
         segmentStart = i + 1;
     }
-    return prefix + out.join('/') || '.';
+    const body = out.join('/');
+    if (!prefix) return body || '.';
+    if (prefix.endsWith('/')) return prefix + body;
+    if (/^[A-Za-z]:$/.test(prefix)) return body ? `${prefix}/${body}` : `${prefix}/`;
+    return body ? `${prefix}/${body}` : prefix;
 }
 
 export function resolvePath(...parts: string[]): string {
@@ -219,16 +376,25 @@ export function resolvePath(...parts: string[]): string {
 export function relativePath(base: string, target: string): string | null {
     let b = normalizePath(toPosixPath(base));
     const t = normalizePath(toPosixPath(target));
-    if (b.endsWith('/')) b = b.slice(0, -1);
-    if (t === b) return '';
-    const prefix = b + '/';
-    if (!t.startsWith(prefix)) return null;
+    if (b !== '/' && b.endsWith('/')) b = b.slice(0, -1);
+    const baseKey = isWindows ? b.toLowerCase() : b;
+    const targetKey = isWindows ? t.toLowerCase() : t;
+    if (targetKey === baseKey) return '';
+    const prefix = b === '/' ? '/' : `${b}/`;
+    const prefixKey = isWindows ? prefix.toLowerCase() : prefix;
+    if (!targetKey.startsWith(prefixKey)) return null;
     return t.slice(prefix.length);
 }
 
+/** True when target is base or a lexical descendant of base. */
+export function isPathWithin(base: string, target: string): boolean {
+    return relativePath(base, target) !== null;
+}
+
 export function isAbsolute(p: string): boolean {
+    p = toPosixPath(p);
     if (p.startsWith('/')) return true;
-    if (uname.sysname.includes('Windows') && p.length >= 3 && p[1] === ':' && (p[2] === '/' || p[2] === '\\') && isAsciiAlpha(p.charCodeAt(0))) {
+    if (isWindows && p.length >= 3 && p[1] === ':' && p[2] === '/' && isAsciiAlpha(p.charCodeAt(0))) {
         return true;
     }
     return false;
@@ -247,14 +413,7 @@ export function isRelative(s: string): boolean {
  */
 export function parentDirKey(parent: string): string {
     let base = parent;
-    if (base.startsWith('file://')) {
-        const raw = base.slice(7);
-        const query = raw.indexOf('?');
-        const hash = raw.indexOf('#');
-        const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
-        base = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
-        if (hasLeadingSlashDrive(base)) base = base.slice(1);
-    }
+    if (schemeId(base) === 'file') base = fileUrlToPath(base);
     const dir = dirname(base);
     // dirname('npm:pkg@1') is '.' — keep the whole parent ref.
     return dir === '.' ? base : dir;

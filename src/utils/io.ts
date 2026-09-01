@@ -6,6 +6,7 @@ import { isWindows } from './platform';
 import { yieldEventLoop } from './yield';
 
 const fs = import.meta.use('fs');
+const asyncfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 
 export const readText = (p: string) => {
@@ -22,6 +23,41 @@ export const readBytes = (p: string) => {
     return new Uint8Array(fs.readFile(p));
 };
 
+/** Existence probes used by filesystem orchestration; false covers any fs error. */
+export function pathExistsSync(path: string): boolean {
+    try {
+        fs.stat(path);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export async function pathExists(path: string): Promise<boolean> {
+    try {
+        await asyncfs.stat(path);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function isDirectorySync(path: string): boolean {
+    try {
+        return fs.stat(path).isDirectory;
+    } catch {
+        return false;
+    }
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+    try {
+        return (await asyncfs.stat(path)).isDirectory;
+    } catch {
+        return false;
+    }
+}
+
 function unlinkIfExists(path: string): void {
     try {
         fs.unlink(path);
@@ -29,13 +65,29 @@ function unlinkIfExists(path: string): void {
 }
 
 export function ensureDir(dir: string): void {
-    if (fs.exists(dir)) return;
+    if (isDirectorySync(dir)) return;
     const parent = dirname(dir);
     if (parent && parent !== dir && parent !== '.') ensureDir(parent);
     try {
         fs.mkdir(dir, 0o755);
     } catch {
-        if (!fs.exists(dir)) throw err(ErrorKind.PermissionError, `Failed to create directory: ${dir}`);
+        // A concurrent creator may have won the race. A same-named file must
+        // remain an error; `fs.exists()` cannot distinguish the two.
+        if (!isDirectorySync(dir)) throw err(ErrorKind.PermissionError, `Failed to create directory: ${dir}`);
+    }
+}
+
+/** Async counterpart used by flow steps and materialization callers. */
+export async function ensureDirAsync(dir: string): Promise<void> {
+    if (await isDirectory(dir)) return;
+    const parent = dirname(dir);
+    if (parent && parent !== dir && parent !== '.') await ensureDirAsync(parent);
+    try {
+        await asyncfs.mkdir(dir, 0o755);
+    } catch {
+        // A concurrent creator may have won the race. A same-named file must
+        // remain an error; stat gives us the required type distinction.
+        if (!await isDirectory(dir)) throw err(ErrorKind.PermissionError, `Failed to create directory: ${dir}`);
     }
 }
 

@@ -932,6 +932,11 @@ export class TypeScriptRuntime {
         clearImportMetaResolveCache();
         this.resolver.clearRuntimeCaches();
         this.resolver.clearHandlerCaches();
+        // The resolver owns the LockStore opened during construction.  Leaving
+        // it open keeps a SQLite handle (and its prepared statements) in the
+        // process-wide LockStore.openStores set until process exit, which is a
+        // leak for embedders that create and dispose runtimes repeatedly.
+        this.resolver.close();
         // clearRuntimeCaches() only clears five resolver maps. Without this, the
         // four createResourceManager() registrations never ran on the `cno pack`
         // path (its only caller), leaving connection pools open — pooled sockets

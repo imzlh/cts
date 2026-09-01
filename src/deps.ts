@@ -1,6 +1,6 @@
 import type { RuntimeConfig, ModuleFormat, FileKind } from './types';
 import { ModuleResolver } from './resolve/index';
-import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative, isAbsolute, parentDirKey, yieldEventLoop } from './utils';
+import { errMsg, log, getMemoryTier, PrecacheProgress, npmPackageName, isRelative, isAbsolute, parentDirKey, yieldEventLoop, schemeId } from './utils';
 import { isRemote } from './source/cache';
 import type { OxcTranspiler } from './oxc';
 import { ImportScanner } from './import-scanner';
@@ -247,7 +247,7 @@ export class DepScanner {
 
             try {
                 // Relative/absolute local edges never download — keep them sync.
-                const info = (isRelative(item.spec) || isAbsolute(item.spec) || item.spec.startsWith('file:'))
+                const info = (isRelative(item.spec) || isAbsolute(item.spec) || schemeId(item.spec) === 'file')
                     ? this.resolver.resolve(item.spec, item.parent)
                     : await this.resolver.resolveAsync(item.spec, item.parent, undefined, onProgress);
                 resolvedMs = Date.now() - startedMs;

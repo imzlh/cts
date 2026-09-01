@@ -71,6 +71,12 @@ export class ModuleCompiler {
             (id, parentPath) => this.cjs.preloadModule(id, parentPath),
             this.cjs.cache,
             resolver,
+            {
+                replaceCache: (value) => this.cjs.replaceCache(value),
+                resetCache: (value) => this.cjs.resetCache(value),
+                replaceExtensions: (value) => this.cjs.replaceExtensions(value),
+                resetExtensions: () => this.cjs.resetExtensions(),
+            },
         );
     }
 
@@ -189,6 +195,7 @@ export class ModuleCompiler {
 
     clearLoadedModules(): void {
         this.esm.clearLoadedModules();
+        this.cjs.clearLoadedModules();
         this.wasm.clearCache();
     }
 

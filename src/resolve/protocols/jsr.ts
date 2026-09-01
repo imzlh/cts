@@ -17,6 +17,15 @@ const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
 type CachedJsrPackageMeta = JsrPackageMeta & { _at?: number };
 type CachedJsrVersionMeta = JsrVersionMeta & { _at?: number };
 
+function parseCachedMeta<T>(text: string): T | null {
+    try {
+        return safeParse<T>(text);
+    } catch (error) {
+        if (error instanceof Error && error.kind === ErrorKind.SyntaxError) return null;
+        throw error;
+    }
+}
+
 function isDigitCode(c: number): boolean {
     return c >= 48 && c <= 57;
 }
@@ -182,11 +191,12 @@ export class JsrHandler implements ProtocolHandler {
         const file = joinPaths(dir, 'meta.json');
         const exists = yield { type: StepType.FS_EXISTS, path: file };
         if (exists) {
-            try {
-                const c = safeParse<CachedJsrPackageMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: file }));
+            const text = expectText(yield { type: StepType.FS_READ_TEXT, path: file });
+            const c = parseCachedMeta<CachedJsrPackageMeta>(text);
+            if (c) {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
                 if (this.cfg.cachedOnly) return c;
-            } catch {}
+            }
         }
         if (this.cfg.cachedOnly) {
             throw err(ErrorKind.ModuleNotFound,
@@ -210,11 +220,12 @@ export class JsrHandler implements ProtocolHandler {
         const file = joinPaths(dir, 'meta.json');
         const exists = yield { type: StepType.FS_EXISTS, path: file };
         if (exists) {
-            try {
-                const c = safeParse<CachedJsrVersionMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: file }));
+            const text = expectText(yield { type: StepType.FS_READ_TEXT, path: file });
+            const c = parseCachedMeta<CachedJsrVersionMeta>(text);
+            if (c) {
                 if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
                 if (this.cfg.cachedOnly) return c;
-            } catch {}
+            }
         }
         if (this.cfg.cachedOnly) {
             throw err(ErrorKind.ModuleNotFound,

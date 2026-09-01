@@ -1,5 +1,5 @@
 import type { FileKind, PackageJson, ModuleFormat } from '../types';
-import { dirname, extname, joinPaths, normalizePath, toPosixPath, resolveFile, safeParse, LRU, log, isValidNpmPackageName } from '../utils';
+import { dirname, extname, joinPaths, normalizePath, isPathWithin, toPosixPath, resolveFile, safeParse, LRU, log, isValidNpmPackageName } from '../utils';
 import { err, ErrorKind } from '../errors';
 
 const fs = import.meta.use('fs');
@@ -134,24 +134,17 @@ function isSafeBinTarget(target: string): boolean {
     return normalizeBinTarget(target) !== null;
 }
 
-function pathWithin(root: string, candidate: string): boolean {
-    const base = normalizePath(toPosixPath(root));
-    const path = normalizePath(toPosixPath(candidate));
-    const prefix = base.endsWith('/') ? base : `${base}/`;
-    return path === base || path.startsWith(prefix);
-}
-
 export function resolvePackageBinPath(pkgDir: string, relPath: string): string | null {
     const relative = normalizeBinTarget(relPath);
     if (!relative) return null;
     const root = normalizePath(toPosixPath(pkgDir));
     const candidate = normalizePath(joinPaths(root, relative));
-    if (!pathWithin(root, candidate)) return null;
+    if (!isPathWithin(root, candidate)) return null;
     try {
         if (!fs.stat(candidate).isFile) return null;
         const realRoot = normalizePath(toPosixPath(fs.realpath(root)));
         const realCandidate = normalizePath(toPosixPath(fs.realpath(candidate)));
-        return pathWithin(realRoot, realCandidate) ? candidate : null;
+        return isPathWithin(realRoot, realCandidate) ? candidate : null;
     } catch {
         return null;
     }
@@ -400,8 +393,7 @@ function packageLocalPath(ctx: ResolveCtx, path: string): string | null {
     if (relative.startsWith('/') || relative.includes('\0') || /^[a-z]:[\\/]/i.test(relative)) return null;
     const root = normalizePath(ctx.pkgDir);
     const candidate = normalizePath(joinPaths(root, relative));
-    const prefix = root.endsWith('/') ? root : `${root}/`;
-    return candidate === root || candidate.startsWith(prefix) ? candidate : null;
+    return isPathWithin(root, candidate) ? candidate : null;
 }
 
 function resolveLegacyPath(ctx: ResolveCtx, p: string): string | null {

@@ -12,7 +12,7 @@ import { BlobHandler }  from './protocols/blob';
 import { LockStore }    from '../lock';
 import { isBuiltinSpecifier } from './builtins';
 import { runAsync, runSync } from '../flow';
-import { normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, hasLeadingSlashDrive, parentDirKey, assert, LRU, log } from '../utils';
+import { fileUrlToPath, normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, parentDirKey, assert, LRU, log, schemeId } from '../utils';
 import { detectFormat } from './pkg';
 import { guessFileKind, applyAttrType, validateAttrType } from './protocols/base';
 
@@ -23,15 +23,7 @@ const fs = import.meta.use('fs');
 // Returns '' for relative/absolute paths, 'http' for 'http://...', etc.
 
 function protoOf(s: string): string {
-    const ci = s.indexOf(':');
-    if (ci < 2 || ci > 8) return '';           // too short/long for a protocol
-    const proto = s.slice(0, ci);
-    // Protocols are lowercase alpha only — reject things like 'C:' on Windows
-    for (let i = 0; i < proto.length; i++) {
-        const c = proto.charCodeAt(i);
-        if (c < 97 || c > 122) return '';      // not a-z
-    }
-    return proto;
+    return schemeId(s) ?? '';
 }
 
 /**
@@ -153,14 +145,7 @@ function buildImportMapMappingsIndex(map: Record<string, string> | undefined): I
 
 function normalizeImportMapScopeRef(ref: string): string {
     let normalized = ref;
-    if (ref.startsWith('file://')) {
-        const raw = ref.slice(7);
-        const query = raw.indexOf('?');
-        const hash = raw.indexOf('#');
-        const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
-        normalized = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
-        if (hasLeadingSlashDrive(normalized)) normalized = normalized.slice(1);
-    }
+    if (schemeId(ref) === 'file') normalized = fileUrlToPath(ref);
     if (!isFilesystemLocalPath(normalized)) return normalized;
     const keepTrailingSlash = normalized.endsWith('/');
     normalized = canonicalizePath(normalizePath(normalized));
@@ -396,31 +381,11 @@ export class ModuleResolver {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
             const h = this.handlers.get(proto);
             if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
-            // `return await`, not a bare `return`, at every promise-returning
-            // tail call in this file's async resolve path.
-            //
-            // A bare `return p` resolves this function's promise WITH p, and the
-            // adoption that attaches a handler to p runs in a later
-            // PromiseResolveThenableJob. When p is *already rejected* at the
-            // moment of return — which is exactly what an async function or a
-            // runAsync(flow) that throws before its first await produces, e.g.
-            // parseNpmSpec rejecting "npm:@foo" in the flow's first .next() —
-            // the host rejection tracker's dispatch job runs BEFORE that
-            // adoption and sees a rejected promise with no handler. It then
-            // reports a spurious "unhandled promise rejection" and, since that
-            // path calls requestFailureExitCode(), turns a caught, recoverable
-            // resolve failure into rc=1. OBSERVED: `await import("npm:@foo")`
-            // inside try/catch printed the diagnostic and exited 1 under
-            // --precache/--reload while node exits 0.
-            //
-            // `await` attaches the handler in the same job, so the promise is
-            // already handled when the tracker's job re-checks. Reduced proof,
-            // no modules involved: `async function outer() { return inner(); }`
-            // reports; `return await inner()` does not.
-            //
-            // Safe here: none of these three methods has a try/catch/finally, so
-            // awaiting cannot reroute a rejection into a local handler. It costs
-            // one microtask and improves the async stack trace.
+            // Await promise-returning tails so an already-rejected flow promise
+            // is marked handled before host rejection tracking runs. A bare
+            // `return p` can expose that rejection before async adoption;
+            // these paths have no local catch/finally, so `await` preserves
+            // propagation while avoiding spurious unhandled-rejection reports.
             return await runAsync(h.resolve(spec, parent, attr, onProgress));
         }
         if (isRelative(spec)) return await this.resolveRelativeAsync(spec, parent, attr, onProgress);
@@ -449,69 +414,22 @@ export class ModuleResolver {
     }
 
     /**
-     * Resolve for INSPECTION only: answer from what is already local (project
-     * node_modules, flat store, lock) and never fetch, install, or materialize.
+     * Resolve for inspection only. Use project/lock/store data already on disk;
+     * never fetch, install, or materialize a dependency. `require.resolve()`
+     * is a synchronous optional-dependency probe, so routing it through normal
+     * resolution can turn a local lookup into network I/O and make fallback
+     * branches unreachable.
      *
-     * ── WHY THIS EXISTS — DO NOT COLLAPSE IT BACK INTO resolve() ──────────────
-     * `require.resolve()` is a synchronous *inspection* API. The universal
-     * ecosystem idiom is
-     *     try { require.resolve('x') } catch { use a fallback }
-     * used for optional deps, plugin discovery and "is X available?" probes.
-     * Routing that through the normal resolve() made it install-on-demand, with
-     * two measured consequences:
+     * A package already present in the local store may resolve even when Node
+     * would require a project `node_modules` entry. This keeps the answer
+     * consistent with the subsequent cno `require()`; stricter declared-deps
+     * policy belongs to node-modules handling. Declared but missing packages
+     * are not materialized here: inspection never fetches.
      *
-     *  1. Every such probe took the WRONG BRANCH. resolve() succeeds for any
-     *     name the *upstream registry* has, i.e. essentially every name, so the
-     *     `catch` was unreachable. Measured: eslint's loadFormatter('json') does
-     *     exactly this probe; under node it falls back to its own bundled
-     *     formatter, under cno the probe "succeeded" and it silently loaded a
-     *     different, older eslint-formatter-json@9.0.1 (plus 9 transitive deps).
-     *  2. require.resolve() became NETWORK I/O that fetches registry code, from
-     *     a call the caller believes is a pure local lookup — including from
-     *     inside a `catch` block. Measured with NPM_CONFIG_REGISTRY pointed at
-     *     127.0.0.1:1: `require.resolve('left-pad')` in a project that does not
-     *     depend on left-pad returned
-     *     "Failed to connect to 127.0.0.1:1 after 2050 ms" — i.e. it really did
-     *     open a connection, and against a working registry it returns a path
-     *     where node throws MODULE_NOT_FOUND.
-     *
-     * NOT node-identical, deliberately: a package ALREADY in the local store
-     * still resolves here, where node would throw. That is required for
-     * internal consistency, not laziness — `require('picocolors')` for an
-     * undeclared store package *succeeds* under cno (measured, --cached-only,
-     * no node_modules). Since require.resolve()'s contract is "the path
-     * require() would load", throwing here while require() succeeds would be a
-     * new defect in the opposite direction: `try{resolve}catch{fallback}` would
-     * take the fallback for a package that demonstrably loads. The residual
-     * divergence is bounded by what the user has already downloaded, whereas
-     * fetching is unbounded over the whole registry. Narrowing it further is
-     * node-modules-mode / declared-deps policy, not this function's business.
-     *
-     * Declared-but-not-yet-downloaded deps are NOT materialized here either.
-     * Rejected on purpose: it would make "does this probe block on the network"
-     * depend on the manifest, unauditable from the call site, inside a
-     * synchronous call that can stall for cfg.requestTimeout (120s default).
-     * Materializing declared deps is the install/precache graph's job, which
-     * runs ahead of time. The rule has to stay one sentence long to survive:
-     * **inspection never fetches.**
-     *
-     * Mechanism: `cachedOnly` is already honoured at every download site
-     * (npm.ts, jsr.ts, http.ts), so it is flipped for the duration of the call
-     * rather than threading a second flag through every handler. Safe because
-     * resolve() is fully synchronous — runSync/executeSync never pump
-     * microtasks, so nothing else can observe the flipped flag.
-     *
-     * `inspect: true` rides along in `attr` purely to SEGREGATE the memo caches
-     * (attrSignature folds unknown attr keys into the sourceInfoCache key, and
-     * rememberExact early-returns when attr is set). Without it a no-fetch
-     * answer — which may legitimately pick a different, store-local version —
-     * could be handed to a later real require(). Handlers ignore the key; only
-     * `attr.cjs` and `attr.type` are ever read.
-     *
-     * Relation to --cached-only: NOT redundant either way. --cached-only is
-     * global (require/import/install all stop fetching) and, measured, does not
-     * fix consequence 1 at all — an undeclared store package still resolved
-     * under it. This is narrower: only the inspection path, always on.
+     * Handlers already honor `cachedOnly`, so toggle it for this synchronous
+     * call instead of threading another flag through every protocol. Mark the
+     * request with `inspect` to keep a store-local inspection result out of
+     * normal memo caches; handlers consume only `cjs` and `type` attributes.
      */
     resolveForInspection(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         const prevCachedOnly = this.cfg.cachedOnly;
@@ -739,18 +657,11 @@ export class ModuleResolver {
             if (handler) return runSync(handler.resolve(spec, parent, attr));
         }
         let base = parent;
-        if (parent.startsWith('file://')) {
-            const raw = parent.slice(7);
-            const query = raw.indexOf('?');
-            // Only a real URL fragment after an encoded path — %23 is a path char.
-            const hash = raw.indexOf('#');
-            const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
-            base = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
+        if (schemeId(parent) === 'file') {
+            base = fileUrlToPath(parent);
         } else {
             base = splitLocalSpecifier(base).path;
         }
-        // file:///C:/... → /C:/... → strip leading / before drive letter
-        if (hasLeadingSlashDrive(base)) base = base.slice(1);
         // Ensure base is an absolute path for correct relative resolution
         if (!isAbsolute(base)) base = resolvePath(base);
         base = dirname(base);

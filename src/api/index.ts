@@ -13,8 +13,9 @@ export { ImportScanner } from '../import-scanner';
 export { fatal, formatError, err, ErrorKind, TransformError, isErrorKind, isResolutionMiss, codeForKind, setErrorCode } from '../errors';
 export {
     log, errMsg, fmtBytes, uname, isWindows, stripJsonc,
-    dirname, normalizePath, isAbsolute, joinPaths, cwd, toPosixPath,
+    dirname, normalizePath, isAbsolute, joinPaths, cwd, toPosixPath, fileUrlToPath, toFileUrl, hasSchemeId, schemeId,
     resolvePath, resolveFile, isRelative, extname, canonicalizePath, basename,
+    relativePath, isPathWithin, toHostPath, toHostPaths, pathRoot, parentDirKey,
 } from '../utils';
 export { createResourceManager, ResourceManager } from '../runtime/resources';
 export { writePack } from '../pack/writer';

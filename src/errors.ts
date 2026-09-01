@@ -99,40 +99,19 @@ export function setErrorCode(e: Error, code: string): void {
     });
 }
 
-/** Default node-style `.code` for an ErrorKind, or undefined for the kinds node
- *  itself leaves codeless.
+/** Default Node-compatible `.code` for an error kind.
  *
- *  WHY THIS EXISTS — do not delete it as cosmetic. Real packages *branch* on
- *  `err.code`, and they assume it is a string whenever a load fails. An error
- *  with no `code` does not merely print less detail; it crashes the consumer
- *  somewhere unrelated and destroys the diagnostic. The measured case:
+ * Consumers commonly branch on `err.code` for every load attempt, so all
+ * non-parse failures need a stable string, including cno-specific kinds.
+ * Syntax and transform failures intentionally remain code-less, matching
+ * Node's parse errors; a resolution code would make a source bug look like a
+ * missing package.
  *
- *      require('sharp')
- *        → TypeError: cannot read property 'endsWith' of undefined
- *          at sharp/dist/sharp.cjs:115
- *            errors.forEach((err) => {
- *              if (!err.code.endsWith("MODULE_NOT_FOUND")) ...
- *
- *  sharp collects an error per load attempt (~10 of them) and builds a
- *  diagnostic message at the end. With `.code` undefined, that builder throws
- *  and the user sees a TypeError inside sharp instead of *which* attempt failed
- *  and why. Before this table only ErrorKind.ModuleNotFound carried a code, so
- *  every other kind — including the addon-load failure that is sharp's actual
- *  problem — arrived codeless.
- *
- *  Codes are the ones node produces for the same situation, measured against
- *  node v24.18.0 rather than assumed. Two kinds deliberately get NO code
- *  because node also leaves them undefined: a module that fails to parse throws
- *  a bare SyntaxError (`import()` of a file with a syntax error, and of a
- *  malformed `data:` URL, both give code === undefined). Inventing a code there
- *  would be worse than none — a parse failure reported as ERR_MODULE_NOT_FOUND
- *  sends a consumer down the "install the package" path for a source bug.
- *
- *  CONSTRAINT: no kind other than ModuleNotFound/FileNotFound may map to
- *  'MODULE_NOT_FOUND' or 'ENOENT'. `isResolutionMiss` treats those two codes as
- *  "keep walking the CJS resolution chain", so handing them to e.g. LockFrozen
- *  or PermissionError would silently swallow a real failure as a miss.
- *  tests/cts/resolve-miss.test.ts pins that boundary. */
+ * Keep `MODULE_NOT_FOUND` and `ENOENT` exclusive to ModuleNotFound and
+ * FileNotFound. `isResolutionMiss()` treats those codes as permission to
+ * continue the CJS resolution chain; assigning one to another kind would
+ * swallow a real failure.
+ */
 export function codeForKind(kind: ErrorKind): string | undefined {
     switch (kind) {
         // require()'s value. ESM upgrades this to ERR_MODULE_NOT_FOUND at the
@@ -141,8 +120,7 @@ export function codeForKind(kind: ErrorKind): string | undefined {
         // path both key off this exact string.
         case ErrorKind.ModuleNotFound:   return 'MODULE_NOT_FOUND';
         case ErrorKind.FileNotFound:     return 'ENOENT';
-        // Node throws exactly this for a scheme its ESM loader won't take
-        // (measured: import('gopher://…')).
+        // Node throws this for a scheme its ESM loader does not support.
         case ErrorKind.ProtocolDisabled: return 'ERR_UNSUPPORTED_ESM_URL_SCHEME';
         case ErrorKind.InvalidSpecifier: return 'ERR_INVALID_MODULE_SPECIFIER';
         case ErrorKind.PermissionError:  return 'EACCES';

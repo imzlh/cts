@@ -1,6 +1,16 @@
-const curlMod = import.meta.use('curl');
+export interface CurlTarget {
+    protocol: string;
+}
 
-export type CurlInitHook = (curl: CModuleCURL.CURL) => void;
+declare const URL: {
+    new(input: string): CurlTarget;
+};
+
+export type CurlInitHook = (curl: CModuleCURL.CURL, url: CurlTarget) => void;
+
+export function createCurlTarget(input: string): CurlTarget {
+    return new URL(input);
+}
 
 let curlInitHook: CurlInitHook | null = null;
 

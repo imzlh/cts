@@ -667,14 +667,36 @@ type ArgType = 'string' | 'boolean' | 'number';
 type ArgTemplate = Record<string, ArgType>;
 type ArgResult<T extends ArgTemplate> = {
     [K in keyof T]?: T[K] extends 'string' ? string : T[K] extends 'number' ? number : boolean;
-} & { _?: string; _args?: string[]; _offset: number };
+} & Record<string, string | number | boolean | string[] | undefined> & {
+    _?: string;
+    _args?: string[];
+    _offset: number;
+};
 export type ParsedArgs = Record<string, string | number | boolean | string[] | undefined> & { _offset: number };
+
+function shouldConsumeArgValue(token: string | undefined, type: ArgType): token is string {
+    if (token === undefined || token === '--') return false;
+    if (!token.startsWith('-')) return true;
+    return type === 'number' && /^-\d+(?:\.\d+)?$/.test(token);
+}
 
 export function parseArgs<T extends ArgTemplate>(argv: string[], tpl: T): ArgResult<T> {
     const out: ParsedArgs = { _offset: 0 };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
         if (arg === undefined) break;
+        if (arg === '--') {
+            const positional = argv[i + 1];
+            if (positional !== undefined) {
+                out._ = positional;
+                out._args = argv.slice(i + 2);
+                out._offset = i + 2;
+            } else {
+                out._args = [];
+                out._offset = i + 1;
+            }
+            break;
+        }
         if (arg.startsWith('--')) {
             const eqIdx = arg.indexOf('=');
             const key = eqIdx >= 0 ? arg.slice(2, eqIdx) : arg.slice(2);
@@ -690,7 +712,7 @@ export function parseArgs<T extends ArgTemplate>(argv: string[], tpl: T): ArgRes
             else if (inlineVal !== undefined) {
                 out[key] = type === 'number' ? +inlineVal : inlineVal;
             }
-            else if (next && !next.startsWith('--')) {
+            else if (shouldConsumeArgValue(next, type)) {
                 out[key] = type === 'number' ? +next : next;
                 i++;
             }
@@ -707,7 +729,7 @@ export function parseArgs<T extends ArgTemplate>(argv: string[], tpl: T): ArgRes
                     out[key] = type === 'number' ? +inlineVal : inlineVal;
                 } else {
                     const next = argv[i + 1];
-                    if (next && !next.startsWith('-')) {
+                    if (shouldConsumeArgValue(next, type)) {
                         out[key] = type === 'number' ? +next : next;
                         i++;
                     }

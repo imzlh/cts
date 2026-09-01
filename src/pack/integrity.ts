@@ -12,6 +12,8 @@
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');
 
+import { dirname } from '../utils/path';
+
 let tempSeq = 0;
 
 export function bytesEqual(actual: Uint8Array, expected: Uint8Array): boolean {
@@ -46,23 +48,10 @@ function tempBeside(path: string): string {
     return `${path}.tmp-${pid}-${Date.now()}-${tempSeq++}`;
 }
 
-/** Parent dir of an unnormalized path; `-o dir\out.jspack` is valid on Windows. */
-function parentDir(path: string): string | null {
-    const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-    if (slash <= 0) return null;
-    // `-o D:/out.jspack`: the parent IS the drive root. Slicing the separator off
-    // leaves the drive-RELATIVE "D:", which does not exist as a directory —
-    // ensureDir then fails with "Failed to create directory: D:".
-    const c = path.charCodeAt(0);
-    const isDriveRoot = slash === 2 && path[1] === ':' &&
-        ((c >= 65 && c <= 90) || (c >= 97 && c <= 122));
-    return isDriveRoot ? `${path.slice(0, 2)}/` : path.slice(0, slash);
-}
-
 /** temp + fsync + rename; Windows: keep healthy dest or unlink+retry. */
 export function writeAtomically(path: string, bytes: Uint8Array, ensureParent: (dir: string) => void): void {
-    const dir = parentDir(path);
-    if (dir !== null) ensureParent(dir);
+    const dir = dirname(path);
+    if (dir !== '.') ensureParent(dir);
     const tempPath = tempBeside(path);
     let fd: number | null = null;
     try {
@@ -87,8 +76,8 @@ export function writeAtomicallyStreamed(
     ensureParent: (dir: string) => void,
     expectedFinal?: Uint8Array,
 ): void {
-    const dir = parentDir(path);
-    if (dir !== null) ensureParent(dir);
+    const dir = dirname(path);
+    if (dir !== '.') ensureParent(dir);
     const tempPath = tempBeside(path);
     let fd: number | null = null;
     try {

@@ -2,9 +2,8 @@ import type { ModuleInfo, RuntimeConfig } from '../../types';
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { StepType, type Flow } from '../../flow';
-import { normalizePath } from '../../utils/path';
+import { fileUrlToPath, normalizePath, schemeId } from '../../utils/path';
 import { detectFormat, detectPackageJsonFormat } from '../pkg';
-import { isWindows } from '../../utils/index';
 import { err, ErrorKind } from '../../errors';
 
 export class FileHandler implements ProtocolHandler {
@@ -21,19 +20,13 @@ export class FileHandler implements ProtocolHandler {
     localPath(specPath: string): string { return this.strip(specPath); }
 
     private strip(url: string): string {
-        // Decode %23 after URL path; literal # in abs paths is a segment (es5-ext).
+        // fileUrlToPath owns URL query/fragment decoding and host handling.
         let p: string;
-        if (url.startsWith('file://')) {
-            const raw = url.slice(7);
-            const query = raw.indexOf('?');
-            const hash = raw.indexOf('#');
-            const cut = query === -1 ? hash : hash === -1 ? query : Math.min(query, hash);
-            p = decodeURIComponent(cut === -1 ? raw : raw.slice(0, cut));
+        if (schemeId(url) === 'file') {
+            p = fileUrlToPath(url);
         } else {
             p = url;
         }
-        if (p.startsWith('/') && isWindows && p.length > 2 && p[2] === ':')
-            p = p.slice(1);
         return normalizePath(p);
     }
 }

@@ -1,7 +1,7 @@
 import { moduleRef, type ModuleInfo } from '../types';
 import type { ModuleResolver } from '../resolve/index';
 import type { ModuleCompiler } from '../compile/index';
-import { fillMeta, isProtocolSpec, toFileUrl } from './meta';
+import { fillMeta, isProtocolSpec, resolveWithModuleHooks, toFileUrl } from './meta';
 import { errMsg, isRelative, joinPaths, dirname, log } from '../utils';
 import { URL } from '../utils/url';
 import { err, ErrorKind, isErrorKind, setErrorCode } from '../errors';
@@ -118,7 +118,7 @@ export function installEngineHooks(
     engine.onModule({
         resolve(spec: string, parent: string, attr?: Record<string, unknown>): string {
             try {
-                const info = resolver.resolve(spec, parent, attr);
+                const info = resolveWithModuleHooks(resolver, spec, parent, attr);
                 // CJS circular stubs only — ESM/pack preRegister is pure waste
                 // (buildPaths walks synthetic pack: keys toward root).
                 if (info.format === 'cjs' && info.fileKind === 'source') {

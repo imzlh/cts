@@ -18,6 +18,7 @@ cts/
 │   ├── flow.ts              # ProgressCallback, FetchOptions, StepType, Fs*Step types
 │   ├── lock.ts              # LockStore class
 │   ├── import-scanner.ts    # ImportScanner — oxc-first extraction used by parse workers
+│   ├── module-hooks.ts      # Process-wide synchronous node:module hook chain
 │   ├── scan.ts              # extractImports(), hasImportAttributes(), path helpers
 │   ├── parse.ts             # ParseDriver — worker scan/transform, main-thread compile
 │   ├── pack/                # .jspack format, writer, validated extraction/reader
@@ -80,7 +81,7 @@ cts/
 │   └── utils/               # Utilities
 │       ├── index.ts         # Barrel re-export (platform, path, io, misc, bin, log, lru, tier, progress)
 │       ├── platform.ts      # uname, isWindows
-│       ├── path.ts          # toPosixPath(), canonicalizePath(), cwd(), pathRoot(), hasLeadingSlashDrive()
+│       ├── path.ts          # POSIX path normalization, host-boundary conversion, file URLs, roots, relativePath(), isPathWithin()
 │       ├── io.ts            # readText, readBytes, writeText, ensureDir, resolveFile
 │       ├── misc.ts          # errMsg(), assert(), hashString(), cacheFilename(), fmtBytes, isEnabled, log
 │       ├── bin.ts           # findLocalBin(), WIN_BIN_EXTS
@@ -133,6 +134,7 @@ Cross-cutting concerns shared by all layers. No dependencies on compile/resolve/
 | `errors.ts` | `ErrorKind` enum, `err()`, `formatError()`, `fatal()`, `TransformError` | Error creation, formatting, colourised output |
 | `flow.ts` | `ProgressCallback`, `FetchOptions`, `StepType`, `FsExistsStep`, `FsReadTextStep` | Generator-based async I/O — Step/StepResult protocol |
 | `lock.ts` | `LockStore` | SQLite-backed persistent cache (modules, sources, imports, bins tables) |
+| `module-hooks.ts` | `registerModuleHooks()`, `runModuleResolveHooks()` | Shared synchronous `node:module` hook registry used by CTS and the Node bridge |
 | `import-scanner.ts` | `ImportScanner` | OXC-first import extraction shared by workers and explicit inline mode |
 | `scan.ts` | `extractImports()`, `hasImportAttributes()`, path helpers | Sucrase extractImports fallback + cheap attribute detector |
 | `parse.ts` | `ParseDriver`, `isParseWorker()`, `runParseWorker()` | Worker import scan/transform; main-thread bytecode compile |
@@ -212,7 +214,7 @@ No circular deps. Used everywhere.
 |---|---|---|
 | `index.ts` | barrel re-export | platform, path, io, misc, bin, log, lru, tier, progress |
 | `platform.ts` | `uname`, `isWindows` | OS detection |
-| `path.ts` | `toPosixPath()`, `canonicalizePath()`, `cwd()`, `pathRoot()` | Path normalisation (backslash → `/`) |
+| `path.ts` | `toPosixPath()`, `canonicalizePath()`, `cwd()`, `pathRoot()`, `relativePath()`, `isPathWithin()` | POSIX-internal path normalization, file URL conversion, host-boundary conversion and root/containment rules |
 | `io.ts` | `readText`, `readBytes`, `writeText`, `ensureDir()`, `resolveFile()` | File I/O with bounded LRU cache |
 | `misc.ts` | `errMsg()`, `assert()`, `hashString()`, `cacheFilename()`, `fmtBytes`, `isEnabled`, `log` | Hash, semver, tar.gz, JSONC, arg parsing |
 | `bin.ts` | `findLocalBin()`, `WIN_BIN_EXTS` | node_modules/.bin resolution |

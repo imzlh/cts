@@ -1,6 +1,13 @@
 import type { ModuleInfo } from '../types';
 import type { ModuleResolver } from '../resolve/index';
-import { dirname, isAbsolute, toHostPath, toPosixPath } from '../utils';
+import { dirname, isAbsolute, toFileUrl, toHostPath, schemeId } from '../utils';
+export { toFileUrl } from '../utils';
+import {
+    hasModuleResolveHooks,
+    runModuleResolveHooks,
+    type ModuleResolveContext,
+    type ModuleResolveResult,
+} from '../module-hooks';
 
 const importMetaResolveCache = new Map<string, (s: string, p?: string, a?: Record<string, unknown>) => string>();
 
@@ -9,54 +16,13 @@ export function clearImportMetaResolveCache(): void {
     importMetaResolveCache.clear();
 }
 
-// Encode # etc. in file URLs (es5-ext uses a real "#" directory).
-function encodeFileUrlPath(path: string): string {
-    let out = '';
-    for (let i = 0; i < path.length; i++) {
-        const c = path.charCodeAt(i);
-        if (c === 35 /*#*/ || c === 63 /*?*/ || c === 37 /*%*/ || c === 32 /* */) {
-            out += `%${c.toString(16).toUpperCase().padStart(2, '0')}`;
-        } else {
-            out += path[i];
-        }
-    }
-    return out;
-}
-
-/** Path → file: URL. Exported for runtime/hooks.ts, which needs the same
- *  encoding to build the `url` property node puts on ERR_MODULE_NOT_FOUND. */
-export function toFileUrl(path: string): string {
-    const normalized = toPosixPath(path);
-    if (isWindowsDrivePath(normalized)) return `file:///${encodeFileUrlPath(normalized)}`;
-    if (normalized.startsWith('//')) return `file:${encodeFileUrlPath(normalized)}`;
-    return normalized.startsWith('/') ? `file://${encodeFileUrlPath(normalized)}` : normalized;
-}
-
-function isAsciiAlpha(c: number): boolean {
-    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-}
-
 /** True when spec carries its own scheme (http:, npm:, data:, file:, …).
  *  Exported for runtime/hooks.ts. */
 export function isProtocolSpec(spec: string): boolean {
-    // Windows drive paths (C:/x) look like a single-letter scheme — not protocol specs.
-    if (isWindowsDrivePath(toPosixPath(spec))) return false;
-    if (!isAsciiAlpha(spec.charCodeAt(0))) return false;
-    for (let i = 1; i < spec.length; i++) {
-        const c = spec.charCodeAt(i);
-        // Require >= 2 chars before the ':' so single-letter (drive) schemes don't match.
-        if (c === 58) return i >= 2;
-        if (isAsciiAlpha(c) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) continue;
-        return false;
-    }
-    return false;
+    return schemeId(spec) !== null;
 }
 
-function isWindowsDrivePath(path: string): boolean {
-    return path.length >= 3 && isAsciiAlpha(path.charCodeAt(0)) && path.charCodeAt(1) === 58 && path.charCodeAt(2) === 47;
-}
-
-function toImportMetaUrl(info: ModuleInfo): string {
+export function toImportMetaUrl(info: ModuleInfo): string {
     // Protocol specs (pack:, npm:, http:, …) keep their identity as URL.
     // Avoid isAbsolute on "pack:/x" which looks absolute after the scheme.
     if (info.specPath.includes('://') || isProtocolSpec(info.specPath)) {
@@ -69,6 +35,76 @@ function toImportMetaUrl(info: ModuleInfo): string {
         return toFileUrl(info.localPath);
     }
     return info.specPath;
+}
+
+function moduleFormat(info: ModuleInfo): string {
+    if (info.fileKind === 'json') return 'json';
+    if (info.fileKind === 'wasm') return 'wasm';
+    return info.format === 'cjs' ? 'commonjs' : 'module';
+}
+
+function withHookFormat(info: ModuleInfo, format: string | null | undefined): ModuleInfo {
+    if (format === 'commonjs' && info.format !== 'cjs') return { ...info, format: 'cjs' };
+    if (format === 'module' && info.format !== 'esm') return { ...info, format: 'esm' };
+    return info;
+}
+
+function parentUrl(parent: string, resolver: ModuleResolver): string {
+    try {
+        return toImportMetaUrl(resolver.getInfo(parent));
+    } catch {
+        return isProtocolSpec(parent) ? parent : toFileUrl(parent);
+    }
+}
+
+/** Resolve through node:module synchronous hooks while retaining CTS identity. */
+export function resolveWithModuleHooks(
+    resolver: ModuleResolver,
+    specifier: string,
+    parent: string,
+    attributes?: Record<string, unknown>,
+): ModuleInfo {
+    if (!hasModuleResolveHooks()) return resolver.resolve(specifier, parent, attributes);
+
+    const terminalResolutions: Array<{
+        result: ModuleResolveResult;
+        url: string;
+        info: ModuleInfo;
+    }> = [];
+    const context: ModuleResolveContext = {
+        parentURL: parentUrl(parent, resolver),
+        conditions: ['node', 'import', 'node-addons'],
+        importAttributes: attributes,
+    };
+    const result = runModuleResolveHooks(specifier, context, (nextSpecifier, nextContext) => {
+        const info = resolver.resolve(
+            nextSpecifier,
+            nextContext.parentURL ?? parent,
+            nextContext.importAttributes ?? attributes,
+        );
+        const url = toImportMetaUrl(info);
+        const terminalResult: ModuleResolveResult = {
+            url,
+            format: moduleFormat(info),
+            shortCircuit: true,
+        };
+        terminalResolutions.push({ result: terminalResult, url, info });
+        return terminalResult;
+    });
+
+    // The normal nextResolve() path already produced the canonical ModuleInfo.
+    // Re-resolving its file URL would collapse npm/jsr identity to a disk path.
+    let terminal = terminalResolutions.find((entry) => entry.result === result && entry.url === result.url);
+    if (!terminal) {
+        const matching = terminalResolutions.filter((entry) => entry.url === result.url);
+        if (matching.length === 1) terminal = matching[0];
+    }
+    if (terminal) {
+        return withHookFormat(terminal.info, result.format);
+    }
+
+    const resolved = resolver.resolve(result.url, parent, attributes);
+    return withHookFormat(resolved, result.format);
 }
 
 /** Fill import.meta with standard properties. */
@@ -100,7 +136,7 @@ export function fillMeta(
     if (!fn) {
         const self = info.specPath;
         fn = (s: string, p?: string, a?: Record<string, unknown>) => {
-            const resolved = resolver.resolve(s, p ?? self, a);
+            const resolved = resolveWithModuleHooks(resolver, s, p ?? self, a);
             return toImportMetaUrl(resolved);
         };
         importMetaResolveCache.set(info.specPath, fn);

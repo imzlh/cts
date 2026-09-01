@@ -211,10 +211,11 @@ export class EsmCompiler {
         try {
             // The sidecar must describe the bytes about to be compiled, not whatever
             // revision happens to be on disk after compilation finishes.
-            sourceFreshness = fileBacked && tryBytecode
-                ? this.jsc.captureFreshness(info.localPath)
+            const source = fileBacked && tryBytecode
+                ? this.jsc.takeSourceSnapshot(info.localPath, moduleId)
                 : undefined;
-            const bytes = readBytes(info.localPath);
+            sourceFreshness = source?.freshness;
+            const bytes = source?.bytes ?? readBytes(info.localPath);
             const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleId);
             mod = this.compileEsm(code, moduleId, info.localPath);
         } catch (e) {

@@ -2,7 +2,7 @@ import type { RuntimeConfig, ModuleInfo, ModuleFormat, LifecycleScriptEntry } fr
 import type { ProtocolHandler } from './base';
 import { guessFileKind } from './base';
 import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarFile, type ProgressCallback } from '../../flow';
-import { joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, hasLeadingSlashDrive } from '../../utils/path';
+import { fileUrlToPath, hasLeadingSlashDrive, joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, schemeId, isPathWithin, relativePath } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
 import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, hasSupportedIntegrity, isValidNpmPackageName, npmDepTarget, parseNpmAliasDep, errMsg } from '../../utils/misc';
 import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, resolvePackageBinPath, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
@@ -11,7 +11,7 @@ import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
 import { uname, isWindows, getMemoryTier } from '../../utils/index';
 import { findLocalBin } from '../../utils/bin';
-import pkg from '../../../package.json';
+import pkg from '../../../package.json' with { type: 'json' };
 
 const version = String(pkg.version ?? '0.0.0');
 /** Shared empty cycle path for top-level ensure/prepare entry points. */
@@ -963,7 +963,7 @@ export class NpmHandler implements ProtocolHandler {
         if (subpath) {
             const root = normalizePath(pkgDir);
             const candidate = normalizePath(joinPaths(root, subpath));
-            if (candidate.startsWith(root + '/')) {
+            if (isPathWithin(root, candidate)) {
                 const direct = resolveFile(candidate);
                 if (direct) return direct;
             }
@@ -991,9 +991,8 @@ export class NpmHandler implements ProtocolHandler {
     private static canonicalSubpath(pkgDir: string, localPath: string): string | null {
         const root = normalizePath(pkgDir);
         const norm = normalizePath(localPath);
-        if (norm === root) return '';
-        if (!norm.startsWith(root + '/')) return null;
-        const rel = norm.slice(root.length + 1);
+        const rel = relativePath(root, norm);
+        if (rel === null) return null;
         return rel === 'package.json' ? '' : rel;
     }
 
@@ -1001,13 +1000,16 @@ export class NpmHandler implements ProtocolHandler {
     private storeOwnerOf(localPath: string): { dir: string; name: string; version: string } | null {
         const root = normalizePath(this.cacheDir);
         let dir = normalizePath(localPath);
-        if (!dir.startsWith(root + '/')) return null;
-        while (dir.length > root.length) {
+        let rel = relativePath(root, dir);
+        if (rel === null) return null;
+        while (rel !== '') {
             const id = this.storePackageId(dir);
             if (id) return { dir, name: id.name, version: id.version };
             const up = dirname(dir);
             if (up === dir) break;
             dir = normalizePath(up);
+            rel = relativePath(root, dir);
+            if (rel === null) break;
         }
         return null;
     }
@@ -1132,8 +1134,8 @@ export class NpmHandler implements ProtocolHandler {
         if (!results.length) return null;
         if (subSuffix) {
             for (const r of results) {
-                const rel = normalizePath(r.slice(dir.length + 1));
-                if (rel.endsWith(subSuffix + '/' + basename)) return r;
+                const rel = relativePath(dir, r);
+                if (rel !== null && rel.endsWith(subSuffix + '/' + basename)) return r;
             }
         }
         return results[0] ?? null;
@@ -1143,7 +1145,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!parent) return null;
         // Node allows self-reference from any package that declares "exports";
         // store parents keep the pre-exports behaviour (legacy main/index too).
-        const fromStore = parent.startsWith('npm:') || parent.includes(this.cacheDir);
+        const fromStore = parent.startsWith('npm:') || isPathWithin(this.cacheDir, this.parentFsPath(parent));
         const parentPkgDir = this.findOwningPackageDir(parent);
         if (!parentPkgDir) return null;
         const parentPkg = readPkg(parentPkgDir);
@@ -1264,9 +1266,7 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private parentFsPath(parent: string): string {
-        let path = parent.startsWith('file://') ? parent.slice(7) : parent;
-        if (hasLeadingSlashDrive(path)) path = path.slice(1);
-        return normalizePath(path);
+        return schemeId(parent) === 'file' ? fileUrlToPath(parent) : normalizePath(parent);
     }
 
     private resolvedParentLocalPath(parent?: string): string | null {
@@ -1275,13 +1275,13 @@ export class NpmHandler implements ProtocolHandler {
         if (tracked) {
             const localPath = normalizePath(tracked);
             const cacheRoot = normalizePath(this.cacheDir);
-            return localPath === cacheRoot || localPath.startsWith(cacheRoot + '/') ? null : localPath;
+            return isPathWithin(cacheRoot, localPath) ? null : localPath;
         }
         const info = this.cfg.lockStore?.getModule(parent);
         if (!info?.localPath) return null;
         const localPath = normalizePath(info.localPath);
         const cacheRoot = normalizePath(this.cacheDir);
-        if (localPath !== cacheRoot && !localPath.startsWith(cacheRoot + '/')) {
+        if (!isPathWithin(cacheRoot, localPath)) {
             try {
                 if (fs.exists(localPath) && (this.isVirtualProjectNodeModulesPath(localPath) || localPath.includes('/node_modules/'))) {
                     return localPath;
@@ -1294,7 +1294,7 @@ export class NpmHandler implements ProtocolHandler {
         } catch {
             return null;
         }
-        return localPath === cacheRoot || localPath.startsWith(cacheRoot + '/') ? null : localPath;
+        return isPathWithin(cacheRoot, localPath) ? null : localPath;
     }
 
     private pushNodeModulesSearchDirs(startDir: string, out: string[], seen: Set<string>): void {
@@ -1348,7 +1348,7 @@ export class NpmHandler implements ProtocolHandler {
         const resolvedLocal = this.resolvedParentLocalPath(parent);
         const norm = normalizePath(resolvedLocal ?? (parent.startsWith('npm:') ? parent : this.parentFsPath(parent)));
         const cacheRoot = normalizePath(this.cacheDir);
-        if ((parent.startsWith('npm:') && !resolvedLocal) || norm === cacheRoot || norm.startsWith(cacheRoot + '/')) {
+        if ((parent.startsWith('npm:') && !resolvedLocal) || isPathWithin(cacheRoot, norm)) {
             return 'cache';
         }
         if (this.isVirtualProjectNodeModulesPath(norm)) return 'project';
@@ -2504,8 +2504,8 @@ export class NpmHandler implements ProtocolHandler {
     private storePackageId(dir: string): { name: string; version: string } | null {
         const root = normalizePath(this.cacheDir);
         const norm = normalizePath(dir);
-        if (!norm.startsWith(root + '/') && norm !== root) return null;
-        const rel = norm.slice(root.length + 1);
+        const rel = relativePath(root, norm);
+        if (rel === null || rel === '') return null;
         const at = rel.startsWith('@') ? rel.indexOf('@', 1) : rel.indexOf('@');
         if (at <= 0) return null;
         const name = rel.slice(0, at);

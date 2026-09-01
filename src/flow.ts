@@ -1,5 +1,5 @@
-import { readText, readBytes, ensureDir, writeText, unTarGz, type TarFile, fmtBytes, isEnabled, log, dirname, getMemoryFile } from './utils';
-import { getCurlInitHook } from './utils/curl';
+import { readText, readBytes, pathExistsSync, pathExists, ensureDir, ensureDirAsync, writeText, unTarGz, type TarFile, fmtBytes, isEnabled, log, getMemoryFile } from './utils';
+import { createCurlTarget, getCurlInitHook } from './utils/curl';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -146,8 +146,9 @@ function parseHeaders(raw: string): Array<[string, string]> {
 }
 
 function configureCurl(curl: CModuleCURL.CURL, step: NetFetchStep): void {
-    getCurlInitHook()?.(curl);
-    curl.setUrl(step.url)
+    curl.setUrl(step.url);
+    getCurlInitHook()?.(curl, createCurlTarget(step.url));
+    curl
         .setMethod('GET')
         .setFollowRedirects(true)
         .setMaxRedirects(20)
@@ -248,7 +249,7 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => NetFetchResult):
         case StepType.FS_EXISTS:
             // Active VFS (pack:) is not on disk — has() is the existence oracle.
             if (getMemoryFile(step.path) !== undefined) return true;
-            return fs.exists(step.path);
+            return pathExistsSync(step.path);
         case StepType.FS_READ_TEXT:
             return readText(step.path);
         case StepType.FS_READ_BYTES:
@@ -284,26 +285,6 @@ function executeSync(step: Step): StepResult {
     return executeStep(step, fetchSync);
 }
 
-async function existsAsync(path: string): Promise<boolean> {
-    try {
-        await asyncfs.stat(path);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-async function ensureDirAsync(dir: string): Promise<void> {
-    if (await existsAsync(dir)) return;
-    const parent = dirname(dir);
-    if (parent && parent !== dir && parent !== '.') await ensureDirAsync(parent);
-    try {
-        await asyncfs.mkdir(dir, 0o755);
-    } catch {
-        if (!await existsAsync(dir)) throw new Error(`Failed to create directory: ${dir}`);
-    }
-}
-
 function arrayBufferBackedBytes(data: Uint8Array | ArrayBuffer): Uint8Array<ArrayBuffer> {
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
     if (data.buffer instanceof ArrayBuffer) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
@@ -329,7 +310,7 @@ async function executeAsync(step: Step): Promise<StepResult> {
     switch (step.type) {
         case StepType.FS_EXISTS:
             if (getMemoryFile(step.path) !== undefined) return true;
-            return existsAsync(step.path);
+            return pathExists(step.path);
         case StepType.FS_READ_TEXT: {
             const v = getMemoryFile(step.path);
             if (v !== undefined) return engine.decodeString(v);

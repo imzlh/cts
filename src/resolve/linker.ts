@@ -3,7 +3,7 @@ import type { NodeModulesMode, PackageJson } from '../types';
 import {
     joinPaths, dirname, ensureDir, errMsg, npmNameVersion, isWindows,
     hardlinkOrCopyDirRecursive, readText, safeParse, matchLatestVersion, isValidNpmPackageName,
-    yieldEventLoop, toPosixPath,
+    yieldEventLoop, toPosixPath, relativePath,
 } from '../utils';
 import { getBinMap, resolvePackageBinPath } from './pkg';
 
@@ -733,10 +733,8 @@ function packageIdFromDir(
     fallbackName: string,
 ): { name: string; version: string } | null {
     // Prefer store path identity — URL-tagged dirs keep `+u…` (package.json does not).
-    const normStore = storeRoot.endsWith('/') ? storeRoot.slice(0, -1) : storeRoot;
-    const normDir = depDir.endsWith('/') ? depDir.slice(0, -1) : depDir;
-    if (normDir.startsWith(normStore + '/')) {
-        const rel = normDir.slice(normStore.length + 1);
+    const rel = relativePath(storeRoot, depDir);
+    if (rel !== null && rel !== '') {
         const at = rel.startsWith('@') ? rel.indexOf('@', 1) : rel.indexOf('@');
         if (at > 0) {
             const name = rel.slice(0, at);

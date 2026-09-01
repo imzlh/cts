@@ -1,13 +1,13 @@
-import type { ModuleInfo } from '../types';
+import { moduleRef, type ModuleInfo } from '../types';
 import { errMsg, log, assert, readBytes } from '../utils';
 import { err, ErrorKind } from '../errors';
 
 const engine = import.meta.use('engine');
 const wasm = import.meta.use('wasm');
 
-const RE_INT_LITERAL = /^-?\d+n?$/;
 type WasmImportExports = Record<string, unknown>;
-type WasmImportFunction = (...args: CModuleWASM.WasmValue[]) => CModuleWASM.WasmValue | void;
+type WasmImportFunction = (...args: CModuleWASM.WasmFunctionArgument[]) =>
+    CModuleWASM.WasmFunctionResult | void;
 
 // Error classes — V8/Deno WebAssembly API compatibility
 
@@ -101,7 +101,7 @@ function resolveImportFunc(
     imp: CModuleWASM.ModuleImportDescriptor,
     parentPath: string,
     importSource: WasmImportSource,
-): ((...args: CModuleWASM.WasmValue[]) => CModuleWASM.WasmValue | void) | null {
+): WasmImportFunction | null {
     assert(wasm, "WASM support not available in this build");
     const { module: modName, name: fnName } = imp;
 
@@ -359,17 +359,12 @@ export function buildWasmModule(
     return { mod, instance: inst };
 }
 
-function toWasmValue(v: unknown): CModuleWASM.WasmValue {
-    if (typeof v === 'number')  return v;
-    if (typeof v === 'bigint')  return v;
-    if (typeof v === 'boolean') return v ? 1 : 0;
-    if (v === null || v === undefined) return 0;
-    if (typeof v === 'string') {
-        if (v === '') return 0;
-        if (RE_INT_LITERAL.test(v)) return BigInt(v.replace(/n$/, ''));
-        return 0;
-    }
-    return 0;
+function toWasmValue(v: unknown): CModuleWASM.WasmFunctionArgument {
+    /* Numeric coercion belongs to the native call boundary, where the
+     * function signature is known.  Converting everything else to zero here
+     * destroyed externref arguments (notably the options object passed to
+     * @deno/loader's wasm-bindgen module). */
+    return v as CModuleWASM.WasmFunctionArgument;
 }
 
 // WasmCompiler — cache + circular dependency handling
@@ -421,9 +416,16 @@ export class WasmCompiler {
         this.wasmLoading.add(info.localPath);
         let loadedSuccessfully = false;
         try {
+            // A WASM module can have many import entries from one JS module.
+            // Resolve and evaluate each imported ESM namespace once.
+            const importedNamespaces = new Map<string, WasmImportExports>();
             const importSource: WasmImportSource = {
                 require: (spec: string, parentPath: string) => {
                     const resolved = resolve(spec, parentPath);
+                    const key = `${moduleRef(resolved)}\0${resolved.fileKind}`;
+                    const cached = importedNamespaces.get(key);
+                    if (cached) return cached;
+
                     const loaded = loadModule(resolved, {});
                     // evalModule, not loaded.eval(): brackets the dependency's
                     // evaluation so a require() back into it throws
@@ -437,6 +439,7 @@ export class WasmCompiler {
                         );
                     }
                     const ns = loaded.namespace;
+                    importedNamespaces.set(key, ns);
                     log.debug('wasm', () => `import "${spec}" resolved -> ${resolved.specPath} (${Object.keys(ns).length} exports)`);
                     return ns;
                 },

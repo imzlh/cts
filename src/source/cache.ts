@@ -1,4 +1,4 @@
-import { dirname, joinPaths, ensureDir, log, canonicalizePath, normalizePath } from '../utils';
+import { dirname, joinPaths, ensureDir, log, canonicalizePath, normalizePath, isPathWithin } from '../utils';
 import { getMemoryBytecode, hasActiveFileStore, hasMemoryFile } from '../utils/memfs';
 
 const fs = import.meta.use('fs');
@@ -26,6 +26,18 @@ export interface SourceFreshness {
 }
 
 /**
+ * The bytes and freshness token observed for one source revision.
+ *
+ * A cache lookup already has to read and hash the source in order to validate
+ * a v3 sidecar. Keeping that read alongside the token lets the compiler reuse
+ * it on a miss instead of opening and hashing the same file again.
+ */
+export interface SourceSnapshot {
+    bytes: Uint8Array;
+    freshness: SourceFreshness;
+}
+
+/**
  * Full-precision mtime token.
  *
  * `String(date)` renders only whole seconds ("Sun Aug 02 2026 11:16:59 GMT+0800"),
@@ -45,7 +57,7 @@ function mtimeToken(mtim: unknown): string {
  * content itself is the authority. Cheap: one small read plus a hash, only on the
  * freshness check, versus a full transform+compile on a miss.
  */
-function sourceDigest(bytes: ArrayBuffer): string {
+function sourceDigest(bytes: CModuleCrypto.BufferSource): string {
     return crypto.hexEncode(crypto.md5(bytes));
 }
 
@@ -74,6 +86,8 @@ export function isFileBackedPath(localPath: string): boolean {
 export class JscCache {
     /** Optional owned L1 buffers (precompile); pack uses VFS bytecode() instead. */
     private readonly memory = new Map<string, ArrayBuffer>();
+    /** Source bytes observed by a disk-cache miss; consumed by the compiler. */
+    private readonly sourceSnapshots = new Map<string, SourceSnapshot>();
     private readonly localDir: string | null;
     private readonly cacheRoot: string | null;
 
@@ -109,7 +123,7 @@ export class JscCache {
         let target = canonicalizePath(normalizePath(localPath));
         try { root = canonicalizePath(normalizePath(fs.realpath(root))); } catch {}
         try { target = canonicalizePath(normalizePath(fs.realpath(localPath))); } catch {}
-        return target === root || target.startsWith(root + '/');
+        return isPathWithin(root, target);
     }
 
     /** Select adjacent remote storage or an isolated local hashed cache. */
@@ -118,21 +132,40 @@ export class JscCache {
         return this.localCachePath(localPath);
     }
 
-    captureFreshness(localPath: string): SourceFreshness | undefined {
+    /** Take the source read performed by the preceding cache lookup. */
+    takeSourceSnapshot(localPath: string, moduleId?: string): SourceSnapshot | undefined {
+        const key = memoryKey(localPath, moduleId);
+        const snapshot = this.sourceSnapshots.get(key);
+        this.sourceSnapshots.delete(key);
+        return snapshot;
+    }
+
+    /** Read source bytes once and derive the matching freshness token. */
+    readSource(localPath: string): SourceSnapshot | undefined {
         try {
             const stat = fs.stat(localPath);
-            const bytes = fs.readFile(localPath);
+            const bytes = new Uint8Array(fs.readFile(localPath));
             // size comes from the hashed bytes so both fields describe one revision.
-            return { mtim: mtimeToken(stat.mtim), size: bytes.byteLength, hash: sourceDigest(bytes) };
+            const freshness = { mtim: mtimeToken(stat.mtim), size: bytes.byteLength, hash: sourceDigest(bytes) };
+            return { bytes, freshness };
         } catch {
             return undefined;
         }
     }
 
+    captureFreshness(localPath: string): SourceFreshness | undefined {
+        return this.readSource(localPath)?.freshness;
+    }
+
     private legacyFreshnessToken(localPath: string, cachedMtime?: number, source?: SourceFreshness): string {
-        if (source) return `${source.mtim}:${source.size}:${source.hash}`;
+        if (source) {
+            // Resolver-supplied mtimes deliberately override the filesystem
+            // mtime while retaining the source bytes/hash from the snapshot.
+            const mtim = cachedMtime === undefined ? source.mtim : mtimeToken(cachedMtime);
+            return `${mtim}:${source.size}:${source.hash}`;
+        }
         const stat = fs.stat(localPath);
-        const bytes = fs.readFile(localPath);
+        const bytes = new Uint8Array(fs.readFile(localPath));
         return `${mtimeToken(cachedMtime ?? stat.mtim)}:${bytes.byteLength}:${sourceDigest(bytes)}`;
     }
 
@@ -149,10 +182,16 @@ export class JscCache {
             : `${FRESHNESS_VERSION}\n${stamp}\n${encodeURIComponent(moduleId)}`;
     }
 
-    private isFreshMtime(localPath: string, mtPath: string, cachedMtime?: number, moduleId?: string): boolean {
+    private isFreshMtime(
+        localPath: string,
+        mtPath: string,
+        cachedMtime?: number,
+        moduleId?: string,
+        source?: SourceFreshness,
+    ): boolean {
         try {
             const cachedMt = engine.decodeString(fs.readFile(mtPath));
-            return cachedMt === this.freshnessToken(localPath, cachedMtime, moduleId);
+            return cachedMt === this.freshnessToken(localPath, cachedMtime, moduleId, source);
         } catch {
             return false;
         }
@@ -163,9 +202,10 @@ export class JscCache {
         localPath: string,
         cachedMtime?: number,
         moduleId?: string,
+        source?: SourceFreshness,
     ): boolean {
         try {
-            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId)) return false;
+            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId, source)) return false;
             return !!fs.stat(paths.jsc);
         } catch {
             return false;
@@ -204,16 +244,32 @@ export class JscCache {
         this.writeMtime(localPath, paths.mt, moduleId, source);
     }
 
-    load(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): CModuleEngine.Module | null {
+    load(
+        localPath: string,
+        remote: boolean,
+        cachedMtime?: number,
+        moduleId?: string,
+    ): CModuleEngine.Module | null {
         return this.loadRaw(localPath, remote, cachedMtime, moduleId, true) as CModuleEngine.Module | null;
     }
 
     /** load() for non-Module values (e.g. EVAL_COMPILE_ONLY); raw deserialize. */
-    loadCompiled(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): unknown | null {
+    loadCompiled(
+        localPath: string,
+        remote: boolean,
+        cachedMtime?: number,
+        moduleId?: string,
+    ): unknown | null {
         return this.loadRaw(localPath, remote, cachedMtime, moduleId, false);
     }
 
-    private loadRaw(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string, wantModule = true): unknown | null {
+    private loadRaw(
+        localPath: string,
+        remote: boolean,
+        cachedMtime?: number,
+        moduleId?: string,
+        wantModule = true,
+    ): unknown | null {
         // CJS-wrapper and ESM bytecode share one identity for a file loaded both
         // ways (--require of an ESM-format .js); a shape mismatch is a cache miss.
         // MISMATCH keeps the entry (it is valid for the other consumer); only a
@@ -223,6 +279,9 @@ export class JscCache {
 
         // L1a: owned buffers (precompile one-shot)
         const key = memoryKey(localPath, moduleId);
+        // Do not let an unconsumed miss from an earlier lookup survive a retry
+        // or an L1 hit for the same identity.
+        this.sourceSnapshots.delete(key);
         const bc = this.memory.get(key);
         if (bc) {
             try {
@@ -253,50 +312,70 @@ export class JscCache {
             }
         }
 
-        // L2: on-disk only for real filesystem paths
+        // L2: on-disk only for real filesystem paths. A v3 freshness check
+        // necessarily reads and hashes source bytes; retain that exact snapshot
+        // so a miss can transform it without another stat/read/hash sequence.
+        const paths = this.cachePaths(localPath, remote);
+        if (!paths) return null;
+        const source = isFileBackedPath(localPath) ? this.readSource(localPath) : undefined;
+        const rememberSource = () => {
+            if (source) this.sourceSnapshots.set(key, source);
+        };
+
         if (remote) {
-            const paths = this.cachePaths(localPath, remote);
-            if (!paths) return null;
-            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId)) {
+            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId, source?.freshness)) {
+                rememberSource();
                 removeCacheFiles(paths);
                 return null;
             }
             try {
                 const mod = accept(engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))));
-                if (mod !== MISMATCH) return mod;
+                if (mod !== MISMATCH) {
+                    return mod;
+                }
+                rememberSource();
                 return null;
             } catch {}
+            rememberSource();
             removeCacheFiles(paths);
             return null;
         }
 
-        const paths = this.cachePaths(localPath, remote);
-        if (!paths) return null;
-
         try {
             const cachedMt = engine.decodeString(fs.readFile(paths.mt));
-            if (cachedMt !== this.freshnessToken(localPath, cachedMtime, moduleId)) {
+            if (cachedMt !== this.freshnessToken(localPath, cachedMtime, moduleId, source?.freshness)) {
+                rememberSource();
                 removeCacheFiles(paths);
                 return null;
             }
         } catch {
+            rememberSource();
             removeCacheFiles(paths);
             return null;
         }
 
         try {
             const mod = accept(engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))));
-            if (mod !== MISMATCH) return mod;
+            if (mod !== MISMATCH) {
+                return mod;
+            }
+            rememberSource();
             return null;
         } catch {
             log.debug('jsc', () => `disk deserialize failed: ${paths.jsc}`);
         }
+        rememberSource();
         removeCacheFiles(paths);
         return null;
     }
 
     /** On-disk .jsc bytes only (no deserialize); for pack. Null if not durable. */
-    loadRawBytes(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): ArrayBuffer | null {
+    loadRawBytes(
+        localPath: string,
+        remote: boolean,
+        cachedMtime?: number,
+        moduleId?: string,
+    ): ArrayBuffer | null {
         const paths = this.cachePaths(localPath, remote);
         if (!paths) return null;
         if (!this.hasFreshFile(paths, localPath, cachedMtime, moduleId)) return null;
@@ -308,7 +387,12 @@ export class JscCache {
     }
 
     /** Freshness without deserializing (precache gate). */
-    hasFresh(localPath: string, remote: boolean, cachedMtime?: number, moduleId?: string): boolean {
+    hasFresh(
+        localPath: string,
+        remote: boolean,
+        cachedMtime?: number,
+        moduleId?: string,
+    ): boolean {
         const paths = this.cachePaths(localPath, remote);
         if (!paths) return false;
         return this.hasFreshFile(paths, localPath, cachedMtime, moduleId);
@@ -316,6 +400,7 @@ export class JscCache {
 
     clearMemory(): void {
         this.memory.clear();
+        this.sourceSnapshots.clear();
     }
 
     setMemory(localPath: string, bc: ArrayBuffer, moduleId?: string): void {
