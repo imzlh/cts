@@ -4,6 +4,7 @@ import { ImportScanner } from './import-scanner';
 import { errMsg, log, getMemoryTier, getMemoryFile, readBytes, readText, type MemoryTier } from './utils';
 import { buildCjsWrapperSource } from './compile/cjs-wrap';
 import type { ModuleFormat } from './types';
+import { readEnv } from './utils/env';
 
 const { setTimeout, clearTimeout } = import.meta.use('timers');
 const os = import.meta.use('os');
@@ -153,16 +154,8 @@ function parseWorkerOverride(raw: string | null | undefined): number | null {
     return Math.max(0, Math.floor(n));
 }
 
-function getWorkerEnv(): string | null {
-    try {
-        return os.getenv('CTS_WORKERS') ?? null;
-    } catch {
-        return null;
-    }
-}
-
 function resolveWorkerPolicy(): WorkerPolicy {
-    const raw = getWorkerEnv();
+    const raw = readEnv('CTS_WORKERS');
     const overridden = parseWorkerOverride(raw);
     if (overridden !== null) {
         return { maxWorkers: overridden, source: `CTS_WORKERS=${raw}` };

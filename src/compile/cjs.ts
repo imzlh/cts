@@ -1124,8 +1124,19 @@ export class CjsLoader {
             };
         }
 
-        // Local filesystem fallback for contexts that bypass the resolver, such as
-        // internal createRequire() consumers operating directly on filenames.
+        // When the resolver is unavailable (for example createRequire()
+        // callers and small loader integrations), relative and absolute
+        // requests still follow Node's LOAD_AS_FILE/LOAD_AS_DIRECTORY rules
+        // from the requiring file itself.  Searching only node_modules below
+        // would turn "./dep.mjs" into "<parent>/node_modules/dep.mjs" and
+        // incorrectly report a perfectly valid sibling as missing.
+        if (isRelative(id) || isAbsolute(id) || id === '.' || id === '..') {
+            const candidate = isAbsolute(id) ? id : joinPaths(dirname(parentPath), id);
+            const resolved = this.resolveLocalPath(candidate);
+            if (resolved) return resolved;
+            return null;
+        }
+
         for (const dir of buildPaths(dirname(parentPath))) {
             const pkgResolved = this.resolveLocalPackage(id, dir);
             if (pkgResolved) return pkgResolved;

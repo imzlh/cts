@@ -1,4 +1,5 @@
 import { getMemoryFile } from './utils/memfs';
+import { readEnv } from './utils/env';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -312,16 +313,8 @@ function highlightAt(line: string, col: number, tty: boolean): string {
     return C.bold(line.slice(0, idx)) + C.invert(line[idx] ?? ' ') + C.bold(line.slice(idx + 1));
 }
 
-function readDebugEnv(): string {
-    try {
-        return os.getenv('DEBUG') ?? '';
-    } catch {
-        return '';
-    }
-}
-
 const debugEnv = (() => {
-    const str = readDebugEnv();
+    const str = readEnv('DEBUG') ?? '';
     return str === '*' || str.includes('stack');
 })();
 

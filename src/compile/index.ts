@@ -4,7 +4,7 @@ import type { ModuleResolver } from '../resolve/index';
 import { isTypeDecl } from '../resolve/protocols/base';
 import { moduleRef, type ModuleInfo, type RuntimeConfig } from '../types';
 import { bridgeCjsToEsm, buildCjsDeps, installGlobalRequire, installInternalBridge } from './bridge';
-import { CjsLoader } from './cjs';
+import { CjsLoader, clearDirPathsCache } from './cjs';
 import { EsmCompiler } from './esm';
 import { WasmCompiler } from './wasm';
 
@@ -86,6 +86,11 @@ export class ModuleCompiler {
 
     setOxcLoader(loader: () => OxcTranspiler | null): void {
         this.esm.setOxcLoader(loader);
+    }
+
+    /** Release process-wide CJS path search state when a runtime is disposed. */
+    clearRuntimeCaches(): void {
+        clearDirPathsCache();
     }
 
     load(info: ModuleInfo, meta: Record<string, unknown> = {}): CModuleEngine.Module {

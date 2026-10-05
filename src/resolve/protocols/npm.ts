@@ -12,6 +12,7 @@ import { isatty } from '../../utils/progress';
 import { uname, isWindows, getMemoryTier } from '../../utils/index';
 import { findLocalBin } from '../../utils/bin';
 import pkg from '../../../package.json' with { type: 'json' };
+import { readEnv } from '../../utils/env';
 
 const version = String(pkg.version ?? '0.0.0');
 /** Shared empty cycle path for top-level ensure/prepare entry points. */
@@ -21,14 +22,6 @@ const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
-
-function env(name: string): string | null {
-    try {
-        return os.getenv(name) ?? null;
-    } catch {
-        return null;
-    }
-}
 
 function chmodQuietly(path: string, mode: number): void {
     try {
@@ -100,9 +93,9 @@ function loadNpmConfig(): NpmConfig {
         const p = joinPaths(toPosixPath(String(os.homeDir ?? '/root')), '.npmrc');
         if (fs.exists(p)) parse(readText(p), false);
     } catch {}
-    const registry = env('NPM_CONFIG_REGISTRY');
+    const registry = readEnv('NPM_CONFIG_REGISTRY');
     if (registry) cfg.registry = trimRegistry(registry);
-    const token = env('NPM_TOKEN') ?? env('NODE_AUTH_TOKEN');
+    const token = readEnv('NPM_TOKEN') ?? readEnv('NODE_AUTH_TOKEN');
     if (token) cfg.authToken = token;
     return cfg;
 }
@@ -258,8 +251,8 @@ function currentCpu(): string {
 function currentAbi(): 'msvc' | 'gnu' | 'musl' | '' {
     const sys = String(uname.sysname || '').toLowerCase();
     const machine = String(uname.machine || '').toLowerCase();
-    const msystem = String(env('MSYSTEM') ?? '').toLowerCase();
-    const ostype = String(env('OSTYPE') ?? '').toLowerCase();
+    const msystem = String(readEnv('MSYSTEM') ?? '').toLowerCase();
+    const ostype = String(readEnv('OSTYPE') ?? '').toLowerCase();
 
     if (sys.includes('windows')) {
         if (sys.includes('mingw') || sys.includes('msys') || sys.includes('cygwin')

@@ -1,4 +1,4 @@
-import { parseShellCommand } from '../shell';
+import { nodeCommandArgv, parseShellCommand } from '../shell';
 import { isAbsolute, joinPaths, normalizePath, toPosixPath } from '../utils/path';
 
 const fs = import.meta.use('fs');
@@ -58,19 +58,6 @@ function shellPlan(script: string, opts: LifecyclePlanOptions): LifecyclePlan {
         commands: [{ argv: [opts.shell, opts.shellArg, script] }],
         fallback: true,
     };
-}
-
-function nodeArgv(args: string[], exePath: string): string[] | null {
-    const [first, second, ...rest] = args;
-    if (first === '-e' || first === '--eval') {
-        if (!second) return null;
-        return [exePath, 'eval', second, ...rest];
-    }
-    if (first?.startsWith('--eval=')) {
-        return [exePath, 'eval', first.slice('--eval='.length), ...args.slice(1)];
-    }
-    if (!first) return null;
-    return [exePath, 'run', ...args];
 }
 
 function hasShellOnlySyntax(bin: string, args: string[]): boolean {
@@ -227,8 +214,8 @@ export function planLifecycleScript(script: string, opts: LifecyclePlanOptions):
             return { commands: [{ argv: [seg.bin, ...seg.args], op }], fallback: false };
         }
         if (seg.bin === 'node' && !hasShellOnlySyntax(seg.bin, seg.args)) {
-            const argv = nodeArgv(seg.args, opts.exePath);
-            if (argv) return { commands: [{ argv, op }], fallback: false };
+            const argv = nodeCommandArgv(seg.args, opts.exePath);
+            return { commands: [{ argv, op }], fallback: false };
         }
         return shellPlan(script, opts);
     }
@@ -256,8 +243,7 @@ export function planLifecycleScript(script: string, opts: LifecyclePlanOptions):
             continue;
         }
 
-        const argv = seg.bin === 'node' ? nodeArgv(seg.args, opts.exePath) : [seg.bin, ...seg.args];
-        if (!argv) return shellPlan(script, opts);
+        const argv = seg.bin === 'node' ? nodeCommandArgv(seg.args, opts.exePath) : [seg.bin, ...seg.args];
         if (op) commands.push({ argv, op });
         else commands.push({ argv });
     }

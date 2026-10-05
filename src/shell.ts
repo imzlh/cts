@@ -11,6 +11,13 @@ export interface CommandSegment {
 
 export type ShellOperator = '&&' | '||' | ';' | '|' | '&';
 
+/** Keep Node runtime options before cno's command boundary. */
+export function nodeCommandArgv(args: string[], exePath: string, forwardedArgs: string[] = []): string[] {
+    const first = args[0];
+    const command = first !== undefined && !first.startsWith('-') ? ['run', ...args] : args;
+    return [exePath, ...forwardedArgs, ...command];
+}
+
 /** Split command by operators; respects quotes. op is between segments. */
 export function parseShellCommand(input: string): CommandSegment[] {
     const segments: CommandSegment[] = [];

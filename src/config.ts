@@ -1,6 +1,7 @@
 import type { RuntimeConfig, ConfigOptions } from './types';
 import { dirname, joinPaths, normalizePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier, isRelative, isAbsolute } from './utils';
 import { err, ErrorKind } from './errors';
+import { readEnv } from './utils/env';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -60,14 +61,6 @@ export function parseSize(s: string | undefined): number | undefined {
         T: 1024**4, TB: 1024**4,
     };
     return Math.floor(parseFloat(value) * (units[(m[2] || 'B').toUpperCase()] ?? 1));
-}
-
-function env(k: string): string | null {
-    try {
-        return os.getenv(k) ?? null;
-    } catch {
-        return null;
-    }
 }
 
 function resolveImportMapTarget(target: string, baseDir?: string): string {
@@ -153,7 +146,7 @@ function envConfig(): Partial<ConfigOptions> {
     const c: Partial<ConfigOptions> = {};
     const bool = (v: string | null) => v !== null ? v === 'true' : undefined;
     const E = 'CTS_';
-    const v = (k: string) => env(E + k);
+    const v = (k: string) => readEnv(E + k);
     const cacheDir = v('CACHE_DIR'); if (cacheDir) c.cacheDir = cacheDir;
     const lockDir = v('LOCK_DIR'); if (lockDir) c.lockDir = lockDir;
     const dc  = bool(v('DISABLE_CACHE')); if (dc  !== undefined) c.enableCache = !dc;
@@ -175,7 +168,7 @@ function envConfig(): Partial<ConfigOptions> {
 
 function defaultCacheDir(): string {
     let home: string | null = getHomeDir();
-    if (!home) home = env(isWindows ? 'USERPROFILE' : 'HOME') ?? '/root';
+    if (!home) home = readEnv(isWindows ? 'USERPROFILE' : 'HOME') ?? '/root';
     return joinPaths(toPosixPath(home), '.cts');
 }
 
@@ -311,8 +304,10 @@ const CLI_TPL = {
     'jsx-fragment-pragma': 'string',
 } satisfies Record<string, 'string'|'boolean'|'number'>;
 
-export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeConfig {
-    const cli = parseArgs(os.args.slice(1), CLI_TPL);
+export function createConfig(userConfig: Partial<ConfigOptions> = {}, argv: string[] = []): RuntimeConfig {
+    // Embedders already own argument parsing. Only the standalone CTS entry
+    // passes argv; a library runtime must never reinterpret its host's args.
+    const cli = parseArgs(argv, CLI_TPL);
     const cfg = { ...DEFAULTS, ...envConfig(), ...userConfig } as RuntimeConfig;
 
     if (cli['cache-dir'])     cfg.cacheDir     = cli['cache-dir'];
@@ -335,9 +330,9 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}): RuntimeCo
         else log.warn('config', () => `invalid --npm-mode "${m}", ignoring`);
     }
     if (cli['memory-limit'] !== undefined)
-        cfg.memoryLimit = parseSize(cli['memory-limit'] || env('CTS_MEMORY_LIMIT') || '1GB');
+        cfg.memoryLimit = parseSize(cli['memory-limit'] || readEnv('CTS_MEMORY_LIMIT') || '1GB');
     if (cli['max-stack-size'] !== undefined)
-        cfg.maxStackSize = parseSize(cli['max-stack-size'] || env('CTS_MAX_STACK_SIZE') || '0');
+        cfg.maxStackSize = parseSize(cli['max-stack-size'] || readEnv('CTS_MAX_STACK_SIZE') || '0');
     if (cli['jsr-cache-ttl'] !== undefined)
         cfg.jsrCacheTTL = cli['jsr-cache-ttl'] * 24 * 60 * 60 * 1000;
     if (cli['jsx-pragma']) cfg.jsxPragma = cli['jsx-pragma'];

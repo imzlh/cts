@@ -1,11 +1,12 @@
 import { basename, dirname, joinPaths, normalizePath, pathRoot, toPosixPath, readText, stripJsonc, safeParse, errMsg, matchLatestVersion, latestVersion, compareVersions, log, findLocalBin, WIN_BIN_EXTS, isWindows, hashString, isValidNpmPackageName } from './utils';
-import { parseShellCommand, requiresShellEvaluation, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
+import { nodeCommandArgv, parseShellCommand, requiresShellEvaluation, resolveWinBinEntry, resolveUnixBinEntry } from './shell';
 import { expandArgv, expandRedirectTarget, parseTaskScript, type TaskCommand, type TaskPipeline } from './task-shell';
 import { LockStore } from './lock';
 import { getBinMap, getLookupBinMap, readPkgFresh, resolvePackageBinPath } from './resolve/pkg';
 import { createConfig } from './config';
 import { NpmHandler } from './resolve/protocols/npm';
 import { runAsync } from './flow';
+import { readEnv } from './utils/env';
 
 const os = import.meta.use('os');
 const console = import.meta.use('console');
@@ -284,14 +285,6 @@ function realpathQuiet(path: string): string {
     return toPosixPath(path);
 }
 
-function env(k: string): string | null {
-    try {
-        return os.getenv(k) ?? null;
-    } catch {
-        return null;
-    }
-}
-
 interface NpmExecSpec {
     name: string;
     version: string;
@@ -385,9 +378,9 @@ function isNpmSpecBinName(name: string): boolean {
 
 function resolveCacheDir(override?: string): string {
     if (override) return toPosixPath(override);
-    const envDir = env('CTS_CACHE_DIR');
+    const envDir = readEnv('CTS_CACHE_DIR');
     if (envDir) return toPosixPath(envDir);
-    const home = toPosixPath(String(os.homeDir || (isWindows ? env('USERPROFILE') : env('HOME')) || '/root'));
+    const home = toPosixPath(String(os.homeDir || (isWindows ? readEnv('USERPROFILE') : readEnv('HOME')) || '/root'));
     return joinPaths(home, '.cts');
 }
 
@@ -554,35 +547,6 @@ function stripDenoRunFlags(tokens: string[]): string[] {
     return out;
 }
 
-function nodeTaskArgv(args: string[], forwardedArgs: string[]): string[] {
-    const first = args[0];
-    if (first === undefined) return [os.exePath, ...forwardedArgs];
-    if (first === '-e' || first === '--eval') {
-        const source = args[1];
-        if (source === undefined) return [os.exePath, ...forwardedArgs, 'eval'];
-        return [os.exePath, ...forwardedArgs, 'eval', source, ...args.slice(2)];
-    }
-    if (first.startsWith('--eval=')) {
-        return [os.exePath, ...forwardedArgs, 'eval', first.slice('--eval='.length), ...args.slice(1)];
-    }
-    if (first === '-p' || first === '--print') {
-        const source = args[1];
-        if (source === undefined) return [os.exePath, ...forwardedArgs, '--print'];
-        return [os.exePath, ...forwardedArgs, '--print', source, ...args.slice(2)];
-    }
-    if (first === '-v' || first === '--version') return [os.exePath, '--version'];
-    if (first === '-h' || first === '--help') return [os.exePath, '--help'];
-    if (first === '--') return args.length > 1
-        ? [os.exePath, ...forwardedArgs, 'run', ...args.slice(1)]
-        : [os.exePath, ...forwardedArgs];
-    // Keep node flags on cno instead of falling back to PATH.  The task
-    // contract is that a `node` token is always the current runtime; an
-    // unsupported flag may still be understood by cno (for example
-    // --require/--inspect), and otherwise cno can report it directly.
-    if (first.startsWith('-')) return [os.exePath, ...forwardedArgs, ...args];
-    return [os.exePath, ...forwardedArgs, 'run', ...args];
-}
-
 function isDirectTaskOperator(op: string | undefined): boolean {
     return op === '&&' || op === '||' || op === ';';
 }
@@ -645,14 +609,22 @@ export function taskShellEnv(env: Record<string, string>, cwd: string): Record<s
     return { ...env, PWD: cwd, [pathKey]: current ? `${pathPrefix}${sep}${current}` : pathPrefix };
 }
 
-export function taskShellArgv(script: string): string[] {
-    if (isWindows) return [env('ComSpec') ?? env('COMSPEC') ?? 'cmd.exe', '/c', script];
+/**
+ * Build the shell fallback argv used for task scripts that need shell
+ * evaluation.  `forwardedArgs` are cno runtime options from the invocation
+ * prefix.  The POSIX wrappers keep `node`/`deno` task commands on this same
+ * cno executable, so those options apply to grandchildren as well.
+ */
+export function taskShellArgv(script: string, forwardedArgs: string[] = []): string[] {
+    if (isWindows) return [readEnv('ComSpec') ?? readEnv('COMSPEC') ?? 'cmd.exe', '/c', script];
     // Keep the foreground shell alive until the leaf decides whether a
     // terminal signal was handled or should become exit 128 + signal.
     const signalNumbers = availableTaskSignalNumbers(taskTerminalSignalNames);
     const trapSignals = signalNumbers.length ? signalNumbers.join(' ') : 'INT QUIT TSTP';
     const runtime = quoteShellArg(os.exePath);
-    return ['sh', '-c', `trap ':' ${trapSignals}\nnode() { ${runtime} "$@"; }\ndeno() { ${runtime} "$@"; }\n${script}`];
+    const runtimeArgs = joinQuotedArgs(forwardedArgs);
+    const invoke = runtimeArgs.length > 0 ? `${runtime} ${runtimeArgs}` : runtime;
+    return ['sh', '-c', `trap ':' ${trapSignals}\nnode() { ${invoke} "$@"; }\ndeno() { ${invoke} "$@"; }\n${script}`];
 }
 
 interface InternalTaskSession {
@@ -707,7 +679,7 @@ function resolveInternalTaskArgv(
 ): string[] {
     const bin = argv[0] ?? '';
     const args = argv.slice(1);
-    if (bin === 'node') return nodeTaskArgv(args, forwardedArgs);
+    if (bin === 'node') return nodeCommandArgv(args, os.exePath, forwardedArgs);
     if (bin === 'deno' && args[0] === 'run') {
         const stripped = stripDenoRunFlags(args.slice(1));
         return [os.exePath, ...forwardedArgs, 'run', ...stripped];
@@ -723,10 +695,12 @@ function resolveInternalTaskArgv(
     if (!resolved) return argv;
     if (resolved.fallback) {
         return isWindows
-            ? [env('ComSpec') ?? env('COMSPEC') ?? 'cmd.exe', '/d', '/s', '/c', resolved.binPath, ...args]
+            ? [readEnv('ComSpec') ?? readEnv('COMSPEC') ?? 'cmd.exe', '/d', '/s', '/c', resolved.binPath, ...args]
             : [resolved.binPath, ...args];
     }
-    return [os.exePath, 'run', `--lock-dir=${session.cwd}`, resolved.entry, ...args];
+    // Keep the resolver's default lock directory before invocation options so
+    // an explicit prefix `--lock-dir` retains normal last-one-wins behavior.
+    return [os.exePath, `--lock-dir=${session.cwd}`, ...forwardedArgs, 'run', resolved.entry, ...args];
 }
 
 function concatTaskChunks(chunks: Uint8Array[], total: number): Uint8Array {
@@ -772,7 +746,7 @@ function runInternalTaskBuiltin(
         return { code: 0, output: engine.encodeString(argv.slice(start).join(' ') + (noNewline ? '' : '\n')) };
     }
     if (bin === 'cd') {
-        const target = argv[1] ?? env('USERPROFILE') ?? env('HOMEPATH') ?? session.cwd;
+        const target = argv[1] ?? readEnv('USERPROFILE') ?? readEnv('HOMEPATH') ?? session.cwd;
         const next = taskRedirectPath(session.cwd, target);
         try {
             if (!fs.stat(next).isDirectory) return { code: 1, output: new Uint8Array(0) };
@@ -941,7 +915,7 @@ async function execCommand(
     const segments = parseShellCommand(cmd);
     if (!segments.length) return 0;
     if (requiresShellEvaluation(cmd) || hasShellOnlySyntax(segments)) {
-        return rawExec(taskShellArgv(fullScript), taskShellEnv(env, cwd), cwd);
+        return rawExec(taskShellArgv(fullScript, forwardedArgs), taskShellEnv(env, cwd), cwd);
     }
 
     // Single-command shortcuts
@@ -971,16 +945,16 @@ async function execCommand(
         }
 
         if (seg.bin === 'node') {
-            const argv = nodeTaskArgv(allArgs, forwardedArgs);
+            const argv = nodeCommandArgv(allArgs, os.exePath, forwardedArgs);
             return rawExec(argv, taskShellEnv(env, cwd), cwd);
         }
 
         const resolved = resolver.resolve(seg.bin, cwd);
         if (resolved) {
-            return execBinary(resolved, allArgs, env, cwd);
+            return execBinary(resolved, allArgs, env, cwd, forwardedArgs);
         }
 
-        return rawExec(taskShellArgv(shellCommand(cmd, extraArgs)), taskShellEnv(env, cwd), cwd);
+        return rawExec(taskShellArgv(shellCommand(cmd, extraArgs), forwardedArgs), taskShellEnv(env, cwd), cwd);
     }
 
     // Pipeline: && / || / ; on previous segment (unsupported ops already rejected).
@@ -1012,14 +986,14 @@ async function execCommand(
         } else if (seg.bin === 'deno') {
             prevCode = await rawExec([os.exePath, ...forwardedArgs, ...segArgs], taskShellEnv(env, cwd), cwd);
         } else if (seg.bin === 'node') {
-            const argv = nodeTaskArgv(segArgs, forwardedArgs);
+            const argv = nodeCommandArgv(segArgs, os.exePath, forwardedArgs);
             prevCode = await rawExec(argv, taskShellEnv(env, cwd), cwd);
         } else {
             const resolved = resolver.resolve(seg.bin, cwd);
             if (!resolved) {
-                prevCode = await rawExec(taskShellArgv(segmentCommand(seg.bin, segArgs)), taskShellEnv(env, cwd), cwd);
+                prevCode = await rawExec(taskShellArgv(segmentCommand(seg.bin, segArgs), forwardedArgs), taskShellEnv(env, cwd), cwd);
             } else {
-                prevCode = await execBinary(resolved, segArgs, env, cwd);
+                prevCode = await execBinary(resolved, segArgs, env, cwd, forwardedArgs);
             }
         }
 
@@ -1045,7 +1019,13 @@ function chmodExecutableQuietly(path: string): void {
     }
 }
 
-async function execBinary(resolved: ResolvedBin, args: string[], env: Record<string, string>, cwd: string): Promise<number> {
+async function execBinary(
+    resolved: ResolvedBin,
+    args: string[],
+    env: Record<string, string>,
+    cwd: string,
+    forwardedArgs: string[] = [],
+): Promise<number> {
     // Nested tools (npm-run-all → vue-tsc) resolve via PATH; keep .bin first.
     const pathEnv = taskShellEnv(env, cwd);
     const mergedEnv = { ...os.environ(), ...pathEnv, PWD: cwd };
@@ -1064,7 +1044,7 @@ async function execBinary(resolved: ResolvedBin, args: string[], env: Record<str
     }
 
     // Run the JS entry through the same CLI path as user files.
-    return rawExec([os.exePath, 'run', `--lock-dir=${cwd}`, resolved.entry, ...args], mergedEnv, cwd);
+    return rawExec([os.exePath, `--lock-dir=${cwd}`, ...forwardedArgs, 'run', resolved.entry, ...args], mergedEnv, cwd);
 }
 
 async function rawExec(argv: string[], env: Record<string, string>, cwd: string): Promise<number> {

@@ -1,5 +1,6 @@
 import type CModuleExternalOxc from '../../ext-oxc/native';
 import { log, errMsg } from './utils';
+import { readEnv } from './utils/env';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -241,8 +242,7 @@ export function oxcExtPath(): string | null {
         const candidates: string[] = [];
 
         // CTS_EXT_PATH (same env var bootstrap.ts's resolveExtDir() honors) wins.
-        let envDir: string | null = null;
-        try { envDir = os.getenv('CTS_EXT_PATH'); } catch {}
+        const envDir = readEnv('CTS_EXT_PATH');
         if (envDir) candidates.push(`${envDir.replace(/[\\/]+$/, '')}${sep}${file}`);
 
         const exeDir = os.exePath.replace(/[\\/][^\\/]+$/, '');

@@ -927,6 +927,7 @@ export class TypeScriptRuntime {
             return;
         }
         this.compiler.clearLoadedModules();
+        this.compiler.clearRuntimeCaches();
         this.engineHooks.clearLoadedModules();
         this.compiler.esm.jsc.clearMemory();
         clearImportMetaResolveCache();

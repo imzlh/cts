@@ -1,5 +1,6 @@
 const os = import.meta.use('os');
 const console = import.meta.use('console');
+import { readEnv } from './env';
 
 let initialised = false;
 const enabled  = new Set<string>();   // active categories
@@ -9,9 +10,7 @@ function init(): void {
     if (initialised) return;
     initialised = true;
     let raw = '';
-    try {
-        raw = os.getenv('DEBUG') ?? '';
-    } catch {}
+    raw = readEnv('DEBUG') ?? '';
     if (!raw) return;
     let start = 0;
     for (let i = 0; i <= raw.length; i++) {

@@ -1,4 +1,5 @@
 export * from './platform';
+export * from './env';
 export * from './path';
 export * from './memfs';
 export type { VirtualFileStore } from './memfs';

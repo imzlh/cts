@@ -280,7 +280,7 @@ async function runEval(code: string, baseCfg: Partial<ConfigOptions>): Promise<v
 }
 
 async function runMain(): Promise<void> {
-    const cli    = createConfig({}) as RuntimeConfig & Record<string, any>;
+    const cli    = createConfig({}, os.args.slice(1)) as RuntimeConfig & Record<string, any>;
 
     // --help, -h
     if (cli['help'] || cli['h']) {

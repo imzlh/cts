@@ -1,4 +1,5 @@
 import { fmtBytes } from './misc';
+import { readEnv } from './env';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -15,14 +16,6 @@ const C = {
     blue:   (s: string) => isatty ? `\x1b[34m${s}\x1b[0m` : s,
 };
 
-function getEnv(name: string): string | null {
-    try {
-        return os.getenv(name) ?? null;
-    } catch {
-        return null;
-    }
-}
-
 export const isatty = (() => {
     try {
         return os.guessHandle(os.STDOUT_FILENO) === 'tty';
@@ -31,7 +24,7 @@ export const isatty = (() => {
     }
 })();
 let termWidth = (() => {
-    const cols = Number(getEnv('COLUMNS') ?? '');
+    const cols = Number(readEnv('COLUMNS') ?? '');
     return Number.isFinite(cols) && cols > 20 ? cols : 80;
 })();
 
