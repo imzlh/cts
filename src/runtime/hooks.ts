@@ -11,16 +11,6 @@ const engine = import.meta.use('engine');
 const SUPPORTED_ATTRS = new Set(['type', 'raw', 'text', 'bytes']);
 let activeInstall = false;
 
-function unknownAttrNames(attr: Record<string, unknown>): string {
-    let out = '';
-    for (const key in attr) {
-        if (SUPPORTED_ATTRS.has(key)) continue;
-        if (out) out += ', ';
-        out += key;
-    }
-    return out;
-}
-
 function unsupportedAttribute(name: string, value: unknown): TypeError {
     const error = new TypeError(`Import attribute "${name}" with value "${String(value)}" is not supported`);
     Object.defineProperty(error, 'code', { value: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED' });
@@ -169,10 +159,9 @@ export function installEngineHooks(
         },
 
         attrchk(attr: Record<string, unknown>): void {
-            const unknown = unknownAttrNames(attr);
-            if (!unknown) return;
-            const name = unknown.split(', ')[0]!;
-            throw unsupportedAttribute(name, attr[name]);
+            for (const name in attr) {
+                if (!SUPPORTED_ATTRS.has(name)) throw unsupportedAttribute(name, attr[name]);
+            }
         },
     });
 

@@ -14,8 +14,8 @@ const crypto = import.meta.use('crypto');
 const JSR = 'https://jsr.io';
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
 
-type CachedJsrPackageMeta = JsrPackageMeta & { _at?: number };
-type CachedJsrVersionMeta = JsrVersionMeta & { _at?: number };
+type JsrMetadata = JsrPackageMeta | JsrVersionMeta;
+type CachedJsrMetadata = JsrMetadata & { _at?: number };
 
 function parseCachedMeta<T>(text: string): T | null {
     try {
@@ -151,13 +151,13 @@ export class JsrHandler implements ProtocolHandler {
     }
 
     private *latestVersion(scope: string, name: string): Flow<string> {
-        const meta = yield* this.pkgMeta(scope, name);
+        const meta = yield* this.metadata(scope, name);
         if (!meta.latest) throw err(ErrorKind.VersionNotFound, `No latest version for @${scope}/${name}`);
         return meta.latest;
     }
 
     private *resolveVersion(scope: string, name: string, ver: string): Flow<string> {
-        const meta = yield* this.pkgMeta(scope, name);
+        const meta = yield* this.metadata(scope, name);
         const resolved = matchLatestRecordVersion(meta.versions, ver);
         if (!resolved) throw err(ErrorKind.VersionNotFound, `No version matching "${ver}" in @${scope}/${name}`);
         return resolved;
@@ -165,7 +165,7 @@ export class JsrHandler implements ProtocolHandler {
 
     private *resolveFilePath(p: ParsedJsrSpec): Flow<{ path: string; checksum?: string }> {
         if (!p.version) throw err(ErrorKind.VersionNotFound, `No resolved version for @${p.scope}/${p.name}`);
-        const meta = yield* this.versionMeta(p.scope, p.name, p.version);
+        const meta = yield* this.metadata(p.scope, p.name, p.version);
         const resolved = (path: string): { path: string; checksum?: string } => {
             const normalized = normalizeJsrFilePath(path);
             return { path: normalized, checksum: meta.manifest[`/${normalized}`]?.checksum };
@@ -186,58 +186,35 @@ export class JsrHandler implements ProtocolHandler {
         throw err(ErrorKind.FileNotFound, `File not found: ${p.path} in @${p.scope}/${p.name}@${p.version}`);
     }
 
-    private *pkgMeta(scope: string, name: string): Flow<JsrPackageMeta> {
-        const dir = joinPaths(this.cfg.cacheDir, 'jsr', scope, name);
+    private metadata(scope: string, name: string): Flow<JsrPackageMeta>;
+    private metadata(scope: string, name: string, ver: string): Flow<JsrVersionMeta>;
+    private *metadata(scope: string, name: string, ver?: string): Flow<JsrMetadata> {
+        const packageId = `@${scope}/${name}`;
+        const id = ver === undefined ? packageId : `${packageId}@${ver}`;
+        const kind = ver === undefined ? 'package' : 'version';
+        const dir = joinPaths(this.cfg.cacheDir, 'jsr', scope, name, ver ?? '');
         const file = joinPaths(dir, 'meta.json');
         const exists = yield { type: StepType.FS_EXISTS, path: file };
         if (exists) {
             const text = expectText(yield { type: StepType.FS_READ_TEXT, path: file });
-            const c = parseCachedMeta<CachedJsrPackageMeta>(text);
-            if (c) {
-                if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
-                if (this.cfg.cachedOnly) return c;
-            }
+            const cached = parseCachedMeta<CachedJsrMetadata>(text);
+            if (cached && (!isCacheExpired(cached._at ?? 0, this.cfg.jsrCacheTTL) || this.cfg.cachedOnly)) return cached;
         }
         if (this.cfg.cachedOnly) {
             throw err(ErrorKind.ModuleNotFound,
-                `JSR package metadata not found in cache: @${scope}/${name}, --cached-only is specified.`);
+                `JSR ${kind} metadata not found in cache: ${id}, --cached-only is specified.`);
         }
-        const url = `${JSR}/@${scope}/${name}/meta.json`;
-        log.debug('jsr', () => `fetch meta @${scope}/${name} <- ${url}`);
+        const url = `${JSR}/${packageId}/${ver === undefined ? 'meta.json' : `${ver}_meta.json`}`;
+        const label = ver === undefined ? 'meta' : 'version meta';
+        log.debug('jsr', () => `fetch ${label} ${id} <- ${url}`);
         const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout });
         if (res.status < 200 || res.status >= 300) {
-            throw err(ErrorKind.NetworkError, `HTTP ${res.status} fetching JSR meta ${url}`);
+            throw err(ErrorKind.NetworkError, `HTTP ${res.status} fetching JSR ${label} ${url}`);
         }
-        const meta = safeParse<JsrPackageMeta>(engine.decodeString(res.body));
-        if (!meta.latest) throw err(ErrorKind.VersionNotFound, `@${scope}/${name}: registry returned no latest`);
-        yield { type: StepType.FS_ENSURE_DIR, path: dir };
-        yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: Date.now() }, null, 2) };
-        return meta;
-    }
-
-    private *versionMeta(scope: string, name: string, ver: string): Flow<JsrVersionMeta> {
-        const dir = joinPaths(this.cfg.cacheDir, 'jsr', scope, name, ver);
-        const file = joinPaths(dir, 'meta.json');
-        const exists = yield { type: StepType.FS_EXISTS, path: file };
-        if (exists) {
-            const text = expectText(yield { type: StepType.FS_READ_TEXT, path: file });
-            const c = parseCachedMeta<CachedJsrVersionMeta>(text);
-            if (c) {
-                if (!isCacheExpired(c._at ?? 0, this.cfg.jsrCacheTTL)) return c;
-                if (this.cfg.cachedOnly) return c;
-            }
+        const meta = safeParse<JsrMetadata>(engine.decodeString(res.body));
+        if (ver === undefined && !('latest' in meta && meta.latest)) {
+            throw err(ErrorKind.VersionNotFound, `${packageId}: registry returned no latest`);
         }
-        if (this.cfg.cachedOnly) {
-            throw err(ErrorKind.ModuleNotFound,
-                `JSR version metadata not found in cache: @${scope}/${name}@${ver}, --cached-only is specified.`);
-        }
-        const url = `${JSR}/@${scope}/${name}/${ver}_meta.json`;
-        log.debug('jsr', () => `fetch version meta @${scope}/${name}@${ver} <- ${url}`);
-        const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout });
-        if (res.status < 200 || res.status >= 300) {
-            throw err(ErrorKind.NetworkError, `HTTP ${res.status} fetching JSR version meta ${url}`);
-        }
-        const meta = safeParse<JsrVersionMeta>(engine.decodeString(res.body));
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
         yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: Date.now() }, null, 2) };
         return meta;

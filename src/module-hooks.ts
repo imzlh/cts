@@ -22,42 +22,32 @@ export interface ModuleLoadResult {
     shortCircuit?: boolean;
 }
 
-export type ModuleResolveHook = (
+type ModuleHook<Context, Result> = (
     specifier: string,
-    context: ModuleResolveContext,
-    nextResolve: (specifier: string, context?: ModuleResolveContext) => ModuleResolveResult,
-) => ModuleResolveResult;
+    context: Context,
+    next: (specifier: string, context?: Context) => Result,
+) => Result;
 
-export type ModuleLoadHook = (
-    url: string,
-    context: ModuleLoadContext,
-    nextLoad: (url: string, context?: ModuleLoadContext) => ModuleLoadResult,
-) => ModuleLoadResult;
+export type ModuleResolveHook = ModuleHook<ModuleResolveContext, ModuleResolveResult>;
+export type ModuleLoadHook = ModuleHook<ModuleLoadContext, ModuleLoadResult>;
 
 export interface SynchronousModuleHooks {
     resolve?: ModuleResolveHook;
     load?: ModuleLoadHook;
 }
 
-interface HookRegistration extends SynchronousModuleHooks {
-    active: boolean;
-}
-
-const registrations: HookRegistration[] = [];
+const registrations: SynchronousModuleHooks[] = [];
 
 /** Process-wide synchronous hooks installed through node:module.registerHooks(). */
 export function registerModuleHooks(hooks: SynchronousModuleHooks): { deregister(): void } {
-    const registration: HookRegistration = {
+    const registration: SynchronousModuleHooks = {
         resolve: typeof hooks?.resolve === 'function' ? hooks.resolve : undefined,
         load: typeof hooks?.load === 'function' ? hooks.load : undefined,
-        active: true,
     };
     registrations.push(registration);
 
     return {
         deregister(): void {
-            if (!registration.active) return;
-            registration.active = false;
             const index = registrations.indexOf(registration);
             if (index !== -1) registrations.splice(index, 1);
         },
@@ -72,22 +62,31 @@ export function hasModuleLoadHooks(): boolean {
     return registrations.some((registration) => registration.load !== undefined);
 }
 
-/** Run newest-first, matching Node's synchronous customization-hook chain. */
+/** Snapshot the chain before invoking hooks; newest registration runs first. */
+function runModuleHooks<Context, Result>(
+    select: (registration: SynchronousModuleHooks) => ModuleHook<Context, Result> | undefined,
+    specifier: string,
+    context: Context,
+    terminal: (specifier: string, context: Context) => Result,
+): Result {
+    let next: (specifier: string, context?: Context) => Result =
+        (nextSpecifier, nextContext) => terminal(nextSpecifier, nextContext ?? context);
+
+    for (const registration of registrations) {
+        const hook = select(registration);
+        if (!hook) continue;
+        const downstream = next;
+        next = (nextSpecifier, nextContext) => hook(nextSpecifier, nextContext ?? context, downstream);
+    }
+    return next(specifier, context);
+}
+
 export function runModuleResolveHooks(
     specifier: string,
     context: ModuleResolveContext,
     terminal: (specifier: string, context: ModuleResolveContext) => ModuleResolveResult,
 ): ModuleResolveResult {
-    let next: (specifier: string, context?: ModuleResolveContext) => ModuleResolveResult =
-        (nextSpecifier, nextContext) => terminal(nextSpecifier, nextContext ?? context);
-
-    for (const registration of registrations) {
-        if (!registration.resolve) continue;
-        const hook = registration.resolve;
-        const downstream = next;
-        next = (nextSpecifier, nextContext) => hook(nextSpecifier, nextContext ?? context, downstream);
-    }
-    return next(specifier, context);
+    return runModuleHooks((registration) => registration.resolve, specifier, context, terminal);
 }
 
 export function runModuleLoadHooks(
@@ -95,14 +94,5 @@ export function runModuleLoadHooks(
     context: ModuleLoadContext,
     terminal: (url: string, context: ModuleLoadContext) => ModuleLoadResult,
 ): ModuleLoadResult {
-    let next: (url: string, context?: ModuleLoadContext) => ModuleLoadResult =
-        (nextUrl, nextContext) => terminal(nextUrl, nextContext ?? context);
-
-    for (const registration of registrations) {
-        if (!registration.load) continue;
-        const hook = registration.load;
-        const downstream = next;
-        next = (nextUrl, nextContext) => hook(nextUrl, nextContext ?? context, downstream);
-    }
-    return next(url, context);
+    return runModuleHooks((registration) => registration.load, url, context, terminal);
 }

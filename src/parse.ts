@@ -173,6 +173,8 @@ export function isParseWorker(): boolean {
 export async function runParseWorker(): Promise<void> {
     const pipe = worker.pipe;
     if (!pipe) throw new Error('Parse worker pipe is not available');
+    // This service owns the native channel until ParseDriver terminates it.
+    pipe.ref();
     const wd = parseWorkerData();
     // Relay sourcemaps to main; worker JSContext is not where modules run.
     const transformer = new Transformer({ sourceMaps: true });

@@ -218,38 +218,33 @@ function _detectFormat(localPath: string): DirFormat {
     if (ext !== '.js') return 'esm';
 
     // Walk up directories, caching every intermediate dir to avoid re-traversal
-    const startDir = dirname(localPath);
-    let dir = startDir;
+    let dir = dirname(localPath);
+    let result: DirFormat = NO_MANIFEST;
     const visited: string[] = []; // dirs we passed through without a result
     while (dir !== '/' && dir !== '.') {
         const cached = formatDirCache.get(dir);
         if (cached !== undefined) {
-            // Back-fill visited dirs with the same result
-            for (const v of visited) formatDirCache.set(v, cached);
-            return cached;
+            result = cached;
+            break;
         }
         visited.push(dir);
         // Deno projects default to ESM
         if (fs.exists(joinPaths(dir, 'deno.json')) || fs.exists(joinPaths(dir, 'deno.jsonc'))) {
-            for (const v of visited) formatDirCache.set(v, 'esm');
-            return 'esm';
+            result = 'esm';
+            break;
         }
         const pkg = readPkg(dir);
         if (pkg) {
-            const fmt: ModuleFormat = pkg.type === 'module' ? 'esm' : 'cjs';
-            for (const v of visited) formatDirCache.set(v, fmt);
-            return fmt;
+            result = pkg.type === 'module' ? 'esm' : 'cjs';
+            break;
         }
         const up = dirname(dir);
         if (up === dir) break;
         dir = up;
     }
-    // No manifest found. The answer is context-dependent, so cache the reason
-    // and let detectFormat() map it: require → CJS (node), import → ESM (Deno
-    // single file). Caching 'esm' here would hand a require() caller the ESM
-    // default and reintroduce "module is not defined".
-    for (const v of visited) formatDirCache.set(v, NO_MANIFEST);
-    return NO_MANIFEST;
+    // Keep NO_MANIFEST context-neutral; detectFormat maps it for each caller.
+    for (const v of visited) formatDirCache.set(v, result);
+    return result;
 }
 
 export interface ResolveCtx { pkgDir: string; pkg: PackageJson; forceCjs?: boolean; conditions?: string[] }
@@ -505,23 +500,20 @@ function resolveTargetOutcome(
         if (mode === 'imports' && !target.startsWith('./')) {
             return { status: 'resolved', value: externalImportTarget(ctx, target) };
         }
-        const resolvedTarget = mode === 'legacy'
-            ? (() => {
-                const path = resolveLegacyPath(ctx, target);
-                return path ? { path, suffix: '' } : null;
-            })()
-            : packageTargetPath(ctx, target);
-        return resolvedTarget
-            ? {
-                status: 'resolved',
-                value: {
-                    path: resolvedTarget.path,
-                    format: preferredFormatForPath(ctx, resolvedTarget.path, preferred),
-                    fileKind: extname(resolvedTarget.path) ? undefined : 'source',
-                    specifierSuffix: resolvedTarget.suffix || undefined,
-                },
-            }
-            : UNMATCHED;
+        let path: string | null;
+        let suffix = '';
+        if (mode === 'legacy') path = resolveLegacyPath(ctx, target);
+        else ({ path, suffix } = packageTargetPath(ctx, target));
+        if (!path) return UNMATCHED;
+        return {
+            status: 'resolved',
+            value: {
+                path,
+                format: preferredFormatForPath(ctx, path, preferred),
+                fileKind: extname(path) ? undefined : 'source',
+                specifierSuffix: suffix || undefined,
+            },
+        };
     }
     if (Array.isArray(t)) {
         let lastInvalid: Error | null = null;

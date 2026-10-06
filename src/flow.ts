@@ -244,7 +244,7 @@ export function closeConnectionPools(): void {
     }
 }
 
-function executeStep(step: Step, fetch: (step: NetFetchStep) => NetFetchResult): StepResult {
+function executeSync(step: Step): StepResult {
     switch (step.type) {
         case StepType.FS_EXISTS:
             // Active VFS (pack:) is not on disk — has() is the existence oracle.
@@ -265,7 +265,7 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => NetFetchResult):
             ensureDir(step.path);
             return undefined;
         case StepType.NET_FETCH:
-            return fetch(step);
+            return fetchSync(step);
         case StepType.ARCHIVE_UNTAR_GZ:
             log.debug('archive', () => `untar.gz start ${fmtBytes(step.data.byteLength)}`);
             const started = Date.now();
@@ -279,10 +279,6 @@ function executeStep(step: Step, fetch: (step: NetFetchStep) => NetFetchResult):
             for (const flow of step.flows) runSync(flow);
             return undefined;
     }
-}
-
-function executeSync(step: Step): StepResult {
-    return executeStep(step, fetchSync);
 }
 
 function arrayBufferBackedBytes(data: Uint8Array | ArrayBuffer): Uint8Array<ArrayBuffer> {
@@ -333,11 +329,7 @@ async function executeAsync(step: Step): Promise<StepResult> {
         case StepType.NET_FETCH:
             return fetchAsync(step);
         case StepType.ARCHIVE_UNTAR_GZ:
-            log.debug('archive', () => `untar.gz start ${fmtBytes(step.data.byteLength)}`);
-            const started = Date.now();
-            const files = unTarGz(step.data);
-            log.debug('archive', () => `untar.gz done ${files.length} entries ${Date.now() - started}ms`);
-            return files;
+            return executeSync(step);
         case StepType.FLOW:
             await runNestedFlow(step);
             return undefined;
@@ -387,11 +379,7 @@ export function runSync<T>(flow: Flow<T>): T {
         try {
             state = flow.next(executeSync(state.value as Step));
         } catch (e) {
-            if (flow.throw) {
-                state = flow.throw(e);
-            } else {
-                throw e;
-            }
+            state = flow.throw(e);
         }
     }
     return state.value;
@@ -403,11 +391,7 @@ export async function runAsync<T>(flow: Flow<T>): Promise<T> {
         try {
             state = flow.next(await executeAsync(state.value as Step));
         } catch (e) {
-            if (flow.throw) {
-                state = flow.throw(e);
-            } else {
-                throw e;
-            }
+            state = flow.throw(e);
         }
     }
     return state.value;

@@ -315,40 +315,8 @@ export class ModuleResolver {
         }
 
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec, parent);
-        const sourceKey = this.sourceCacheKey(mapped, parent, attr);
-        const sourceHit = this.sourceInfoCache.get(sourceKey);
-        if (sourceHit) {
-            this.rememberExact(requestSpec, parent, attr, sourceHit);
-            return sourceHit;
-        }
-
-        const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
-        if (srcKey) {
-            const cached = this.lock.getModule(srcKey);
-            if (cached && this.canUseSourceIndexHit(mapped, cached)) {
-                return this.publishResolved(requestSpec, mapped, parent, cached, attr, { rememberExact: true });
-            }
-        }
-
-        const localPreferred = this.tryResolveLocalNpm(mapped, parent, attr);
-        if (localPreferred) {
-            return this.publishResolved(requestSpec, mapped, parent, localPreferred, attr, {
-                persistModule: true,
-                persistSource: true,
-                rememberExact: true,
-            });
-        }
-
-        const proto = protoOf(mapped);
-        if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
-            const lockHit = this.lock.getModule(mapped);
-            if (lockHit && this.canUseCachedInfo(lockHit)) {
-                return this.publishResolved(requestSpec, mapped, parent, lockHit, attr, {
-                    persistSource: true,
-                    rememberExact: true,
-                });
-            }
-        }
+        const known = this.resolveKnown(requestSpec, mapped, parent, attr);
+        if (known) return known;
 
         if (this.cfg.frozen) {
             throw err(ErrorKind.LockFrozen, `Module not in lock: "${mapped}"`);
@@ -471,6 +439,31 @@ export class ModuleResolver {
         // Uses isAbsolute/isRelative from utils/path to handle Windows drive letters.
         const mapped = (isRelative(spec) || isAbsolute(spec)) ? spec : this.applyImportMap(spec, parent);
         if (mapped !== spec) log.debug('resolver', () => `importmap: "${spec}" → "${mapped}"`);
+        const known = this.resolveKnown(requestSpec, mapped, parent, attr);
+        if (known) return known;
+
+        // L3 — full dispatch (downloads, package.json reads, etc.)
+        // --frozen: refuse to resolve anything not already in the lock
+        if (this.cfg.frozen) {
+            throw err(ErrorKind.LockFrozen,
+                `Module not in lock: "${mapped}"\n` +
+                `  Run \x1b[36mcts cache <entry>\x1b[0m to update the lock, then retry with --frozen.`
+            );
+        }
+        const info = this.dispatch(mapped, parent, attr, mapped !== spec && isAbsolute(mapped));
+        return this.publishResolved(requestSpec, mapped, parent, info, attr, {
+            persistModule: true,
+            persistSource: true,
+            rememberExact: true,
+        });
+    }
+
+    private resolveKnown(
+        requestSpec: string,
+        mapped: string,
+        parent: string,
+        attr?: Record<string, unknown>,
+    ): ModuleInfo | undefined {
         const sourceKey = this.sourceCacheKey(mapped, parent, attr);
         const sourceHit = this.sourceInfoCache.get(sourceKey);
         if (sourceHit) {
@@ -482,7 +475,7 @@ export class ModuleResolver {
         const srcKey = this.canReadSourceIndex(attr) ? this.lock.getSourceByKey(sourceKey) : undefined;
         if (srcKey) {
             const cached = this.lock.getModule(srcKey);
-            if (cached && this.canUseSourceIndexHit(mapped, cached)) {
+            if (cached && this.canUseCachedInfo(cached)) {
                 log.debug('resolver', () => `L1 hit: "${mapped}" → "${srcKey}"`);
                 return this.publishResolved(requestSpec, mapped, parent, cached, attr, { rememberExact: true });
             }
@@ -510,20 +503,7 @@ export class ModuleResolver {
             }
         }
 
-        // L3 — full dispatch (downloads, package.json reads, etc.)
-        // --frozen: refuse to resolve anything not already in the lock
-        if (this.cfg.frozen) {
-            throw err(ErrorKind.LockFrozen,
-                `Module not in lock: "${mapped}"\n` +
-                `  Run \x1b[36mcts cache <entry>\x1b[0m to update the lock, then retry with --frozen.`
-            );
-        }
-        const info = this.dispatch(mapped, parent, attr, mapped !== spec && isAbsolute(mapped));
-        return this.publishResolved(requestSpec, mapped, parent, info, attr, {
-            persistModule: true,
-            persistSource: true,
-            rememberExact: true,
-        });
+        return undefined;
     }
 
     getInfo(specPath: string): ModuleInfo {
@@ -847,10 +827,6 @@ export class ModuleResolver {
 
     private canUseCachedInfo(info: ModuleInfo): boolean {
         return !(this.cfg.persistLock && !this.cfg.ignoreScripts && protoOf(info.specPath) === 'npm');
-    }
-
-    private canUseSourceIndexHit(_mapped: string, info: ModuleInfo): boolean {
-        return this.canUseCachedInfo(info);
     }
 
     private sourceCacheKey(spec: string, parent: string, attr?: Record<string, unknown>): string {

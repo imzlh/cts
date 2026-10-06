@@ -633,12 +633,15 @@ export class CjsLoader {
         return mod;
     }
 
-    /** exec(), marking the module as on-stack so cycles do not re-enter it. */
-    private execTracked(mod: CjsModule): void {
+    /** Mark file and inline execution on-stack so cycles do not re-enter it. */
+    private execTracked(mod: CjsModule, source?: string): void {
         const filename = getInternalFilename(mod);
         const parent = mod.parent;
         this.executing.add(filename);
-        try { this.exec(mod); }
+        try {
+            if (source === undefined) this.exec(mod);
+            else this.execWithSource(mod, source);
+        }
         catch (e) {
             this.removeFailedModule(mod, parent);
             throw e;
@@ -657,13 +660,7 @@ export class CjsLoader {
         const mod    = cached ?? this.make(filename, parent);
         if (!cached) this.cache.set(filename, mod);
 
-        this.executing.add(filename);
-        try { this.execWithSource(mod, code); }
-        catch (e) {
-            this.removeFailedModule(mod, parent);
-            throw e;
-        }
-        finally { this.executing.delete(filename); }
+        this.execTracked(mod, code);
         return mod;
     }
 
@@ -1085,13 +1082,8 @@ export class CjsLoader {
     private loadResolvedCjs(path: string, parent: CjsModule | null): CjsModule {
         const mod = this.make(path, parent);
         this.cache.set(path, mod);
-        try {
-            this.execTracked(mod);
-            return mod;
-        } catch (e) {
-            this.cache.delete(path);
-            throw e;
-        }
+        this.execTracked(mod);
+        return mod;
     }
 
     private resolveId(id: string, parentPath: string, inspect = false): ResolvedCjsRequest | null {

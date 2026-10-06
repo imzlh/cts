@@ -37,8 +37,12 @@ type TaskDef = string | {
 
 type TaskSource = 'package' | 'deno';
 
-interface DenoConfig {
+interface TaskConfigFile {
     tasks?: Record<string, TaskDef>;
+    scripts?: Record<string, string>;
+    name?: unknown;
+    version?: unknown;
+    config?: unknown;
 }
 
 interface LoadTasksOptions {
@@ -918,29 +922,23 @@ async function execCommand(
         return rawExec(taskShellArgv(fullScript, forwardedArgs), taskShellEnv(env, cwd), cwd);
     }
 
-    // Single-command shortcuts
-    if (segments.length === 1) {
-        const seg = segments[0];
-        if (!seg) return 0;
-        if (!seg.bin) return 0;  // empty command after parsing
-        const allArgs = [...seg.args, ...extraArgs];
-
-        // deno run [flags] <file> [args]
-        if (seg.bin === 'deno' && seg.args[0] === 'run') {
-            const stripped = stripDenoRunFlags(seg.args.slice(1));
-            if (!stripped.length) {
-                console.error('[task] `deno run` with no entry file');
-                return 1;
-            }
-            return execRun([...stripped, ...extraArgs], env, cwd, forwardedArgs);
-        }
-
-        // deno task <name>
-        if (seg.bin === 'deno' && seg.args[0] === 'task') {
-            return execTask([...seg.args.slice(1), ...extraArgs], env, cwd, forwardedArgs);
-        }
-
+    const executeSegment = async (
+        seg: (typeof segments)[number],
+        trailingArgs: string[],
+        fallbackScript: string,
+    ): Promise<number> => {
+        const allArgs = [...seg.args, ...trailingArgs];
         if (seg.bin === 'deno') {
+            const command = seg.args[0];
+            if (command === 'run' || command === 'task') {
+                const args = command === 'run' ? stripDenoRunFlags(seg.args.slice(1)) : seg.args.slice(1);
+                if (command === 'run' && !args.length) {
+                    console.error('[task] `deno run` with no entry file');
+                    return 1;
+                }
+                const mergedEnv = { ...os.environ(), ...taskShellEnv(env, cwd), PWD: cwd };
+                return runTaskChild([os.exePath, ...forwardedArgs, command, ...args, ...trailingArgs], mergedEnv, cwd);
+            }
             return rawExec([os.exePath, ...forwardedArgs, ...allArgs], taskShellEnv(env, cwd), cwd);
         }
 
@@ -954,7 +952,14 @@ async function execCommand(
             return execBinary(resolved, allArgs, env, cwd, forwardedArgs);
         }
 
-        return rawExec(taskShellArgv(shellCommand(cmd, extraArgs), forwardedArgs), taskShellEnv(env, cwd), cwd);
+        return rawExec(taskShellArgv(fallbackScript, forwardedArgs), taskShellEnv(env, cwd), cwd);
+    };
+
+    if (segments.length === 1) {
+        const seg = segments[0];
+        if (!seg?.bin) return 0;
+        // Preserve the original quoting/expansion when the whole script falls back.
+        return executeSegment(seg, extraArgs, fullScript);
     }
 
     // Pipeline: && / || / ; on previous segment (unsupported ops already rejected).
@@ -970,45 +975,10 @@ async function execCommand(
             if (!shouldRun) continue;
         }
         const isLast = i === segments.length - 1;
-        const segArgs = isLast ? [...seg.args, ...extraArgs] : seg.args;
-
-        // Handle deno run/task in multi-segment too
-        if (seg.bin === 'deno' && seg.args[0] === 'run') {
-            const stripped = stripDenoRunFlags(seg.args.slice(1));
-            if (!stripped.length) {
-                console.error('[task] `deno run` with no entry file');
-                prevCode = 1;
-            } else {
-                prevCode = await execRun(isLast ? [...stripped, ...extraArgs] : stripped, env, cwd, forwardedArgs);
-            }
-        } else if (seg.bin === 'deno' && seg.args[0] === 'task') {
-            prevCode = await execTask(isLast ? [...seg.args.slice(1), ...extraArgs] : seg.args.slice(1), env, cwd, forwardedArgs);
-        } else if (seg.bin === 'deno') {
-            prevCode = await rawExec([os.exePath, ...forwardedArgs, ...segArgs], taskShellEnv(env, cwd), cwd);
-        } else if (seg.bin === 'node') {
-            const argv = nodeCommandArgv(segArgs, os.exePath, forwardedArgs);
-            prevCode = await rawExec(argv, taskShellEnv(env, cwd), cwd);
-        } else {
-            const resolved = resolver.resolve(seg.bin, cwd);
-            if (!resolved) {
-                prevCode = await rawExec(taskShellArgv(segmentCommand(seg.bin, segArgs), forwardedArgs), taskShellEnv(env, cwd), cwd);
-            } else {
-                prevCode = await execBinary(resolved, segArgs, env, cwd, forwardedArgs);
-            }
-        }
-
+        const trailingArgs = isLast ? extraArgs : [];
+        prevCode = await executeSegment(seg, trailingArgs, segmentCommand(seg.bin, [...seg.args, ...trailingArgs]));
     }
     return prevCode;
-}
-
-async function execRun(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...taskShellEnv(env, cwd), PWD: cwd };
-    return runTaskChild([os.exePath, ...forwardedArgs, 'run', ...args], mergedEnv, cwd);
-}
-
-async function execTask(args: string[], env: Record<string, string>, cwd: string, forwardedArgs: string[] = []): Promise<number> {
-    const mergedEnv = { ...os.environ(), ...taskShellEnv(env, cwd), PWD: cwd };
-    return runTaskChild([os.exePath, ...forwardedArgs, 'task', ...args], mergedEnv, cwd);
 }
 
 function chmodExecutableQuietly(path: string): void {
@@ -1028,23 +998,21 @@ async function execBinary(
 ): Promise<number> {
     // Nested tools (npm-run-all → vue-tsc) resolve via PATH; keep .bin first.
     const pathEnv = taskShellEnv(env, cwd);
-    const mergedEnv = { ...os.environ(), ...pathEnv, PWD: cwd };
-    const isWin = isWindows;
 
     log.debug('task', () => `exec bin: entry=${resolved.entry} binPath=${resolved.binPath} fallback=${resolved.fallback} reason=${resolved.reason ?? ''}`);
 
     if (resolved.fallback) {
         // Couldn't parse the wrapper script — fall back to cmd.exe / sh
-        if (isWin || resolved.binPath.toLowerCase().endsWith('.cmd') || resolved.binPath.toLowerCase().endsWith('.bat')) {
-            return rawExec(['cmd', '/c', resolved.binPath, ...args], mergedEnv, cwd);
+        if (isWindows || resolved.binPath.toLowerCase().endsWith('.cmd') || resolved.binPath.toLowerCase().endsWith('.bat')) {
+            return rawExec(['cmd', '/c', resolved.binPath, ...args], pathEnv, cwd);
         }
         // Unix fallback: make executable
         chmodExecutableQuietly(resolved.binPath);
-        return rawExec([resolved.binPath, ...args], mergedEnv, cwd);
+        return rawExec([resolved.binPath, ...args], pathEnv, cwd);
     }
 
     // Run the JS entry through the same CLI path as user files.
-    return rawExec([os.exePath, `--lock-dir=${cwd}`, ...forwardedArgs, 'run', resolved.entry, ...args], mergedEnv, cwd);
+    return rawExec([os.exePath, `--lock-dir=${cwd}`, ...forwardedArgs, 'run', resolved.entry, ...args], pathEnv, cwd);
 }
 
 async function rawExec(argv: string[], env: Record<string, string>, cwd: string): Promise<number> {
@@ -1297,121 +1265,77 @@ export class TaskRunner {
     }
 }
 
-function taskRunnerForConfig(
-    configPath: string,
+interface TaskConfig {
+    tasks: Record<string, TaskDef>;
+    taskSources: Record<string, TaskSource>;
+    packageMetadata?: TaskPackageMetadata;
+}
+
+function mergeTaskConfig(configPath: string, merged: TaskConfig, explicit: boolean): boolean {
+    if (!fs.exists(configPath)) return false;
+    try {
+        const source: TaskSource = basename(configPath) === 'package.json' ? 'package' : 'deno';
+        const text = readText(configPath);
+        const config = safeParse<TaskConfigFile>(source === 'package' ? text : stripJsonc(text));
+        if (source === 'package' && config) {
+            merged.packageMetadata = {
+                path: toPosixPath(configPath),
+                name: config.name === undefined ? undefined : String(config.name),
+                version: config.version === undefined ? undefined : String(config.version),
+                config: config.config,
+            };
+        }
+        const tasks = source === 'package' ? config?.scripts : config.tasks;
+        // Discovery stops at an object field, including an empty one. An explicit
+        // config retains Object.entries coercion and must produce tasks below.
+        if (!explicit && (!tasks || typeof tasks !== 'object')) return false;
+        for (const [name, command] of Object.entries(tasks ?? {})) {
+            merged.tasks[name] = source === 'package' ? String(command) : command;
+            merged.taskSources[name] = source;
+        }
+        return true;
+    } catch (e) {
+        log.warn('task', () => `Failed to parse ${configPath}: ${errMsg(e)}`);
+        return false;
+    }
+}
+
+function taskRunnerForConfigs(
+    configPaths: string[],
     startDir: string,
     lockStore: LockStore,
     options: LoadTasksOptions,
 ): { runner: TaskRunner; configPath: string } | null {
-    if (!fs.exists(configPath)) return null;
-    const merged: Record<string, TaskDef> = {};
-    const taskSources: Record<string, TaskSource> = {};
-    let packageMetadata: TaskPackageMetadata | undefined;
-    try {
-        const base = basename(configPath);
-        if (base === 'package.json') {
-            const pkg = safeParse<{ name?: unknown; version?: unknown; config?: unknown; scripts?: Record<string, string> }>(readText(configPath));
-            if (pkg) {
-                packageMetadata = {
-                    path: toPosixPath(configPath),
-                    name: pkg.name === undefined ? undefined : String(pkg.name),
-                    version: pkg.version === undefined ? undefined : String(pkg.version),
-                    config: pkg.config,
-                };
-            }
-            for (const [k, v] of Object.entries(pkg?.scripts ?? {})) {
-                merged[k] = String(v);
-                taskSources[k] = 'package';
-            }
-        } else {
-            const cfg = safeParse<DenoConfig>(stripJsonc(readText(configPath)));
-            for (const [k, v] of Object.entries(cfg.tasks ?? {})) {
-                merged[k] = v;
-                taskSources[k] = 'deno';
-            }
-        }
-    } catch (e) {
-        log.warn('task', () => `Failed to parse ${configPath}: ${errMsg(e)}`);
-        return null;
+    const merged: TaskConfig = { tasks: {}, taskSources: {} };
+    let configPath = '';
+    for (const path of configPaths) {
+        if (mergeTaskConfig(path, merged, !!options.configPath)) configPath = path;
     }
-    if (!Object.keys(merged).length) return null;
-    const configDir = dirname(configPath);
-    const runCwd = options.runCwd ?? configDir;
+    if (!configPath || (options.configPath && !Object.keys(merged.tasks).length)) return null;
+    const runCwd = options.runCwd ?? dirname(configPath);
     const initCwd = options.initCwd ?? toPosixPath(startDir);
-    return { runner: new TaskRunner(merged, runCwd, lockStore, { ...options, initCwd, taskSources, packageMetadata }), configPath };
+    return {
+        runner: new TaskRunner(merged.tasks, runCwd, lockStore, {
+            ...options, initCwd, taskSources: merged.taskSources, packageMetadata: merged.packageMetadata,
+        }),
+        configPath,
+    };
 }
 
 /** Find and load the nearest deno.json/deno.jsonc or package.json containing tasks. */
 export function loadTasks(startDir: string, lockStore: LockStore, options: LoadTasksOptions = {}): { runner: TaskRunner; configPath: string } | null {
     if (options.configPath) {
-        return taskRunnerForConfig(toPosixPath(options.configPath), startDir, lockStore, options);
+        return taskRunnerForConfigs([toPosixPath(options.configPath)], startDir, lockStore, options);
     }
     let dir = toPosixPath(startDir);
     const isWin = isWindows;
     while (true) {
-        // Collect tasks from both deno.json and package.json (deno.json takes priority)
-        const merged: Record<string, TaskDef> = {};
-        const taskSources: Record<string, TaskSource> = {};
-        let packageMetadata: TaskPackageMetadata | undefined;
-        let found = false;
-        let configPath = '';
-
-        // package.json "scripts" — loaded first so deno.json can override
-        const pkgP = joinPaths(dir, 'package.json');
-        if (fs.exists(pkgP)) {
-            try {
-                const pkg = safeParse<{ name?: unknown; version?: unknown; config?: unknown; scripts?: Record<string, string> }>(readText(pkgP));
-                if (pkg) {
-                    packageMetadata = {
-                        path: toPosixPath(pkgP),
-                        name: pkg.name === undefined ? undefined : String(pkg.name),
-                        version: pkg.version === undefined ? undefined : String(pkg.version),
-                        config: pkg.config,
-                    };
-                }
-                if (pkg?.scripts && typeof pkg.scripts === 'object') {
-                    for (const [k, v] of Object.entries(pkg.scripts)) {
-                        merged[k] = String(v);
-                        taskSources[k] = 'package';
-                    }
-                    found = true;
-                    configPath = pkgP;
-                }
-            } catch (e) {
-                log.warn('task', () => `Failed to parse ${pkgP}: ${errMsg(e)}`);
-            }
-        }
-
-        // deno.json / deno.jsonc — overrides package.json on conflict
-        for (const name of ['deno.json', 'deno.jsonc']) {
-            const p = joinPaths(dir, name);
-            if (!fs.exists(p)) continue;
-            try {
-                const cfg = safeParse<DenoConfig>(stripJsonc(readText(p)));
-                if (cfg.tasks && typeof cfg.tasks === 'object') {
-                    for (const [k, v] of Object.entries(cfg.tasks)) {
-                        merged[k] = v;
-                        taskSources[k] = 'deno';
-                    }
-                    found = true;
-                    configPath = p;  // deno.json is the primary config
-                }
-            } catch (e) {
-                log.warn('task', () => `Failed to parse ${p}: ${errMsg(e)}`);
-            }
-        }
-
-        if (found) {
-            return {
-                runner: new TaskRunner(merged, options.runCwd ?? dir, lockStore, {
-                    ...options,
-                    initCwd: options.initCwd ?? toPosixPath(startDir),
-                    taskSources,
-                    packageMetadata,
-                }),
-                configPath,
-            };
-        }
+        // Later configs override earlier tasks, while keeping package metadata.
+        const loaded = taskRunnerForConfigs(
+            ['package.json', 'deno.json', 'deno.jsonc'].map(name => joinPaths(dir, name)),
+            startDir, lockStore, { ...options, runCwd: options.runCwd ?? dir },
+        );
+        if (loaded) return loaded;
 
         const up = dirname(dir);
         if (up === dir) break;

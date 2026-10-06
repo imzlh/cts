@@ -103,12 +103,14 @@ export class Transformer {
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
-                return this.runCapture(
-                    code, filename,
-                    kind !== KIND_JSX,
-                    kind === KIND_TSX || kind === KIND_JSX,
-                    mapKey,
-                );
+                return {
+                    code: this.run(
+                        code, filename,
+                        kind !== KIND_JSX,
+                        kind === KIND_TSX || kind === KIND_JSX,
+                        mapKey,
+                    ),
+                };
             }
             case KIND_JSON: return { code: `export default ${code};` };
             default:
@@ -223,28 +225,6 @@ export class Transformer {
                 this.jsxFragmentPragma,
                 keepUnusedImports,
             );
-        } catch (e) {
-            throw this.toTransformError(e, filename);
-        }
-    }
-
-    private runCapture(
-        code: string,
-        filename: string,
-        isTypeScriptEnabled: boolean,
-        isJSXEnabled: boolean,
-        mapKey?: string,
-    ): { code: string; sourceMap?: object } {
-        try {
-            const codeOut = transformCnoCode(
-                code,
-                mapKey ?? filename,
-                isTypeScriptEnabled,
-                isJSXEnabled,
-                this.jsxPragma,
-                this.jsxFragmentPragma,
-            );
-            return { code: codeOut };
         } catch (e) {
             throw this.toTransformError(e, filename);
         }

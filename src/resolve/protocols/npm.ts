@@ -1658,20 +1658,7 @@ export class NpmHandler implements ProtocolHandler {
             const dir = joinPaths(this.cacheDir, `${name}@${cachedVer}`);
             if (fs.exists(joinPaths(dir, 'package.json'))) return;
         }
-        log.debug('npm', () => `fetch tarball URL ${name} <- ${url}`);
-        const fetchStarted = Date.now();
-        const tarRes = expectFetch(yield {
-            type: StepType.NET_FETCH,
-            url,
-            headers: npmAuthHeaders(url, this.getNpmCfg()),
-            timeout: this.cfg.requestTimeout,
-            onProgress,
-        });
-        if (tarRes.status < 200 || tarRes.status >= 300) {
-            throw err(ErrorKind.NetworkError, `HTTP ${tarRes.status} fetching tarball ${url}`);
-        }
-        const body = tarRes.body;
-        log.debug('npm', () => `fetched tarball URL ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - fetchStarted}ms`);
+        const body = yield* this.fetchTarball(`URL ${name}`, url, onProgress);
         const files = expectTarFiles(yield { type: StepType.ARCHIVE_UNTAR_GZ, data: body });
         // Tag with URL hash so two dist pins with the same package.json version
         // never share a store directory (wrong content / silent reuse).
@@ -1713,20 +1700,18 @@ export class NpmHandler implements ProtocolHandler {
         }
         // Hollow/partial extract (no package.json): never mark prepared.
         if (!fs.exists(joinPaths(dir, 'package.json'))) return;
-        const nextPath = new Set(cyclePath);
-        nextPath.add(key);
         this.linkCacheAlias(name, dir);
         yield* this.indexInstalledBins(name, ver, dir);
         // Warm re-cache: complete package-local views skip recursive dep walks.
         if (this.isPackageViewComplete(dir)) {
             this.dependenciesChecked.add(key);
-            this.queueLifecycleScripts(name, ver, dir);
-            this.packagesPrepared.add(key);
-            return;
+        } else {
+            const nextPath = new Set(cyclePath);
+            nextPath.add(key);
+            yield* this.installDependencies(name, ver, dir, onProgress, nextPath);
+            yield* this.installPeerDeps(dir, name, ver, onProgress, nextPath);
+            yield* this.installOptionalDeps(dir, onProgress, nextPath);
         }
-        yield* this.installDependencies(name, ver, dir, onProgress, nextPath);
-        yield* this.installPeerDeps(dir, name, ver, onProgress, nextPath);
-        yield* this.installOptionalDeps(dir, onProgress, nextPath);
         this.queueLifecycleScripts(name, ver, dir);
         // Mark prepared only after deps succeed so a failed github: child can
         // retry on the next resolve instead of leaving a hollow package.
@@ -1752,13 +1737,8 @@ export class NpmHandler implements ProtocolHandler {
                 // github:/tarball pins land in URL-tagged store dirs (+u…).
                 // A plain registry copy must not count as "complete".
                 if (isOpaqueVersionRange(range)) {
-                    try {
-                        const real = fs.realpath(linked);
-                        const id = this.storePackageId(real);
-                        return !!id && isUrlStoreVersion(id.version);
-                    } catch {
-                        return false;
-                    }
+                    const id = this.storePackageId(fs.realpath(linked));
+                    return !!id && isUrlStoreVersion(id.version);
                 }
                 const child = readPkg(linked);
                 return !!child && localPackageMatchesRange(child.version, range);
@@ -2024,6 +2004,23 @@ export class NpmHandler implements ProtocolHandler {
         yield { type: StepType.FS_WRITE_TEXT, path: cacheTs, text: String(Date.now()) };
     }
 
+    private *fetchTarball(label: string, url: string, onProgress?: ProgressCallback): Flow<Uint8Array> {
+        log.debug('npm', () => `fetch tarball ${label} <- ${url}`);
+        const started = Date.now();
+        const response = expectFetch(yield {
+            type: StepType.NET_FETCH,
+            url,
+            headers: npmAuthHeaders(url, this.getNpmCfg()),
+            timeout: this.cfg.requestTimeout,
+            onProgress,
+        });
+        if (response.status < 200 || response.status >= 300) {
+            throw err(ErrorKind.NetworkError, `HTTP ${response.status} fetching tarball ${url}`);
+        }
+        log.debug('npm', () => `fetched tarball ${label} ${fmtBytes(response.body.byteLength)} in ${Date.now() - started}ms`);
+        return response.body;
+    }
+
     /** Fetch+extract registry tarball only — dep walks stay outside the FLOW key. */
     private *installPackageBody(name: string, ver: string, dir: string, onProgress?: ProgressCallback): Flow<void> {
         if (fs.exists(joinPaths(dir, 'package.json'))) return;
@@ -2032,14 +2029,7 @@ export class NpmHandler implements ProtocolHandler {
         const dist = meta.versions[ver]?.dist;
         const tarball = dist?.tarball;
         if (!tarball) throw err(ErrorKind.VersionNotFound, `Version ${ver} not found for ${name}`);
-        log.debug('npm', () => `fetch tarball ${name}@${ver} <- ${tarball}`);
-        const fetchStarted = Date.now();
-        const tarRes = expectFetch(yield { type: StepType.NET_FETCH, url: tarball, headers: npmAuthHeaders(tarball, this.getNpmCfg()), timeout: this.cfg.requestTimeout, onProgress });
-        if (tarRes.status < 200 || tarRes.status >= 300) {
-            throw err(ErrorKind.NetworkError, `HTTP ${tarRes.status} fetching tarball ${tarball}`);
-        }
-        const body = tarRes.body;
-        log.debug('npm', () => `fetched tarball ${name}@${ver} ${fmtBytes(body.byteLength)} in ${Date.now() - fetchStarted}ms`);
+        const body = yield* this.fetchTarball(`${name}@${ver}`, tarball, onProgress);
         verifyRegistryTarball(body, dist, name, ver);
         if (fs.exists(joinPaths(dir, 'package.json'))) return;
         log.debug('npm', () => `extract ${name}@${ver} ${fmtBytes(body.byteLength)}`);
@@ -2109,10 +2099,6 @@ export class NpmHandler implements ProtocolHandler {
 
         const pkg = readPkg(dir);
         const deps = pkg?.dependencies;
-        if (!deps) {
-            this.dependenciesChecked.add(key);
-            return;
-        }
         // Names also listed in optionalDependencies are installed as optional only.
         const optional = pkg?.optionalDependencies;
         const required: Record<string, string> = Object.create(null);
@@ -2121,20 +2107,18 @@ export class NpmHandler implements ProtocolHandler {
             required[depName] = deps[depName]!;
         }
         const depNames = recordKeysForLog(required);
-        if (!depNames) {
-            this.dependenciesChecked.add(key);
-            return;
+        if (depNames) {
+            log.debug('npm', () => `deps for ${key}: ${depNames}`);
+            const flows: Flow<void>[] = [];
+            for (const depName in required) {
+                // `"key": "npm:real@range"` installs `real`, but links under `key`.
+                const target = npmDepTarget(depName, required[depName]!);
+                flows.push(this.installDependency(
+                    dir, name, ver, target.name, target.range, onProgress, cyclePath, target.linkName,
+                ));
+            }
+            yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
         }
-        log.debug('npm', () => `deps for ${key}: ${depNames}`);
-        const flows: Flow<void>[] = [];
-        for (const depName in required) {
-            // `"key": "npm:real@range"` installs `real`, but links under `key`.
-            const target = npmDepTarget(depName, required[depName]!);
-            flows.push(this.installDependency(
-                dir, name, ver, target.name, target.range, onProgress, cyclePath, target.linkName,
-            ));
-        }
-        yield { type: StepType.FLOW_ALL, flows, concurrency: this.packageInstallConcurrency() };
         // Only after a full successful walk — a mid-flight github: failure must retry.
         this.dependenciesChecked.add(key);
     }
