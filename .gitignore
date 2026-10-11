@@ -2,6 +2,8 @@ package-lock.json
 package-lock.yaml
 test.json
 dist.js
+dist.min.js
+SHA256SUMS.txt
 cjs
 node_modules/
 types/

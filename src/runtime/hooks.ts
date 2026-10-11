@@ -31,17 +31,7 @@ function hasSyntaxSourceCause(error: SyntaxError): boolean {
     return !!cause && typeof cause === 'object' && Reflect.get(cause, 'source') instanceof SyntaxError;
 }
 
-/** The URL node reports on a failed `import()`, or undefined when node omits it.
- *
- *  Measured against node v24.18.0: `url` is present exactly when the specifier
- *  named a *location* — an absolute file URL, or a relative path resolved
- *  against the importer — and absent when it named a *package*:
- *
- *    import('file:///D:/no/such/x.mjs')  → url 'file:///D:/no/such/x.mjs'
- *    import('./missing.mjs')            → url of the resolved absolute path
- *    import('no-such-pkg')              → no url ("Cannot find package …")
- *
- *  So a bare specifier returns undefined here rather than a fabricated URL. */
+/** Failed imports expose a URL for locations, but not bare package names. */
 function importUrlFor(spec: string, parent: string): string | undefined {
     // Already a URL (file:, http:, data:, npm:, pack:, …) — node echoes it back.
     if (spec.includes('://') || isProtocolSpec(spec)) return spec;
@@ -59,20 +49,7 @@ function importUrlFor(spec: string, parent: string): string | undefined {
     return undefined;
 }
 
-/** Give a failed `import()` the shape node gives it: ERR_MODULE_NOT_FOUND plus
- *  a `url`. Node uses two different codes for the same miss depending on the
- *  loader — `require()` reports MODULE_NOT_FOUND (which is what codeForKind
- *  hands out, and what cno already got right), while `import()` reports
- *  ERR_MODULE_NOT_FOUND. This is the import side, so it upgrades.
- *
- *  A more specific code already on the inner error wins: pkg.ts raises
- *  ERR_PACKAGE_PATH_NOT_EXPORTED and resolve/protocols/node.ts raises
- *  ERR_UNKNOWN_BUILTIN_MODULE, both of which node also reports in preference to
- *  a generic not-found. Only the two default resolution-miss codes get
- *  overwritten, so anything ERR_-prefixed is treated as deliberate.
- *
- *  Exported for tests/cts/import-error-code.test.ts — cts/src is baked into the
- *  binary, so the unit is the only layer where this is verifiable pre-rebuild. */
+/** Use ESM's ERR_MODULE_NOT_FOUND while preserving specific ERR_* causes. */
 export function esmResolveError(spec: string, parent: string, cause: unknown, kind: ErrorKind): Error {
     const inner = cause instanceof Error ? Reflect.get(cause, 'code') : undefined;
     const specific = typeof inner === 'string' && inner.startsWith('ERR_') ? inner : undefined;

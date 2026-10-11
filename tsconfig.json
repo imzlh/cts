@@ -2,7 +2,7 @@
     // Visit https://aka.ms/tsconfig to read more about this file
     "compilerOptions": {
         // File Layout
-        "rootDir": "./",
+        "rootDir": "../",
         "outDir": "./dist",
         // Environment Settings
         // See also https://aka.ms/tsconfig/module
@@ -11,8 +11,7 @@
         "moduleResolution": "bundler",
         "resolveJsonModule": true,
         "allowSyntheticDefaultImports": true,
-        // Empty typeRoots: do not auto-load @types/*. circu.js ambients come
-        // from hardlinked types/ (same files as circu.js/types).
+        // Load the pinned runtime declarations explicitly, without host @types.
         "typeRoots": [],
         // For nodejs:
         "lib": [
@@ -53,10 +52,14 @@
         "out": "../api/",
         "disableSources": true
     },
+    "files": [
+        "node_modules/.cache/cno-types/lib.deno.d.ts",
+        "../circu.js/types/index.d.ts"
+    ],
     "include": [
         "main.ts",
         "src/**/*.ts",
-        "types/**/*.d.ts"
+        "../circu.js/types/**/*.d.ts"
     ],
     "exclude": ["deps/sucrase/**/*", "tests/**/*"]
 }

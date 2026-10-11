@@ -1,0 +1,58 @@
+name: Build JavaScript
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  javascript:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cts
+          submodules: recursive
+      # CTS consumes native declarations without building the native runtime.
+      - uses: actions/checkout@v4
+        with:
+          repository: imzlh/circu.js
+          ref: 8df0b515762350a1cb29731655c9ecca39edc098
+          path: circu.js
+          sparse-checkout: types
+      - uses: actions/checkout@v4
+        with:
+          repository: imzlh/cno-stdhttp
+          ref: 219d3e077418e8d8135c03857611e5409b1a3354
+          path: http
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: cts/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: cts/pnpm-lock.yaml
+      - name: Install frozen JavaScript dependencies
+        run: pnpm install --frozen-lockfile --registry=https://registry.npmjs.org
+      - name: Check types and build both JavaScript bundles
+        run: |
+          pnpm run type-check
+          pnpm run build
+          pnpm run min-build
+          node --check dist.js
+          node --check dist.min.js
+          sha256sum dist.js dist.min.js > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cts-javascript
+          path: |
+            cts/dist.js
+            cts/dist.min.js
+            cts/SHA256SUMS.txt
+          if-no-files-found: error

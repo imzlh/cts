@@ -65,11 +65,7 @@ export interface CompileTarget {
     identity?: string;
 }
 
-// The eval filename is baked into the bytecode atom table, so it must equal the
-// filename the runtime would use compiling the same module fresh: CjsLoader evals
-// under the host localPath, ESM under specPath. Pack overrides both with its
-// `pack:` id — a host path there leaks the build machine's directory layout into
-// every distributed container.
+// Match fresh compilation identities; packs override host paths with pack: ids.
 const compileIdentity = (m: CompileTarget): string =>
     m.identity ?? (m.format === 'cjs' ? m.localPath : m.specPath);
 
@@ -130,17 +126,8 @@ function isWorkerReady(value: unknown): boolean {
     return isRecord(value) && value.__cts_parse_ready === true;
 }
 
-function availableParallelism(): number {
-    try {
-        const n = Number(os.availableParallelism ? os.availableParallelism() : 1);
-        return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
-    } catch {
-        return 1;
-    }
-}
-
 function workersForTier(tier: MemoryTier): number {
-    const cores = availableParallelism();
+    const cores = os.availableParallelism();
     if (tier === 'low' || cores <= 1) return 0;
     const transformCores = cores - 1;
     if (tier === 'normal') return Math.min(2, transformCores);
@@ -405,12 +392,7 @@ export class ParseDriver {
         }
     }
 
-    /**
-     * Import extraction for dep scan.
-     * oxc is native and cheap on the main thread — worker IPC dominates for 1k+
-     * small files and shows up as main-thread 100% (resolve + wait). Workers only
-     * help when falling back to Sucrase (no oxc).
-     */
+    // OXC scans stay on main: worker IPC costs more than the native scan.
     async scanFile(localPath: string, lang?: string, strict = false): Promise<string[]> {
         if (this.closing) throw new ParseWorkerError('parse worker pool is closing');
         if (this.workerFailure) throw this.workerFailure;
@@ -815,12 +797,11 @@ export class ParseDriver {
         for (const task of this.scanQueue) this.taskRetries.delete(task.id);
         this.scanQueue.length = 0;
 
-        while (this.pending.length > 0) {
-            const task = this.pending.shift();
-            if (!task) break;
+        for (const task of this.pending) {
             this.specMap.delete(task.id);
             this.taskRetries.delete(task.id);
         }
+        this.pending.length = 0;
 
         for (const taskId of [...this.taskInfo.keys()]) {
             const taken = this.takeTask(taskId);

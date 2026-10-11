@@ -9,6 +9,7 @@ import { ModuleResolver } from '../resolve/index';
 import { LockStore } from '../lock';
 import { materializeNodeModules } from '../resolve/linker';
 import { guessFileKind, isTypeDecl } from '../resolve/protocols/base';
+import { isScannablePath } from '../scan';
 import { isRemote } from '../source/cache';
 import { moduleRef, type FileKind, type ModuleFormat, type ModuleInfo, type NodeBuiltinResolver, type RuntimeConfig } from '../types';
 import { PrecacheProgress, clearNegativeCache, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, npmNameVersion, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
@@ -83,38 +84,16 @@ function runtimeErrorInfo(error: unknown): { name: string; message: string; stac
     return { name: 'Error', message: String(error) };
 }
 
-/**
- * Slot published by the CLI entry (src/main.ts) so the runtime can ask for a
- * nonzero process status WITHOUT stopping the event loop.
- *
- * A Symbol slot rather than an import because the dependency runs the wrong way:
- * cts is a library and must not import the CLI entry, and only that entry owns
- * the exit machinery. Absent slot = no-op, which is what a worker, a `cno test`
- * child, and cts-embedded-as-a-library all want.
- */
+// The CLI owns exit status; workers and library embeddings may omit this hook.
 const REQUEST_EXIT_CODE_SLOT = Symbol.for('cno.runtime.requestExitCode');
 
-/**
- * Report "this run failed" to the host, non-fatally.
- *
- * Node's measured contract for an unhandled async error (v24.18.0): with no
- * handler it prints the error, exits 1, and STOPS the loop — a `MARK` scheduled
- * after the throw never prints. cno deliberately keeps the loop running and only
- * takes the exit code, because the stop-the-loop version is implemented by
- * returning `false` from this receiver, which reaches TJS_Stop (utils.c:180) and
- * would kill a whole `cno test` file mid-suite on any async throw in any test.
- *
- * So the return values below are unchanged; only the status is taken. First
- * nonzero wins and an already-set `process.exitCode` is never clobbered — both
- * enforced on the host side in requestExitCode().
- */
+/** Mark failure without stopping the event loop and aborting a test suite. */
 function requestFailureExitCode(): void {
     try {
         const fn = (globalThis as unknown as Record<symbol, unknown>)[REQUEST_EXIT_CODE_SLOT];
         if (typeof fn === 'function') (fn as (code: number) => void)(1);
     } catch {
-        // No host machinery (worker, test child, library embedding): the
-        // diagnostic above is the whole of the reporting.
+        // Host reporting must not interrupt the event receiver.
     }
 }
 
@@ -164,45 +143,7 @@ function lifecyclePathValue(cwd: string, existing: string, sep: string, nodeShim
 }
 
 function isPrecompilePath(filename: string): boolean {
-    const length = filename.length;
-    if (length < 3) return false;
-    // Native addons / non-JS: never bytecode-compile (.node already fails the
-    // extension checks below; keep the guard explicit for clarity).
-    if (length >= 5 &&
-        filename.charCodeAt(length - 5) === 46 &&
-        filename.charCodeAt(length - 4) === 110 &&
-        filename.charCodeAt(length - 3) === 111 &&
-        filename.charCodeAt(length - 2) === 100 &&
-        filename.charCodeAt(length - 1) === 101) {
-        return false;
-    }
-    // Type declarations are not runtime modules.
-    if (isTypeDecl(filename)) return false;
-    const last = filename.charCodeAt(length - 1);
-    if (last === 115) {
-        const prev = filename.charCodeAt(length - 2);
-        // .ts / .mts / .cts
-        if (prev === 116) {
-            const third = filename.charCodeAt(length - 3);
-            if (third === 46) return true;
-            return length >= 4 &&
-                (third === 109 || third === 99) &&
-                filename.charCodeAt(length - 4) === 46;
-        }
-        // .js / .mjs / .cjs
-        if (prev !== 106) return false;
-        const third = filename.charCodeAt(length - 3);
-        return third === 46 ||
-            (length >= 4 &&
-                (third === 109 || third === 99) &&
-                filename.charCodeAt(length - 4) === 46);
-    }
-    if (last !== 120 || length < 4) return false;
-    const prev = filename.charCodeAt(length - 2);
-    if (prev !== 115) return false;
-    const third = filename.charCodeAt(length - 3);
-    return (third === 116 || third === 106) &&
-        filename.charCodeAt(length - 4) === 46;
+    return isScannablePath(filename) && !isTypeDecl(filename);
 }
 
 /** Empty modules for every import edge during precache bytecode compile. */
@@ -372,7 +313,6 @@ export class TypeScriptRuntime {
 
         this.hookEvents();
 
-        // Register handler cache cleanup
         this.resources.register(() => this.resolver.clearHandlerCaches());
     }
 
@@ -402,20 +342,11 @@ export class TypeScriptRuntime {
         }
     }
 
-    // Event hooks (unhandled rejections, job exceptions)
-
     private hookEvents(): void {
         const trace = new Set<unknown>();
 
-        // The webapi bridge must be on the bus before diagnostics, so that a
-        // user's preventDefault() can suppress the "Uncaught" warning below.
-        // No-op once cno/src/webapi/index.ts registers under WEBAPI_ROLE.
+        // User handlers run before diagnostics so they can mark errors handled.
         installWebApiCompatBridge();
-
-        // EV_UNHANDLED_REJECTION was never bridged to node's `process`, so
-        // `process.on('unhandledRejection')` never fired while this receiver
-        // printed its warning. Registers above PRIORITY_DIAGNOSTICS so a
-        // delivered rejection can set ctx.handled and silence that warning.
         installNodeProcessRejectionBridge();
 
         installEventReceiver('cts-diagnostics', (name: number, data: unknown, ctx) => {
@@ -437,25 +368,13 @@ export class TypeScriptRuntime {
                         return false;
                     }
                 }
-                // A listener called preventDefault(), or the node rejection
-                // bridge delivered to a `process.on('unhandledRejection')`
-                // handler: the rejection is handled, so neither the alarming
-                // diagnostic nor the nonzero status applies. Node agrees —
-                // with a handler present it prints nothing and exits 0
-                // (OBSERVED v24.18.0).
                 if (ctx.handled) return false;
                 if (trace.size > 20) trace.clear();
                 else if (trace.has(r)) return false;
                 trace.add(r);
                 log.warn('runtime', formatError(r, 'unhandled promise rejection'));
-                // Unhandled: node exits 1. Take the status but keep the loop
-                // alive (see requestFailureExitCode). Reached only after the
-                // ctx.handled and dedup guards above, so a handled rejection and
-                // a re-dispatch of the same one cannot request it.
                 requestFailureExitCode();
-                // POLARITY: vm.c:242 raises JS_EXCEPTION on any non-false, so
-                // `false` is "do not abort" for a rejection — inverted from
-                // JOB_EXCEPTION below. Unchanged by the status request.
+                // Native polarity: false continues after a rejection.
                 return false;
             }
             if (name === ET.JOB_EXCEPTION) {
@@ -474,40 +393,16 @@ export class TypeScriptRuntime {
                         return true;
                     }
                 }
-                // A 'uncaughtException' handler dealt with it (process/mod.ts
-                // sets ctx.handled at PRIORITY_NODE_PROCESS, which dispatches
-                // before this receiver): node exits 0 in that case, so no status.
                 if (ctx.handled) return true;
                 log.warn('runtime', formatError(data, 'unhandled job exception'));
-                // Unhandled: node exits 1. Take the status only.
                 requestFailureExitCode();
-                // POLARITY: utils.c:180 calls TJS_Stop when this returns FALSE,
-                // and TJS_Stop itself forces exit_code 1 (vm.c:932-938) — which
-                // would match node exactly, loop-stop included. Deliberately NOT
-                // done: it would kill a whole `cno test` file mid-suite on any
-                // async throw. `true` = keep running.
+                // Native polarity: true continues after a job exception.
                 return true;
             }
-            // Not ours. Return `undefined`, NOT `false`: dispatch is
-            // highest-priority-first and the LAST explicit boolean wins
-            // (event-mux.ts:159), so a `false` from this receiver — which sits at
-            // PRIORITY_DIAGNOSTICS (0), with only the REPL's PRIORITY_FALLBACK
-            // band below it — overwrites the opinion of every receiver above.
-            //
-            // Concretely reachable: EV_BEFORE_UNLOAD (private.h:172) is
-            // dispatched by the C (vm.c:851) and is absent from the mux's EV map,
-            // so it falls through to here. vm.c:863 treats only an explicit
-            // `true` as "cancelled, keep running", so a future beforeunload
-            // bridge returning `true` to cancel teardown would have that cancel
-            // silently converted into a proceed. EV_EXIT and EV_LOAD land here
-            // too; their return values are freed and ignored by the C, so those
-            // are harmless today — but this receiver should not claim events it
-            // has no opinion about either way.
+            // Preserve other receivers' decisions, including beforeunload cancellation.
             return undefined;
         }, PRIORITY_DIAGNOSTICS);
     }
-
-    // Pre-cache: async parallel BFS, then full resource cleanup
 
     async precache(entrySpecPath: string, entryLocalPath: string): Promise<ScanResult> {
         return this.runPrecache((scanner) =>
@@ -548,11 +443,6 @@ export class TypeScriptRuntime {
             `transform=${oxc ? 'oxc+workers' : 'sucrase+workers'}, compile=main`);
 
         let result: ScanResult;
-        // One cleanup path for every exit. The post-scan flushLock() and the
-        // hasFresh() precompile gate below sat outside all cleanup: a throw there
-        // leaked the compile workers, held the libuv loop open, and hung
-        // `cno cache` instead of reporting the error. stop/terminate/release are
-        // each idempotent, so the removed per-branch calls are pure duplication.
         try {
             try {
                 log.debug('deps', () => 'scan begin');
@@ -711,13 +601,17 @@ export class TypeScriptRuntime {
 
             return result;
         } finally {
-            // Reached on every exit, including a throw from flushLock()/hasFresh().
-            // Leaking parseDriver here kept the libuv loop open and hung `cno cache`.
-            prog?.stop();
-            log.debug('precache', () => 'worker terminate begin');
-            await parseDriver.terminate();
-            log.debug('precache', () => 'worker terminate end');
-            this.resources.release();
+            try {
+                prog?.stop();
+            } finally {
+                try {
+                    log.debug('precache', () => 'worker terminate begin');
+                    await parseDriver.terminate();
+                    log.debug('precache', () => 'worker terminate end');
+                } finally {
+                    this.resources.release();
+                }
+            }
         }
     }
 
@@ -933,16 +827,11 @@ export class TypeScriptRuntime {
         clearImportMetaResolveCache();
         this.resolver.clearRuntimeCaches();
         this.resolver.clearHandlerCaches();
-        // The resolver owns the LockStore opened during construction.  Leaving
-        // it open keeps a SQLite handle (and its prepared statements) in the
-        // process-wide LockStore.openStores set until process exit, which is a
-        // leak for embedders that create and dispose runtimes repeatedly.
-        this.resolver.close();
-        // clearRuntimeCaches() only clears five resolver maps. Without this, the
-        // four createResourceManager() registrations never ran on the `cno pack`
-        // path (its only caller), leaving connection pools open — pooled sockets
-        // can hold the libuv loop open and stall exit. Idempotent.
-        this.resources.release();
+        try {
+            this.resolver.close();
+        } finally {
+            this.resources.release();
+        }
     }
 
     private reportSyntax(e: SyntaxError): never {

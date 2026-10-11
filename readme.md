@@ -163,18 +163,37 @@ cno cache --npm-mode=hard
 
 ## Development
 
-From the repository root:
+In a `cno-cli` checkout, the sibling repositories are already present. For a
+standalone CTS checkout, prepare the same layout from its parent directory:
 
 ```sh
-pnpm run type-check
+git clone --recurse-submodules https://github.com/imzlh/cts.git cts
+git clone --filter=blob:none --no-checkout https://github.com/imzlh/circu.js.git circu.js
+git -C circu.js sparse-checkout set types
+git -C circu.js checkout 8df0b515762350a1cb29731655c9ecca39edc098
+git clone https://github.com/imzlh/cno-stdhttp.git http
+git -C http checkout 219d3e077418e8d8135c03857611e5409b1a3354
 ```
 
-From this directory:
+Then, from `cts/`, use the pnpm version declared in `package.json`:
 
 ```sh
+pnpm install --frozen-lockfile
 pnpm run type-check
 pnpm run build
+pnpm run min-build
 ```
+
+Type checking uses the sibling `circu.js/types` declarations and downloads the
+SHA-256-verified Deno 2.9.0 declarations on first use. The latter are cached under
+`node_modules/.cache/cno-types/`; no untracked `types/` directory is required.
+The HTTP sibling supplies `@cnojs/http/dns-cache`. CTS does not require a CNO
+polyfill checkout to build these bundles.
+
+CI runs those commands on pushes and pull requests, then checks the JavaScript
+syntax. Pushing a `v*` tag publishes `dist.js`, `dist.min.js`, and
+`SHA256SUMS.txt` as GitHub Release assets. The bundles contain the `main.ts` CLI
+and run on `circu.js`; they retain its `import.meta.use` native API calls.
 
 The root CMake build bundles CTS into the final `cno` binary; this package is
 also useful as the loader implementation boundary during development.

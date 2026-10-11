@@ -216,7 +216,7 @@ async function fetchAsync(step: NetFetchStep): Promise<NetFetchResult> {
     configureCurl(curl, step);
     log.debug('fetch', () => `start ${step.url}`);
     const started = Date.now();
-    const res = await curl.perform()
+    const res = await curl.perform();
     log.debug('fetch', () => `done ${step.url} ${res.status} ${fmtBytes(res.body ? res.body.byteLength : 0)} ${Date.now() - started}ms`);
     return toResult(res);
 }
@@ -232,7 +232,6 @@ function fetchSync(step: NetFetchStep): NetFetchResult {
     return toResult(res);
 }
 
-/** Close all connection pools */
 export function closeConnectionPools(): void {
     if (asyncPool) {
         asyncPool.close();
@@ -253,7 +252,6 @@ function executeSync(step: Step): StepResult {
         case StepType.FS_READ_TEXT:
             return readText(step.path);
         case StepType.FS_READ_BYTES:
-            // Prefer VFS (pack:) — same as readText; raw fs misses overlays.
             return readBytes(step.path);
         case StepType.FS_WRITE_TEXT:
             writeText(step.path, step.text);
@@ -346,8 +344,7 @@ async function runNestedFlow(step: FlowStep): Promise<void> {
     }
     let active = activeFlows.get(step.key);
     if (!active) {
-        // Owner chain: create the shared promise. Nested work under this key
-        // must not re-yield the same key (see npm installOnce body vs prepare).
+        // A nested flow must not wait on its own coalescing key.
         active = runAsync(step.flow);
         activeFlows.set(step.key, active);
         try {
@@ -357,20 +354,25 @@ async function runNestedFlow(step: FlowStep): Promise<void> {
         }
         return;
     }
-    // Coalesce: other chains wait for the owner (safe; not same-chain re-await).
     await active;
 }
 
 async function runNestedFlows(flows: Flow<void>[], concurrency: number): Promise<void> {
     const count = Math.min(flows.length, Math.max(1, Math.floor(concurrency) || 1));
     let next = 0;
+    let failure: { error: unknown } | undefined;
     const worker = async () => {
-        while (next < flows.length) {
-            const flow = flows[next++];
-            if (flow) await runAsync(flow);
+        while (!failure && next < flows.length) {
+            try {
+                await runAsync(flows[next++]!);
+            } catch (error) {
+                failure ??= { error };
+            }
         }
     };
+    // Drain started work before the caller can release shared connection pools.
     await Promise.all(Array.from({ length: count }, () => worker()));
+    if (failure) throw failure.error;
 }
 
 export function runSync<T>(flow: Flow<T>): T {

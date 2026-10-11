@@ -425,43 +425,24 @@ export class LockStore {
     }
 
     close(): void {
-        this.applyPendingWrites();
-        const db = this.db;
-        if (!db) {
-            this.clearPendingWrites();
-            this.clearReadCaches();
-            if (!this.readOnly) this.cleanupSidecars();
-            LockStore.openStores.delete(this);
-            return;
-        }
         try {
-            this.finalizeStatements();
-            db.close();
-        }
-        finally {
-            this.db = null;
-            this.clearPendingWrites();
-            this.clearReadCaches();
-            if (!this.readOnly) this.cleanupSidecars();
-            LockStore.openStores.delete(this);
+            this.applyPendingWrites();
+        } finally {
+            this.closeFast();
         }
     }
 
     closeFast(): void {
         const db = this.db;
-        if (!db) {
-            this.clearReadCaches();
-            return;
-        }
         try {
             this.finalizeStatements();
-            db.close();
+            db?.close();
         }
         finally {
             this.db = null;
             this.clearPendingWrites();
             this.clearReadCaches();
-            if (!this.readOnly) this.cleanupSidecars();
+            if (db && !this.readOnly) this.cleanupSidecars();
             LockStore.openStores.delete(this);
         }
     }

@@ -10,8 +10,6 @@ export class ResourceManager {
     private done = false;
 
     register(fn: Cleanup): void {
-        // Already released (e.g. precache finished): run now instead of
-        // queueing into a list that will never be drained again.
         if (this.done) {
             try { fn(); }
             catch (e) { log.debug('resources', 'late cleanup error', e); }
@@ -25,11 +23,11 @@ export class ResourceManager {
         if (this.done) return;
         this.done = true;
 
-        for (let i = this.cleanups.length - 1; i >= 0; i--) {
-            try { this.cleanups[i]?.(); }
+        let cleanup: Cleanup | undefined;
+        while ((cleanup = this.cleanups.pop())) {
+            try { cleanup(); }
             catch (e) { log.debug('resources', 'cleanup error', e); }
         }
-        this.cleanups.length = 0;
     }
 
     get released(): boolean { return this.done; }
@@ -39,17 +37,9 @@ export class ResourceManager {
 export function createResourceManager(): ResourceManager {
     const mgr = new ResourceManager();
 
-    mgr.register(() => {
-        closeConnectionPools();
-    });
-
-    mgr.register(() => {
-        clearDnsCache();
-    });
-
-    mgr.register(() => {
-        clearPkgCache();
-    });
+    mgr.register(closeConnectionPools);
+    mgr.register(clearDnsCache);
+    mgr.register(clearPkgCache);
 
     mgr.register(() => {
         clearResolveCache();

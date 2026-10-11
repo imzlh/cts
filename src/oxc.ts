@@ -1,11 +1,9 @@
-import type CModuleExternalOxc from '../../ext-oxc/native';
 import { log, errMsg } from './utils';
 import { readEnv } from './utils/env';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const smap = import.meta.use('sourcemap');
-const console = import.meta.use('console');
 
 // ── oxc native extension types ────────────────────────────────────────────────
 
@@ -48,9 +46,6 @@ const OXC_SCAN_JS_OPTIONS: OxcOptions = { kind: 'js' };
 const OXC_SCAN_JSX_OPTIONS: OxcOptions = { kind: 'jsx' };
 const OXC_SCAN_TS_OPTIONS: OxcOptions = { kind: 'ts' };
 const OXC_SCAN_TSX_OPTIONS: OxcOptions = { kind: 'tsx' };
-const REGISTER_SYMBOL = Symbol.for('cjs.internal.register');
-
-type NativeRegister = (name: string, path: string) => void;
 
 export function isOxcModule(value: unknown): value is OxcModule {
     return value !== null
@@ -99,21 +94,13 @@ export class OxcTranspiler {
 
     /** Transpile to JS. mapKey = runtime id (sourcemap + Module name), not disk path. */
     transpile(source: string, filename: string, mapKey?: string, lang?: string): string | null {
-        try {
-            const kind = kindFromFilename(filename, lang);
-            const name = mapKey ?? filename;
-            const { code, sourceMap } = this.transpileFast
-                ? this.transpileFast(source, kind, name)
-                : this.transpileCompat(source, kind, name);
-            if (sourceMap) {
-                try { smap.loadJSON(name, sourceMap); }
-                catch (e) { log.debug('oxc', () => `smap: ${filename}: ${errMsg(e)}`); }
-            }
-            return code;
-        } catch (e) {
-            log.debug('oxc', () => `transpile failed for ${filename}: ${errMsg(e)}`);
-            return null;
+        const result = this.transpileCapture(source, filename, mapKey, lang);
+        if (!result) return null;
+        if (result.sourceMap) {
+            try { smap.loadJSON(mapKey ?? filename, result.sourceMap); }
+            catch (e) { log.debug('oxc', () => `smap: ${filename}: ${errMsg(e)}`); }
         }
+        return result.code;
     }
 
     /** Like transpile(); return sourcemap for remote JSContext to register. */
@@ -190,26 +177,9 @@ function kindFromFilename(filename: string, lang?: string): OxcKind {
     if (lang === 'ts' || lang === 'mts' || lang === 'cts') return OXC_KIND_TS;
     if (lang === 'tsx') return OXC_KIND_TSX;
     if (lang === 'jsx') return OXC_KIND_JSX;
-    const length = filename.length;
-    if (length >= 3 &&
-        filename.charCodeAt(length - 1) === 115 &&
-        filename.charCodeAt(length - 2) === 116) {
-        const third = filename.charCodeAt(length - 3);
-        if (third === 46 ||
-            (length >= 4 &&
-                (third === 109 || third === 99) &&
-                filename.charCodeAt(length - 4) === 46)) {
-            return OXC_KIND_TS;
-        }
-    }
-    if (length >= 4 &&
-        filename.charCodeAt(length - 1) === 120 &&
-        filename.charCodeAt(length - 2) === 115 &&
-        filename.charCodeAt(length - 4) === 46) {
-        const lang = filename.charCodeAt(length - 3);
-        if (lang === 116) return OXC_KIND_TSX;
-        if (lang === 106) return OXC_KIND_JSX;
-    }
+    if (filename.endsWith('.ts') || filename.endsWith('.mts') || filename.endsWith('.cts')) return OXC_KIND_TS;
+    if (filename.endsWith('.tsx')) return OXC_KIND_TSX;
+    if (filename.endsWith('.jsx')) return OXC_KIND_JSX;
     return OXC_KIND_JS;
 }
 

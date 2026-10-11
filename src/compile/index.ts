@@ -157,35 +157,12 @@ export class ModuleCompiler {
     }
 
     /**
-     * Evaluate a module loaded by this compiler with its localPath marked as
-     * evaluating, exactly as loadEsmSync does (bridge.ts:117).
-     *
-     * Every entry-eval site must use this instead of a bare `mod.eval()`. Without
-     * the window, a module that is the *process entry* can require() itself (or be
-     * required back by a CJS module it pulls in) and loadEsmSync's isInFlight
-     * check sees nothing: esmInFlightPaths was already cleared when compilation
-     * finished, and nothing marks the evaluation. loadEsmSync then calls .eval()
-     * on a module in JS_MODULE_STATUS_EVALUATING, which js_link_module does not
-     * allow (quickjs.c:32089) — the process aborts (rc=3) instead of throwing
-     * ERR_REQUIRE_CYCLE_MODULE. The same cycle reached through require() from a
-     * CJS entry already threw correctly, because that route goes via loadEsmSync.
-     *
-     * The window is deliberately only as wide as the *synchronous* part of
-     * evaluation: trackEvaluation's finally runs when `.eval()` returns its
-     * promise, not when that promise settles. Synchronous self-require — the
-     * whole defect — happens inside it. Holding the flag across the await would
-     * instead make a legitimate post-evaluation require() (from a timer or an
-     * async callback) throw a spurious cycle error, and would strand the flag
-     * for any entry that never settles.
-     *
-     * Returns whatever `.eval()` returns (a promise); unlike loadEsmSync this
-     * does NOT apply promiseResult, because callers await normally.
+     * Guard synchronous self-require during entry evaluation. Clear the guard
+     * when eval() returns its promise; keeping it until settlement rejects valid
+     * later require() calls and strands entries with unresolved top-level await.
      */
     evalTracked(mod: CModuleEngine.Module): ReturnType<CModuleEngine.Module['eval']> {
         const localPath = this.modulePaths.get(mod);
-        // Not from this compiler (e.g. a raw `new engine.Module`): nothing to key
-        // the window on, and such a module is not in esmCache, so no require()
-        // can reach it mid-evaluation.
         if (localPath === undefined) return mod.eval();
         return this.esm.trackEvaluation(localPath, () => mod.eval());
     }

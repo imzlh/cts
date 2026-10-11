@@ -2,12 +2,13 @@
   "name": "cts",
   "version": "3.4.0",
   "description": "cts - circu.js bootstrap to provide full typescript experience",
-  "main": "src/main.ts",
+  "main": "main.ts",
+  "type": "module",
   "scripts": {
-    "build": "esbuild main.ts --bundle --target=es2024 --format=esm --outfile=dist.js",
-    "min-build": "esbuild dist.js --minify --bundle --target=es2024 --format=esm --outfile=dist.min.js",
+    "build": "esbuild main.ts --bundle --platform=node --target=es2024 --format=esm --outfile=dist.js",
+    "min-build": "esbuild main.ts --minify --bundle --platform=node --target=es2024 --format=esm --outfile=dist.min.js",
     "bundle": "cjsc -b cjs -e dist.js",
-    "type-check": "tsc --noEmit"
+    "type-check": "node scripts/prepare-types.mjs && tsc --noEmit"
   },
   "keywords": [],
   "author": "",
