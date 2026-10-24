@@ -374,13 +374,7 @@ function canUseLocalPackageForRange(range: string): boolean {
     return !range || range === 'latest' || range === '*';
 }
 
-/**
- * `''` / `latest` / `*` — the caller stated no version, so *the registry*
- * decides what "latest" means, not whatever happens to sit in the store.
- * Same predicate as canUseLocalPackageForRange(); named separately because the
- * version-selection policy in resolveUnconstrainedVersion() turns on it and a
- * reader should not have to infer that from a function about local packages.
- */
+/** `''` / `latest` / `*` — the registry, not the store, decides what "latest" means. */
 function isUnconstrainedRange(range: string): boolean {
     return canUseLocalPackageForRange(range);
 }
@@ -630,14 +624,8 @@ function isVirtualProjectNodeModules(norm: string): boolean {
     return false;
 }
 
-/**
- * A dotted store slot (`node_modules/.deno/…`, `node_modules/.cts/…`) rather
- * than a package body. Slot dirs (`.deno/vite@7.3.6`) hold no package.json;
- * the body one level down (`.deno/vite@7.3.6/node_modules/vite`) is a real
- * package root, so only the *last* node_modules hop decides. Disqualifying the
- * body too made an owner walk skip it and attribute the file to an unrelated
- * ancestor package.json.
- */
+/** A dotted store slot (`node_modules/.deno/…`), not a package body. Only the
+ *  *last* node_modules hop decides; see cts/docs/resolver.md. */
 function isDotNodeModulesSlot(norm: string): boolean {
     const index = norm.lastIndexOf('/node_modules/');
     if (index === -1) return false;
@@ -685,7 +673,6 @@ export class NpmHandler implements ProtocolHandler {
         this.cacheDir = joinPaths(cfg.cacheDir, 'npm');
     }
 
-    /** Clear version resolution cache */
     clearCache(): void {
         this.verCache.clear();
         this.localCache.clear();
@@ -1521,15 +1508,8 @@ export class NpmHandler implements ProtocolHandler {
                 return { dir: local, resolvedVer: exactRange };
             }
         }
-        // Warm store hit for CONSTRAINED ranges (^/~/exact): use an
-        // already-extracted name@version without registry meta. Re-cache of
-        // large trees was stuck minutes on resolve npm:foo@^x while foo@y sat
-        // in ~/.cts/npm — do not remove this fast path.
-        //
-        // `false` excludes the UNCONSTRAINED ('' / latest / *) case, which must
-        // not be answered from store contents; resolveUnconstrainedVersion()
-        // below owns that and documents why. For a constrained range the flag
-        // is inert, so the optimisation above is unaffected.
+        // Warm store hit for constrained ranges, without registry meta. `false`
+        // excludes unconstrained ranges; see resolveUnconstrainedVersion().
         const storeHit = this.findCachedPackageMatching(name, version, false);
         if (storeHit) {
             const hitPkg = readPkg(storeHit);
@@ -1796,19 +1776,9 @@ export class NpmHandler implements ProtocolHandler {
         return resolved;
     }
 
-    /**
-     * Version policy for an UNCONSTRAINED range (`''` / `latest` / `*`).
-     *
-     * Only the registry knows what "latest" means, so a store hit alone is not an
-     * answer: the warm store is sticky, and an unversioned `npm:foo` that skipped
-     * `resolveVersion` (the sole `dist-tags` reader) accepted any planted version
-     * in the store. Constrained ranges state their own intent and keep the fast path.
-     *
-     * Offline fallback is limited to registry-attested versions. `dist-tags.latest`
-     * drifts and needs fresh metadata; membership in `meta.versions` is immutable,
-     * so metadata of any age attests it. With no metadata the highest store version
-     * is used with a warning, never silently.
-     */
+    /** Version policy for an unconstrained range (`''` / `latest` / `*`): the
+     *  registry decides; the store is only a documented offline fallback. See
+     *  resolveUnconstrainedVersion in cts/docs/resolver.md. */
     private *resolveUnconstrainedVersion(
         name: string,
         range: string,
@@ -1864,13 +1834,7 @@ export class NpmHandler implements ProtocolHandler {
         return pick;
     }
 
-    /**
-     * Correctness advisory, not progress chatter: emitted regardless of
-     * `silent` (which gates log.download/progress only, matching every other
-     * log.warn in cts), on stderr via console.warn so it cannot corrupt stdout
-     * data. Deduplicated per package so a large offline tree warns once each
-     * instead of once per edge.
-     */
+    /** Correctness advisory: emitted even under `silent`, once per package. */
     private warnStoreFallback(name: string, msg: () => string): void {
         if (this.warnedStoreFallback.has(name)) return;
         this.warnedStoreFallback.add(name);
@@ -1954,11 +1918,7 @@ export class NpmHandler implements ProtocolHandler {
             onProgress,
         });
         if (metaRes.status < 200 || metaRes.status >= 300) {
-            // A registry 404/410 means "no such package" — that is a resolution
-            // miss, not a transport failure. Node reports MODULE_NOT_FOUND, and
-            // packages rely on `e.code === 'MODULE_NOT_FOUND'` to treat an
-            // optional dependency as absent. Every other status stays a
-            // NetworkError so compile/bridge.ts keeps rethrowing it.
+            // A registry 404/410 is a resolution miss, not a transport failure. Every other
             if (metaRes.status === 404 || metaRes.status === 410) {
                 throw err(ErrorKind.ModuleNotFound, `npm package not found: "${name}" (HTTP ${metaRes.status} ${url})`);
             }
@@ -2186,17 +2146,9 @@ export class NpmHandler implements ProtocolHandler {
         }
     }
 
-    /**
-     * Prefer an already-extracted store package that satisfies `range`.
-     *
-     * `allowUnconstrainedStoreHit` (default true) governs ONLY the `''`/`latest`/`*`
-     * case. It is false at the two version-resolution entry points, because
-     * "highest thing in the store" is not a valid answer to "give me latest" —
-     * see resolveUnconstrainedVersion(). It stays true for the peer/optional
-     * callers, which are explicitly store-only link-if-present paths where the
-     * alternative is not a better version but a missing link. For a constrained
-     * range the flag is inert, so the warm fast path is untouched.
-     */
+    /** Prefer an already-extracted store package that satisfies `range`.
+     *  `allowUnconstrainedStoreHit` governs only the `''`/`latest`/`*` case; it is
+     *  false at the version-resolution entry points and inert elsewhere. */
     private findCachedPackageMatching(name: string, range: string, allowUnconstrainedStoreHit = true): string | null {
         if (!isValidNpmPackageName(name)) return null;
         // URL/github ranges pin a dist; only ensureInstalledFromTarballUrl may hit them.

@@ -166,12 +166,10 @@ export class DepScanner {
             wake();
         };
 
-        // Seed the queue
         for (const seed of seeds) {
             enqueue(seed.spec, seed.parent);
         }
 
-        // Guard: empty seed list — nothing to do
         if (pending === 0) {
             return { visited: 0, downloaded: 0, errors: [], modules: [], edges: [], resolutions: [] };
         }
@@ -346,7 +344,6 @@ export class DepScanner {
         };
     }
 
-    // Read + parse a single file, return its import specifiers
 
     private filterImports(
         specPath: string,

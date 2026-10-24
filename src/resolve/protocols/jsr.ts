@@ -70,7 +70,6 @@ export class JsrHandler implements ProtocolHandler {
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
-    /** Clear resolved cache */
     clearCache(): void {
         this.resolved.clear();
     }
@@ -221,9 +220,7 @@ export class JsrHandler implements ProtocolHandler {
         return meta;
     }
 
-    /** Map a registry HTTP status. 404/410 mean the path/package does not exist
-     *  (resolution miss, as npm.ts does for registry metadata); anything else
-     *  (5xx, 403, 429, proxy errors) is a transport failure. */
+    /** 404/410 are a resolution miss (as npm.ts); anything else is transport failure. */
     private httpStatusError(status: number, what: string, notFoundMsg: string): Error {
         if (status === 404 || status === 410) return err(ErrorKind.ModuleNotFound, notFoundMsg);
         return err(ErrorKind.NetworkError, `HTTP ${status} fetching JSR ${what}`);

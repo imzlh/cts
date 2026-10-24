@@ -60,19 +60,9 @@ function isAttributedSyntaxError(e: SyntaxError): boolean {
 export class EsmCompiler {
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
     private readonly esmLoading  = new Set<string>();
-    // Modules whose *evaluation* is on the stack right now. Distinct from
-    // esmLoading, which only covers compile/link and is cleared at esm.ts's
-    // `esmLoading.delete` before evaluation ever starts. Without this window a
-    // CJS module reached during an ESM module's evaluation can require() that
-    // same ESM module back, and loadEsmSync would call .eval() on a module in
-    // JS_MODULE_STATUS_EVALUATING — which is not in js_link_module's status
-    // allow-list and aborts the process instead of throwing.
-    //
-    // Both in-flight sets are keyed by **localPath**, not by the moduleRef used
-    // for esmCache/esmLoading. require() reaches this class via
-    // infoFromLocalPath, where specPath === localPath, while the ESM graph may
-    // key the very same file under an npm:/file: spec or a moduleId. Keying the
-    // cycle check on moduleRef would silently miss those cycles.
+    // Evaluation-in-progress window (esmLoading only covers compile/link);
+    // re-entering via eval() while EVALUATING aborts the process. Keyed by
+    // localPath, not moduleRef, or npm:/file: keyed cycles go undetected.
     private readonly esmInFlightPaths = new Set<string>();
     private readonly esmEvaluating = new Set<string>();
     readonly transformer: Transformer;

@@ -47,16 +47,10 @@ function safeRmdir(path: string): void {
 }
 
 /**
- * Materialize a project-local node_modules tree. Store packages are read-only
- * here: install owns store-internal soft links, materialize never writes there.
- *
- * soft — project-root links into the flat store only.
- * hard — pnpm-style virtual store under `node_modules/.cts/`: each name@version
- *        body is hard-linked once, and dependency edges and project roots are
- *        soft links into it.
- *
- * Fails closed on missing required store packages / link errors. `onLinked` is
- * pure counters, not a UI API.
+ * Materialize a project-local node_modules tree (never writes the store: install
+ * owns store-internal soft links). soft — project-root links into the flat store;
+ * hard — pnpm-style virtual store under `node_modules/.cts/`.
+ * Fails closed on missing required store packages / link errors.
  */
 export async function materializeNodeModules(
     edges: ScanEdge[],
@@ -250,10 +244,8 @@ function virtualBodyDir(projectDir: string, name: string, version: string): stri
 }
 
 /**
- * Hard materialize (pnpm-aligned, incremental): prune `.cts` keys outside the
- * current package set, skip a body whose stamp matches the store package.json,
- * then soft-link deps and project roots into the virtual bodies. Never writes
- * under the flat cache store.
+ * Hard materialize (incremental): prune stale `.cts` keys, skip bodies whose stamp
+ * matches, then soft-link deps and project roots into the virtual bodies.
  */
 async function materializeHardVirtual(
     roots: ScanEdge[],
@@ -431,9 +423,7 @@ function pruneVirtualOrphans(virtualRoot: string, desiredKeys: Set<string>): voi
 }
 
 /**
- * Read-only install-graph edges from package.json deps/peers.
- * Seeds from scan edges; expands declared records only — never sibling inject.
- * Does not materialize or write the store (install owns store soft links).
+ * Read-only install-graph edges from package.json deps/peers; never writes the store.
  */
 export function buildInstallViewEdges(edges: ScanEdge[], storeRoot: string): ViewEdge[] {
     const seeds = collectSeedPackages(edges, storeRoot);
@@ -570,10 +560,8 @@ function collectDeclaredDeps(pkg: {
 }
 
 /**
- * Resolve name@range against the flat store (`<store>/<name>@<ver>`).
- * When `parentDir` is set, an install-owned link at
- * `parentDir/node_modules/<name>` wins if its version still satisfies `range`
- * — materialize must not rewrite install targets to a newer store match.
+ * Resolve name@range against the flat store. With `parentDir`, an install-owned
+ * link there wins if it still satisfies `range` (materialize must not newer-match).
  */
 export function resolveStorePackage(
     storeRoot: string,

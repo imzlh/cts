@@ -104,25 +104,14 @@ export function setErrorCode(e: Error, code: string): CodedError {
     return e as CodedError;
 }
 
-/** Default Node-compatible `.code` for an error kind.
- *
- * Consumers commonly branch on `err.code` for every load attempt, so all
- * non-parse failures need a stable string, including cno-specific kinds.
- * Syntax and transform failures intentionally remain code-less, matching
- * Node's parse errors; a resolution code would make a source bug look like a
- * missing package.
- *
- * Keep `MODULE_NOT_FOUND` and `ENOENT` exclusive to ModuleNotFound and
- * FileNotFound. `isResolutionMiss()` treats those codes as permission to
- * continue the CJS resolution chain; assigning one to another kind would
- * swallow a real failure.
- */
+/** Default Node-compatible `.code` for an error kind. Parse/transform failures
+ *  stay code-less. `MODULE_NOT_FOUND`/`ENOENT` are exclusive to ModuleNotFound and
+ *  FileNotFound: `isResolutionMiss()` treats them as permission to continue the
+ *  CJS resolution chain. */
 export function codeForKind(kind: ErrorKind): string | undefined {
     switch (kind) {
-        // require()'s value. ESM upgrades this to ERR_MODULE_NOT_FOUND at the
-        // import boundary (runtime/hooks.ts) — node uses a different code for
-        // the two loaders. isResolutionMiss and the npm optional-dependency
-        // path both key off this exact string.
+        // require()'s value; ESM upgrades it to ERR_MODULE_NOT_FOUND at the import
+        // boundary. isResolutionMiss and the npm optional path key off this string.
         case ErrorKind.ModuleNotFound:   return 'MODULE_NOT_FOUND';
         case ErrorKind.FileNotFound:     return 'ENOENT';
         // Node throws this for a scheme its ESM loader does not support.
@@ -168,13 +157,8 @@ export function err(kind: ErrorKind, msg: string, source?: unknown, code?: strin
 }
 
 /** ERR_REQUIRE_CYCLE_MODULE, as Node throws for a require()-crossed ESM/CJS cycle.
- *  Node refuses these outright rather than handing out a partially-initialized
- *  module. Two message shapes, matching upstream:
- *    require(esm) where the ESM is already in flight   → "Cannot require() ES Module X in a cycle."
- *    import cjs   where the CJS body is on the stack   → "Cannot import CommonJS Module X in a cycle."
- *  Throwing (rather than returning a partial) is also what keeps the QuickJS
- *  module machinery safe: re-entering a module that is mid-link/mid-eval trips
- *  the js_link_module status assertion (an abort, not an exception). */
+ *  Must throw rather than return a partial: re-entering a mid-link module trips the
+ *  QuickJS js_link_module status assertion (an abort, not an exception). */
 export function requireCycleError(target: string, from: string, kind: 'require-esm' | 'import-cjs'): Error {
     const what = kind === 'require-esm'
         ? `Cannot require() ES Module ${target} in a cycle.`

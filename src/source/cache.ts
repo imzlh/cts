@@ -26,11 +26,8 @@ export interface SourceFreshness {
 }
 
 /**
- * The bytes and freshness token observed for one source revision.
- *
- * A cache lookup already has to read and hash the source in order to validate
- * a v3 sidecar. Keeping that read alongside the token lets the compiler reuse
- * it on a miss instead of opening and hashing the same file again.
+ * Bytes + freshness token for one revision; the compiler reuses the read on a
+ * miss instead of hashing the file twice.
  */
 export interface SourceSnapshot {
     bytes: Uint8Array;
@@ -38,13 +35,8 @@ export interface SourceSnapshot {
 }
 
 /**
- * Full-precision mtime token.
- *
- * `String(date)` renders only whole seconds ("Sun Aug 02 2026 11:16:59 GMT+0800"),
- * so a same-size edit landing in the same wall-clock second produced a stamp
- * identical to the previous revision and stale bytecode was served. Epoch
- * milliseconds keep every bit fs.stat reports. Plain numbers (resolver-supplied
- * mtimes for remote entries) pass through unchanged.
+ * Full-precision mtime token: String(date) is second-resolution and served stale
+ * bytecode; numbers (resolver mtimes) pass through unchanged.
  */
 function mtimeToken(mtim: unknown): string {
     const t = (mtim as Date | undefined)?.getTime?.();

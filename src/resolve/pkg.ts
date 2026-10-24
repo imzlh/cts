@@ -18,11 +18,8 @@ export type ResolveKind = 'require' | 'import';
 
 /**
  * `'unresolved'` = the directory walk reached the root without finding a
- * package.json or deno.json. It is deliberately NOT a ModuleFormat: the caches
- * store this *reason* rather than a final answer, because the answer depends on
- * the ResolveKind of the caller and the same directory is legitimately CJS via
- * require() and ESM via import. Caching the reason keeps both caches keyed on
- * path alone and makes cross-context poisoning structurally impossible.
+ * package.json or deno.json. Not a ModuleFormat: caches store the reason, since
+ * the answer depends on the caller's ResolveKind for the same directory.
  */
 const NO_MANIFEST = 'unresolved';
 type DirFormat = ModuleFormat | typeof NO_MANIFEST;
@@ -79,24 +76,19 @@ export function normalizeBinField(pkgName: string, bin: string | Record<string, 
 }
 
 /**
- * Bin map for sites that turn the bin KEY into a filesystem path — the
- * node_modules/.bin symlink writer and the lock bin index. The key filter is
- * load-bearing there: joinPaths(binDir, '..\\..\\evil') normalises to
- * binDir/../../evil and escapes, and that call site has no pathWithin() check.
- * Use getLookupBinMap() for read-only key lookups instead of loosening this.
+ * Bin map for sites that turn the bin KEY into a filesystem path (`.bin` symlink
+ * writer, lock bin index). Load-bearing there: `joinPaths` normalises `..\\..\\evil`
+ * into an escape and that call site has no containment check. Use
+ * getLookupBinMap() for read-only lookups instead of loosening this.
  */
 export function getBinMap(pkg: PackageJson): Record<string, string> {
     return buildBinMap(pkg, isSafeBinName);
 }
 
 /**
- * Bin map for read-only lookups (`npm:pkg@ver/<bin>` resolution and `explain`).
- * A bin key is a name to match against the manifest, not a path: npm allows
- * keys such as `\foo"` (the @denotest/special-chars-in-bin-name fixture), which
- * are legal filenames on POSIX and carry no traversal meaning for a lookup.
- * Containment is still enforced on the bin TARGET by resolvePackageBinPath(),
- * so a hostile key can only ever select a value that stays inside the package.
- * '/' stays rejected because in a specifier it means a subpath, not a bin.
+ * Bin map for read-only lookups (`npm:pkg@ver/<bin>`, `explain`). Keys may be
+ * arbitrary strings such as `\foo"`; containment is enforced on the target by
+ * resolvePackageBinPath(). '/' stays rejected: in a specifier it means a subpath.
  */
 export function getLookupBinMap(pkg: PackageJson): Record<string, string> {
     return buildBinMap(pkg, isLookupBinName);
@@ -153,14 +145,9 @@ export function resolvePackageBinPath(pkgDir: string, relPath: string): string |
 // Format detection — two-level bounded cache
 
 /**
- * Classify `localPath`. `kind` matters for exactly one case: a `.js` file with no
- * package.json or deno.json anywhere up the tree.
- *
- *   require() → 'cjs'   import → 'esm'
- *
- * These are different rules, not an inconsistency. Node treats a no-manifest
- * `.js` under require() as CommonJS (ESM would leave `module`/`exports`
- * unbound), while import is the Deno-style single-file case, which is ESM.
+ * Classify `localPath`. `kind` matters only for a `.js` file with no manifest
+ * above it: require() → 'cjs' (Node would leave `module`/`exports` unbound),
+ * import → 'esm' (Deno single-file case).
  */
 export function detectFormat(localPath: string, kind: ResolveKind = 'import'): ModuleFormat {
     return resolveDirFormat(cachedDirFormat(localPath), kind);

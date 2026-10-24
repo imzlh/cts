@@ -258,11 +258,8 @@ export class ModuleResolver {
         for (const p of h.protocols) this.handlers.set(p, h);
     }
 
-    /**
-     * Release the lock store this resolver owns; otherwise the SQLite handle stays
-     * open until process exit and the lock dir cannot be deleted in-process (on
-     * Windows unlink then fails EINVAL).
-     */
+    /** Close the owned lock store: on Windows an open handle makes deleting the
+     *  lock dir fail with EINVAL. */
     close(): void {
         this.lock.close();
     }
@@ -378,17 +375,8 @@ export class ModuleResolver {
 
     /**
      * Resolve for inspection only, from project/lock/store data already on disk:
-     * never fetch or install. `require.resolve()` is a synchronous
-     * optional-dependency probe, so normal resolution could turn a local lookup
-     * into network I/O.
-     *
-     * A package already in the local store may resolve even without a project
-     * `node_modules` entry, keeping the answer consistent with the subsequent
-     * `require()`.
-     *
-     * Handlers already honour `cachedOnly`, so toggle it here rather than threading
-     * another flag through every protocol. `inspect` keeps a store-local result out
-     * of the normal memo caches.
+     * never fetch or install (`require.resolve()` must not do network I/O).
+     * Toggles handler-level `cachedOnly` instead of threading another flag.
      */
     resolveForInspection(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         const prevCachedOnly = this.cfg.cachedOnly;
@@ -773,9 +761,7 @@ export class ModuleResolver {
         this.rememberRuntimeInfo(resolved);
 
         const cacheLockEntry = protoOf(canonical.specPath) !== 'node';
-        // specPath → info must be recoverable by getInfo() even for transient
-        // (require) resolves: a local package gets an `npm:` specPath whose
-        // localPath is not derivable from the store layout. Transient fills only
+        // Recoverable by getInfo() even for transient resolves. Transient fills only
         // when absent — a real ESM resolve wins (conditions and format may differ).
         if (!transient || !this.resolvedModules.has(canonical.specPath)) {
             this.resolvedModules.set(canonical.specPath, canonical);
@@ -803,9 +789,8 @@ export class ModuleResolver {
     }
 
     /**
-     * In-memory exact-hit key. Relative edges share parentDirKey so dense
-     * same-dir graphs do not re-run resolveFile for every `./util.js` importer.
-     * Always pass the original request specifier (not post-canonicalize).
+     * Exact-hit key. Relative edges share parentDirKey so dense same-dir graphs do
+     * not re-run resolveFile per importer. Pass the original request specifier.
      */
     private exactResolveKey(spec: string, parent: string): string {
         if (isRelative(spec)) return `${spec}\0${parentDirKey(parent)}`;

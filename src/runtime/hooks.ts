@@ -96,10 +96,8 @@ export function installEngineHooks(
                 const code = e instanceof Error ? Reflect.get(e, 'code') : undefined;
                 if (code === 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED'
                     || code === 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE') throw e;
-                // Preserve LockFrozen / ProtocolDisabled / NetworkError / … and an
-                // existing .kind. Un-kinded errors are NOT resolution misses: a
-                // network or I/O failure must not turn into MODULE_NOT_FOUND
-                // (isResolutionMiss would let a CJS require() walk past it).
+                // Preserve existing kinds. Un-kinded errors are NOT resolution misses:
+                // a network/I/O failure must not become MODULE_NOT_FOUND.
                 const kind = e instanceof Error && isErrorKind(e.kind)
                     ? e.kind
                     : ErrorKind.Generic;

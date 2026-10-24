@@ -347,19 +347,10 @@ function rejectNonUtf8(bytes: Uint8Array, filename: string): void {
 }
 
 /**
- * Byte offset of the first invalid UTF-8 sequence, or -1 when the input is
- * well-formed.
- *
- * Exported for direct unit testing: a false positive here (flagging valid UTF-8)
- * would silently turn a working Sucrase fallback into a hard error, which
- * end-to-end tests cannot observe.
- *
- * The native oxc transpiler rejects non-UTF-8 input outright
- * (`std::str::from_utf8` in ext-oxc/src/lib.rs), and OxcTranspiler collapses
- * that failure into `null`, indistinguishable from "oxc declined". Falling
- * back to Sucrase would be unsafe: it silently erases `namespace` bodies and
- * decorated classes, so one stray byte yields wrong runtime behaviour with
- * exit code 0. Detect it here and fail loudly. */
+ * Byte offset of the first invalid UTF-8 sequence, or -1. Must fail loudly:
+ * oxc returns null on non-UTF-8 (looks like "declined") and the Sucrase
+ * fallback would erase namespaces/decorators silently. A false positive here
+ * is untestable end to end, hence exported for unit tests. */
 export function firstInvalidUtf8(bytes: Uint8Array): number {
     const len = bytes.byteLength;
     let i = 0;

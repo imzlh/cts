@@ -25,7 +25,6 @@ const DEFAULTS = {
     cacheDir:    '',
 } as const;
 
-// Tier-based runtime defaults (applied when no explicit CLI/env override)
 
 const TIER_MEM_LIMIT: Record<string, number> = {
     low:    32 * 1024 * 1024,  // 32 MB
@@ -235,7 +234,6 @@ function clearJscSync(dir: string): void {
     } catch {}
 }
 
-/** Remove a directory and all contents (used for {cacheDir}/local/ cleanup). */
 function rmrf(dir: string): void {
     try {
         for (const e of fs.readdir(dir)) {

@@ -1,13 +1,5 @@
-/** Atomic write helpers for .jspack (runtime pack is memory-only).
- *
- *  NOTE ON THE NAME: nothing here checks content integrity, and nothing here
- *  runs on the load path. This module is about *durability* — temp file, fsync,
- *  rename, and the Windows "rename never clobbers" dance. `bytesEqual` and
- *  `hasExpectedContent` exist only to decide whether an atomic rename already
- *  landed, not to authenticate anything.
- *
- *  Container integrity — the manifest digest in the header and the per-module
- *  digests verified on read — lives in ./format.ts. Look there, not here. */
+/** Atomic write helpers for .jspack. This is durability (temp file, fsync,
+ *  rename), not integrity; container digests live in ./format.ts. */
 
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');

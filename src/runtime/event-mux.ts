@@ -1,11 +1,6 @@
-/**
- * Process-wide owner of engine.onEvent's single native receiver.
- *
- * The `Symbol.for()` registry keeps baked and disk-loaded CTS copies on one
- * bus. Native return polarity differs by event: `false` continues an
- * unhandled rejection but stops a job exception, and only `true` cancels
- * beforeunload. Do not normalize those return values.
- */
+// Sole owner of engine.onEvent; Symbol.for() keeps baked and disk-loaded CTS
+// on one bus. Return polarity differs per event (false continues a rejection
+// but stops a job exception) — do not normalize it.
 
 const engine = import.meta.use('engine');
 

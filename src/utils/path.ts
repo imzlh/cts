@@ -127,9 +127,8 @@ export function toFileUrl(path: string): string {
 }
 
 /**
- * True for a scheme-qualified id ("pack:/0.js", "npm:foo", "https://x").
- * Requires >= 2 scheme chars so a Windows drive ("C:") is never mistaken for a
- * scheme -- the single-letter trap that made entryUrl() return a raw path.
+ * True for a scheme-qualified id. Requires >= 2 scheme chars so a Windows drive
+ * ("C:") is never mistaken for a scheme.
  */
 export function hasSchemeId(s: string): boolean {
     return schemeId(s) !== null;
@@ -285,9 +284,8 @@ export function normalizePath(p: string): string {
     const protocol = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(p);
     const windowsDrive = /^[A-Za-z]:/.test(p);
     if (protocol && !windowsDrive) return p;
-    // Keep the complete Windows root outside the dot-segment stack. In
-    // particular, the UNC share is a root just like a drive, and device paths
-    // have either a drive root, an extended UNC share, or a device namespace.
+    // Keep the complete Windows root (drive, UNC share, device namespace) outside
+    // the dot-segment stack.
     let prefix = '';
     let start = 0;
     if (isWindows) {
@@ -395,9 +393,8 @@ export function isRelative(s: string): boolean {
 }
 
 /**
- * Parent directory identity for relative (./ ../) resolve/scan caches.
- * Same-dir importers of `./util.js` must share one key. Handles file://,
- * Windows /C:…, and scheme parents (npm:/pack:…); no slash → keep full parent.
+ * Parent directory identity for relative resolve/scan caches. Handles file://,
+ * Windows /C:…, and scheme parents; no slash → keep full parent.
  */
 export function parentDirKey(parent: string): string {
     let base = parent;

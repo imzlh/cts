@@ -26,12 +26,8 @@ interface SourceSnapshot extends BlobRange {
     sourceOnly: boolean;
     /** Digest of the ON-DISK bytes, for the pack-time change check. */
     digest: string;
-    /** Embedded text after sourceMappingURL stripping.
-     *
-     *  Currently UNUSED at the compile step, and kept deliberately: it is exactly
-     *  the text that has to reach the compiler to close the bytecode-sourcemap
-     *  gap documented at the sourceModules.push below. Nothing reads it today, so
-     *  do not treat its presence as evidence the gap is closed. */
+    /** Embedded text after sourceMappingURL stripping. UNUSED at the compile
+     *  step today; needed to close the bytecode-sourcemap gap (see sourceModules.push). */
     code: string;
 }
 
@@ -55,11 +51,8 @@ class BlobBuilder implements PackBlobSource {
 
     get byteLength(): number { return this.cursor; }
 
-    /** Exact bytes of one appended chunk. Only whole chunks are addressable,
-     *  which is precisely what the manifest declares: every range in it came
-     *  from one push() above. A partial or straddling range means the manifest
-     *  and the builder have desynced, so refuse rather than silently hash the
-     *  wrong bytes. */
+    /** Exact bytes of one appended chunk; a partial or straddling range means the
+     *  manifest desynced from the builder, so refuse rather than hash the wrong bytes. */
     range(offset: number, length: number): Uint8Array {
         if (length === 0) return new Uint8Array(0);
         const chunk = this.byOffset.get(offset);
@@ -140,11 +133,8 @@ function classifyModules(modules: ScanModule[], workspaceRoots: string[]): Class
                 ? `pack:${scheme}/${m.specPath.slice(scheme.length + 1)}`
                 : externalLocalId(m);
         }
-        // ModuleResolver canonicalizes every specifier before the manifest
-        // lookup, so an id that is not already in canonical form would produce
-        // an artifact whose modules are unreachable at run time. Sources feeding
-        // the ids above are canonical today; pin the invariant here so a future
-        // change fails as a pack-time id collision instead of a broken .jspack.
+        // Must be canonical: ModuleResolver canonicalizes specifiers before the
+        // manifest lookup, so a non-canonical id yields unreachable modules.
         id = canonicalizePath(id);
 
         const existing = syntheticToReal.get(id);
@@ -289,10 +279,8 @@ export async function writePack(
             let snapshot = sourceSnapshots.get(m.localPath);
             if (!snapshot) {
                 const onDisk = new Uint8Array(fs.readFile(m.localPath));
-                // Strip `sourceMappingURL` before the bytes reach the artifact.
-                // An inline map carries the build machine's absolute paths and
-                // the full pre-build original in base64 — invisible to a grep of
-                // the .jspack. See ./sourcemap.ts for why this is unconditional.
+                // Strip `sourceMappingURL`: an inline map leaks build paths and the
+                // pre-build original in base64 — invisible to a grep. See ./sourcemap.ts.
                 const stripped = stripSourceMappingURL(engine.decodeString(onDisk));
                 const source = stripped.removed > 0 ? engine.encodeString(stripped.text) : onDisk;
                 if (stripped.removed > 0) {
@@ -307,30 +295,18 @@ export async function writePack(
                             ? isTypeScriptLang(options.entryLang)
                             : isTsLikePath(m.localPath),
                     ),
-                    // Change detection must hash what is ON DISK, not what was
-                    // embedded: the re-read below compares against the file, so
-                    // digesting the stripped bytes would report "source changed
-                    // while packing" for every module that had an annotation.
+                    // Hash what is ON DISK (the re-read below compares against the
+                    // file), not the stripped bytes.
                     digest: contentDigest(onDisk),
                     code: stripped.text,
                 };
                 sourceSnapshots.set(m.localPath, snapshot);
-                // Deliberately NOT registered in rawRanges. That map backs
-                // non-source (text/binary/json) views, whose contract is the
-                // file's verbatim bytes; aliasing them onto this stripped range
-                // would silently serve an asset the rewritten text. The cost is
-                // one duplicated blob range for a file imported both as source
-                // and as an asset, which validateBlobLayout allows as dedup.
+                // NOT in rawRanges: that map backs verbatim asset views, which must
+                // not alias the stripped text (dedup allows the duplicate range).
             }
             sourceRanges.set(id, snapshot);
-            // Compile under pack: ids; host .jsc is not portable (bakes npm:/file: identity).
-            // `identity` is the eval filename baked into the bytecode atom table and must
-            // be the pack id, never localPath (the on-disk CJS default).
-            //
-            // KNOWN GAP: stripSourceMappingURL cleans the source range only. ParseDriver
-            // re-reads the file to compile, and QuickJS keeps the CJS wrapper source in
-            // bytecode, so an inline map also ships inside the bytecode range. Closing it
-            // needs the stripped text passed through CompileTarget into both compile paths.
+            // Compile under pack: ids; `identity` must be the pack id, never localPath.
+            // KNOWN GAP: an inline map also ships inside the bytecode range (see pack-format.md).
             sourceModules.push({
                 specPath: id,
                 localPath: m.localPath,
@@ -469,16 +445,9 @@ export async function writePack(
     }
 }
 
-/** Write the container and return the manifest as it was serialized, with
- *  blobLength and per-module digests filled in by completePackManifest.
- *
- *  Ordering constraint: writeAtomicallyStreamed emits the header before the
- *  blob, and the header carries the manifest digest, which covers the manifest
- *  including every per-module digest. So all blob digests must exist before the
- *  first byte is written. BlobBuilder holds its chunks in memory and serves them
- *  through PackBlobSource.range, so the pre-pass is a hash over buffers already
- *  in hand — no extra I/O, and the blob is still streamed rather than
- *  concatenated. */
+/** Write the container; returns the serialized manifest with digests filled in.
+ *  All blob digests must exist before the first byte is written (the header carries
+ *  the manifest digest); the pre-pass hashes buffers already held, so no extra I/O. */
 function writeAtomically(outPath: string, manifest: PackManifest, blob: BlobBuilder): PackManifest {
     const completed = completePackManifest(manifest, blob);
     const header = encodePackHeader(completed, blob);

@@ -269,11 +269,8 @@ export class BinResolver {
         if (realBin.toLowerCase().endsWith('.js') || realBin.toLowerCase().endsWith('.mjs') || realBin.toLowerCase().endsWith('.cjs')) {
             return { entry: realBin, binPath, fallback: false, reason: 'direct-js' };
         }
-        // Extensionless `#!/usr/bin/env node` scripts (typescript/bin/tsc, tape/bin/tape)
-        // are the norm for store bins. Windows cannot exec them, and the fallback below
-        // hands them to `cmd /c`, which reports "is not recognized as an internal or
-        // external command". Shebang parsing is pure text work, so run it on every
-        // platform — the node_modules/.bin branch above already does (see 'win-posix-shim-entry').
+        // Shebang parsing is pure text work; run it on every platform — Windows
+        // cannot exec these and the cmd /c fallback reports "not recognized".
         const entry = resolveUnixBinEntry(binPath);
         if (entry) return { entry: realpathQuiet(entry), binPath, fallback: false, reason: 'direct-node-shebang' };
 
@@ -368,12 +365,8 @@ function isSafeBinCommandName(name: string): boolean {
 }
 
 /**
- * The `<bin>` half of `npm:pkg@ver/<bin>`. Unlike a bare command name this is
- * only ever a key looked up in the package's own bin map, never a path, so a
- * literal '\' or '"' is legal — npm permits such keys and the
- * @denotest/special-chars-in-bin-name fixture declares `\foo"`. '/' stays
- * rejected because it would mean a subpath, and ':' because it collides with
- * specifier scheme parsing.
+ * The `<bin>` half of `npm:pkg@ver/<bin>`: only a key in the package's own bin map,
+ * never a path. '/' stays rejected (subpath), ':' (scheme collision).
  */
 function isNpmSpecBinName(name: string): boolean {
     return !!name && name !== '.' && name !== '..' && !name.includes('/') &&
@@ -594,10 +587,8 @@ export function taskShellEnv(env: Record<string, string>, cwd: string): Record<s
         }
     }
     const sep = isWindows ? ';' : ':';
-    // Keep project bins before the inherited PATH, like npm.  `node` and `deno`
-    // are rewritten from parsed task commands; they must not be emulated with
-    // PATH links because the link's directory is also used by Windows DLL
-    // search and can hide the runtime's native dependencies.
+    // Project bins before inherited PATH, like npm. `node`/`deno` must not be
+    // PATH links: that dir is also used for Windows DLL search.
     let pathPrefix = '';
     let dir = toPosixPath(cwd);
     const root = pathRoot(dir);
@@ -614,10 +605,8 @@ export function taskShellEnv(env: Record<string, string>, cwd: string): Record<s
 }
 
 /**
- * Build the shell fallback argv used for task scripts that need shell
- * evaluation.  `forwardedArgs` are cno runtime options from the invocation
- * prefix.  The POSIX wrappers keep `node`/`deno` task commands on this same
- * cno executable, so those options apply to grandchildren as well.
+ * Shell fallback argv. The POSIX wrappers keep `node`/`deno` task commands on this
+ * cno executable, so `forwardedArgs` apply to grandchildren too.
  */
 export function taskShellArgv(script: string, forwardedArgs: string[] = []): string[] {
     if (isWindows) return [readEnv('ComSpec') ?? readEnv('COMSPEC') ?? 'cmd.exe', '/c', script];

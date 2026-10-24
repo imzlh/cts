@@ -25,7 +25,6 @@ export function guessFileKind(localPath: string): FileKind {
     return 'binary';
 }
 
-/** fileKind from import attribute type: text | bytes | json. */
 export function applyAttrType(kind: FileKind, attr?: Record<string, unknown>): FileKind {
     const t = attr?.type;
     if (t === 'text') return 'text';
@@ -50,7 +49,6 @@ export function validateAttrType(kind: FileKind, attr: Record<string, unknown> |
     }
 }
 
-/** Check if a path is a TypeScript type declaration file (.d.ts, .d.mts, .d.cts) */
 export function isTypeDecl(localPath: string): boolean {
     return localPath.endsWith('.d.ts') || localPath.endsWith('.d.mts') || localPath.endsWith('.d.cts');
 }

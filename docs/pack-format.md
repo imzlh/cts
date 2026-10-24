@@ -124,6 +124,28 @@ diagnostic. Bytecode is not self-describing enough to catch that later.
 
 Zero-length ranges are ignored (they address no bytes).
 
+`BlobBuilder.range` only serves exact whole chunks; a partial or straddling
+range means the manifest desynced from the builder and is refused. All blob
+digests must exist before the first byte is written because the header carries
+the manifest digest, which covers them.
+
+`pack/integrity.ts` is about atomic *durability* (temp file, fsync, rename),
+not integrity; content digests are implemented in `format.ts`.
+
+## Source maps in embedded source
+
+`stripSourceMappingURL` (`cts/src/pack/sourcemap.ts`) removes `sourceMappingURL`
+annotations (inline `data:` and external file refs, `//` and `/* */` syntaxes,
+`#` and legacy `@` pragmas) from source on the way into the blob, preserving
+line structure. Reasons: a map can never resolve inside a pack, and its
+`sources`/sourcesContent leak build-machine paths and pre-build originals. Both
+`digest` and the pack-time "source changed" check use the on-disk bytes.
+
+Known gap: `ParseDriver` re-reads the file to compile, and QuickJS retains the
+CJS wrapper's function source in bytecode, so an inline map still ships inside
+the bytecode range. `SourceSnapshot.code` holds the stripped text that would
+close this once it is passed through `CompileTarget` into both compile paths.
+
 ## Duplicate keys
 
 `assertNoDuplicateKeys` scans the raw manifest text before `JSON.parse` rejects
@@ -151,3 +173,11 @@ serializer so callers can build exact fixtures.
   precede the blob; `encodePack` concatenates it with a materialized blob.
 - `PackBlobSource` is a random-access view so the writer can supply its
   streaming `BlobBuilder` instead of a flat buffer.
+
+## Event bus
+
+`cts/src/runtime/event-mux.ts` is the only `engine.onEvent` receiver;
+`Symbol.for()` keeps baked and disk-loaded CTS copies on the same bus.
+Native return polarity is per-event (`false` continues an unhandled rejection
+but stops a job exception, `true` cancels beforeunload) and must not be
+normalized.

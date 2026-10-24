@@ -68,9 +68,7 @@ interface ResolvedCjsRequest {
 const INTERNAL_ID = Symbol('cts.cjs.id');
 const INTERNAL_FILENAME = Symbol('cts.cjs.filename');
 /** Marks a cache entry that only exists to be some child's `module.parent`.
- *  preRegister() synthesizes one for an ESM importer, and synth() stamps it
- *  `loaded: true` — so without this flag it is indistinguishable from a fully
- *  loaded module and its empty `exports` satisfies a require() of that path. */
+ *  Without it a preRegister() stub is indistinguishable from a loaded module. */
 const PARENT_STUB = Symbol('cts.cjs.parentStub');
 
 type InternalCjsModule = CjsModule & {
@@ -303,11 +301,8 @@ export interface CjsCacheStore {
     keys(): IterableIterator<string>;
 }
 
-/**
- * The CJS cache has one backing store.  The normal store is keyed by CTS'
- * POSIX paths; a Node replacement is used directly and receives host paths at
- * the boundary so `delete require.cache[require.resolve(x)]` remains live.
- */
+/** One backing store keyed by CTS POSIX paths. A Node replacement object is used
+ *  directly with host paths, so `delete require.cache[require.resolve(x)]` stays live. */
 export class CjsCacheAdapter implements CjsCacheStore {
     private readonly store = new Map<string, CjsModule>();
     private external: Record<string, CjsModule> | undefined;
@@ -525,9 +520,8 @@ export class CjsLoader {
     private readonly builtinCache = new Map<string, CjsModule>();
     private mainModule: CjsModule | null = null;
     /**
-     * Fallback table used when the Node polyfill has not been loaded (for
-     * embedded CTS and isolated compiler tests).  Once node:module registers
-     * its table, `currentExtensions()` below switches every require to that
+     * Fallback table for when the Node polyfill has not been loaded. Once
+     * node:module registers its table, `currentExtensions()` switches to that
      * exact object by identity.
      */
     private readonly fallbackExtensions: Record<string, (m: CjsModule, f: string) => unknown> = Object.create(null);
@@ -540,14 +534,7 @@ export class CjsLoader {
         this.extensions = new CjsExtensionsAdapter(this.fallbackExtensions);
     }
 
-    /**
-     * Drop every module-owned reference held by this loader.
-     *
-     * CJS modules are retained in both the public require.cache map and the
-     * private builtin/cycle tables.  A TypeScriptRuntime is terminal after
-     * cleanup(), so retaining those objects serves no cache contract and can
-     * keep complete export graphs alive for the lifetime of an embedding.
-     */
+    /** Drop every module-owned reference (require.cache, builtin and cycle tables). */
     clearLoadedModules(): void {
         this.cache.clear();
         this.builtinCache.clear();
@@ -581,9 +568,8 @@ export class CjsLoader {
         return this.executing.has(normalizePath(filename));
     }
 
-    /** Most recently entered still-executing CJS file, for cycle attribution.
-     *  A Set preserves insertion order, so the last entry is the innermost
-     *  frame — the module whose require() closed the loop. */
+    /** Most recently entered still-executing CJS file (insertion-ordered Set:
+     *  the last entry is the innermost frame). */
     innermostExecuting(): string | null {
         let last: string | null = null;
         for (const f of this.executing) last = f;
@@ -593,14 +579,10 @@ export class CjsLoader {
     /** The ERR_REQUIRE_CYCLE_MODULE an ESM importer must throw for `filename`,
      *  or null when importing it is legitimate.
      *
-     *  Non-null exactly when the file's body is on the stack: the ESM module
-     *  being compiled right now imports a CJS module that is mid-require of it,
-     *  so bridging `mod.exports` would hand out the pre-require() half. Node
-     *  refuses instead. Lives here rather than inline in ModuleCompiler.load so
-     *  the decision is reachable without constructing a resolver.
-     *
-     *  A cached-but-never-executed stub (preRegister) is NOT a cycle — it also
-     *  has loaded === false, which is why `executing` exists separately. */
+     *  Non-null only when the CJS body is on the stack (mid-require of the ESM
+     *  being compiled), so bridging `mod.exports` would hand out the
+     *  pre-require() half. A cached preRegister stub is not a cycle: it also has
+     *  loaded === false, hence the separate `executing` set. */
     importCycleError(filename: string): Error | null {
         if (!this.isExecuting(filename)) return null;
         return requireCycleError(normalizePath(filename), this.importCycleFrom(filename), 'import-cjs');
@@ -1116,12 +1098,8 @@ export class CjsLoader {
             };
         }
 
-        // When the resolver is unavailable (for example createRequire()
-        // callers and small loader integrations), relative and absolute
-        // requests still follow Node's LOAD_AS_FILE/LOAD_AS_DIRECTORY rules
-        // from the requiring file itself.  Searching only node_modules below
-        // would turn "./dep.mjs" into "<parent>/node_modules/dep.mjs" and
-        // incorrectly report a perfectly valid sibling as missing.
+        // Relative/absolute requests follow Node's LOAD_AS_FILE/LOAD_AS_DIRECTORY
+        // rules from the requiring file; only node_modules is searched below.
         if (isRelative(id) || isAbsolute(id) || id === '.' || id === '..') {
             const candidate = isAbsolute(id) ? id : joinPaths(dirname(parentPath), id);
             const resolved = this.resolveLocalPath(candidate);

@@ -44,12 +44,8 @@ export interface NpmDepTarget {
 }
 
 /**
- * npm alias syntax: `"<localName>": "npm:<realName>[@<range>]"`. The registry
- * must be queried for the real name, never the local key — a key that happens
- * to exist would otherwise resolve at unrelated versions. The leading `@` of a
- * scoped target is not the version delimiter.
- *
- * Returns null for every non-alias value so callers keep `(key, value)` verbatim.
+ * `"<localName>": "npm:<realName>[@<range>]"`; query the real name, never the
+ * local key. Null for non-aliases so callers keep `(key, value)` verbatim.
  */
 export function parseNpmAliasDep(value: string): { name: string; range: string } | null {
     if (!value.startsWith('npm:')) return null;
