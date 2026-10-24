@@ -33,7 +33,16 @@ export class HttpHandler implements ProtocolHandler {
                     onProgress,
                 });
                 if (result.status < 200 || result.status >= 300) {
+                    // Same convention as npm.ts: only "this resource does not
+                    // exist" is a resolution miss; 5xx/403/429 are transport-level
+                    // failures and must not fall through to the next CJS location.
+                    if (result.status === 404 || result.status === 410) {
+                        // One message for every non-2xx, so the text a consumer logs
+                    // never changes when a status moves between the two kinds.
                     throw err(ErrorKind.ModuleNotFound,
+                        `HTTP ${result.status} fetching ${url}`);
+                    }
+                    throw err(ErrorKind.NetworkError,
                         `HTTP ${result.status} fetching ${url}`);
                 }
                 yield { type: StepType.FS_ENSURE_DIR, path: dirname(cachePath) };

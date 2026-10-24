@@ -39,12 +39,17 @@ export class TransformError extends Error {
     }
 }
 
-// Extend Error so every error can optionally carry a kind
+// Extend Error with `kind`. `code` is NOT declared globally: cno and the CLI
+// use `number` for DOMException/exit codes, and a global `code?: string` makes
+// every one of those a type error.
 declare global {
     interface Error {
         kind?: ErrorKind;
     }
 }
+
+/** An Error carrying a node-style string `code`. */
+export type CodedError = Error & { code: string };
 
 /** True when value is a known ErrorKind (incl. Generic). */
 export function isErrorKind(value: unknown): value is ErrorKind {
@@ -89,13 +94,14 @@ function locationFromStack(source: Error | undefined): { line: number; col: numb
 
 /** Attach a node-style `.code` string. Enumerable + configurable so a more
  *  specific call site (see pkg.ts `codedError`) can override the default. */
-export function setErrorCode(e: Error, code: string): void {
+export function setErrorCode(e: Error, code: string): CodedError {
     Object.defineProperty(e, 'code', {
         value: code,
         writable: true,
         enumerable: true,
         configurable: true,
     });
+    return e as CodedError;
 }
 
 /** Default Node-compatible `.code` for an error kind.

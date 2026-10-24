@@ -1,5 +1,6 @@
-import { readText, readBytes, pathExistsSync, pathExists, ensureDir, ensureDirAsync, writeText, unTarGz, type TarFile, fmtBytes, isEnabled, log, getMemoryFile } from './utils';
+import { readText, readBytes, pathExistsSync, pathExists, ensureDir, ensureDirAsync, writeText, unTarGz, type TarFile, fmtBytes, isEnabled, log, getMemoryFile, errMsg } from './utils';
 import { createCurlTarget, getCurlInitHook } from './utils/curl';
+import { err, ErrorKind, isErrorKind, type CodedError } from './errors';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -216,7 +217,14 @@ async function fetchAsync(step: NetFetchStep): Promise<NetFetchResult> {
     configureCurl(curl, step);
     log.debug('fetch', () => `start ${step.url}`);
     const started = Date.now();
-    const res = await curl.perform();
+    // Transport failures (DNS, TLS, timeout) must carry a kind: an un-kinded
+    // error defaults to a generic code and loses NetworkError/protocol context.
+    let res: CModuleCURL.Response;
+    try {
+        res = await curl.perform();
+    } catch (e) {
+        throw fetchFailed(step, e);
+    }
     log.debug('fetch', () => `done ${step.url} ${res.status} ${fmtBytes(res.body ? res.body.byteLength : 0)} ${Date.now() - started}ms`);
     return toResult(res);
 }
@@ -227,9 +235,23 @@ function fetchSync(step: NetFetchStep): NetFetchResult {
     configureCurl(curl, step);
     log.debug('fetch', () => `start ${step.url}`);
     const started = Date.now();
-    const res = curl.performSync();
+    let res: CModuleCURL.Response;
+    try {
+        res = curl.performSync();
+    } catch (e) {
+        throw fetchFailed(step, e);
+    }
     log.debug('fetch', () => `done ${step.url} ${res.status} ${fmtBytes(res.body ? res.body.byteLength : 0)} ${Date.now() - started}ms`);
     return toResult(res);
+}
+
+/** NetworkError for a failed transfer. A flow error the step already classified
+ *  (e.g. a caller's own ErrorKind) is rethrown untouched. */
+function fetchFailed(step: NetFetchStep, e: unknown): Error {
+    if (e instanceof Error && isErrorKind(e.kind) && e.kind !== ErrorKind.Generic) {
+        return err(e.kind, `Failed to fetch ${step.url}: ${e.message}`, e, (e as Partial<CodedError>).code);
+    }
+    return err(ErrorKind.NetworkError, `Failed to fetch ${step.url}: ${errMsg(e)}`, e);
 }
 
 export function closeConnectionPools(): void {

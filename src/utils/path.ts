@@ -1,4 +1,5 @@
 import { isWindows, uname } from './platform';
+import { setErrorCode } from '../errors';
 import { URL } from './url';
 
 // Convention: all public functions normalise backslashes to '/' internally.
@@ -32,9 +33,7 @@ export function toPosixPath(p: string): string {
 }
 
 function invalidFileUrlPath(pathname: string): never {
-    const error = new TypeError(`Invalid file URL path: ${pathname}`);
-    Object.defineProperty(error, 'code', { value: 'ERR_INVALID_FILE_URL_PATH', enumerable: true });
-    throw error;
+    throw setErrorCode(new TypeError(`Invalid file URL path: ${pathname}`), 'ERR_INVALID_FILE_URL_PATH');
 }
 
 /** Convert a file URL to a normalized CTS POSIX-internal filesystem path. */

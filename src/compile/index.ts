@@ -33,6 +33,7 @@ export class ModuleCompiler {
 
         // Wire CjsLoader to resolver + ESM compiler via bridge callbacks
         const deps = buildCjsDeps(resolver, this.esm, (info) => {
+            const wasmRef = moduleRef(info);
             // Same hazard as loadEsmSync (see bridge.ts): a WASM module whose JS
             // glue require()s the .wasm back reaches wasm.load's cache and gets
             // the *same* Module object, already in JS_MODULE_STATUS_EVALUATING.
@@ -40,8 +41,8 @@ export class ModuleCompiler {
             // (quickjs.c:32089) and .eval() aborts the process instead of
             // throwing. Check before wasm.load, which would hand back the
             // placeholder and lose the fact that this was a cycle.
-            if (this.esm.isInFlight(info.localPath)) {
-                throw requireCycleError(info.localPath, '<wasm>', 'require-esm');
+            if (this.esm.isInFlight(wasmRef)) {
+                throw requireCycleError(wasmRef, '<wasm>', 'require-esm');
             }
             const mod = this.wasm.load(
                 info,
@@ -50,10 +51,12 @@ export class ModuleCompiler {
                 (m) => this.evalTracked(m),
             );
             const result = engine.promiseResult(
-                this.esm.trackEvaluation(info.localPath, () => mod.eval()),
+                this.esm.trackEvaluation(wasmRef, () => mod.eval()),
             );
             if (result === null) {
-                throw new Error(`Cannot require() async WASM module '${info.specPath}'`);
+                throw err(ErrorKind.Generic,
+                    `Cannot require() async WASM module '${info.specPath}'`,
+                    undefined, 'ERR_REQUIRE_ASYNC_MODULE');
             }
             return mod.namespace;
         });

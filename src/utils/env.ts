@@ -1,10 +1,10 @@
 const os = import.meta.use('os');
 
-/** Read an environment variable without turning an unset value into an exception. */
-export function readEnv(name: string): string | null {
+/** The host throws for an unset variable; callers only care about "no value". */
+export function readEnv(name: string): string | undefined {
     try {
-        return os.getenv(name) ?? null;
+        return os.getenv(name);
     } catch {
-        return null;
+        return undefined;
     }
 }

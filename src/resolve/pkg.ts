@@ -1,6 +1,6 @@
 import type { FileKind, PackageJson, ModuleFormat } from '../types';
 import { dirname, extname, joinPaths, normalizePath, isPathWithin, toPosixPath, resolveFile, safeParse, LRU, log, isValidNpmPackageName } from '../utils';
-import { err, ErrorKind } from '../errors';
+import { err, ErrorKind, setErrorCode } from '../errors';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -153,25 +153,14 @@ export function resolvePackageBinPath(pkgDir: string, relPath: string): string |
 // Format detection — two-level bounded cache
 
 /**
- * Classify `localPath`. `kind` is the context that reached the file and is
- * load-bearing for exactly one case: a `.js` file with no package.json and no
- * deno.json anywhere up the tree.
+ * Classify `localPath`. `kind` matters for exactly one case: a `.js` file with no
+ * package.json or deno.json anywhere up the tree.
  *
  *   require() → 'cjs'   import → 'esm'
  *
- * Those two lines must NOT be merged. They are different rules, not an
- * inconsistency to tidy up:
- *
- *  - `require()` is node's ecosystem. Node's rule for a `.js` file whose
- *    nearest package.json has no "type" — including the case where there is no
- *    package.json at all — is CommonJS. Defaulting to ESM here makes
- *    `require('./child.js')` evaluate the child as a module, where `module` and
- *    `exports` are not bound, so a plain `module.exports = …` child dies with
- *    "ReferenceError: module is not defined" on its first line. Measured
- *    against node v24: require of a no-manifest `.js` is CJS unconditionally.
- *  - `import` with no manifest at all is the Deno-style single-file case, which
- *    has no package.json by design and is ESM. That default is intentional;
- *    inverting it would break running a loose `.js` script as a module.
+ * These are different rules, not an inconsistency. Node treats a no-manifest
+ * `.js` under require() as CommonJS (ESM would leave `module`/`exports`
+ * unbound), while import is the Deno-style single-file case, which is ESM.
  */
 export function detectFormat(localPath: string, kind: ResolveKind = 'import'): ModuleFormat {
     return resolveDirFormat(cachedDirFormat(localPath), kind);
@@ -312,14 +301,7 @@ export function packageImportNotDefinedError(spec: string, pkgDir: string, paren
 }
 
 function codedError(kind: ErrorKind, code: string, message: string): Error {
-    const error = err(kind, message);
-    Object.defineProperty(error, 'code', {
-        value: code,
-        writable: true,
-        enumerable: true,
-        configurable: true,
-    });
-    return error;
+    return setErrorCode(err(kind, message), code);
 }
 
 function invalidPackageTargetError(ctx: ResolveCtx, target: unknown): Error {

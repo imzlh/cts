@@ -1,6 +1,6 @@
 import { moduleRef, type ModuleInfo } from '../types';
 import { errMsg, log, assert, readBytes } from '../utils';
-import { err, ErrorKind } from '../errors';
+import { err, codeForKind, ErrorKind, isErrorKind, setErrorCode } from '../errors';
 
 const engine = import.meta.use('engine');
 const wasm = import.meta.use('wasm');
@@ -15,7 +15,9 @@ export class CompileError extends Error {
     constructor(message: string) { super(message); this.name = 'CompileError'; }
 }
 export class LinkError extends Error {
-    constructor(message: string) { super(message); this.name = 'LinkError'; }
+    constructor(message: string, kind: ErrorKind = ErrorKind.ModuleNotFound) {
+        super(message); this.name = 'LinkError'; this.kind = kind;
+    }
 }
 export class RuntimeError extends Error {
     constructor(message: string) { super(message); this.name = 'RuntimeError'; }
@@ -233,28 +235,32 @@ export function buildWasmModule(
                 if (resolved) {
                     funcDescs.push({ module: imp.module, name: imp.name, func: resolved });
                 } else {
-                    throw new LinkError(`Unresolved import: ${imp.module}::${imp.name} (function)`);
+                    throw new LinkError(
+                        `Unresolved import: ${imp.module}::${imp.name} (function) in ${info.localPath}`);
                 }
             } else if (imp.kind === 'global') {
                 const resolved = resolveGlobalImport(imp, info.specPath, importSource);
                 if (resolved) {
                     globalDescs.push(resolved);
                 } else {
-                    throw new LinkError(`Unresolved import: ${imp.module}::${imp.name} (global)`);
+                    throw new LinkError(
+                        `Unresolved import: ${imp.module}::${imp.name} (global) in ${info.localPath}`);
                 }
             } else if (imp.kind === 'table') {
                 const resolved = resolveTableImport(imp, info.specPath, importSource);
                 if (resolved) {
                     tableDescs.push(resolved);
                 } else {
-                    throw new LinkError(`Unresolved import: ${imp.module}::${imp.name} (table)`);
+                    throw new LinkError(
+                        `Unresolved import: ${imp.module}::${imp.name} (table) in ${info.localPath}`);
                 }
             } else if (imp.kind === 'memory') {
                 const resolved = resolveMemoryImport(imp, info.specPath, importSource);
                 if (resolved) {
                     memoryDescs.push(resolved);
                 } else {
-                    throw new LinkError(`Unresolved import: ${imp.module}::${imp.name} (memory)`);
+                    throw new LinkError(
+                        `Unresolved import: ${imp.module}::${imp.name} (memory) in ${info.localPath}`);
                 }
             }
         }
@@ -412,7 +418,8 @@ export class WasmCompiler {
         }
 
         this.wasmLoading.add(info.localPath);
-        let loadedSuccessfully = false;
+        let failError: Error | null = null;
+        let rootCause: Error | undefined;
         try {
             // A WASM module can have many import entries from one JS module.
             // Resolve and evaluate each imported ESM namespace once.
@@ -429,9 +436,11 @@ export class WasmCompiler {
                         evalModule(loaded) as ReturnType<CModuleEngine.Module['eval']>,
                     );
                     if (evalResult === null) {
-                        throw new Error(
-                            `Cannot load async ESM module '${resolved.specPath}' as a WASM dependency`
-                        );
+                        // Node: ERR_REQUIRE_ASYNC_MODULE (a WASM glue's async import).
+                        rootCause = err(ErrorKind.Generic,
+                            `Cannot require() async ESM module '${resolved.specPath}' as a WASM dependency`,
+                            undefined, 'ERR_REQUIRE_ASYNC_MODULE');
+                        throw rootCause;
                     }
                     const ns = loaded.namespace;
                     importedNamespaces.set(key, ns);
@@ -442,30 +451,56 @@ export class WasmCompiler {
 
             const result = buildWasmModule(info, importSource);
             if (!result) throw err(ErrorKind.Generic, `WASM load failed: ${info.localPath}`);
-
-            // Populate placeholder if one was created during circular resolution
-            const pending = this.pendingWasm.get(info.localPath);
-            if (pending) {
-                const ns = result.mod.namespace;
-                Object.assign(pending.values, ns);
-
-                this.pendingWasm.delete(info.localPath);
-                log.debug('wasm', () =>
-                    `populated placeholder: ${info.specPath} (${Object.keys(pending.values).length} exports)`);
-                loadedSuccessfully = true;
-                return pending.module;
+            return this.finishLoad(info, result.mod);
+        } catch (e) {
+            if (e instanceof LinkError) {
+                // Unresolved imports are thrown as LinkError already; carry the code.
+                // Keep it linear: QuickJS rebuilds errors that cross a C boundary.
+                const coded = e as LinkError & { code?: string };
+                if (coded.code === undefined) setErrorCode(e, codeForKind(e.kind ?? ErrorKind.ModuleNotFound)!);
+                // Preserve the root failure: an async glue dependency must not read
+                // as a plain missing import. Non-enumerable, so the error stays linear.
+                if (e.cause === undefined) {
+                    Object.defineProperty(e, 'cause', {
+                        value: rootCause ?? e, writable: true, enumerable: false, configurable: true,
+                    });
+                }
+                // buildWasmModule reports "Unresolved import", which misdescribes a
+                // glue module that failed to evaluate. State the real reason when known:
+                // a QuickJS error rebuilt across this boundary keeps only its message.
+                if (rootCause && e.message.startsWith('Unresolved import')) e.message = rootCause.message;
+            } else if (e instanceof Error && isErrorKind(e.kind)) {
+                // Keep the WebAssembly-style LinkError identity, attach the coded cause.
+                const wrapped = Object.assign(new LinkError(e.message, e.kind), { cause: e });
+                failError = setErrorCode(wrapped, codeForKind(e.kind)!);
+                throw failError;
             }
-
-            this.wasmCache.set(info.localPath, result.mod);
-            loadedSuccessfully = true;
-            return result.mod;
+            if (e instanceof Error) failError = e;
+            throw e;
         } finally {
             this.wasmLoading.delete(info.localPath);
-            if (!loadedSuccessfully) {
+            if (failError) {
                 this.pendingWasm.delete(info.localPath);
                 this.wasmCache.delete(info.localPath);
             }
         }
+    }
+
+    /** Populate a placeholder created during circular resolution, else cache. */
+    private finishLoad(info: ModuleInfo, mod: CModuleEngine.Module): CModuleEngine.Module {
+        const pending = this.pendingWasm.get(info.localPath);
+        if (pending) {
+            const ns = mod.namespace;
+            Object.assign(pending.values, ns);
+
+            this.pendingWasm.delete(info.localPath);
+            log.debug('wasm', () =>
+                `populated placeholder: ${info.specPath} (${Object.keys(pending.values).length} exports)`);
+            return pending.module;
+        }
+
+        this.wasmCache.set(info.localPath, mod);
+        return mod;
     }
 
     clearCache(): void {

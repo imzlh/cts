@@ -324,28 +324,13 @@ export async function writePack(
             }
             sourceRanges.set(id, snapshot);
             // Compile under pack: ids; host .jsc is not portable (bakes npm:/file: identity).
-            // `identity` is the eval filename baked into the bytecode atom table: it must
-            // be the pack id, never localPath, or the artifact carries the pack-time
-            // absolute host path (CJS defaults to localPath for on-disk caches).
+            // `identity` is the eval filename baked into the bytecode atom table and must
+            // be the pack id, never localPath (the on-disk CJS default).
             //
-            // KNOWN GAP, measured — do not read the stripping below as complete.
-            // `stripSourceMappingURL` cleans the bytes that go into the *source*
-            // blob range, and that part works. It does NOT clean bytecode:
-            // ParseDriver re-reads the file from disk to compile (parse.ts:637 for
-            // CJS, :542 inline), and QuickJS keeps the CJS wrapper's function
-            // source inside the bytecode, so a CJS module that had an inline map
-            // ships a second copy of it inside its bytecode range — build-machine
-            // absolute paths and the base64 pre-build original included.
-            //
-            // Measured on a two-module CJS fixture: the embedded source ranges
-            // were clean, and `pack:/lib.cjs`'s BYTECODE range still contained the
-            // annotation, decoding to the build path. Closing it means plumbing
-            // the stripped text through CompileTarget (parse.ts:58, which has no
-            // `code` member) into both compile paths. A `code: snapshot.code`
-            // property used to be passed here for exactly that purpose, but
-            // nothing ever read it — it was silently dropped as an unknown
-            // property, which is what the long-standing tsc error on this call
-            // was reporting.
+            // KNOWN GAP: stripSourceMappingURL cleans the source range only. ParseDriver
+            // re-reads the file to compile, and QuickJS keeps the CJS wrapper source in
+            // bytecode, so an inline map also ships inside the bytecode range. Closing it
+            // needs the stripped text passed through CompileTarget into both compile paths.
             sourceModules.push({
                 specPath: id,
                 localPath: m.localPath,

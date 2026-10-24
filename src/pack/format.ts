@@ -4,9 +4,7 @@ import { canonicalizePath } from '../utils/path';
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 
-// .jspack layout: [4B magic "JSPK"][u16 version][u32 manifestLen]
-// [32B manifestDigest][manifest JSON][blob table, referenced by offset+length
-// from the manifest].
+// .jspack container layout: see cts/docs/pack-format.md
 const MAGIC = [0x4a, 0x53, 0x50, 0x4b]; // "JSPK"
 const VERSION = 4;
 /** Format versions this reader refuses, with the reason, for a usable error. */
@@ -18,39 +16,30 @@ const FORMATS = new Set<ModuleFormat>(['esm', 'cjs']);
 const FILE_KINDS = new Set<FileKind>(['source', 'json', 'wasm', 'binary', 'text']);
 
 export interface PackModuleEntry {
-    /** Synthetic runtime id ("pack:/<rel>" or "pack:<scheme>/…"). Also the
-     *  PackBlobStore / loader key after install — not a host filesystem path. */
+    /** Synthetic pack: id, not a host filesystem path. */
     localPath: string;
     format: ModuleFormat;
     fileKind: FileKind;
     offset: number;
     length: number;
-    /** Original source bytes used when bytecode was produced by another QuickJS ABI. */
+    /** Fallback source bytes; mandatory for fileKind "source". */
     sourceOffset?: number;
     sourceLength?: number;
-    /** Compile from bundled source because serialized bytecode loses required semantics. */
+    /** Recompile from bundled source even if bytecode is present. */
     sourceOnly?: boolean;
-    /** Explicit source language for entries whose path has no useful extension. */
+    /** Explicit source language; set only on source entries. */
     lang?: string;
-    /** Lowercase-hex sha256 of the EMBEDDED bytes at offset+length — the
-     *  bytecode for a source module, the payload otherwise. Verified lazily by
-     *  readBlob. Not the digest of the file on disk: a source module's embedded
-     *  bytes have had sourceMappingURL stripped (see ./sourcemap.ts), so the two
-     *  differ for any module that carried an annotation. */
+    /** sha256 of the embedded bytes at offset+length. NOT the on-disk file hash
+     *  (sourceMappingURL is stripped first, see ./sourcemap.ts). */
     digest?: string;
-    /** Lowercase-hex sha256 of the embedded bytes at sourceOffset+sourceLength.
-     *  Source modules only. Verified lazily by readSourceBlob. */
+    /** sha256 of the embedded bytes at sourceOffset+sourceLength. Source entries only. */
     sourceDigest?: string;
 }
 
-/** Lowercase-hex sha256, the manifest's digest encoding. */
 function contentDigest(bytes: Uint8Array): string {
     return crypto.hexEncode(crypto.sha256(bytes));
 }
 
-/** Constant-time-ish hex compare. These digests are not secrets and an attacker
- *  who can time this can also just recompute them, so this is only about not
- *  short-circuiting on the first nibble; correctness is what matters here. */
 function digestEqual(a: string, b: string): boolean {
     if (a.length !== b.length) return false;
     let diff = 0;
@@ -59,34 +48,22 @@ function digestEqual(a: string, b: string): boolean {
 }
 
 export interface PackManifest {
-    /** specPath of the entry module. */
     entry: string;
-    /** specPath -> module entry. */
     modules: Record<string, PackModuleEntry>;
-    /** parentSpecPath -> (raw import specifier -> child specPath), for
-     *  offline resolution of relative/bare imports inside packed code. */
+    /** parent -> (raw import specifier -> child). */
     edges: Record<string, Record<string, string>>;
-    /** QuickJS bytecode ABI that produced source-module blobs.
-     *
-     *  NOT a security control. It selects bytecode-vs-recompile and nothing
-     *  else; it is attacker-controlled like every other manifest field, and a
-     *  tamperer sets it *correctly* so their bytecode runs instead of being
-     *  recompiled from source. The digests are the integrity mechanism. */
+    /** QuickJS bytecode ABI. Selects recompile, never verification: the digests
+     *  are the integrity mechanism. */
     bytecodeVersion: string;
-    /** Declared blob byte length. Present so truncation and tail-extension are
-     *  caught eagerly instead of only when they happen to cut a declared range:
-     *  the blob is "whatever bytes remain after the manifest", so without this
-     *  its length is implicit and uncheckable. Covered by manifestDigest. */
+    /** Declared blob length; without it trailing-data/truncation are undetectable. */
     blobLength?: number;
 }
 
-/** Random-access view of blob bytes for digest computation at encode time.
- *  The writer streams its blob chunk-by-chunk and never materializes it as one
- *  buffer, so it supplies its BlobBuilder here rather than a flat array. */
+/** Random-access view of blob bytes; the writer streams its blob and never
+ *  materializes one buffer. */
 export interface PackBlobSource {
     readonly byteLength: number;
-    /** Exact bytes at offset+length. Must throw if the range is not one the
-     *  source can serve exactly. */
+    /** Exact bytes at offset+length; must throw if it cannot serve them. */
     range(offset: number, length: number): Uint8Array;
 }
 
@@ -110,7 +87,6 @@ export function encodePack(manifest: PackManifest, blob: Uint8Array): Uint8Array
     return out;
 }
 
-/** Adapt a materialized blob to PackBlobSource. */
 export function blobSourceFromBytes(blob: Uint8Array): PackBlobSource {
     return {
         byteLength: blob.byteLength,
@@ -123,18 +99,8 @@ export function blobSourceFromBytes(blob: Uint8Array): PackBlobSource {
     };
 }
 
-/** Fill in blobLength and the per-module digests, returning a COPY.
- *
- *  Exported so the writer can record in its returned manifest exactly what it
- *  put on disk. Calling it twice is safe: the second call recomputes and
- *  compares every digest, confirming that the blob source and manifest agree.
- *
- *  Digests are computed here from the bytes actually embedded. That matters:
- *  the writer keeps a separate digest of each source file's ON-DISK bytes for
- *  its "source changed while packing" check, and that differs from the embedded
- *  bytes whenever a sourceMappingURL was stripped on the way into the blob.
- *
- *  A digest already present on an entry is verified, not trusted. */
+/** Fill in blobLength and per-module digests, returning a copy. A digest already
+ *  present is verified, not trusted. */
 export function completePackManifest(manifest: PackManifest, source: PackBlobSource): PackManifest {
     const modules: Record<string, PackModuleEntry> = Object.create(null);
     for (const [id, entry] of Object.entries(manifest.modules)) {
@@ -146,7 +112,11 @@ export function completePackManifest(manifest: PackManifest, source: PackBlobSou
         }
         const out: PackModuleEntry = { ...entry, digest };
         if (entry.fileKind === 'source') {
-            const sourceDigest = contentDigest(source.range(entry.sourceOffset!, entry.sourceLength!));
+            // Only reachable on an unvalidated draft; encodePackHeader validates first.
+            if (entry.sourceOffset === undefined || entry.sourceLength === undefined) {
+                throw new Error(`Cannot encode .jspack file: source module "${id}" is missing its source range`);
+            }
+            const sourceDigest = contentDigest(source.range(entry.sourceOffset, entry.sourceLength));
             if (entry.sourceDigest !== undefined && !digestEqual(entry.sourceDigest, sourceDigest)) {
                 throw new Error(
                     `Cannot encode .jspack file: supplied source digest for "${id}" does not match its blob bytes ` +
@@ -159,16 +129,12 @@ export function completePackManifest(manifest: PackManifest, source: PackBlobSou
     return { ...manifest, modules, blobLength: source.byteLength };
 }
 
-/** Serialize header + manifest. Returns the bytes that precede the blob.
- *
- *  The manifest digest covers the manifest bytes as serialized here, which is
- *  why it sits in the fixed-width header, outside its own coverage. */
+/** Serialize the header and manifest (the bytes preceding the blob). */
 export function encodePackHeader(manifest: PackManifest, source: PackBlobSource): Uint8Array {
     if (!Number.isSafeInteger(source.byteLength) || source.byteLength < 0) {
         throw new Error('Cannot encode .jspack file: invalid blob length');
     }
-    // Shape and bounds first: completeManifest reads every declared range, and
-    // an out-of-bounds one should report as a range error, not a digest error.
+    // Validate before digesting: bounds errors must not surface as digest errors.
     validateManifest(manifest, source.byteLength, false);
     const completed = completePackManifest(manifest, source);
     const manifestBytes = engine.encodeString(JSON.stringify(completed));
@@ -193,12 +159,8 @@ export function decodePack(bytes: Uint8Array): PackContainer {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const version = view.getUint16(4, true);
     if (version !== VERSION) {
-        // A digest-less container is UNVERIFIABLE, so accepting one — even with a
-        // warning — would hand the attacker the bypass: flip this byte back to 3,
-        // drop the digest field, and every check below is skipped. The version is
-        // attacker-controlled, so it must not select the verification mode. Same
-        // shape as JWT "alg":"none". .jspack files are regenerable build
-        // artifacts, so the cost of refusing is one `cno pack`.
+        // Never accept old versions: the attacker-controlled version must not
+        // select a weaker verification mode. See cts/docs/pack-format.md.
         throw new Error(SUPERSEDED_VERSIONS.has(version)
             ? `Unsupported .jspack version: ${version}. This file predates pack ` +
               `integrity digests (current version ${VERSION}) and cannot be verified; ` +
@@ -211,12 +173,8 @@ export function decodePack(bytes: Uint8Array): PackContainer {
     const manifestEnd = manifestStart + manifestLength;
     if (manifestEnd > bytes.byteLength) throw new Error('Invalid .jspack file: truncated manifest');
 
-    // Verify the root digest BEFORE parsing, for two reasons: a malformed or
-    // hostile manifest never reaches JSON.parse, and the digest covers the raw
-    // bytes as they sit in the file. Hashing a re-serialization of the parsed
-    // object instead would silently drop anything JSON.parse normalizes away —
-    // duplicate keys collapse to the last occurrence, so a manifest that reads
-    // one way and runs another would hash as if it were clean.
+    // Digest the raw bytes BEFORE parsing; hashing a re-serialization would
+    // hide things JSON.parse normalizes away.
     const manifestBytes = bytes.subarray(manifestStart, manifestEnd);
     const declaredDigest = bytesToHex(bytes.subarray(10, 10 + MANIFEST_DIGEST_LEN));
     const actualDigest = contentDigest(manifestBytes);
@@ -227,11 +185,7 @@ export function decodePack(bytes: Uint8Array): PackContainer {
     }
 
     const manifestText = engine.decodeString(manifestBytes);
-    // Reject duplicate top-level module/edge keys before parsing hides them.
-    // JSON.parse collapses duplicates to the LAST occurrence per ECMA-262, so a
-    // manifest can read one way to a human auditing the artifact and run
-    // another. The digest does not help here: it covers these exact bytes, so a
-    // duplicate is faithfully hashed and passes. Cheap to reject outright.
+    // The digest cannot catch duplicate keys (it hashes them faithfully).
     assertNoDuplicateKeys(manifestText);
     let parsed: unknown;
     try {
@@ -240,9 +194,7 @@ export function decodePack(bytes: Uint8Array): PackContainer {
         throw new Error(`Invalid .jspack file: malformed manifest: ${e instanceof Error ? e.message : String(e)}`);
     }
     const blob = bytes.subarray(manifestEnd);
-    // Fast path: JSON escapes '\' as '\\', so a manifest whose text contains no
-    // backslash at all cannot carry a separator to canonicalize. Skip the
-    // manifest rebuild on every startup (decodeMs is on the startup path).
+    // Fast path: no backslash in the text means nothing to canonicalize.
     const parsedIds = manifestText.includes('\\') ? canonicalizeIds(parsed) : parsed;
     const manifest = validateManifest(parsedIds, blob.byteLength, true);
     return { manifest, blob };
@@ -259,10 +211,7 @@ function bytesToHex(bytes: Uint8Array): string {
     return out;
 }
 
-/** Read the JSON string starting at `start` (which must be '"'), returning its
- *  decoded value and the index just past the closing quote, or null if it is
- *  malformed. Escapes are decoded so two spellings of one key compare equal,
- *  which is how JSON.parse would see them. */
+/** Scan the JSON string at `start`; null if malformed. Escapes are decoded. */
 function scanJsonString(text: string, start: number): { value: string; end: number } | null {
     let out = '';
     let i = start + 1;
@@ -299,12 +248,8 @@ function scanJsonString(text: string, start: number): { value: string; end: numb
     return null;
 }
 
-/** Reject a manifest whose text repeats a key inside any one object.
- *
- *  Not redundant with the digest: the digest covers these exact bytes, so a
- *  duplicate hashes faithfully and passes. What it defeats is *review* — a
- *  reader sees the first value, the runtime uses the last. One linear scan, same
- *  order as the JSON.parse that follows. */
+/** Reject a repeated key inside any one object: JSON.parse keeps only the last,
+ *  so the file would run differently than it reads. */
 function assertNoDuplicateKeys(text: string): void {
     // null frame = array (no keys); Set frame = object.
     const stack: Array<Set<string> | null> = [];
@@ -316,8 +261,7 @@ function assertNoDuplicateKeys(text: string): void {
         if (ch === '}' || ch === ']') { stack.pop(); i++; continue; }
         if (ch !== '"') { i++; continue; }
         const str = scanJsonString(text, i);
-        // Malformed: leave the diagnostic to JSON.parse, which runs next.
-        if (str === null) return;
+        if (str === null) return; // JSON.parse reports it next
         let j = str.end;
         while (j < text.length && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n' || text[j] === '\r')) j++;
         if (text[j] === ':') {
@@ -335,18 +279,12 @@ function assertNoDuplicateKeys(text: string): void {
     }
 }
 
-/** Per-container record of ranges already digest-checked, so a repeatedly-read
- *  module is hashed once. Keyed by container so two containers sharing an entry
- *  object (a test cloning a manifest) cannot cross-credit. */
+/** Ranges already digest-checked, per container (keys are shared between
+ *  containers that reuse an entry object). */
 const verifiedRanges = new WeakMap<PackContainer, Set<string>>();
 
 /** Verify an embedded range against its manifest digest, once per container.
- *
- *  Lazy on purpose: this is on the startup path and hashing the whole blob
- *  eagerly would make every launch pay for modules it never loads.
- *
- *  A missing digest is a hard failure, not a skip: "no digest means don't check"
- *  is exactly the bypass this mechanism exists to remove. */
+ *  A missing digest is a hard failure, never a skip. */
 function verifyRange(
     container: PackContainer,
     id: string,
@@ -376,8 +314,7 @@ function verifyRange(
 }
 
 export function readBlob(container: PackContainer, entry: PackModuleEntry): Uint8Array {
-    // Ranges were validated in decodePack; re-checked because this is public API
-    // and subarray would silently clamp a bad range into a truncated module.
+    // subarray clamps, so a bad range would look like a short valid module.
     assertRange(container, entry.offset, entry.length, 'blob');
     verifyRange(container, entry.localPath, entry.offset, entry.length, entry.digest, 'blob');
     return container.blob.subarray(entry.offset, entry.offset + entry.length);
@@ -387,14 +324,12 @@ export function readSourceBlob(container: PackContainer, entry: PackModuleEntry)
     if (entry.sourceOffset === undefined || entry.sourceLength === undefined) {
         throw new Error('Invalid .jspack file: source module is missing fallback source bytes');
     }
-    // Same trust as readBlob — validateManifest already checked source ranges.
     assertRange(container, entry.sourceOffset, entry.sourceLength, 'source');
     verifyRange(container, entry.localPath, entry.sourceOffset, entry.sourceLength, entry.sourceDigest, 'source');
     return container.blob.subarray(entry.sourceOffset, entry.sourceOffset + entry.sourceLength);
 }
 
-/** Guard against silent truncation: subarray clamps, so an out-of-range entry
- *  would otherwise yield a short buffer that looks like a valid module. */
+/** subarray clamps, so an unchecked out-of-range entry would look valid. */
 function assertRange(container: PackContainer, offset: number, length: number, what: string): void {
     if (!validRange(offset, length, container.blob.byteLength)) {
         throw new Error(`Invalid .jspack file: ${what} range ${offset}+${length} is out of bounds`);
@@ -405,23 +340,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** Rewrite container ids into the canonical separator form before validation.
- *
- *  Module ids are opaque keys — never filesystem paths — but ModuleResolver
- *  canonicalizes every specifier (canonicalizePath: '\' -> '/') before it looks
- *  a pack id up in this manifest. A container carrying '\' in an id (produced on
- *  Windows, or hand-crafted) would therefore be silently unreachable: the entry
- *  lookup misses and the loader blames static analysis with ModuleNotFound.
- *  Canonicalizing here keeps reader keys and resolver lookups in one form, and
- *  makes a container behave identically on Windows and POSIX.
- *
- *  Edge *specifier* keys are left verbatim: they are raw import strings, not
- *  ids, and a non-matching one already fails closed with a message naming it.
- *  encodePack stays a faithful serializer so callers can build exact fixtures. */
+/** Canonicalize module/edge-parent ids ('\' -> '/') before validation, because
+ *  the resolver looks ids up in canonical form and '\' ids would be unreachable.
+ *  Edge specifier keys are raw import strings and stay verbatim. */
 function canonicalizeIds(value: unknown): unknown {
     if (!isRecord(value)) return value;
     const { entry, modules, edges } = value;
-    // Shape errors belong to validateManifest, which runs on the result.
     if (!isRecord(modules) || !isRecord(edges)) return value;
 
     const outModules: Record<string, unknown> = Object.create(null);
@@ -430,7 +354,6 @@ function canonicalizeIds(value: unknown): unknown {
         if (Object.prototype.hasOwnProperty.call(outModules, key)) {
             throw new Error(`Invalid .jspack file: duplicate module id "${key}" after path canonicalization`);
         }
-        // localPath mirrors the id (validateManifest enforces it) — keep in step.
         outModules[key] = isRecord(raw) && typeof raw.localPath === 'string'
             ? { ...raw, localPath: canonicalizePath(raw.localPath) }
             : raw;
@@ -473,22 +396,10 @@ function spanKey(start: number, end: number): string {
     return `${start}\0${end}`;
 }
 
-/** Reject blob layouts no writer can produce, because they let a container run
- *  code its own manifest and embedded source disown.
- *
- *  BlobBuilder only appends whole buffers and dedupes by local path, so every
- *  declared range is either byte-identical to another (a deduped payload — two
- *  ids may share one file) or completely disjoint: nothing partially overlaps.
- *
- *  A source module's bytecode is stricter still: a fresh append per module id,
- *  compiled under that id (baked into the atom table as the eval filename), so it
- *  can never alias other bytecode or any embedded source. That aliasing is the
- *  attack: point safe's bytecode range at evil's bytecode and the runtime runs
- *  evil's body under safe's id — exit 0, no diagnostic, safe's source untouched
- *  for anyone auditing. Bytecode is not self-describing enough to catch it, so
- *  the invariant is enforced here.
- *
- *  Zero-length ranges are ignored: they address no bytes and cannot alias. */
+/** Ranges must be identical (dedup) or disjoint; source bytecode must be unique
+ *  and never alias other bytecode or source. Aliasing would run foreign code
+ *  under a clean id; bytecode is not self-describing enough to catch it later.
+ *  Zero-length ranges are ignored. */
 function validateBlobLayout(modules: Record<string, unknown>): void {
     const spans: BlobSpan[] = [];
     const bytecodeOwner = new Map<string, string>();
@@ -532,9 +443,6 @@ function validateBlobLayout(modules: Record<string, unknown>): void {
         }
     }
 
-    // Identical spans are legitimate dedup, so compare only distinct ones: after
-    // dedup any remaining intersection is a partial overlap or a nesting, and
-    // neither can come out of an append-only builder.
     const distinct = new Map<string, BlobSpan>();
     for (const span of spans) {
         const key = spanKey(span.start, span.end);
@@ -559,8 +467,7 @@ function validateBlobLayout(modules: Record<string, unknown>): void {
 
 const HEX_DIGEST_LEN = MANIFEST_DIGEST_LEN * 2;
 
-/** Lowercase hex of exactly sha256 width. Rejected early so a mismatch is
- *  reported as a malformed manifest rather than as a digest mismatch. */
+/** Lowercase hex of exactly sha256 width. */
 function isHexDigest(value: unknown): value is string {
     if (typeof value !== 'string' || value.length !== HEX_DIGEST_LEN) return false;
     for (let i = 0; i < value.length; i++) {
@@ -571,9 +478,7 @@ function isHexDigest(value: unknown): value is string {
     return true;
 }
 
-/** @param requireDigests decode-side strictness. False only inside
- *  encodePackHeader, which runs before completeManifest has filled the digests
- *  in; every container that reaches a reader must carry them. */
+/** @param requireDigests false only inside encodePackHeader, before digests exist. */
 function validateManifest(value: unknown, blobLength: number, requireDigests: boolean): PackManifest {
     if (!isRecord(value)) throw new Error('Invalid .jspack file: manifest must be an object');
     const { entry, modules, edges, bytecodeVersion, blobLength: declaredBlobLength } = value;
@@ -586,9 +491,7 @@ function validateManifest(value: unknown, blobLength: number, requireDigests: bo
     if (!isRecord(modules) || !isRecord(edges)) {
         throw new Error('Invalid .jspack file: modules and edges must be objects');
     }
-    // The blob is "whatever bytes follow the manifest", so its length is only
-    // checkable against a declaration. That catches truncation stopping short of
-    // any declared range, and tail-extension — neither visible per-range.
+    // Catches truncation and trailing data that per-range checks cannot see.
     if (requireDigests || declaredBlobLength !== undefined) {
         if (!Number.isSafeInteger(declaredBlobLength) || Number(declaredBlobLength) < 0) {
             throw new Error('Invalid .jspack file: missing or invalid blob length');
@@ -610,15 +513,19 @@ function validateManifest(value: unknown, blobLength: number, requireDigests: bo
         if (!validRange(raw.offset, raw.length, blobLength)) {
             throw new Error(`Invalid .jspack file: blob range is out of bounds for "${id}"`);
         }
-        if (raw.fileKind === 'source' && !validRange(raw.sourceOffset, raw.sourceLength, blobLength)) {
-            throw new Error(`Invalid .jspack file: source range is out of bounds for "${id}"`);
+        if (raw.fileKind === 'source') {
+            // Mandatory, not just bounds-checked: validRange passes on undefined.
+            if (raw.sourceOffset === undefined || raw.sourceLength === undefined) {
+                throw new Error(`Invalid .jspack file: source module "${id}" is missing its source range`);
+            }
+            if (!validRange(raw.sourceOffset, raw.sourceLength, blobLength)) {
+                throw new Error(`Invalid .jspack file: source range is out of bounds for "${id}"`);
+            }
         }
         if (raw.fileKind !== 'source' &&
             (raw.sourceOffset !== undefined || raw.sourceLength !== undefined || raw.sourceOnly !== undefined || raw.lang !== undefined)) {
             throw new Error(`Invalid .jspack file: non-source module has source metadata for "${id}"`);
         }
-        // A non-source module has no source range, so a sourceDigest on one
-        // would name bytes that do not exist — reject rather than ignore.
         if (raw.fileKind !== 'source' && raw.sourceDigest !== undefined) {
             throw new Error(`Invalid .jspack file: non-source module has a source digest for "${id}"`);
         }
@@ -639,8 +546,6 @@ function validateManifest(value: unknown, blobLength: number, requireDigests: bo
         if (raw.sourceOnly !== undefined && typeof raw.sourceOnly !== 'boolean') {
             throw new Error(`Invalid .jspack file: invalid sourceOnly flag for "${id}"`);
         }
-        // sourceOnly means "must recompile from fallback source" — the source
-        // range is mandatory (already checked for fileKind===source above).
         if (raw.sourceOnly === true && raw.fileKind !== 'source') {
             throw new Error(`Invalid .jspack file: sourceOnly requires fileKind source for "${id}"`);
         }
@@ -651,7 +556,6 @@ function validateManifest(value: unknown, blobLength: number, requireDigests: bo
     if (!Object.prototype.hasOwnProperty.call(modules, entry)) {
         throw new Error(`Invalid .jspack file: entry module "${entry}" is missing`);
     }
-    // Ranges are individually in bounds by here; check how they relate.
     validateBlobLayout(modules);
 
     for (const [parent, rawBucket] of Object.entries(edges)) {

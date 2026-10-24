@@ -1799,44 +1799,15 @@ export class NpmHandler implements ProtocolHandler {
     /**
      * Version policy for an UNCONSTRAINED range (`''` / `latest` / `*`).
      *
-     * DO NOT "simplify" this back into a bare findCachedPackageMatching() hit.
-     * That is the exact shape of the defect this replaced: ensureInstalled()
-     * returned from the warm-store fast path *before* resolveVersion() — the
-     * only reader of `dist-tags` — ever ran, so an unversioned `npm:foo`
-     * resolved to `latestVersion(<whatever foo@* happened to sit in the
-     * store>)`. Measured: a planted `commander@99.0.0`, a version published by
-     * no registry, won a top-level `import('npm:commander')` while metadata
-     * with a fresh marker and `dist-tags.latest = 15.0.0` sat readable on
-     * disk. Store contents are sticky — once something lands it is preferred
-     * forever — so that is a supply-chain hazard, not merely a wrong answer.
+     * Only the registry knows what "latest" means, so a store hit alone is not an
+     * answer: the warm store is sticky, and an unversioned `npm:foo` that skipped
+     * `resolveVersion` (the sole `dist-tags` reader) accepted any planted version
+     * in the store. Constrained ranges state their own intent and keep the fast path.
      *
-     * A CONSTRAINED range (`^1`, `~1.2`, `1.2.3`) is the caller's own stated
-     * intent, so a store answer is legitimate and deliberately keeps the fast
-     * path (see the comment above the findCachedPackageMatching() call in
-     * ensureInstalled()). Only the unconstrained case delegates the choice,
-     * because only the registry knows what "latest" currently means.
-     *
-     * Requiring metadata outright was REJECTED: it turns every unversioned
-     * `npm:` import red offline, which is worse than the bug. Instead the store
-     * may still answer, but only for versions the registry has ATTESTED:
-     *
-     *   tier 1  metadata fresh on disk (<24h) or fetchable -> `dist-tags.latest`.
-     *           Authoritative, and matches npm. If that version is not in the
-     *           store and cannot be fetched, the error stands rather than
-     *           silently substituting a different version — deno's `--cached-only`
-     *           refuses here too, and a loud miss beats a quiet downgrade.
-     *   tier 2  metadata on disk at ANY age -> highest store version that is
-     *           present in `meta.versions`, preferring a still-present
-     *           `dist-tags.latest`. This asymmetry is the crux: the `latest`
-     *           POINTER drifts and so needs the 24h gate, but MEMBERSHIP in
-     *           `meta.versions` is an immutable historical fact — 92h-old
-     *           metadata still proves `99.0.0` was never published. Attestation
-     *           therefore survives staleness, which is what lets this stay
-     *           useful offline without trusting arbitrary store contents.
-     *   tier 3  no metadata at all -> highest store version, with a warning.
-     *           The store *is* the cache, so refusing here would break offline
-     *           first-run for no safety gain over warning; but the answer is
-     *           unverified, so it must not be silent.
+     * Offline fallback is limited to registry-attested versions. `dist-tags.latest`
+     * drifts and needs fresh metadata; membership in `meta.versions` is immutable,
+     * so metadata of any age attests it. With no metadata the highest store version
+     * is used with a warning, never silently.
      */
     private *resolveUnconstrainedVersion(
         name: string,

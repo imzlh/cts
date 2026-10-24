@@ -209,7 +209,8 @@ export class JsrHandler implements ProtocolHandler {
         log.debug('jsr', () => `fetch ${label} ${id} <- ${url}`);
         const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout });
         if (res.status < 200 || res.status >= 300) {
-            throw err(ErrorKind.NetworkError, `HTTP ${res.status} fetching JSR ${label} ${url}`);
+            throw this.httpStatusError(res.status, `${label} ${url}`,
+                `JSR ${label} not found: ${id} (HTTP ${res.status} ${url})`);
         }
         const meta = safeParse<JsrMetadata>(engine.decodeString(res.body));
         if (ver === undefined && !('latest' in meta && meta.latest)) {
@@ -218,6 +219,14 @@ export class JsrHandler implements ProtocolHandler {
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
         yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: Date.now() }, null, 2) };
         return meta;
+    }
+
+    /** Map a registry HTTP status. 404/410 mean the path/package does not exist
+     *  (resolution miss, as npm.ts does for registry metadata); anything else
+     *  (5xx, 403, 429, proxy errors) is a transport failure. */
+    private httpStatusError(status: number, what: string, notFoundMsg: string): Error {
+        if (status === 404 || status === 410) return err(ErrorKind.ModuleNotFound, notFoundMsg);
+        return err(ErrorKind.NetworkError, `HTTP ${status} fetching JSR ${what}`);
     }
 
     private *download(
@@ -241,7 +250,7 @@ export class JsrHandler implements ProtocolHandler {
             yield { type: StepType.FS_ENSURE_DIR, path: dirname(local) };
             const res = expectFetch(yield { type: StepType.NET_FETCH, url, timeout: this.cfg.requestTimeout, onProgress });
             if (res.status < 200 || res.status >= 300) {
-                throw err(ErrorKind.ModuleNotFound, `HTTP ${res.status} fetching ${url}`);
+                throw this.httpStatusError(res.status, `file ${url}`, `module @${scope}/${name}@${ver}/${file} (HTTP ${res.status} ${url})`);
             }
             if (!checksum || !matchesJsrChecksum(res.body, checksum)) {
                 throw err(ErrorKind.NetworkError, `Integrity check failed for ${url}`);

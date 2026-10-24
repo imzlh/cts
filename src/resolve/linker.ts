@@ -5,6 +5,7 @@ import {
     hardlinkOrCopyDirRecursive, readText, safeParse, matchLatestVersion, isValidNpmPackageName,
     yieldEventLoop, toPosixPath, relativePath,
 } from '../utils';
+import { err, ErrorKind } from '../errors';
 import { getBinMap, resolvePackageBinPath } from './pkg';
 
 const fs = import.meta.use('fs');
@@ -81,8 +82,8 @@ export async function materializeNodeModules(
     if (graphMissing.length) {
         const head = graphMissing.slice(0, 5).join('; ');
         const more = graphMissing.length > 5 ? ` (+${graphMissing.length - 5} more)` : '';
-        throw new Error(
-            `node_modules materialization failed (${graphMissing.length} missing): ${head}${more}`,
+        throw err(ErrorKind.FileNotFound,
+            `node_modules materialization failed (${graphMissing.length} missing): ${head}${more} (store ${storeRoot})`,
         );
     }
 
@@ -115,7 +116,7 @@ export async function materializeNodeModules(
     if (failures.length > 0) {
         const head = failures.slice(0, 5).join('; ');
         const more = failures.length > 5 ? ` (+${failures.length - 5} more)` : '';
-        throw new Error(
+        throw err(ErrorKind.FileNotFound,
             `node_modules materialization failed (${failures.length} link(s)): ${head}${more}`,
         );
     }
@@ -280,15 +281,15 @@ async function materializeHardVirtual(
             const depDir = resolveStorePackage(storeRoot, dep.name, dep.range, pkg.storeDir);
             if (!depDir) {
                 if (dep.optional) continue;
-                throw new Error(
-                    `store package missing for ${dep.name} (required by ${pkg.name}@${pkg.version})`,
+                throw err(ErrorKind.FileNotFound,
+                    `store package missing for ${dep.name} (required by ${pkg.name}@${pkg.version}) in ${storeRoot}`,
                 );
             }
             const cv = packageIdFromDir(storeRoot, depDir, dep.name);
             if (!cv) {
                 if (dep.optional) continue;
-                throw new Error(
-                    `store package missing for ${dep.name} (required by ${pkg.name}@${pkg.version})`,
+                throw err(ErrorKind.FileNotFound,
+                    `store package missing for ${dep.name} (required by ${pkg.name}@${pkg.version}) in ${storeRoot}`,
                 );
             }
             softJobs.push({
@@ -348,7 +349,7 @@ async function materializeHardVirtual(
         }
     });
     if (failures.length) {
-        throw new Error(failures.slice(0, 5).join('; '));
+        throw err(ErrorKind.Generic, failures.slice(0, 5).join('; '));
     }
 
     // Phase 2+3: dependency edges and project roots (bounded concurrency).
@@ -359,7 +360,7 @@ async function materializeHardVirtual(
                     bump();
                     return;
                 }
-                throw new Error(`virtual package missing for ${job.label}: ${job.source}`);
+                throw err(ErrorKind.FileNotFound, `virtual package missing for ${job.label}: ${job.source}`);
             }
             await placeSoftLink(job.source, job.target);
             bump();
@@ -372,7 +373,7 @@ async function materializeHardVirtual(
         }
     });
     if (failures.length) {
-        throw new Error(failures.slice(0, 5).join('; '));
+        throw err(ErrorKind.Generic, failures.slice(0, 5).join('; '));
     }
 
     if (linked < total) onLinked?.(total, total);
@@ -879,11 +880,11 @@ async function linkProjectRootSoft(
     const linkSource = joinPaths(storeRoot, `${cv.name}@${cv.version}`);
     try {
         if (!fs.exists(joinPaths(linkSource, 'package.json'))) {
-            throw new Error(`store package missing: ${linkSource}`);
+            throw err(ErrorKind.FileNotFound, `store package missing: ${linkSource}`);
         }
         await placeSoftLink(linkSource, targetDir);
     } catch (e) {
-        throw new Error(`failed to link ${edge.name} into ${targetDir}: ${errMsg(e)}`, { cause: e });
+        throw err(ErrorKind.FileNotFound, `failed to link ${edge.name} into ${targetDir}: ${errMsg(e)}`, e);
     }
 }
 

@@ -1,8 +1,8 @@
-import { type ModuleInfo } from '../types';
+import { type ModuleInfo, moduleRef } from '../types';
 import type { CjsCacheStore, CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
-import { isResolutionMiss, requireCycleError } from '../errors';
+import { isResolutionMiss, requireCycleError, setErrorCode } from '../errors';
 import { BUILTINS } from '../resolve/builtins';
 import { errMsg, log } from '../utils';
 import type { NodeModuleInteropBridge } from './node-interop';
@@ -105,20 +105,22 @@ export function loadEsmSync(
     from = '<unknown>',
 ): Record<string, unknown> {
     // Never expose or evaluate a partial in-flight ESM namespace to require().
-    if (esm.isInFlight(info.localPath)) {
-        throw requireCycleError(info.localPath, from, 'require-esm');
+    // Same key the compiler tracks: moduleRef(info), not localPath (types.ts).
+    if (esm.isInFlight(moduleRef(info))) {
+        throw requireCycleError(moduleRef(info), from, 'require-esm');
     }
 
     const mod = esm.load(info, {}, resolveMtime);
-    const result = engine.promiseResult(esm.trackEvaluation(info.localPath, () => mod.eval()));
+    const evalScope = moduleRef(info);
+    const result = engine.promiseResult(esm.trackEvaluation(evalScope, () => mod.eval()));
 
     // null = top-level await unresolved; do NOT weaken with namespace check (causes silent dead-lock)
     if (result === null) {
         // Node: ERR_REQUIRE_ASYNC_MODULE
         const e = new Error(
             `Cannot require() async ESM module '${info.specPath}'; use dynamic import() instead`
-        ) as Error & { code?: string };
-        e.code = 'ERR_REQUIRE_ASYNC_MODULE';
+        );
+        setErrorCode(e, 'ERR_REQUIRE_ASYNC_MODULE');
         throw e;
     }
 

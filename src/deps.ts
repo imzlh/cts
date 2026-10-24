@@ -383,7 +383,7 @@ export class DepScanner {
             const scanned = this.importScanner.scanFileResult(localPath, undefined, fullGraph);
             if (scanned === null) {
                 if (fullGraph) throw new Error(`Could not read source for full dependency scan: ${localPath}`);
-                return [];
+                return null;
             }
             imports = scanned;
         } else {

@@ -13,7 +13,7 @@ let activeInstall = false;
 
 function unsupportedAttribute(name: string, value: unknown): TypeError {
     const error = new TypeError(`Import attribute "${name}" with value "${String(value)}" is not supported`);
-    Object.defineProperty(error, 'code', { value: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED' });
+    setErrorCode(error, 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED');
     return error;
 }
 
@@ -97,10 +97,12 @@ export function installEngineHooks(
                 if (code === 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED'
                     || code === 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE') throw e;
                 // Preserve LockFrozen / ProtocolDisabled / NetworkError / … and an
-                // existing non-enum .kind, rather than rewriting all as ModuleNotFound.
+                // existing .kind. Un-kinded errors are NOT resolution misses: a
+                // network or I/O failure must not turn into MODULE_NOT_FOUND
+                // (isResolutionMiss would let a CJS require() walk past it).
                 const kind = e instanceof Error && isErrorKind(e.kind)
                     ? e.kind
-                    : ErrorKind.ModuleNotFound;
+                    : ErrorKind.Generic;
                 throw esmResolveError(spec, parent, e, kind);
             }
         },

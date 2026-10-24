@@ -1,6 +1,7 @@
 import type { ModuleInfo, FileKind } from '../../types';
 import type { Flow, ProgressCallback } from '../../flow';
 import { extname } from '../../utils/path';
+import { setErrorCode } from '../../errors';
 
 export type { ModuleInfo };
 
@@ -39,12 +40,12 @@ export function validateAttrType(kind: FileKind, attr: Record<string, unknown> |
     if (type === undefined || type === 'text' || type === 'bytes') return;
     if (type !== 'json') {
         const error = new TypeError(`Import attribute "type" with value "${String(type)}" is not supported in ${specPath}`);
-        Object.defineProperty(error, 'code', { value: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED' });
+        setErrorCode(error, 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED');
         throw error;
     }
     if (kind !== 'json') {
         const error = new TypeError(`Module "${specPath}" is not of type "json"`);
-        Object.defineProperty(error, 'code', { value: 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE' });
+        setErrorCode(error, 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE');
         throw error;
     }
 }

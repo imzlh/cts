@@ -140,7 +140,7 @@ function filterPathAliases(raw: unknown): Record<string, string[]> | undefined {
 
 function envConfig(): Partial<ConfigOptions> {
     const c: Partial<ConfigOptions> = {};
-    const bool = (v: string | null) => v !== null ? v === 'true' : undefined;
+    const bool = (v: string | undefined) => v !== undefined ? v === 'true' : undefined;
     const E = 'CTS_';
     const v = (k: string) => readEnv(E + k);
     const cacheDir = v('CACHE_DIR'); if (cacheDir) c.cacheDir = cacheDir;
