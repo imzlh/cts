@@ -172,9 +172,6 @@ export function resolvePackageBinPath(pkgDir: string, relPath: string): string |
  *  - `import` with no manifest at all is the Deno-style single-file case, which
  *    has no package.json by design and is ESM. That default is intentional;
  *    inverting it would break running a loose `.js` script as a module.
- *
- * A package.json that exists but lacks "type" still resolves to CJS through the
- * manifest branch below, in both contexts, matching node.
  */
 export function detectFormat(localPath: string, kind: ResolveKind = 'import'): ModuleFormat {
     return resolveDirFormat(cachedDirFormat(localPath), kind);
@@ -220,7 +217,7 @@ function _detectFormat(localPath: string): DirFormat {
     // Walk up directories, caching every intermediate dir to avoid re-traversal
     let dir = dirname(localPath);
     let result: DirFormat = NO_MANIFEST;
-    const visited: string[] = []; // dirs we passed through without a result
+    const visited: string[] = [];
     while (dir !== '/' && dir !== '.') {
         const cached = formatDirCache.get(dir);
         if (cached !== undefined) {
@@ -306,26 +303,12 @@ export function isRootExportRuntimeless(ctx: ResolveCtx): boolean {
 }
 
 export function packagePathNotExportedError(spec: string): Error {
-    const error = err(ErrorKind.ModuleNotFound, `Package subpath is not exported: ${spec}`);
-    Object.defineProperty(error, 'code', {
-        value: 'ERR_PACKAGE_PATH_NOT_EXPORTED',
-        writable: true,
-        enumerable: true,
-        configurable: true,
-    });
-    return error;
+    return codedError(ErrorKind.ModuleNotFound, 'ERR_PACKAGE_PATH_NOT_EXPORTED', `Package subpath is not exported: ${spec}`);
 }
 
 export function packageImportNotDefinedError(spec: string, pkgDir: string, parent: string): Error {
-    const error = err(ErrorKind.ModuleNotFound,
+    return codedError(ErrorKind.ModuleNotFound, 'ERR_PACKAGE_IMPORT_NOT_DEFINED',
         `Package import specifier "${spec}" is not defined in package ${joinPaths(pkgDir, 'package.json')} imported from "${parent}"`);
-    Object.defineProperty(error, 'code', {
-        value: 'ERR_PACKAGE_IMPORT_NOT_DEFINED',
-        writable: true,
-        enumerable: true,
-        configurable: true,
-    });
-    return error;
 }
 
 function codedError(kind: ErrorKind, code: string, message: string): Error {

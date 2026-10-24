@@ -48,7 +48,6 @@ export class DataHandler implements ProtocolHandler {
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
-    /** Clear resolved cache */
     clearCache(): void {
         this.resolved.clear();
     }

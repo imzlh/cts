@@ -19,33 +19,30 @@ import { guessFileKind, applyAttrType, validateAttrType } from './protocols/base
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 
-// protoOf — extract protocol prefix without regex
-// Returns '' for relative/absolute paths, 'http' for 'http://...', etc.
-
+// Protocol prefix without a regex: '' for relative/absolute paths, 'http' for
+// 'http://...', etc.
 function protoOf(s: string): string {
     return schemeId(s) ?? '';
 }
 
 /**
- * Node resolves ESM specifiers as URLs, so `./with%20space.mjs` refers to the
- * file `with space.mjs`. Try the literal path first (a file may legitimately
- * contain '%'), then the percent-decoded form.
+ * Node resolves ESM specifiers as URLs, so `./with%20space.mjs` refers to
+ * `with space.mjs`. Try the literal path first (a file may contain '%'), then
+ * the percent-decoded form.
  */
 function resolveLocalFile(path: string): string {
     // ESM specifiers are URLs: encoded separators are invalid even when a file
-    // with the literal `%2F`/`%5C` spelling exists. Encoded dot segments would
-    // otherwise become `..` after decoding below and escape the importer's
-    // directory. Reject those forms before trying the literal path.
+    // with the literal `%2F`/`%5C` spelling exists, and encoded dot segments would
+    // become `..` after decoding below and escape the importer's directory.
     if (path.includes('%')) {
         if (/%(?:2f|5c)/i.test(path)) {
             throw err(ErrorKind.InvalidSpecifier,
                 `Invalid module specifier: encoded path separator in "${path}"`);
         }
         for (const segment of path.split('/')) {
-            // Only ENCODED dot segments are rejected. A literal `..` is legal here:
-            // resolveRelative normalises it away before calling, and resolveAbsolute
-            // passes an already-absolute path. Testing segments without a '%' would
-            // reject any path that merely contains '%' elsewhere (`/dir%20x/../y`).
+            // Only ENCODED dot segments are rejected; a literal `..` is legal here
+            // (resolveRelative normalised it away). Testing segments without a '%'
+            // would reject any path that merely contains '%' elsewhere.
             if (!segment.includes('%')) continue;
             if (!/(?:%2e|\.){1,2}$/i.test(segment)) continue;
             let decoded: string;
@@ -262,9 +259,9 @@ export class ModuleResolver {
     }
 
     /**
-     * Release the lock store this resolver owns. Without it the SQLite handle
-     * stays open until process exit (LockStore.closeAll), so a caller cannot
-     * delete the lock dir in-process — on Windows unlink then fails EINVAL.
+     * Release the lock store this resolver owns; otherwise the SQLite handle stays
+     * open until process exit and the lock dir cannot be deleted in-process (on
+     * Windows unlink then fails EINVAL).
      */
     close(): void {
         this.lock.close();
@@ -349,11 +346,9 @@ export class ModuleResolver {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
             const h = this.handlers.get(proto);
             if (!h) throw err(ErrorKind.ProtocolDisabled, `No handler for protocol "${proto}:"`);
-            // Await promise-returning tails so an already-rejected flow promise
-            // is marked handled before host rejection tracking runs. A bare
-            // `return p` can expose that rejection before async adoption;
-            // these paths have no local catch/finally, so `await` preserves
-            // propagation while avoiding spurious unhandled-rejection reports.
+            // `await` rather than bare `return`: these paths have no local catch, and
+            // awaiting marks an already-rejected promise handled before host
+            // rejection tracking runs.
             return await runAsync(h.resolve(spec, parent, attr, onProgress));
         }
         if (isRelative(spec)) return await this.resolveRelativeAsync(spec, parent, attr, onProgress);
@@ -382,22 +377,18 @@ export class ModuleResolver {
     }
 
     /**
-     * Resolve for inspection only. Use project/lock/store data already on disk;
-     * never fetch, install, or materialize a dependency. `require.resolve()`
-     * is a synchronous optional-dependency probe, so routing it through normal
-     * resolution can turn a local lookup into network I/O and make fallback
-     * branches unreachable.
+     * Resolve for inspection only, from project/lock/store data already on disk:
+     * never fetch or install. `require.resolve()` is a synchronous
+     * optional-dependency probe, so normal resolution could turn a local lookup
+     * into network I/O.
      *
-     * A package already present in the local store may resolve even when Node
-     * would require a project `node_modules` entry. This keeps the answer
-     * consistent with the subsequent cno `require()`; stricter declared-deps
-     * policy belongs to node-modules handling. Declared but missing packages
-     * are not materialized here: inspection never fetches.
+     * A package already in the local store may resolve even without a project
+     * `node_modules` entry, keeping the answer consistent with the subsequent
+     * `require()`.
      *
-     * Handlers already honor `cachedOnly`, so toggle it for this synchronous
-     * call instead of threading another flag through every protocol. Mark the
-     * request with `inspect` to keep a store-local inspection result out of
-     * normal memo caches; handlers consume only `cjs` and `type` attributes.
+     * Handlers already honour `cachedOnly`, so toggle it here rather than threading
+     * another flag through every protocol. `inspect` keeps a store-local result out
+     * of the normal memo caches.
      */
     resolveForInspection(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         const prevCachedOnly = this.cfg.cachedOnly;
@@ -565,10 +556,8 @@ export class ModuleResolver {
         return [];
     }
 
-    /**
-     * Ensure required install-graph packages are in the flat store before
-     * soft/hard materialize (scan may never resolve pure package.json edges).
-     */
+    /** Put required install-graph packages in the flat store before materialize
+     *  (scan may never resolve pure package.json edges). */
     async ensureInstallGraph(
         seeds: Array<{ name: string; version: string }>,
         onProgress?: ProgressCallback,
@@ -785,19 +774,17 @@ export class ModuleResolver {
 
         const cacheLockEntry = protoOf(canonical.specPath) !== 'node';
         // specPath → info must be recoverable by getInfo() even for transient
-        // (require) resolves: a local node_modules package gets an `npm:` specPath
-        // whose localPath cannot be recovered from the store layout alone, so
-        // require()-ing an ESM file there would fail with "Package not in cache".
-        // Transient fills only when absent — a real ESM resolve wins (conditions
-        // and format may differ) and overwrites.
+        // (require) resolves: a local package gets an `npm:` specPath whose
+        // localPath is not derivable from the store layout. Transient fills only
+        // when absent — a real ESM resolve wins (conditions and format may differ).
         if (!transient || !this.resolvedModules.has(canonical.specPath)) {
             this.resolvedModules.set(canonical.specPath, canonical);
         }
         if (!transient) {
             if (cacheLockEntry && opts?.persistModule) this.lock.setModule(canonical);
             if (cacheLockEntry && opts?.persistSource) this.lock.setSourceByKey(sourceKey, canonical.specPath);
-            // mainEntry is set only by loadEntry / loadSourceEntry(main), not first resolve —
-            // so `cno test` modules keep import.meta.main === false (Deno semantics).
+            // mainEntry is set only by loadEntry / loadSourceEntry(main), not first
+            // resolve — so `cno test` modules keep import.meta.main === false.
         }
 
         if (opts?.rememberExact) this.rememberExact(requestSpec, parent, attr, resolved);

@@ -8,8 +8,6 @@ const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
 
-// Defaults (only truly required fields)
-
 const DEFAULTS = {
     enableHttp:  true,
     enableJsr:   true,
@@ -44,8 +42,6 @@ const TIER_STACK_SIZE: Record<string, number> = {
 
 const DEFAULT_MEM_LIMIT = TIER_MEM_LIMIT.normal;
 const DEFAULT_STACK_SIZE = TIER_STACK_SIZE.normal;
-
-// Memory size parser  "256MB" → bytes
 
 export function parseSize(s: string | undefined): number | undefined {
     if (!s) return undefined;
@@ -217,7 +213,6 @@ function isJscArtifact(path: string): boolean {
 }
 
 function clearJsc(dir: string): void {
-    // Delete bytecode artifacts in a background timer so we don't block startup.
     timers.setTimeout(() => {
         try {
             clearJscSync(dir);
@@ -353,8 +348,6 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}, argv: stri
     cfg._cli = cli;  // keep raw CLI args for unknown flag warning
     return cfg;
 }
-
-// loadConfigFile — reads tsconfig / deno.json / package.json
 
 export function loadConfigFile(dir: string): Partial<ConfigOptions> {
     const cfg: Partial<ConfigOptions> = {};

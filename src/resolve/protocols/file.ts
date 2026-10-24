@@ -20,13 +20,6 @@ export class FileHandler implements ProtocolHandler {
     localPath(specPath: string): string { return this.strip(specPath); }
 
     private strip(url: string): string {
-        // fileUrlToPath owns URL query/fragment decoding and host handling.
-        let p: string;
-        if (schemeId(url) === 'file') {
-            p = fileUrlToPath(url);
-        } else {
-            p = url;
-        }
-        return normalizePath(p);
+        return normalizePath(schemeId(url) === 'file' ? fileUrlToPath(url) : url);
     }
 }

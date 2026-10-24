@@ -126,20 +126,15 @@ export function blobSourceFromBytes(blob: Uint8Array): PackBlobSource {
 /** Fill in blobLength and the per-module digests, returning a COPY.
  *
  *  Exported so the writer can record in its returned manifest exactly what it
- *  put on disk. Calling it twice is safe and cheap to reason about: the second
- *  call recomputes every digest and compares, which is a genuine self-check that
- *  the blob source and the manifest ranges agree.
+ *  put on disk. Calling it twice is safe: the second call recomputes and
+ *  compares every digest, confirming that the blob source and manifest agree.
  *
- *  Digests are computed here, from the bytes actually being embedded, rather
- *  than accepted from the caller. That is deliberate and it is the whole reason
- *  this function exists: the writer separately keeps a digest of each source
- *  file's ON-DISK bytes for its "source changed while packing" check, and those
- *  two digests differ for every module whose sourceMappingURL was stripped on
- *  the way into the blob. Computing from the embedded bytes at the one place
- *  that has them makes it impossible to wire the wrong one in.
+ *  Digests are computed here from the bytes actually embedded. That matters:
+ *  the writer keeps a separate digest of each source file's ON-DISK bytes for
+ *  its "source changed while packing" check, and that differs from the embedded
+ *  bytes whenever a sourceMappingURL was stripped on the way into the blob.
  *
- *  A digest already present on an entry is verified, not trusted, so a
- *  hand-built manifest carrying a stale digest fails at write time. */
+ *  A digest already present on an entry is verified, not trusted. */
 export function completePackManifest(manifest: PackManifest, source: PackBlobSource): PackManifest {
     const modules: Record<string, PackModuleEntry> = Object.create(null);
     for (const [id, entry] of Object.entries(manifest.modules)) {
@@ -166,10 +161,8 @@ export function completePackManifest(manifest: PackManifest, source: PackBlobSou
 
 /** Serialize header + manifest. Returns the bytes that precede the blob.
  *
- *  Takes a PackBlobSource rather than a length because the per-module digests
- *  are computed here; the streamed writer hands over its in-memory chunk list.
- *  The manifest digest necessarily covers the manifest bytes as serialized here,
- *  which is why it sits in the fixed-width header, outside its own coverage. */
+ *  The manifest digest covers the manifest bytes as serialized here, which is
+ *  why it sits in the fixed-width header, outside its own coverage. */
 export function encodePackHeader(manifest: PackManifest, source: PackBlobSource): Uint8Array {
     if (!Number.isSafeInteger(source.byteLength) || source.byteLength < 0) {
         throw new Error('Cannot encode .jspack file: invalid blob length');
@@ -266,13 +259,10 @@ function bytesToHex(bytes: Uint8Array): string {
     return out;
 }
 
-/** Per-container record of which ranges have already been digest-checked, so a
- *  repeatedly-read module is hashed once. Keyed by container so two containers
- *  sharing an entry object (a test cloning a manifest) cannot cross-credit. */
 /** Read the JSON string starting at `start` (which must be '"'), returning its
  *  decoded value and the index just past the closing quote, or null if it is
- *  malformed. Escapes are decoded so two spellings of one key ("a" and
- *  "a") compare equal, which is how JSON.parse would see them. */
+ *  malformed. Escapes are decoded so two spellings of one key compare equal,
+ *  which is how JSON.parse would see them. */
 function scanJsonString(text: string, start: number): { value: string; end: number } | null {
     let out = '';
     let i = start + 1;
@@ -345,18 +335,18 @@ function assertNoDuplicateKeys(text: string): void {
     }
 }
 
+/** Per-container record of ranges already digest-checked, so a repeatedly-read
+ *  module is hashed once. Keyed by container so two containers sharing an entry
+ *  object (a test cloning a manifest) cannot cross-credit. */
 const verifiedRanges = new WeakMap<PackContainer, Set<string>>();
 
 /** Verify an embedded range against its manifest digest, once per container.
  *
- *  Lazy on purpose: this runs on the startup path and hashing the whole blob
- *  eagerly would make every launch pay for modules it never loads. The bytes
- *  hashed here are bytes the caller is about to read anyway.
+ *  Lazy on purpose: this is on the startup path and hashing the whole blob
+ *  eagerly would make every launch pay for modules it never loads.
  *
- *  A missing digest is a hard failure, not a skip. decodePack requires the field
- *  on every entry, so absence means the manifest was built by something other
- *  than encodePackHeader — and "no digest means don't check" is exactly the
- *  bypass this whole mechanism exists to remove. */
+ *  A missing digest is a hard failure, not a skip: "no digest means don't check"
+ *  is exactly the bypass this mechanism exists to remove. */
 function verifyRange(
     container: PackContainer,
     id: string,
@@ -486,23 +476,19 @@ function spanKey(start: number, end: number): string {
 /** Reject blob layouts no writer can produce, because they let a container run
  *  code its own manifest and embedded source disown.
  *
- *  BlobBuilder only ever *appends whole buffers*, and dedupes by local path, so
- *  every declared range is either byte-identical to another (a deduped source or
- *  asset payload — legitimate: two ids may share one file, e.g. `a.ts` and
- *  `a.ts?v=1`) or completely disjoint. Nothing partially overlaps or nests.
+ *  BlobBuilder only appends whole buffers and dedupes by local path, so every
+ *  declared range is either byte-identical to another (a deduped payload — two
+ *  ids may share one file) or completely disjoint: nothing partially overlaps.
  *
- *  A source module's *bytecode* is stricter still: it is a fresh append per
- *  module id, compiled under that id (the id is baked into the bytecode atom
- *  table as the eval filename), so it can never alias another module's bytecode
- *  or any module's embedded source. Aliasing it is the interesting attack: point
- *  `pack:/safe.ts`'s bytecode range at `pack:/evil.ts`'s bytecode and the
- *  runtime executes evil's body, and exports its bindings, under safe's id —
- *  exit 0, no diagnostic, while safe's untouched source still sits in the blob
- *  for anyone auditing the artifact. Bytecode is not self-describing enough for
- *  the loader to notice, so the layout invariant is enforced here instead.
+ *  A source module's bytecode is stricter still: a fresh append per module id,
+ *  compiled under that id (baked into the atom table as the eval filename), so it
+ *  can never alias other bytecode or any embedded source. That aliasing is the
+ *  attack: point safe's bytecode range at evil's bytecode and the runtime runs
+ *  evil's body under safe's id — exit 0, no diagnostic, safe's source untouched
+ *  for anyone auditing. Bytecode is not self-describing enough to catch it, so
+ *  the invariant is enforced here.
  *
- *  Zero-length ranges are ignored: they address no bytes, so they cannot alias
- *  a payload, and an empty source file is a legitimate 0-byte range. */
+ *  Zero-length ranges are ignored: they address no bytes and cannot alias. */
 function validateBlobLayout(modules: Record<string, unknown>): void {
     const spans: BlobSpan[] = [];
     const bytecodeOwner = new Map<string, string>();
@@ -601,9 +587,8 @@ function validateManifest(value: unknown, blobLength: number, requireDigests: bo
         throw new Error('Invalid .jspack file: modules and edges must be objects');
     }
     // The blob is "whatever bytes follow the manifest", so its length is only
-    // checkable against a declaration. This catches truncation that stops short
-    // of any declared range, and tail-extension, neither of which any per-range
-    // bounds check can see. Safe to trust because manifestDigest covers it.
+    // checkable against a declaration. That catches truncation stopping short of
+    // any declared range, and tail-extension — neither visible per-range.
     if (requireDigests || declaredBlobLength !== undefined) {
         if (!Number.isSafeInteger(declaredBlobLength) || Number(declaredBlobLength) < 0) {
             throw new Error('Invalid .jspack file: missing or invalid blob length');

@@ -48,16 +48,14 @@ function requireArguments(name: string, actual: number, required: number): void 
 }
 
 const normalizeWindowsPath = (path: string): string => {
-    // Normalize Windows paths to C:/…
-
     path = path.replace(/\\/g, '/');
 
-    // Remove leading slash (if followed by a drive letter)
+    // `/C:/...` -> `C:/...`
     if (path.startsWith('/') && isWindowsDriveLetter(path.slice(1, 3))) {
         path = path.slice(1);
     }
 
-    // Handle C| format
+    // `C|/...` -> `C:/...`
     if (isWindowsDriveLetter(path.slice(0, 2)) && path[1] === '|') {
         path = path[0] + ':' + path.slice(2);
     }
@@ -414,9 +412,9 @@ export class URL {
         this.#scheme = 'file';
         path = normalizeWindowsPath(path);
 
-        // C:/aaa/bbb -> /C:/aaa/bbb
+        // `C:/aaa/bbb` -> `['', 'C:', 'aaa', 'bbb']`
         this.#path = path.split('/').filter(p => p);
-        this.#path.unshift(''); // Add leading empty element to generate /C:/aaa
+        this.#path.unshift('');
     }
 
     #parseUnixPath(path: string): void {
@@ -467,7 +465,6 @@ export class URL {
                 if (port > 65535) {
                     throw new TypeError('Invalid URL: invalid port');
                 }
-                // Only set when non-default port
                 const defaultPort = SPECIAL_SCHEMES[this.#scheme];
                 if (defaultPort !== port) {
                     this.#port = String(port);
@@ -523,11 +520,7 @@ export class URL {
     }
 
     get origin(): string {
-        if (this.#scheme === 'file') {
-            return 'null';
-        }
-
-        if (!(this.#scheme in SPECIAL_SCHEMES)) {
+        if (this.#scheme === 'file' || !(this.#scheme in SPECIAL_SCHEMES)) {
             return 'null';
         }
 

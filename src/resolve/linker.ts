@@ -22,10 +22,7 @@ const SOFT_LINK_CONCURRENCY = 8;
 
 type ScanEdge = ScanResult['edges'][number];
 
-/**
- * Read-only install-graph edge (parent → dep store dir). Used for inspection /
- * tests. Materialize does not write these into the store.
- */
+/** Read-only install-graph edge (parent → dep store dir), for inspection/tests. */
 export interface ViewEdge {
     parentName: string;
     parentVersion: string;
@@ -49,19 +46,16 @@ function safeRmdir(path: string): void {
 }
 
 /**
- * Materialize a project-local node_modules tree.
+ * Materialize a project-local node_modules tree. Store packages are read-only
+ * here: install owns store-internal soft links, materialize never writes there.
  *
- * Store packages are read-only here. Install owns store-internal soft links
- * (`parent/node_modules/dep` → store). Materialize never writes under the store.
+ * soft — project-root links into the flat store only.
+ * hard — pnpm-style virtual store under `node_modules/.cts/`: each name@version
+ *        body is hard-linked once, and dependency edges and project roots are
+ *        soft links into it.
  *
- * soft — project-root symlinks/junctions into the flat store only.
- * hard — pnpm-style virtual store under `node_modules/.cts/`:
- *        each name@version body is hard-linked once; dependency edges and
- *        project roots are soft links into that virtual store. Store stays
- *        read-only.
- *
- * Fail closed on missing required store packages / link errors.
- * Optional `onLinked` is pure counters — not a UI API.
+ * Fails closed on missing required store packages / link errors. `onLinked` is
+ * pure counters, not a UI API.
  */
 export async function materializeNodeModules(
     edges: ScanEdge[],
@@ -255,12 +249,10 @@ function virtualBodyDir(projectDir: string, name: string, version: string): stri
 }
 
 /**
- * Hard materialize (pnpm-aligned, incremental):
- * 1. Inventory `.cts` — prune keys not in the current unique package set
- * 2. Per package: skip body if stamp matches store package.json; else rebuild
- * 3. Soft-link deps (bounded concurrency) under each virtual node_modules
- * 4. Soft-link project roots → virtual bodies
- * Never writes under the flat cache store. Never full-wipe `.cts` as the only path.
+ * Hard materialize (pnpm-aligned, incremental): prune `.cts` keys outside the
+ * current package set, skip a body whose stamp matches the store package.json,
+ * then soft-link deps and project roots into the virtual bodies. Never writes
+ * under the flat cache store.
  */
 async function materializeHardVirtual(
     roots: ScanEdge[],

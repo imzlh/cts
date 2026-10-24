@@ -68,7 +68,7 @@ export function esmResolveError(spec: string, parent: string, cause: unknown, ki
     return e;
 }
 
-/** Install onModule hooks (C layer replaces; re-install warns). */
+/** Install onModule hooks (the C layer replaces any prior receiver, so re-install warns). */
 export function installEngineHooks(
     resolver: ModuleResolver,
     compiler: ModuleCompiler,
@@ -86,8 +86,8 @@ export function installEngineHooks(
         resolve(spec: string, parent: string, attr?: Record<string, unknown>): string {
             try {
                 const info = resolveWithModuleHooks(resolver, spec, parent, attr);
-                // CJS circular stubs only — ESM/pack preRegister is pure waste
-                // (buildPaths walks synthetic pack: keys toward root).
+                // Only CJS circular stubs need pre-registration; ESM/pack would make
+                // buildPaths walk synthetic pack: keys toward root.
                 if (info.format === 'cjs' && info.fileKind === 'source') {
                     compiler.preRegister(info.localPath, parentLocal(parent));
                 }
@@ -96,9 +96,8 @@ export function installEngineHooks(
                 const code = e instanceof Error ? Reflect.get(e, 'code') : undefined;
                 if (code === 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED'
                     || code === 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE') throw e;
-                // Preserve LockFrozen / ProtocolDisabled / NetworkError / … —
-                // rewriting everything as ModuleNotFound hid real failure kinds.
-                // Reject non-enum .kind (garbage numbers would poison formatError).
+                // Preserve LockFrozen / ProtocolDisabled / NetworkError / … and an
+                // existing non-enum .kind, rather than rewriting all as ModuleNotFound.
                 const kind = e instanceof Error && isErrorKind(e.kind)
                     ? e.kind
                     : ErrorKind.ModuleNotFound;

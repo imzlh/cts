@@ -41,15 +41,13 @@ export class HttpHandler implements ProtocolHandler {
             }
             this.resolved.set(url, cachePath);
         }
-        const localPath = this.resolved.get(url) ?? cachePath;
-        return { specPath: url, localPath, format: 'esm', fileKind: guessFileKind(localPath) };
+        return { specPath: url, localPath: cachePath, format: 'esm', fileKind: guessFileKind(cachePath) };
     }
 
     localPath(specPath: string): string {
         return this.resolved.get(specPath) ?? this.cachePath(specPath);
     }
 
-    /** Clear resolved cache */
     clearCache(): void {
         this.resolved.clear();
     }

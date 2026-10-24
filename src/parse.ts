@@ -173,16 +173,17 @@ export async function runParseWorker(): Promise<void> {
     let processing = false;
 
     const runTask = async (task: WorkerTask): Promise<void> => {
+        // Pack/VFS paths are not on disk; workers share the process store when installed.
         let bytes: Uint8Array;
         try {
-            // Pack/VFS paths are not on disk; workers share process store when installed.
             const mem = getMemoryFile(task.localPath);
             bytes = mem !== undefined ? mem : await asyncfs.readFile(task.localPath);
         } catch (e) {
+            // Must report the failure: without a result the driver retries the task
+            // until it times out instead of failing it with this read error.
             postResult({ id: task.id, error: errMsg(e) });
             return;
         }
-
         try {
             if (task.kind === 'scan') {
                 postResult({ id: task.id, deps: importScanner.scanBytes(bytes, task.localPath, task.lang, task.strict) });
@@ -190,8 +191,7 @@ export async function runParseWorker(): Promise<void> {
             }
             let result = transformer.transformCaptureBytes(bytes, task.localPath, task.lang, task.specPath);
             if (result === null) {
-                const source = engine.decodeString(bytes);
-                result = transformer.transformCapture(source, task.localPath, task.lang, task.specPath);
+                result = transformer.transformCapture(engine.decodeString(bytes), task.localPath, task.lang, task.specPath);
             }
             const { code, sourceMap } = result;
             postResult({
@@ -252,15 +252,14 @@ class TxWorker {
         this.idx = idx;
         this.w = new worker.Worker({ __cts_role: 'parse', __cts_enable_oxc: enableOxc });
         this.pipe = this.w.messagePipe;
+        // A ready notice or a result can follow a transport error; only the error is final.
         this.pipe.onmessage = (data: unknown) => {
             if (isWorkerReady(data)) {
                 if (!this.ready) {
                     this.ready = true;
                     onReady(this.idx);
                 }
-                return;
-            }
-            if (isWorkerResult(data)) {
+            } else if (isWorkerResult(data)) {
                 this.inFlight = Math.max(0, this.inFlight - 1);
                 onResult(data);
             } else {

@@ -327,9 +327,8 @@ function stripShebang(code: string): string {
 }
 
 /**
- * Throw a located TransformError when `bytes` is not valid UTF-8.
- *
- * Called only on the oxc-declined path, so well-formed sources are unaffected.
+ * Throw a located TransformError when `bytes` is not valid UTF-8; only the
+ * oxc-declined path calls this, so well-formed sources are unaffected.
  */
 function rejectNonUtf8(bytes: Uint8Array, filename: string): void {
     const bad = firstInvalidUtf8(bytes);
@@ -351,19 +350,16 @@ function rejectNonUtf8(bytes: Uint8Array, filename: string): void {
  * Byte offset of the first invalid UTF-8 sequence, or -1 when the input is
  * well-formed.
  *
- * Exported for direct unit testing: the call sites below only reach this when
- * oxc has already declined, so a false positive here (flagging valid UTF-8)
- * would silently convert a working Sucrase fallback into a hard error, and
- * end-to-end tests cannot observe that. Test it directly instead.
+ * Exported for direct unit testing: a false positive here (flagging valid UTF-8)
+ * would silently turn a working Sucrase fallback into a hard error, which
+ * end-to-end tests cannot observe.
  *
  * The native oxc transpiler rejects non-UTF-8 input outright
  * (`std::str::from_utf8` in ext-oxc/src/lib.rs), and OxcTranspiler collapses
- * that failure into `null` — indistinguishable from "oxc declined". Falling
- * back to Sucrase on such a file is not safe: Sucrase silently erases
- * `namespace` bodies and decorated classes, so a single stray byte turns into
- * wrong runtime behaviour with exit code 0. Detect the condition here and
- * fail loudly instead.
- */
+ * that failure into `null`, indistinguishable from "oxc declined". Falling
+ * back to Sucrase would be unsafe: it silently erases `namespace` bodies and
+ * decorated classes, so one stray byte yields wrong runtime behaviour with
+ * exit code 0. Detect it here and fail loudly. */
 export function firstInvalidUtf8(bytes: Uint8Array): number {
     const len = bytes.byteLength;
     let i = 0;

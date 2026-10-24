@@ -20,9 +20,7 @@ export class ModuleCompiler {
     readonly wasm: WasmCompiler;
 
     /**
-     * Module → localPath, so `evalTracked` can name the module it is about to
-     * evaluate. Weak: the Module is owned by esmCache/wasmCache, and a compiler
-     * that outlives a dropped module must not pin it.
+     * Weak so a compiler outliving a dropped module (owned by esmCache/wasmCache) does not pin it.
      */
     private readonly modulePaths = new WeakMap<CModuleEngine.Module, string>();
 

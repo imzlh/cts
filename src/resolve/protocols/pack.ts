@@ -12,7 +12,6 @@ export class PackHandler implements ProtocolHandler {
     constructor(private readonly manifest: PackManifest) {}
 
     *resolve(spec: string, parent: string): Flow<ModuleInfo> {
-        // Self-resolve: `spec` may already be one of our own synthetic specPaths.
         const direct = this.ownModule(spec);
         if (direct) return this.toInfo(spec, direct);
 

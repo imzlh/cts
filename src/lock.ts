@@ -146,10 +146,6 @@ export class LockStore {
         }
 
         const db = this.db;
-        if (!db) {
-            this.loadFailed = true;
-            return;
-        }
 
         try {
             db.exec('PRAGMA journal_mode = DELETE');
@@ -255,11 +251,10 @@ export class LockStore {
     }
 
     private rollbackQuietly(db: CModuleSQLite3.Sqlite3Handle): void {
+        // Rollback is best-effort; it must not mask the original flush failure.
         try {
             db.exec('ROLLBACK');
-        } catch {
-            // Preserve the original flush warning; rollback is best-effort.
-        }
+        } catch {}
     }
 
     private applyPendingWrites(): void {
@@ -351,11 +346,9 @@ export class LockStore {
 
     getImports(spec: string): string[] | undefined {
         const pending = this.pendingImports.get(spec);
-        // Empty [] is a valid warm hit (no static imports) — do not treat as miss.
-        // Callers only read; setImports always stores a fresh copy.
+        // [] is a valid warm hit (no static imports), not a miss.
         if (pending !== undefined) return pending;
         const cached = this.importCache.get(spec);
-        // null = negative miss; [] is a valid positive hit.
         if (cached !== undefined) return cached === null ? undefined : cached;
         const rows = this.query('SELECT deps FROM imports WHERE spec = ?', [spec]);
         if (!rows.length || typeof rows[0].deps !== 'string') {
@@ -395,7 +388,7 @@ export class LockStore {
 
     setImports(spec: string, deps: string[]): void {
         if (this.readOnly) return;
-        // Copy + freeze so getImports can return the cached array without cloning.
+        // Frozen so getImports can hand out the array without cloning.
         const copy = Object.freeze(deps.slice()) as string[];
         this.pendingImports.set(spec, copy);
         this.importCache.set(spec, copy);

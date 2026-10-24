@@ -44,7 +44,6 @@ function resolve(msg: Msg): string {
 }
 
 // Prefer console.__originals__ so debug logs skip the CDP console hook.
-
 function nativeLog(...args: unknown[]): void {
     const origs = (console as ConsoleWithOriginals).__originals__;
     const fn = origs?.log ?? console.log;
@@ -82,10 +81,8 @@ export const log = {
     },
 
     /**
-     * Download progress is DIAGNOSTIC, not program output, so it belongs on
-     * stderr. On stdout it corrupted redirected output: `cno run build.js > out.js`
-     * embedded "✨ pkg@ver..." in out.js. Every call site is already gated on
-     * `!cfg.silent && !isatty`, so this only moves the stream.
+     * Download progress is DIAGNOSTIC, so it belongs on stderr: on stdout it
+     * corrupted `cno run build.js > out.js`.
      */
     download(url: string): void {
         nativeError(`✨ ${url}...`);

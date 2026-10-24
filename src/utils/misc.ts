@@ -10,15 +10,12 @@ export function assert(c: unknown, msg?: string): asserts c {
     if (!c) throw err(ErrorKind.Generic, msg ?? 'Assertion failed');
 }
 
-// Hash — FNV-1a 32-bit (using regular JS numbers, much faster than BigInt)
-// Returns 8-char hex string.
-
+/** FNV-1a 32-bit (plain JS numbers, faster than BigInt), as 8 hex chars. */
 export function hashString(s: string): string {
-    let h = 0x811c9dc5;   // FNV offset basis (32-bit)
+    let h = 0x811c9dc5;
     for (let i = 0; i < s.length; i++) {
         h ^= s.charCodeAt(i);
-        // Multiply by FNV prime (0x01000193), keeping to 32-bit via |0
-        h = (Math.imul(h, 0x01000193)) >>> 0;
+        h = Math.imul(h, 0x01000193) >>> 0;
     }
     return h.toString(16).padStart(8, '0');
 }
@@ -47,20 +44,18 @@ export interface NpmDepTarget {
 }
 
 /**
- * npm alias syntax: `"<localName>": "npm:<realName>[@<range>]"`. The KEY is a
- * local rename, the VALUE names the real package and its range — so querying the
- * registry for the key asks for a package that either does not exist or (worse)
- * exists at unrelated versions.
+ * npm alias syntax: `"<localName>": "npm:<realName>[@<range>]"`. The registry
+ * must be queried for the real name, never the local key — a key that happens
+ * to exist would otherwise resolve at unrelated versions. The leading `@` of a
+ * scoped target is not the version delimiter.
  *
  * Returns null for every non-alias value so callers keep `(key, value)` verbatim.
- * The leading `@` of a scoped target is not the version delimiter.
  */
 export function parseNpmAliasDep(value: string): { name: string; range: string } | null {
     if (!value.startsWith('npm:')) return null;
     let rest = value.slice(4);
     while (rest.startsWith('/')) rest = rest.slice(1);
     if (!rest) return null;
-    // Scoped targets keep their leading '@'; search past it for the version '@'.
     const at = rest.startsWith('@') ? rest.indexOf('@', 1) : rest.indexOf('@');
     const name = at === -1 ? rest : rest.slice(0, at);
     const range = at === -1 ? '' : rest.slice(at + 1);
@@ -459,8 +454,6 @@ export function matchLatestRecordVersion(vs: Record<string, unknown>, r: string)
     return latest;
 }
 
-// Parse canonical npm:name@version[/sub] (not raw range/alias specs).
-
 export function npmNameVersion(specPath: string): { name: string; version: string } | null {
     if (!specPath.startsWith('npm:')) return null;
     const rest = specPath.slice(4);
@@ -530,12 +523,10 @@ function parsePaxPath(content: Uint8Array): string | null {
 export function unTarGz(data: ArrayBuffer | Uint8Array): TarFile[] {
     const bytes = new Uint8Array(zlib.gunzip(data));
     const str = (off: number, len: number) => {
-        // Decode bytes to string, stopping at the first NUL (tar header padding).
         const slice = bytes.subarray(off, off + len);
         const n = slice.indexOf(0);
-        const relevant = n === -1 ? slice : slice.subarray(0, n);
-        // Bulk convert via spread — safe because tar header fields are ≤ 155 bytes
-        return String.fromCharCode(...relevant);
+        // Spread is safe: tar header fields are at most 155 bytes.
+        return String.fromCharCode(...(n === -1 ? slice : slice.subarray(0, n)));
     };
     const oct = (off: number, len: number) => {
         const s = str(off, len).trim();
@@ -652,9 +643,7 @@ export function safeParse<T = unknown>(json: string): T {
         const msg = e instanceof Error ? e.message : String(e);
         const m = msg.match(/\(line (\d+) column (\d+)\)/);
         if (m) {
-            const line = m[1];
-            if (line === undefined) throw err(ErrorKind.SyntaxError, msg);
-            const ln = +line;
+            const ln = +m[1]!;
             const ctx = json.split(/\r?\n/).slice(Math.max(0, ln - 2), ln + 2)
                 .map((l, i) => `  ${(i + ln - 1).toString().padStart(4)} | ${l}`).join('\n');
             throw err(ErrorKind.SyntaxError, msg + '\n' + ctx);
@@ -683,8 +672,7 @@ function shouldConsumeArgValue(token: string | undefined, type: ArgType): token 
 export function parseArgs<T extends ArgTemplate>(argv: string[], tpl: T): ArgResult<T> {
     const out: ParsedArgs = { _offset: 0 };
     for (let i = 0; i < argv.length; i++) {
-        const arg = argv[i];
-        if (arg === undefined) break;
+        const arg = argv[i]!;
         if (arg === '--') {
             const positional = argv[i + 1];
             if (positional !== undefined) {

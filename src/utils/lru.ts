@@ -8,7 +8,6 @@ export class LRU<K, V> {
     get(key: K): V | undefined {
         const v = this.map.get(key);
         if (v === undefined) return undefined;
-        // Move to back (MRU)
         this.map.delete(key);
         this.map.set(key, v);
         return v;
@@ -20,7 +19,6 @@ export class LRU<K, V> {
     set(key: K, value: V): void {
         if (this.map.has(key)) this.map.delete(key);
         this.map.set(key, value);
-        // Evict LRU entry if over capacity
         if (this.map.size > this.cap) {
             const oldest = this.map.keys().next();
             if (!oldest.done) this.map.delete(oldest.value);

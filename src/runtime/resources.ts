@@ -49,5 +49,5 @@ export function createResourceManager(): ResourceManager {
     return mgr;
 }
 
-// Process-exit cleanup singleton when no TypeScriptRuntime is held.
+// Process-exit fallback when no TypeScriptRuntime owns cleanup.
 export const resources = createResourceManager();

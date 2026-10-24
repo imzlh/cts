@@ -170,10 +170,9 @@ export class JscCache {
     }
 
     /**
-     * Identity-aware sidecars reject legacy stamps instead of risking a stale graph.
-     * The version prefix is unconditional: a v2 stamp (second-granularity mtime, no
-     * content hash) must never satisfy a v3 check, so pre-upgrade entries recompile
-     * once rather than being trusted.
+     * Identity-aware sidecars reject legacy stamps. The version prefix is
+     * unconditional: a v2 stamp (second-granularity mtime, no content hash) must
+     * never satisfy a v3 check, so pre-upgrade entries recompile once.
      */
     private freshnessToken(localPath: string, cachedMtime?: number, moduleId?: string, source?: SourceFreshness): string {
         const stamp = this.legacyFreshnessToken(localPath, cachedMtime, source);
@@ -313,8 +312,8 @@ export class JscCache {
         }
 
         // L2: on-disk only for real filesystem paths. A v3 freshness check
-        // necessarily reads and hashes source bytes; retain that exact snapshot
-        // so a miss can transform it without another stat/read/hash sequence.
+        // necessarily reads and hashes source bytes; keep that exact snapshot so
+        // a miss transforms it without another stat/read/hash sequence.
         const paths = this.cachePaths(localPath, remote);
         if (!paths) return null;
         const source = isFileBackedPath(localPath) ? this.readSource(localPath) : undefined;

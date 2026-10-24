@@ -95,7 +95,8 @@ export async function ensureDirAsync(dir: string): Promise<void> {
 
 const EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.node', '.wasm'];
 const cache = new LRU<string, string>(2048);
-const negCache = new LRU<string, boolean>(4096);  // bounded: paths known not to exist
+// Bounded so a long session cannot grow it without limit.
+const negCache = new LRU<string, boolean>(4096);
 
 export function resolveFile(base: string, exts = EXTS): string {
     const hit = cache.get(base);
@@ -110,7 +111,6 @@ export function resolveFile(base: string, exts = EXTS): string {
 /** Mark a path as definitively non-existent (stat failed). */
 function markMissing(p: string): void { negCache.set(p, true); }
 
-/** Clear negative cache to allow re-checking paths */
 export function clearNegativeCache(): void { negCache.clear(); }
 
 function tryIndex(base: string, exts: string[]): string | null {
@@ -164,10 +164,7 @@ function _resolve(base: string, exts: string[]): string {
 
 export function clearResolveCache(): void { cache.clear(); negCache.clear(); }
 
-// hardlinkOrCopyDirRecursive — hard mode: hardlink files, copy on EXDEV; keep symlinks.
-// Yields the event loop during huge trees so other timers can run (not a UI API).
-
-/** Sync walk — only for tiny trees / tests; prefer async for materialize. */
+/** Sync walk of a tiny tree; prefer the async walk for materialize. */
 export function hardlinkOrCopyDirRecursiveSync(src: string, dest: string): void {
     ensureDir(dest);
     for (const entry of fs.readdir(src, true)) {
@@ -186,9 +183,9 @@ export function hardlinkOrCopyDirRecursiveSync(src: string, dest: string): void 
 export interface HardlinkWalkOptions {
     /** Top-level entry names to skip (e.g. store-owned `node_modules`). */
     skipNames?: readonly string[];
-    /** Yield after this many file ops (default 256; was 64). */
+    /** Yield after this many file ops (default 256). */
     yieldEvery?: number;
-    /** Min ms between yields (default 50; was 16). */
+    /** Min ms between yields (default 50). */
     yieldMs?: number;
 }
 
@@ -233,13 +230,13 @@ export async function hardlinkOrCopyDirRecursive(
 }
 
 function linkSymlinkEntry(s: string, d: string): void {
-    // Relative install links (../pkg@ver) break when re-rooted under hard views.
     let target = fs.readlink(s);
+    // Relative install links (../pkg@ver) break when re-rooted under hard views.
     if (!isAbsolute(target)) {
         try {
             target = fs.realpath(s);
         } catch {
-            // Dangling relative: keep as-is.
+            // Dangling link: keep the target as written.
         }
     }
     unlinkIfExists(d);

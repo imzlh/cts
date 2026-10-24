@@ -341,7 +341,7 @@ export function buildWasmModule(
         }
     }
 
-    // Instance wrapper with .exports (V8/Deno compatibility)
+    // V8/Deno compatibility
     const wrappedInst: {
         callFunction(name: string, ...args: CModuleWASM.WasmValue[]): CModuleWASM.WasmFunctionResult;
         exports: Record<string, unknown>;
@@ -360,10 +360,9 @@ export function buildWasmModule(
 }
 
 function toWasmValue(v: unknown): CModuleWASM.WasmFunctionArgument {
-    /* Numeric coercion belongs to the native call boundary, where the
-     * function signature is known.  Converting everything else to zero here
-     * destroyed externref arguments (notably the options object passed to
-     * @deno/loader's wasm-bindgen module). */
+    /* Coercion happens at the native call boundary, where the signature is known:
+     * zeroing non-numbers here destroyed externref args (e.g. @deno/loader's
+     * wasm-bindgen options object). */
     return v as CModuleWASM.WasmFunctionArgument;
 }
 
@@ -371,10 +370,9 @@ function toWasmValue(v: unknown): CModuleWASM.WasmFunctionArgument {
 
 type LoadFn = (info: ModuleInfo, meta: Record<string, unknown>) => CModuleEngine.Module;
 type ResolveFn = (spec: string, parent: string) => ModuleInfo;
-/** Evaluate a module loaded by LoadFn. Supplied by the caller so the evaluation
- *  can be bracketed (ModuleCompiler.evalTracked) — a bare `mod.eval()` here lets
- *  a JS dependency of a WASM module be require()d back mid-evaluation, which
- *  .eval()s a JS_MODULE_STATUS_EVALUATING module and aborts the process. */
+/** Supplied by the caller so evaluation is bracketed (ModuleCompiler.evalTracked);
+ *  a bare `mod.eval()` here lets a JS dependency be require()d back mid-evaluation,
+ *  .eval()ing a JS_MODULE_STATUS_EVALUATING module and aborting the process. */
 type EvalFn = (mod: CModuleEngine.Module) => unknown;
 
 interface PendingWasmModule {
@@ -427,9 +425,6 @@ export class WasmCompiler {
                     if (cached) return cached;
 
                     const loaded = loadModule(resolved, {});
-                    // evalModule, not loaded.eval(): brackets the dependency's
-                    // evaluation so a require() back into it throws
-                    // ERR_REQUIRE_CYCLE_MODULE instead of aborting. See EvalFn.
                     const evalResult = engine.promiseResult(
                         evalModule(loaded) as ReturnType<CModuleEngine.Module['eval']>,
                     );

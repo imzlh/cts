@@ -36,13 +36,9 @@ const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '�
 const PAINT_MS = 200;
 
 /**
- * TTY progress for precache/pack.
- *
- * Ownership:
- * - Callers only mutate state (counters, activity, download rows).
- * - This class owns all paints via a private setInterval.
- * - Long sync work must yield the event loop elsewhere (`yieldEventLoop`)
- *   so the timer can fire — yielding is not a progress API.
+ * TTY progress for precache/pack. Callers only mutate state; the class owns all
+ * paints via a private setInterval. Long sync work must yield elsewhere
+ * (`yieldEventLoop`) so that timer can fire — yielding is not a progress API.
  */
 interface DownloadItem {
     label: string;
@@ -88,7 +84,7 @@ export class PrecacheProgress {
         this.ensureTimer();
     }
 
-    // ---- State only (never paint) ----
+    // ---- State only (never paints) ----
 
     bumpResolved(n = 1): void {
         this.resolved += n;

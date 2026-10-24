@@ -41,9 +41,7 @@ function invalidFileUrlPath(pathname: string): never {
 export function fileUrlToPath(value: string): string {
     let pathname: string;
     let hostname = '';
-    // Older CNO callers formed `file://${windowsPath}`, producing
-    // `file://C:/...` or `file://C:\...` instead of the canonical triple slash
-    // form. Keep accepting that spelling at this boundary.
+    // Legacy `file://C:/...` / `file://C:\...` spelling produced by older CNO callers.
     const legacy = value.startsWith('file://') ? value.slice(7) : '';
     if (/^[A-Za-z]:[\\/]/.test(legacy)) {
         const query = legacy.indexOf('?');
@@ -56,9 +54,7 @@ export function fileUrlToPath(value: string): string {
         pathname = url.pathname;
         hostname = url.hostname;
     }
-    // A decoded separator would change the URL path structure and is rejected
-    // by Node's file URL conversion on Windows. `%5C` is a filename character
-    // on POSIX, while `%2F` is always a path separator.
+    // A decoded separator changes the URL path structure; Node rejects it on Windows.
     if (/%2f/i.test(pathname) || (isWindows && /%5c/i.test(pathname))) {
         invalidFileUrlPath(pathname);
     }
@@ -68,8 +64,6 @@ export function fileUrlToPath(value: string): string {
     }
     if (isWindows) {
         if (hostname && hostname !== 'localhost') {
-            // Accept the legacy `file://C:/path` spelling used by older CNO
-            // callers as well as the canonical `file:///C:/path` form.
             path = /^[A-Za-z]$/.test(hostname)
                 ? `${hostname.toUpperCase()}:${path}`
                 : `//${hostname}${path}`;
@@ -88,8 +82,8 @@ function encodeFileUrlPath(path: string): string {
 }
 
 function normalizeDecodedFilePath(path: string): string {
-    // On POSIX, a decoded `\\` is a filename character, not a separator.
-    // Keep it opaque while still collapsing URL path dot-segments.
+    // On POSIX a decoded `\\` is a filename character, so keep it opaque while
+    // still collapsing URL dot-segments.
     if (isWindows) {
         return normalizePath(path);
     }
@@ -157,7 +151,7 @@ export function schemeId(s: string): string | null {
 
 /**
  * Convert CTS's POSIX-internal paths to native paths at public boundaries.
- * Scheme-qualified IDs stay unchanged because their slashes are identifier syntax, not path separators.
+ * Scheme IDs are left alone: their slashes are identifier syntax, not separators.
  */
 export function toHostPath(p: string): string {
     if (!isWindows || hasSchemeId(p)) return p;
@@ -179,8 +173,8 @@ export function canonicalizePath(p: string): string {
     p = normalizeSlashes(p);
     if (p.length >= 2 && p[1] === ':') {
         const c = p.charCodeAt(0);
-        const drive = p[0];
-        if (drive !== undefined && c >= 97 && c <= 122) p = drive.toUpperCase() + p.slice(1); // a-z
+        const drive = p[0]!;
+        if (c >= 97 && c <= 122) p = drive.toUpperCase() + p.slice(1);
     }
     return p;
 }
@@ -197,8 +191,7 @@ export function pathRoot(p: string): string {
         return s.slice(0, 2) + '/';
     }
     if (isWindows && s.startsWith('//')) {
-        // UNC shares are the filesystem root for upward searches. Treat
-        // extended UNC and extended drive paths separately from //./pipe/*.
+        // UNC shares and device paths are filesystem roots for upward searches.
         const deviceNamespace = /^\/\/[?.]\/?$/.exec(s);
         if (deviceNamespace) return deviceNamespace[0].endsWith('/') ? deviceNamespace[0] : `${deviceNamespace[0]}/`;
         const verbatimUnc = /^\/\/[?.]\/UNC\/[^/]+\/[^/]+/i.exec(s);
@@ -230,8 +223,7 @@ export function dirname(p: string): string {
     const i = s.lastIndexOf('/');
     if (i <= 0) return i === 0 ? '/' : '.';
     const dir = s.slice(0, i);
-    // On Windows, "C:" (without trailing slash) means "current dir on C:",
-    // not the root.  Ensure we always return "C:/" for drive-root children.
+    // "C:" (no slash) is the current dir on C:, never the root.
     if (dir.length === 2 && dir[1] === ':' && isAsciiAlpha(dir.charCodeAt(0))) return dir + '/';
     return dir;
 }
@@ -268,8 +260,7 @@ export function joinPaths(...parts: string[]): string {
             out = p;
             continue;
         }
-        if (!out) { out = p; continue;
-        }
+        if (!out) { out = p; continue; }
         if (isWindows && p.startsWith('//')) {
             out = p;
             continue;
@@ -277,18 +268,17 @@ export function joinPaths(...parts: string[]): string {
         const outSlash = out.endsWith('/');
         const pSlash = p.startsWith('/');
         if (outSlash && pSlash) {
-            out += p.slice(1);          // both have / → dedup
+            out += p.slice(1);
         } else if (!outSlash && !pSlash) {
-            out += '/' + p;             // neither has / → insert
+            out += '/' + p;
         } else {
-            out += p;                   // exactly one / → concat as-is
+            out += p;
         }
     }
     return out;
 }
 
 export function normalizePath(p: string): string {
-    // Normalize backslashes first so all subsequent checks work with '/'
     p = normalizeSlashes(p);
     if (!p) return '';
     // Protocol specifiers are not filesystem paths: repeated slashes can be
@@ -314,9 +304,8 @@ export function normalizePath(p: string): string {
             prefix = verbatimDrive[0];
             start = prefix.length;
         } else if (deviceRoot) {
-            // The namespace's first component is itself a root for paths such
-            // as \\.\pipe\name and \\?\GLOBALROOT\Device\...; .. must not
-            // walk back through the namespace prefix.
+            // The namespace's first component is a root: `..` must not walk back
+            // through it (\\.\pipe\name, \\?\GLOBALROOT\Device\...).
             prefix = deviceRoot[0];
             start = prefix.length;
         } else if (deviceNamespace) {
@@ -352,8 +341,8 @@ export function normalizePath(p: string): string {
         }
         if (len === 2 && p.charCodeAt(segmentStart) === 46 && p.charCodeAt(segmentStart + 1) === 46) {
             if (out.length && out[out.length - 1] !== '..') out.pop();
+            // Under an absolute root, `..` at the root is dropped.
             else if (!abs) out.push('..');
-            // When abs (Unix root or Windows drive root), silently ignore
         } else {
             out.push(p.slice(segmentStart, i));
         }

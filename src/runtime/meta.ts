@@ -115,11 +115,9 @@ export function fillMeta(
 ): void {
     meta.url      = toImportMetaUrl(info);
     // localPath is POSIX-internal (cts/AGENT.md:230). filename/dirname are
-    // user-visible, so they cross the boundary and must be NATIVE, matching
-    // node v24.18.0 and deno 2.9.3 measured on Windows 11:
-    //   deno: import.meta.filename -> D:\tmp\agsep\dn.ts   (not D:/tmp/...)
-    //   node: import.meta.dirname  -> D:\tmp\agsep
-    // meta.url stays a file:// URL with '/' — only these two denormalize.
+    // user-visible, so they cross the boundary NATIVE, matching node v24.18.0 and
+    // deno 2.9.3 measured on Windows 11. Only these two denormalize; meta.url stays
+    // a file:// URL and the URL keeps '/'.
     // toHostPath leaves scheme ids ("pack:/e.mjs") alone.
     meta.filename = toHostPath(info.localPath);
     meta.dirname  = toHostPath(dirname(info.localPath));
@@ -129,9 +127,7 @@ export function fillMeta(
     // Pack/extensionless: keep lang for transform on source-only recompile.
     if (info.lang !== undefined && meta.lang === undefined) meta.lang = info.lang;
 
-    // import.meta.resolve returns a URL string (Node / lib.deno.d.ts), not a host
-    // path: file:// for disk modules, scheme kept for node:/http:/pack:. Same
-    // mapping as meta.url so both agree. Cache per specPath.
+    // Same scheme mapping as meta.url so both agree.
     let fn = importMetaResolveCache.get(info.specPath);
     if (!fn) {
         const self = info.specPath;

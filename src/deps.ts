@@ -150,7 +150,6 @@ export class DepScanner {
         // Queue holds specifiers to resolve (spec, parentSpecPath)
         const queue: Array<{ spec: string; parent: string } | undefined> = [];
         let queueHead = 0;
-        // pending counts items not yet fully processed (queued + active).
         let pending = 0;
         let fatalWorkerError: Error | null = null;
         const wakeWaiters: Array<() => void> = [];
@@ -380,15 +379,15 @@ export class DepScanner {
         if (!isImportScannable(localPath, fileKind)) {
             return [];
         }
-        if (this.parseImports) {
-            imports = await this.parseImports(localPath);
-        } else {
+        if (!this.parseImports) {
             const scanned = this.importScanner.scanFileResult(localPath, undefined, fullGraph);
             if (scanned === null) {
                 if (fullGraph) throw new Error(`Could not read source for full dependency scan: ${localPath}`);
-                return null;
+                return [];
             }
             imports = scanned;
+        } else {
+            imports = await this.parseImports(localPath);
         }
         if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
         return imports;
@@ -402,26 +401,26 @@ export class DepScanner {
     ): Array<{ spec: string; parent: string }> {
         try {
             const fullGraph = this.options.fullGraph === true;
-            let imports: string[] | undefined;
-            if (!fullGraph) {
-                const cached = this.resolver.lockStore.getImports(specPath);
-                if (cached !== undefined) imports = cached;
-            }
-            if (imports === undefined) {
-                if (!isImportScannable(localPath, fileKind)) return [];
-                const scanned = this.importScanner.scanFileResult(localPath, undefined, fullGraph);
-                if (scanned === null) {
-                    if (fullGraph) throw new Error(`Could not read source for full dependency scan: ${localPath}`);
-                    return [];
-                }
-                imports = scanned;
-                if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
-            }
-            return this.filterImports(specPath, imports, fullGraph);
+            return this.filterImports(specPath, this.loadImportsSync(specPath, localPath, fileKind, fullGraph), fullGraph);
         } catch (e) {
             if (this.options.fullGraph === true) throw e;
             return [];
         }
+    }
+
+    private loadImportsSync(specPath: string, localPath: string, fileKind: FileKind | undefined, fullGraph: boolean): string[] {
+        if (!fullGraph) {
+            const cached = this.resolver.lockStore.getImports(specPath);
+            if (cached !== undefined) return cached;
+        }
+        if (!isImportScannable(localPath, fileKind)) return [];
+        const scanned = this.importScanner.scanFileResult(localPath, undefined, fullGraph);
+        if (scanned === null) {
+            if (fullGraph) throw new Error(`Could not read source for full dependency scan: ${localPath}`);
+            return [];
+        }
+        if (!fullGraph) this.resolver.lockStore.setImports(specPath, scanned);
+        return scanned;
     }
 
     private async parseOne(
@@ -443,8 +442,7 @@ export class DepScanner {
     /** DEBUG: if work stays in-flight a long time, log once per 10s (not a kill). */
     private maybeLogStall(pending: number, queued: number): void {
         const now = Date.now();
-        if (now - this.lastStallLogMs < 10_000) return;
-        if (pending <= 0) return;
+        if (now - this.lastStallLogMs < 10_000 || pending <= 0) return;
         this.lastStallLogMs = now;
         log.debug('deps', () => `in-flight pending=${pending} queued=${queued} visited=${this.seen.size}`);
     }

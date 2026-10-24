@@ -152,10 +152,9 @@ export class EsmCompiler {
     }
 
     private loadEsm(info: ModuleInfo, meta: Record<string, unknown>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
-        const moduleId = moduleRef(info);
-        const cacheKey = moduleId;
-        const hit = this.esmCache.get(cacheKey);
-        if (hit) {
+        const cacheKey = moduleRef(info);
+        const moduleId = cacheKey;
+        const hit = this.esmCache.get(cacheKey);        if (hit) {
             if (meta.main !== undefined) Reflect.set(hit.meta, 'main', meta.main);
             return hit;
         }
@@ -163,7 +162,7 @@ export class EsmCompiler {
         // Circular dependency guard
         if (this.esmLoading.has(cacheKey)) {
             log.debug('loader', () => `cycle: ${info.specPath} -- returning placeholder`);
-            const placeholder = engine.Module.create(moduleRef(info));
+            const placeholder = engine.Module.create(cacheKey);
             this.esmCache.set(cacheKey, placeholder);
             return placeholder;
         }
@@ -171,9 +170,9 @@ export class EsmCompiler {
         const remote = isRemote(info.specPath);
         const fileBacked = isFileBackedPath(info.localPath);
         // Extension policy (works for pack:/name.ts keys, not only host paths).
+        // Transform-source paths are always cache candidates; plain local .js only when file-backed (L2).
         const needsTransform = isTransformSourcePath(info.localPath);
         const needsCompile = !needsTransform && isCompiledSourcePath(info.localPath);
-        // sourceOnly: no cache. L1 if remote/pack/local candidate; L2 only if file-backed.
         const allowCache = info.cacheBytecode !== false && this.cfg.enableCache !== false;
         const tryBytecode = allowCache && (remote || needsTransform || needsCompile);
 

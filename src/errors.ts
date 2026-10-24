@@ -87,8 +87,6 @@ function locationFromStack(source: Error | undefined): { line: number; col: numb
     return m ? { line: +m[1]!, col: +m[2]! } : null;
 }
 
-// Helper: create an Error with .kind attached
-
 /** Attach a node-style `.code` string. Enumerable + configurable so a more
  *  specific call site (see pkg.ts `codedError`) can override the default. */
 export function setErrorCode(e: Error, code: string): void {
@@ -175,8 +173,7 @@ export function requireCycleError(target: string, from: string, kind: 'require-e
     const what = kind === 'require-esm'
         ? `Cannot require() ES Module ${target} in a cycle.`
         : `Cannot import CommonJS Module ${target} in a cycle.`;
-    const e = err(ErrorKind.Generic, `${what} (from ${from})`, undefined, 'ERR_REQUIRE_CYCLE_MODULE');
-    return e;
+    return err(ErrorKind.Generic, `${what} (from ${from})`, undefined, 'ERR_REQUIRE_CYCLE_MODULE');
 }
 
 /** Resolution miss (continue CJS walk). Non-miss kinds must rethrow. */
@@ -189,17 +186,15 @@ export function isResolutionMiss(e: unknown): boolean {
 
 // Terminal colour helpers (graceful degradation)
 
-const _isTTY: boolean = os.guessHandle(os.STDERR_FILENO) == 'tty';
-function isTTY(): boolean { return _isTTY; }
-
+const isTTY: boolean = os.guessHandle(os.STDERR_FILENO) == 'tty';
 const C = {
-    red:    (s: string) => isTTY() ? `\x1b[31m${s}\x1b[0m` : s,
-    yellow: (s: string) => isTTY() ? `\x1b[33m${s}\x1b[0m` : s,
-    cyan:   (s: string) => isTTY() ? `\x1b[36m${s}\x1b[0m` : s,
-    bold:   (s: string) => isTTY() ? `\x1b[1m${s}\x1b[0m`  : s,
-    dim:    (s: string) => isTTY() ? `\x1b[2m${s}\x1b[0m`  : s,
-    green:  (s: string) => isTTY() ? `\x1b[32m${s}\x1b[0m` : s,
-    invert: (s: string) => isTTY() ? `\x1b[7m${s}\x1b[0m`  : s,
+    red:    (s: string) => isTTY ? `\x1b[31m${s}\x1b[0m` : s,
+    yellow: (s: string) => isTTY ? `\x1b[33m${s}\x1b[0m` : s,
+    cyan:   (s: string) => isTTY ? `\x1b[36m${s}\x1b[0m` : s,
+    bold:   (s: string) => isTTY ? `\x1b[1m${s}\x1b[0m`  : s,
+    dim:    (s: string) => isTTY ? `\x1b[2m${s}\x1b[0m`  : s,
+    green:  (s: string) => isTTY ? `\x1b[32m${s}\x1b[0m` : s,
+    invert: (s: string) => isTTY ? `\x1b[7m${s}\x1b[0m`  : s,
 };
 
 function label(kind: ErrorKind): string {
@@ -285,7 +280,7 @@ function sourceContext(file: string, line: number, col: number): string {
 
     // Fixed gutter width before line content: "  " + num + " │ "
     const gutter = numW + 5;
-    const tty = isTTY();
+    const tty = isTTY;
 
     for (let i = lo; i < hi; i++) {
         const isErr = i === line - 1;
@@ -323,7 +318,7 @@ export function formatError(e: unknown, context?: string): string {
     const msg   = error.message;
 
     // 1. Use .kind if available (set by internal throw sites via `err()`)
-    // 2. Fall back to message heuristics for external errors
+    // 2. Fall back to errorFromUnknown's default
     const kind = error.kind ?? ErrorKind.Generic;
     const hint = suggest(kind, msg);
 

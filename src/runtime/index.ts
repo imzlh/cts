@@ -60,11 +60,6 @@ function isNodeWorkerRuntime(): boolean {
         && '__node_workerData' in data;
 }
 
-function runtimeErrorMessage(error: unknown): string {
-    if (error instanceof Error) return error.message;
-    return String(error);
-}
-
 function postNodeWorkerError(error: unknown): boolean {
     if (!isNodeWorkerRuntime()) return false;
     const pipe = worker.pipe;
@@ -169,8 +164,8 @@ function precompileStubLoader(): {
 }
 
 /**
- * Env for one spawn: session map is the full env after export/unset (clone of process
- * env at script start). Without session, inherit process env. Then PATH shim.
+ * Env for one spawn: sessionEnv is the full env after export/unset; without a
+ * session, inherit process env. PATH shim appended either way.
  */
 function lifecycleEnv(cwd: string, exePath: string, sessionEnv?: Record<string, string>): Record<string, string> {
     // Session is authoritative so `unset` deletions stick; do not re-merge os.environ().
@@ -359,7 +354,7 @@ export class TypeScriptRuntime {
                     if (pipe) {
                         pipe.postMessage({
                             __cno_role: 'error',
-                            message: runtimeErrorMessage(r),
+                            message: runtimeErrorInfo(r).message,
                             error: runtimeErrorInfo(r),
                             filename: '',
                             lineno: 0,
@@ -384,7 +379,7 @@ export class TypeScriptRuntime {
                     if (pipe) {
                         pipe.postMessage({
                             __cno_role: 'error',
-                            message: runtimeErrorMessage(data),
+                            message: runtimeErrorInfo(data).message,
                             error: runtimeErrorInfo(data),
                             filename: '',
                             lineno: 0,
@@ -483,8 +478,8 @@ export class TypeScriptRuntime {
                     );
                     prog?.setActivity(null);
                 } catch (e) {
-                    // Fail closed: --npm-mode=soft|hard promised real node_modules.
-                    // Swallowing here printed "✔ N modules cached" after zero links.
+                    // Fail closed: --npm-mode=soft|hard promised real node_modules, and
+                    // swallowing here printed "✔ N modules cached" after zero links.
                     prog?.clearForOutput();
                     log.warn('precache', () => `node_modules materialization failed: ${errMsg(e)}`);
                     throw e instanceof Error ? e : new Error(errMsg(e));
@@ -582,8 +577,7 @@ export class TypeScriptRuntime {
                         ),
                     );
                 } catch (e) {
-                    // Batch/driver failure is not "best effort cache warm" — surface it.
-                    // Per-module failures still report via onFailed without throwing.
+                    // Surface batch failures; per-module failures already report via onFailed.
                     prog?.clearForOutput();
                     log.warn('precompile', () => `batch failed: ${errMsg(e)}`);
                     throw e instanceof Error ? e : new Error(errMsg(e));
@@ -725,8 +719,8 @@ export class TypeScriptRuntime {
             return { code, diag: formatLifecycleDiag(argv, code, stderr) };
         } catch (e) {
             // Shell-compatible: missing binary is exit 127 so `||` chains continue.
-            const errno = (e as { code?: unknown; errno?: unknown })?.code
-                ?? (e as { errno?: unknown })?.errno;
+            const errno = (e as { code?: unknown; errno?: unknown }).code
+                ?? (e as { errno?: unknown }).errno;
             if (errno === 'ENOENT' || errno === -2 || /ENOENT/i.test(errMsg(e))) {
                 return {
                     code: 127,
@@ -741,9 +735,8 @@ export class TypeScriptRuntime {
 
     async loadPolyfill(path: string): Promise<void> {
         const localPath = this.resolvePolyfillPath(path);
-        const specPath = localPath;
         const info: ModuleInfo = {
-            specPath,
+            specPath: localPath,
             localPath,
             format: 'esm',
             fileKind: guessFileKind(localPath),
@@ -751,13 +744,13 @@ export class TypeScriptRuntime {
         const meta: Record<string, unknown> = {};
         fillMeta(meta, info, this.resolver);
         meta.polyfill = true;
-        // Keep the same evaluation guard as entry/run paths.  A polyfill can
-        // synchronously reach a CJS module which requires the polyfill back;
-        // evaluating the same QuickJS Module again while it is EVALUATING is
-        // a native assertion, whereas evalTracked turns it into Node's
-        // ERR_REQUIRE_CYCLE_MODULE and reliably clears the in-flight marker.
+        // Keep the same evaluation guard as entry/run paths. A polyfill can
+        // synchronously reach a CJS module that requires the polyfill back;
+        // evaluating the same QuickJS Module again while it is EVALUATING is a
+        // native assertion, whereas evalTracked turns it into Node's
+        // ERR_REQUIRE_CYCLE_MODULE and clears the in-flight marker.
         await this.compiler.evalTracked(this.compiler.load(info, meta));
-        log.debug('runtime', () => `polyfill: ${specPath}`);
+        log.debug('runtime', () => `polyfill: ${info.specPath}`);
     }
 
     private resolvePolyfillPath(path: string): string {

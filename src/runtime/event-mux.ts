@@ -77,11 +77,11 @@ interface MuxInternal extends EventMux {
 
 const SLOT = Symbol.for('cno.engine.eventMux.v1');
 
-/** Default native return per event, matching pre-mux behaviour exactly. */
+/** Default native return per event, matching pre-mux behaviour exactly.
+ *  `true` is the only value that cancels BEFORE_UNLOAD and the only one that
+ *  errs a JOB_EXCEPTION; rejections need `false` to continue. */
 function defaultReturn(name: number): boolean {
-    if (name === EV.JOB_EXCEPTION) return true;   // false would TJS_Stop
-    // Only `true` cancels BEFORE_UNLOAD, so its default must remain false.
-    return false;                                  // rejection: false = do not abort
+    return name === EV.JOB_EXCEPTION;
 }
 
 function createMux(): MuxInternal {
