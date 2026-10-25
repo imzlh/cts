@@ -22,6 +22,11 @@ export function moduleRef(info: Pick<ModuleInfo, 'specPath' | 'moduleId'>): stri
     return info.moduleId ?? info.specPath;
 }
 
+/** File aliases share a cycle guard; explicit import views keep their own identity. */
+export function moduleEvaluationKey(info: Pick<ModuleInfo, 'localPath' | 'moduleId'>): string {
+    return info.moduleId ?? info.localPath;
+}
+
 /** Collision-free runtime identity for alternate text/bytes/json views. */
 export function moduleViewRef(specPath: string, fileKind: FileKind): string {
     return `ctsview:${fileKind}/${encodeURIComponent(specPath)}`;

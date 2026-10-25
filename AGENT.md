@@ -233,6 +233,7 @@ No circular deps. Used everywhere.
 - **Flow**: protocol handlers `yield Step`; `runSync`/`runAsync` drive them — no direct I/O inside handlers
 - **LRU**: instantiate with capacity, use `get`/`set` — no manual eviction
 - **Module identity**: use `moduleRef(info)` (returns `info.moduleId ?? info.specPath`) as the QuickJS module name, not `localPath`
+- **Cycle guards**: use `moduleEvaluationKey(info)` (returns `info.moduleId ?? info.localPath`) across compilation, bytecode linking, and synchronous evaluation; file aliases share a guard, while explicit views remain independent.
 - **Bytecode identity**: pass the effective QuickJS module identity through every `JscCache` load/freshness/write API; identity-aware sidecars reject legacy or mismatched stamps instead of reusing a bytecode graph compiled for another ref. Capture `SourceFreshness` before reading a file and pass it to persistence, so edits during compilation cannot bless stale bytecode. If that snapshot fails, execute without persisting. Remote bytecode is adjacent only when the resolved file is inside the configured cache root; workspace/symlink targets use the hashed local cache. Cache roots are normalized in both `createConfig` and `JscCache`, so trailing/repeated separators cannot change ownership or cache keys; protocol specifiers remain untouched by filesystem normalization.
 - **Pack isolation**: do not resolve a missing manifest edge against disk/network; incomplete scans and compiles are fatal
 - **Attribute views**: use `moduleViewRef()`; do not encode view state in a user query/hash suffix
@@ -255,7 +256,7 @@ caching, rebuild the embedded CLI and run at least:
 ```bash
 cmake --build build -j2
 CTS_CACHE_DIR=/tmp/cno-pack-test build/stage/cno setup
-CTS_CACHE_DIR=/tmp/cno-pack-test build/stage/cno test tests/cts/pack-command.test.ts --concurrency=1
+node --test tests/cts/pack-command.test.mjs
 CTS_CACHE_DIR=/tmp/cno-pack-test build/stage/cno test tests/cts/import-attributes-runtime.test.ts tests/cjs/require-esm-interop.test.ts --concurrency=1
 git diff --check
 git -C cts diff --check

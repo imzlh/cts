@@ -1,4 +1,4 @@
-import { type ModuleInfo, moduleRef } from '../types';
+import { type ModuleInfo, moduleEvaluationKey, moduleRef } from '../types';
 import type { CjsCacheStore, CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
@@ -105,13 +105,12 @@ export function loadEsmSync(
     from = '<unknown>',
 ): Record<string, unknown> {
     // Never expose or evaluate a partial in-flight ESM namespace to require().
-    // Same key the compiler tracks: moduleRef(info), not localPath (types.ts).
-    if (esm.isInFlight(moduleRef(info))) {
+    const evalScope = moduleEvaluationKey(info);
+    if (esm.isInFlight(evalScope)) {
         throw requireCycleError(moduleRef(info), from, 'require-esm');
     }
 
     const mod = esm.load(info, {}, resolveMtime);
-    const evalScope = moduleRef(info);
     const result = engine.promiseResult(esm.trackEvaluation(evalScope, () => mod.eval()));
 
     // null = top-level await unresolved; do NOT weaken with namespace check (causes silent dead-lock)

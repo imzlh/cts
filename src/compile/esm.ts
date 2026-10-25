@@ -1,4 +1,4 @@
-import { moduleRef, type RuntimeConfig, type ModuleInfo } from '../types';
+import { moduleEvaluationKey, moduleRef, type RuntimeConfig, type ModuleInfo } from '../types';
 import { Transformer } from '../source/transform';
 import { JscCache, isRemote, isFileBackedPath, type SourceFreshness } from '../source/cache';
 import { readText, readBytes, log } from '../utils';
@@ -60,9 +60,8 @@ function isAttributedSyntaxError(e: SyntaxError): boolean {
 export class EsmCompiler {
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
     private readonly esmLoading  = new Set<string>();
-    // Evaluation-in-progress window (esmLoading only covers compile/link);
-    // re-entering via eval() while EVALUATING aborts the process. Keyed by
-    // localPath, not moduleRef, or npm:/file: keyed cycles go undetected.
+    // Compile and evaluation guards share moduleEvaluationKey: local file aliases
+    // cannot re-enter one another, while explicit moduleId views remain separate.
     private readonly esmInFlightPaths = new Set<string>();
     private readonly esmEvaluating = new Set<string>();
     readonly transformer: Transformer;
@@ -144,7 +143,9 @@ export class EsmCompiler {
     private loadEsm(info: ModuleInfo, meta: Record<string, unknown>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
         const cacheKey = moduleRef(info);
         const moduleId = cacheKey;
-        const hit = this.esmCache.get(cacheKey);        if (hit) {
+        const evalScope = moduleEvaluationKey(info);
+        const hit = this.esmCache.get(cacheKey);
+        if (hit) {
             if (meta.main !== undefined) Reflect.set(hit.meta, 'main', meta.main);
             return hit;
         }
@@ -173,7 +174,8 @@ export class EsmCompiler {
             // false there, so bridge.ts's require-esm guard misses and the cycle
             // surfaces later as the opposite direction ("Cannot import CommonJS
             // Module b.cjs" instead of "Cannot require() ES Module a.mjs").
-            this.esmInFlightPaths.add(info.localPath);
+            const alreadyLoading = this.esmInFlightPaths.has(evalScope);
+            this.esmInFlightPaths.add(evalScope);
             let cached: CModuleEngine.Module | null;
             try {
                 cached = this.jsc.load(
@@ -183,7 +185,7 @@ export class EsmCompiler {
                     moduleId,
                 );
             } finally {
-                this.esmInFlightPaths.delete(info.localPath);
+                if (!alreadyLoading) this.esmInFlightPaths.delete(evalScope);
             }
             if (cached) {
                 Object.assign(cached.meta, meta);
@@ -194,7 +196,8 @@ export class EsmCompiler {
 
         // VFS (pack) or fs → transform → compile
         this.esmLoading.add(cacheKey);
-        this.esmInFlightPaths.add(info.localPath);
+        const alreadyLoading = this.esmInFlightPaths.has(evalScope);
+        this.esmInFlightPaths.add(evalScope);
         let sourceFreshness: SourceFreshness | undefined;
         let mod: CModuleEngine.Module;
         try {
@@ -216,7 +219,7 @@ export class EsmCompiler {
             // turns the next import into a permanent empty placeholder and keeps
             // Runtime.cleanup() from releasing the compiler.
             this.esmLoading.delete(cacheKey);
-            this.esmInFlightPaths.delete(info.localPath);
+            if (!alreadyLoading) this.esmInFlightPaths.delete(evalScope);
         }
 
         // Populate placeholder if one was created during circular resolution
@@ -255,8 +258,16 @@ export class EsmCompiler {
             if (meta.main !== undefined) Reflect.set(hit.meta, 'main', meta.main);
             return hit;
         }
-        const transformed = this.transformer.transform(code, info.localPath, metaLang(meta), moduleRef(info));
-        const mod = this.compileEsm(transformed, moduleRef(info), info.localPath);
+        const evalScope = moduleEvaluationKey(info);
+        const alreadyLoading = this.esmInFlightPaths.has(evalScope);
+        this.esmInFlightPaths.add(evalScope);
+        let mod: CModuleEngine.Module;
+        try {
+            const transformed = this.transformer.transform(code, info.localPath, metaLang(meta), moduleRef(info));
+            mod = this.compileEsm(transformed, moduleRef(info), info.localPath);
+        } finally {
+            if (!alreadyLoading) this.esmInFlightPaths.delete(evalScope);
+        }
         Object.assign(mod.meta, meta);
         this.esmCache.set(cacheKey, mod);
         return mod;
@@ -285,19 +296,18 @@ export class EsmCompiler {
         this.esmCache.clear();
     }
 
-    /** True while `localPath` is mid-compile or mid-evaluate — i.e. a require()
-     *  of it right now would close a cycle. Callers must throw rather than hand
-     *  back a placeholder namespace. Keyed by localPath: see esmInFlightPaths. */
-    isInFlight(localPath: string): boolean {
-        return this.esmInFlightPaths.has(localPath) || this.esmEvaluating.has(localPath);
+    /** True while this moduleEvaluationKey is compiling or evaluating. */
+    isInFlight(evalScope: string): boolean {
+        return this.esmInFlightPaths.has(evalScope) || this.esmEvaluating.has(evalScope);
     }
 
-    /** Run `fn` with `localPath` marked as evaluating, so a CJS module reached
+    /** Run `fn` with its moduleEvaluationKey marked as evaluating, so a CJS module reached
      *  during evaluation cannot require() back into it. */
-    trackEvaluation<T>(localPath: string, fn: () => T): T {
-        this.esmEvaluating.add(localPath);
+    trackEvaluation<T>(evalScope: string, fn: () => T): T {
+        const alreadyEvaluating = this.esmEvaluating.has(evalScope);
+        this.esmEvaluating.add(evalScope);
         try { return fn(); }
-        finally { this.esmEvaluating.delete(localPath); }
+        finally { if (!alreadyEvaluating) this.esmEvaluating.delete(evalScope); }
     }
 
     hasPendingLoads(): boolean {

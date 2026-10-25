@@ -2,7 +2,7 @@ import { err, ErrorKind, requireCycleError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 import type { ModuleResolver } from '../resolve/index';
 import { isTypeDecl } from '../resolve/protocols/base';
-import { moduleRef, type ModuleInfo, type RuntimeConfig } from '../types';
+import { moduleEvaluationKey, moduleRef, type ModuleInfo, type RuntimeConfig } from '../types';
 import { bridgeCjsToEsm, buildCjsDeps, installGlobalRequire, installInternalBridge } from './bridge';
 import { CjsLoader, clearDirPathsCache } from './cjs';
 import { EsmCompiler } from './esm';
@@ -41,7 +41,8 @@ export class ModuleCompiler {
             // (quickjs.c:32089) and .eval() aborts the process instead of
             // throwing. Check before wasm.load, which would hand back the
             // placeholder and lose the fact that this was a cycle.
-            if (this.esm.isInFlight(wasmRef)) {
+            const evalScope = moduleEvaluationKey(info);
+            if (this.esm.isInFlight(evalScope)) {
                 throw requireCycleError(wasmRef, '<wasm>', 'require-esm');
             }
             const mod = this.wasm.load(
@@ -51,7 +52,7 @@ export class ModuleCompiler {
                 (m) => this.evalTracked(m),
             );
             const result = engine.promiseResult(
-                this.esm.trackEvaluation(wasmRef, () => mod.eval()),
+                this.esm.trackEvaluation(evalScope, () => mod.eval()),
             );
             if (result === null) {
                 throw err(ErrorKind.Generic,
@@ -153,7 +154,7 @@ export class ModuleCompiler {
     }
 
     private remember(mod: CModuleEngine.Module, info: ModuleInfo): CModuleEngine.Module {
-        this.modulePaths.set(mod, info.localPath);
+        this.modulePaths.set(mod, moduleEvaluationKey(info));
         return mod;
     }
 
@@ -163,9 +164,9 @@ export class ModuleCompiler {
      * later require() calls and strands entries with unresolved top-level await.
      */
     evalTracked(mod: CModuleEngine.Module): ReturnType<CModuleEngine.Module['eval']> {
-        const localPath = this.modulePaths.get(mod);
-        if (localPath === undefined) return mod.eval();
-        return this.esm.trackEvaluation(localPath, () => mod.eval());
+        const evalScope = this.modulePaths.get(mod);
+        if (evalScope === undefined) return mod.eval();
+        return this.esm.trackEvaluation(evalScope, () => mod.eval());
     }
 
     preRegister(localPath: string, parentPath: string): void {
