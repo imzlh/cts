@@ -3,7 +3,7 @@ import type { CjsCacheStore, CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
 import { isResolutionMiss, requireCycleError, setErrorCode } from '../errors';
-import { BUILTINS } from '../resolve/builtins';
+import { builtinModuleNames } from '../resolve/builtins';
 import { errMsg, log } from '../utils';
 import type { NodeModuleInteropBridge } from './node-interop';
 import {
@@ -300,7 +300,7 @@ export function installInternalBridge(
     const value = {
         mkRequire,
         preloadModule,
-        builtinModules: [...BUILTINS],
+        builtinModules: builtinModuleNames(),
         cache,
         registerModuleHooks,
         hasModuleResolveHooks,

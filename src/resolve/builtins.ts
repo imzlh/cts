@@ -20,14 +20,12 @@ export const PREFIXED_BUILTINS = new Set([
 // Only fixed dual builtins; "fs/utils" or "string_decoder/" are userland (slash bypass).
 const BUILTIN_SUBPATHS = new Set([
     'fs/promises', 'dns/promises', 'stream/promises', 'stream/web', 'stream/consumers',
-    'timers/promises', 'readline/promises', 'util/types',
+    'stream/iter', 'zlib/iter', 'timers/promises', 'readline/promises', 'util/types',
     'assert/strict', 'path/posix', 'path/win32', 'inspector/promises',
 ]);
 
-/** Subpaths of `node:`-only builtins (`node:test/reporters`). */
-const PREFIXED_BUILTIN_SUBPATHS = new Set([
-    'test/reporters',
-]);
+/** Subpaths of `node:`-only builtins. */
+const PREFIXED_BUILTIN_SUBPATHS = new Set<string>();
 
 export function isBuiltinSpecifier(id: string): boolean {
     const prefixed = id.startsWith('node:');
@@ -39,5 +37,10 @@ export function isBuiltinSpecifier(id: string): boolean {
 
 /** Node's `module.builtinModules` shape: bare names plus `node:`-only entries. */
 export function builtinModuleNames(): string[] {
-    return [...BUILTINS, ...[...PREFIXED_BUILTINS].map(n => `node:${n}`)];
+    return [
+        ...BUILTINS,
+        ...BUILTIN_SUBPATHS,
+        ...[...PREFIXED_BUILTINS].map(n => `node:${n}`),
+        ...[...PREFIXED_BUILTIN_SUBPATHS].map(n => `node:${n}`),
+    ];
 }
