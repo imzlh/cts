@@ -8,13 +8,12 @@ export const BUILTINS = new Set([
 ]);
 
 /**
- * Builtins Node only exposes under an explicit `node:` prefix — bare `sqlite` /
- * `test` are userland package names on npm and must NOT be shadowed
- * (`require('test')` in Node is a registry package, not `node:test`).
+ * Builtins Node only exposes under an explicit `node:` prefix — bare names can
+ * still be userland package names and must not be shadowed.
  * `module.builtinModules` lists these in prefixed form, which is what Node does.
  */
 export const PREFIXED_BUILTINS = new Set([
-    'sqlite', 'test',
+    'ffi', 'sqlite', 'test',
 ]);
 
 // Only fixed dual builtins; "fs/utils" or "string_decoder/" are userland (slash bypass).
