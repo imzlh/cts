@@ -1,3 +1,5 @@
+import { getInternalBridge } from './internal-registry';
+
 export interface NodeModuleInteropBridge {
     getCache?: () => Record<string, unknown>;
     getExtensions?: () => Record<string, unknown>;
@@ -14,11 +16,6 @@ export interface NodeModuleInteropBridge {
     defaultExtensions?: Record<string, unknown>;
 }
 
-const CTS_INTERNAL = Symbol.for('cts.internal');
-
 export function getNodeModuleInterop(): NodeModuleInteropBridge | undefined {
-    const internal = Reflect.get(globalThis, CTS_INTERNAL) as {
-        nodeModuleInterop?: NodeModuleInteropBridge;
-    } | undefined;
-    return internal?.nodeModuleInterop;
+    return getInternalBridge()?.nodeModuleInterop as NodeModuleInteropBridge | undefined;
 }

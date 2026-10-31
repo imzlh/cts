@@ -82,6 +82,23 @@ TypeScriptRuntime.runPrecache()
 | `src/config.ts` | Config, env, CLI, and cache directory setup |
 | `src/lock.ts` | SQLite-backed lock store |
 
+## Internal Bridge Discovery
+
+CTS and the Node compatibility layer use an internal bridge for operations
+such as `require()` and `node:module` interop. When available, the native
+[`evbus`](../circu.js/README.md#runtime-local-event-bus) registry lets contexts
+in the same QuickJS runtime discover the same bridge object. The current
+namespace/key are `cts.internal` / `bridge`; this is internal coordination,
+not a user-facing package API.
+
+Bridge discovery also checks the legacy `globalThis[Symbol.for('cts.internal')]`
+slot when the native registry or a valid shared bridge is unavailable. That
+fallback supports older runtimes and existing installations, but the property
+is local to a global object: it does not reproduce evbus sharing across
+sandbox contexts. Workers have separate runtimes and do not share either
+registry. See the [CTS registry](src/compile/internal-registry.ts) and
+[CNO bridge](../cno/src/node/_internal/cts-bridge.ts) for the implementation.
+
 ## Resolution Cache
 
 `ModuleResolver` uses three resolution layers:

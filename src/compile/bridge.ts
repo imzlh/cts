@@ -5,6 +5,7 @@ import type { ModuleResolver } from '../resolve/index';
 import { isResolutionMiss, requireCycleError, setErrorCode } from '../errors';
 import { builtinModuleNames } from '../resolve/builtins';
 import { errMsg, log } from '../utils';
+import { ensureInternalBridge, notifyInternalBridge } from './internal-registry';
 import type { NodeModuleInteropBridge } from './node-interop';
 import {
     hasModuleLoadHooks,
@@ -16,7 +17,6 @@ import {
 
 const engine = import.meta.use('engine');
 
-const CTS_INTERNAL = Symbol.for('cts.internal');
 const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
 let cjsBridgeId = 0;
 
@@ -261,7 +261,7 @@ export function installGlobalRequire(
     }
 }
 
-/** Install/overwrite globalThis[CTS_INTERNAL] bridge fields. */
+/** Install/overwrite the runtime's shared internal bridge fields. */
 export function installInternalBridge(
     mkRequire: (parentPath: string) => CjsRequireFn,
     preloadModule: (id: string, parentPath: string) => unknown,
@@ -274,13 +274,15 @@ export function installInternalBridge(
         resetExtensions(): void;
     },
 ): void {
-    const existingDesc = Object.getOwnPropertyDescriptor(globalThis, CTS_INTERNAL);
-    const existingValue = existingDesc && 'value' in existingDesc && existingDesc.value &&
-        typeof existingDesc.value === 'object'
-        ? existingDesc.value as { nodeModuleInterop?: NodeModuleInteropBridge }
-        : undefined;
+    const bridge = ensureInternalBridge();
     // Cached node:module copies retain this identity across runtime installs.
-    const nodeModuleInterop = existingValue?.nodeModuleInterop ?? {};
+    const previousInterop = bridge.nodeModuleInterop;
+    const nodeModuleInterop: NodeModuleInteropBridge = previousInterop !== null &&
+        (typeof previousInterop === 'object' || typeof previousInterop === 'function')
+        ? previousInterop as NodeModuleInteropBridge
+        : {};
+    Reflect.set(bridge, 'nodeModuleInterop', nodeModuleInterop);
+    notifyInternalBridge(bridge);
     if (cacheControl) {
         nodeModuleInterop.replaceCache = cacheControl.replaceCache;
         nodeModuleInterop.resetCache = cacheControl.resetCache;
@@ -316,18 +318,11 @@ export function installInternalBridge(
             } catch { return null; }
         },
     };
-    const desc = existingDesc;
-    if (!desc) {
-        Object.defineProperty(globalThis, CTS_INTERNAL, {
-            value, writable: false, enumerable: false, configurable: false,
-        });
-        return;
-    }
-    if ('value' in desc && desc.value && typeof desc.value === 'object') {
+    if (typeof bridge.mkRequire === 'function') {
         log.warn('bridge', () => 'CTS_INTERNAL re-installed — prior runtime hijacked');
-        for (const [k, v] of Object.entries(value)) {
-            try { Reflect.set(desc.value, k, v); }
-            catch (e) { log.debug('bridge', () => `CTS_INTERNAL field "${k}" overwrite failed: ${errMsg(e)}`); }
-        }
+    }
+    for (const [k, v] of Object.entries(value)) {
+        try { Reflect.set(bridge, k, v); }
+        catch (e) { log.debug('bridge', () => `CTS_INTERNAL field "${k}" overwrite failed: ${errMsg(e)}`); }
     }
 }
