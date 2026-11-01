@@ -25,7 +25,6 @@ import { clearImportMetaResolveCache, fillMeta } from './meta';
 import {
     PRIORITY_DIAGNOSTICS,
     installEventReceiver,
-    installNodeProcessRejectionBridge,
     installWebApiCompatBridge,
 } from './event-mux';
 import { ResourceManager, createResourceManager } from './resources';
@@ -82,7 +81,6 @@ function runtimeErrorInfo(error: unknown): { name: string; message: string; stac
 // The CLI owns exit status; workers and library embeddings may omit this hook.
 const REQUEST_EXIT_CODE_NAMESPACE = 'cno.runtime';
 const REQUEST_EXIT_CODE_KEY = 'requestExitCode';
-const REQUEST_EXIT_CODE_SLOT = Symbol.for('cno.runtime.requestExitCode');
 
 /** Mark failure without stopping the event loop and aborting a test suite. */
 function requestFailureExitCode(): void {
@@ -90,14 +88,7 @@ function requestFailureExitCode(): void {
     try {
         fn = import.meta.use('evbus')?.get(REQUEST_EXIT_CODE_NAMESPACE, REQUEST_EXIT_CODE_KEY);
     } catch {
-        // Missing or unavailable bus: try the legacy realm-local hook.
-    }
-    if (typeof fn !== 'function') {
-        try {
-            fn = (globalThis as unknown as Record<symbol, unknown>)[REQUEST_EXIT_CODE_SLOT];
-        } catch {
-            return;
-        }
+        return;
     }
     try {
         if (typeof fn === 'function') (fn as (code: number) => void)(1);
@@ -356,7 +347,6 @@ export class TypeScriptRuntime {
 
         // User handlers run before diagnostics so they can mark errors handled.
         installWebApiCompatBridge();
-        installNodeProcessRejectionBridge();
 
         installEventReceiver('cts-diagnostics', (name: number, data: unknown, ctx) => {
             const ET = engine.EventType;

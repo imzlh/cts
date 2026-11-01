@@ -305,10 +305,16 @@ export function installInternalBridge(
             else cacheControl.replaceExtensions(nodeExtensions);
         }
     }
+    // Sandbox realms expose only base intrinsics — no Set. The bridge value must
+    // stay installable there (tests/cts/evbus-module-bridge-native.test.mjs).
+    const builtinModules = builtinModuleNames().slice();
+    for (const name of BUN_MODULES) {
+        if (!builtinModules.includes(name)) builtinModules.push(name);
+    }
     const value = {
         mkRequire,
         preloadModule,
-        builtinModules: [...new Set([...builtinModuleNames(), ...BUN_MODULES])],
+        builtinModules,
         cache,
         registerModuleHooks,
         hasModuleResolveHooks,

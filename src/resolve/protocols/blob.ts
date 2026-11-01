@@ -11,12 +11,23 @@ interface BlobPayload {
 
 type BlobResolver = (url: string) => BlobPayload | null;
 
+// The CLI publishes this resolver under its `cno.runtime` channel; without a
+// publisher there is no blob support in this runtime.
+function blobUrlResolver(): BlobResolver | undefined {
+    try {
+        const resolver: unknown = import.meta.use('evbus')?.get('cno.runtime', 'blobUrlResolver');
+        return typeof resolver === 'function' ? resolver as BlobResolver : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 function resolveBlobPayload(spec: string): BlobPayload {
-    const resolver = Reflect.get(globalThis, '__cno_resolve_blob_url');
-    if (typeof resolver !== 'function') {
+    const resolver = blobUrlResolver();
+    if (!resolver) {
         throw err(ErrorKind.ProtocolDisabled, 'blob: object URLs are not available in this runtime');
     }
-    const payload = (resolver as BlobResolver)(spec);
+    const payload = resolver(spec);
     if (!payload) throw err(ErrorKind.ModuleNotFound, `Invalid object URL: ${spec}`);
     return payload;
 }

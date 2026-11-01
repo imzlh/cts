@@ -1,7 +1,6 @@
 const NAMESPACE = 'cts.internal';
 const BRIDGE_KEY = 'bridge';
 const BRIDGE_READY = 'bridge-ready';
-const LEGACY_SLOT = Symbol.for('cts.internal');
 
 type InternalBridge = Record<string, unknown>;
 type Registry = Pick<typeof CModuleEvBus, 'get' | 'set'> & Partial<Pick<typeof CModuleEvBus, 'emit'>>;
@@ -19,34 +18,26 @@ function isBridge(value: unknown): value is InternalBridge {
     return value !== null && (typeof value === 'object' || typeof value === 'function');
 }
 
-function legacyBridge(): InternalBridge | undefined {
-    try {
-        const value: unknown = Reflect.get(globalThis, LEGACY_SLOT);
-        return isBridge(value) ? value : undefined;
-    } catch {
-        return undefined;
-    }
-}
+/** Realm-local fallback when no bus exists, so repeated calls keep one identity. */
+let localBridge: InternalBridge | undefined;
 
 export function getInternalBridge(): InternalBridge | undefined {
     const shared = evbus?.get(NAMESPACE, BRIDGE_KEY);
-    return isBridge(shared) ? shared : legacyBridge();
+    if (isBridge(shared)) return shared;
+    return localBridge;
 }
 
 export function ensureInternalBridge(): InternalBridge {
     const shared = evbus?.get(NAMESPACE, BRIDGE_KEY);
-    const bridge = isBridge(shared) ? shared : (legacyBridge() ?? {});
+    if (isBridge(shared)) return shared;
 
     // Rewriting an entry would transfer its owner to the current sandbox.
-    if (evbus && !isBridge(shared)) evbus.set(NAMESPACE, BRIDGE_KEY, bridge);
-
-    const desc = Object.getOwnPropertyDescriptor(globalThis, LEGACY_SLOT);
-    if (!desc || (desc.configurable && (!('value' in desc) || desc.value !== bridge))) {
-        Object.defineProperty(globalThis, LEGACY_SLOT, {
-            value: bridge, writable: false, enumerable: false, configurable: true,
-        });
+    if (evbus) {
+        const bridge: InternalBridge = {};
+        evbus.set(NAMESPACE, BRIDGE_KEY, bridge);
+        return bridge;
     }
-    return bridge;
+    return localBridge ??= {};
 }
 
 export function notifyInternalBridge(bridge: InternalBridge): void {

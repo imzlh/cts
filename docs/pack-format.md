@@ -176,8 +176,9 @@ serializer so callers can build exact fixtures.
 
 ## Event bus
 
-`cts/src/runtime/event-mux.ts` is the only `engine.onEvent` receiver;
-`Symbol.for()` keeps baked and disk-loaded CTS copies on the same bus.
-Native return polarity is per-event (`false` continues an unhandled rejection
-but stops a job exception, `true` cancels beforeunload) and must not be
-normalized.
+Each receiver in `cts/src/runtime/event-mux.ts` subscribes directly to evbus'
+native runtime-event channel. The realm-local `Symbol.for()` facade only keeps
+role replacement, introspection, and lifecycle state shared between baked and
+disk-loaded CTS copies. Native return polarity is per-event (`false` continues
+an unhandled rejection but stops a job exception, `true` cancels beforeunload)
+and must not be normalized.

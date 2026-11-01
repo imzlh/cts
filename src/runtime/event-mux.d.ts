@@ -1,21 +1,14 @@
 /**
- * Global engine-event multiplexer.
+ * Runtime-event subscription facade.
  *
- * `engine.onEvent()` (native `tjs__set_event_receiver`, circu.js/src/mod_engine.c:871)
- * is a SINGLE-SLOT setter: it frees the previously registered receiver. Every
- * module that called it directly therefore silently displaced the others. The
- * observed casualty was `cno/src/webapi/index.ts`, whose EV_LOAD/EV_EXIT ->
- * 'load'/'unload' bridge was overwritten by the cts diagnostics receiver, so
- * `addEventListener('unload'|'load'|'unhandledrejection')` registered fine and
- * never fired.
+ * Every receiver subscribes directly to evbus' native runtime-event channel.
+ * Native evbus owns cross-realm ordering, the per-dispatch shared context, and
+ * return-value aggregation; CTS does not own a native receiver or run a central
+ * JavaScript dispatch loop.
  *
- * This module owns the one native registration. Everything else registers here.
- *
- * Order independence: the registry lives on a `Symbol.for()` slot on
- * `globalThis`, not in module scope. Whichever module loads first creates it;
- * later modules find the same object. That also survives the case where two
- * *copies* of this file are live at once (cts is baked into cno.exe, but a
- * relative-path import of the same source loads a second instance from disk).
+ * A realm-local `Symbol.for()` facade preserves role replacement, introspection,
+ * lifecycle flags, and identity across baked and disk-loaded CTS copies. The
+ * unsubscribe returned by `install()` removes the native evbus subscription.
  *
  * Native return-value contract, per the C dispatch sites — the polarity is NOT
  * uniform, so the mux must not invent a single rule:
@@ -71,10 +64,10 @@ export interface EventMux {
     has(role: string): boolean;
     /** Registered roles, in dispatch order. */
     roles(): string[];
-    /** Dispatch as the native receiver would. Exposed for tests. */
+    /** Dispatch through the native runtime-event channel. Exposed for tests. */
     dispatch(name: number, data: unknown): boolean;
 }
-/** The process-wide mux, created on first use. */
+/** The realm-local facade, created on first use. */
 export declare function getEventMux(): EventMux;
 /** Convenience wrapper: `installEventReceiver('role', fn, priority)`. */
 export declare function installEventReceiver(role: string, fn: EventReceiver, priority?: number): () => void;
@@ -84,8 +77,6 @@ export declare const WEBAPI_ROLE = "webapi";
 export declare const WEBAPI_COMPAT_ROLE = "webapi-compat";
 /** Role of the node `process` bridge in cno/src/node/process/mod.ts. */
 export declare const NODE_PROCESS_ROLE = "node-process";
-/** Role of the `unhandledRejection` -> `process` bridge below. */
-export declare const NODE_PROCESS_REJECTION_ROLE = "node-process-rejection";
 /** Priority band: user-visible dispatch must run before diagnostics. */
 export declare const PRIORITY_WEBAPI = 100;
 /**
@@ -106,32 +97,21 @@ export declare const PRIORITY_FALLBACK = -100;
  * Bridges native events to the global EventTarget, so
  * `addEventListener('unload'|'unhandledrejection')` actually fires.
  *
- * This duplicates what `cno/src/webapi/index.ts` does, because that file is
- * baked into cno.exe and its receiver was already destroyed by the single-slot
- * setter before this code runs — there is no native getter, so the displaced
- * receiver cannot be recovered and chained to. It therefore has to be
- * reproduced here.
- *
- * Once webapi registers through the mux under `WEBAPI_ROLE`, this bridge steps
- * aside (both the role check and `ctx.dispatched` guard against double
- * dispatch), which is what keeps the two order-independent.
+ * Once webapi subscribes under `WEBAPI_ROLE`, this compatibility bridge steps
+ * aside. The role check and shared `ctx.dispatched` guard keep registration
+ * order irrelevant and prevent duplicate global dispatch.
  */
 export declare function installWebApiCompatBridge(): () => void;
 /** Role of the internal lifecycle once-guard. Exported for tests. */
 export declare const LIFECYCLE_GUARD_ROLE = "lifecycle-guard";
 /**
- * Bridge EV_UNHANDLED_REJECTION to `process.on('unhandledRejection')`.
+ * EV_UNHANDLED_REJECTION delivery to `process` belongs to
+ * `cno/src/node/process/mod.ts`, which subscribes directly to evbus when the
+ * node module installs (eagerly, at bootstrap). CTS never discovers node
+ * objects.
  *
- * It was not bridged at all: the cts diagnostics receiver printed its warning
- * and nothing ever emitted on `process`, so a registered
- * `process.on('unhandledRejection')` handler never fired (Node fires it —
- * OBSERVED against v24.18.0: handler runs, reason and promise both delivered,
- * rc=0). `process/mod.ts` bridges EV_EXIT and EV_JOB_EXCEPTION under
- * NODE_PROCESS_ROLE but has no rejection arm, so this fills that gap from the
- * cts side under its own role.
- *
- * RETURN-VALUE POLARITY — inverted relative to job exceptions, and getting it
- * backwards is fatal rather than merely wrong:
+ * Return-value polarity for this event — inverted relative to job exceptions,
+ * and getting it backwards is fatal rather than merely wrong:
  *   EV_UNHANDLED_REJECTION  vm.c:242  `!JS_IsEqual(ret, JS_FALSE)` -> JS_EXCEPTION
  *   EV_JOB_EXCEPTION        utils.c:180 `JS_IsEqual(ret, JS_FALSE)` -> TJS_Stop
  * So for a rejection, `false` means "handled, do not abort" and any other value
@@ -139,13 +119,7 @@ export declare const LIFECYCLE_GUARD_ROLE = "lifecycle-guard";
  * JOB_EXCEPTION, where `true` means continue. That inversion was already shipped
  * as a real bug once, in webapi's bridge, where a `preventDefault()` on
  * 'unhandledrejection' returned `true` and thereby asked for a process abort.
- *
- * This bridge returns `false` when it delivered to a handler, and `undefined`
- * when it did not — never `true`. `undefined` leaves defaultReturn(), which is
- * also `false` for this event, so the non-fatal behaviour is preserved either
- * way; the explicit `false` documents the claim.
  */
-export declare function installNodeProcessRejectionBridge(): () => void;
 /** Has the user-visible 'load' event already been fired? */
 export declare function loadEventFired(): boolean;
 /** Has the user-visible 'unload' event already been fired (or EV_EXIT seen)? */

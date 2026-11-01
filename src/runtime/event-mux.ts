@@ -1,5 +1,5 @@
-// Sole owner of engine.onEvent. Each realm has its own registry; evbus joins
-// those registries inside one runtime without sharing realm lifecycle state.
+// Each receiver owns a native runtime-event subscription. The realm-local
+// facade only retains role replacement, introspection, and lifecycle state.
 // Return polarity differs per event — do not normalize it.
 
 const engine = import.meta.use('engine');
@@ -45,7 +45,7 @@ interface Entry {
     role: string;
     priority: number;
     seq: number;
-    fn: EventReceiver;
+    unsubscribe: () => void;
 }
 
 export interface EventMux {
@@ -56,62 +56,40 @@ export interface EventMux {
     has(role: string): boolean;
     /** Registered roles, in dispatch order. */
     roles(): string[];
-    /** Dispatch as the native receiver would. Exposed for tests. */
+    /** Dispatch through the native runtime-event channel. Exposed for tests. */
     dispatch(name: number, data: unknown): boolean;
 }
 
 interface MuxInternal extends EventMux {
+    readonly backend: 'runtime-evbus';
     entries: Entry[];
     seq: number;
-    native: boolean;
-    dispatchDepth: number;
-    nativeReceiver?: (name: number, data: unknown) => boolean;
     /** Shared by CTS copies in this realm, not by other realms. */
     loadFired: boolean;
     unloadFired: boolean;
 }
 
 const SLOT = Symbol.for('cno.engine.eventMux.v1');
-const BUS_NAMESPACE = 'cno.engine.eventMux.v1';
-const BUS_EVENT = 'dispatch';
-const BUS_STATE = 'state';
 
-interface NativeBus {
-    get(namespace: string, key: string): unknown;
-    set(namespace: string, key: string, value: unknown): void;
-    on(namespace: string, event: string, listener: (frame: DispatchFrame) => void): () => void;
-    emit(namespace: string, event: string, frame: DispatchFrame): boolean;
-}
-
-interface BusState {
-    seq: number;
-    owner?: object;
-}
-
-interface SnapshotEntry {
-    entry: Entry;
-    ctx: EventContext;
-}
-
-interface DispatchFrame {
+interface RuntimeEventFrame {
     name: number;
     data: unknown;
-    phase: 'start' | 'collect' | 'done';
-    ctx: EventContext;
-    entries: SnapshotEntry[];
-    muxes: MuxInternal[];
-    result: boolean;
+    context: EventContext;
 }
 
-function nativeBus(): NativeBus | null {
-    try {
-        // Older circu versions return null for unknown native modules.
-        const bus = (import.meta.use as (name: string) => unknown)('evbus') as NativeBus | null;
-        if (bus && typeof bus.get === 'function' && typeof bus.set === 'function'
-            && typeof bus.on === 'function' && typeof bus.emit === 'function') return bus;
-    } catch { /* an older host may throw instead */ }
-    return null;
+interface RuntimeEventBus {
+    readonly RUNTIME_NAMESPACE: string;
+    readonly RUNTIME_EVENT: string;
+    on<T>(
+        namespace: string,
+        event: string,
+        listener: (frame: T) => boolean | undefined,
+        priority?: number,
+    ): () => void;
+    dispatchRuntimeEvent(name: number, data: unknown): boolean | undefined;
 }
+
+const evbus = import.meta.use('evbus') as unknown as RuntimeEventBus;
 
 /** Default native return per event, matching pre-mux behaviour exactly.
  *  `true` is the only value that cancels BEFORE_UNLOAD and the only one that
@@ -120,64 +98,56 @@ function defaultReturn(name: number): boolean {
     return name === EV.JOB_EXCEPTION;
 }
 
-function dispatchSnapshot(name: number, data: unknown, entries: SnapshotEntry[]): boolean {
-    let ret: boolean | undefined;
-    for (const { entry, ctx } of entries) {
-        let r: boolean | undefined;
-        try {
-            r = entry.fn(name, data, ctx);
-        } catch (e) {
-            if (name === EV.BEFORE_UNLOAD || name === EV.BEFORE_EXIT) throw e;
-            continue;
-        }
-        if (typeof r === 'boolean') {
-            // beforeunload cancellation is sticky; other events are last-wins.
-            if (name === EV.BEFORE_UNLOAD) ret = ret === true || r;
-            else ret = r;
-        }
+function invokeReceiver(fn: EventReceiver, frame: RuntimeEventFrame): boolean | undefined {
+    try {
+        return fn(frame.name, frame.data, frame.context);
+    } catch (e) {
+        // Let native lifecycle handling observe listener failures. Other engine
+        // event listeners remain isolated, matching the previous facade.
+        if (frame.name === EV.BEFORE_UNLOAD || frame.name === EV.BEFORE_EXIT) throw e;
+        return undefined;
     }
-    return typeof ret === 'boolean' ? ret : defaultReturn(name);
 }
 
 function createMux(): MuxInternal {
-    let bus = nativeBus();
-    let state: BusState | undefined;
-    if (bus) {
-        try {
-            const existing = bus.get(BUS_NAMESPACE, BUS_STATE) as BusState | undefined;
-            state = existing && typeof existing.seq === 'number' ? existing : { seq: 0 };
-            if (state !== existing) bus.set(BUS_NAMESPACE, BUS_STATE, state);
-        } catch {
-            bus = null;
-        }
-    }
-
     const mux: MuxInternal = {
         version: 1,
+        backend: 'runtime-evbus',
         entries: [],
         seq: 0,
-        native: false,
-        dispatchDepth: 0,
         loadFired: false,
         unloadFired: false,
 
         install(role: string, fn: EventReceiver, priority = 0): () => void {
             // Same-role re-install replaces rather than stacks, so a module that
             // is evaluated twice cannot double-dispatch.
-            const existing = mux.entries.findIndex((e) => e.role === role);
-            if (existing !== -1) mux.entries.splice(existing, 1);
+            const existing = mux.entries.find((entry) => entry.role === role);
+            existing?.unsubscribe();
 
-            const entry: Entry = { role, priority, seq: state ? state.seq++ : mux.seq++, fn };
+            let active = true;
+            let entry: Entry | undefined;
+            const offNative = evbus.on<RuntimeEventFrame>(
+                evbus.RUNTIME_NAMESPACE,
+                evbus.RUNTIME_EVENT,
+                (frame) => invokeReceiver(fn, frame),
+                priority,
+            );
+            entry = {
+                role,
+                priority,
+                seq: mux.seq++,
+                unsubscribe: () => {
+                    if (!active) return;
+                    active = false;
+                    const index = entry ? mux.entries.indexOf(entry) : -1;
+                    if (index !== -1) mux.entries.splice(index, 1);
+                    offNative();
+                },
+            };
             mux.entries.push(entry);
             // Higher priority first; ties keep registration order.
             mux.entries.sort((a, b) => (b.priority - a.priority) || (a.seq - b.seq));
-
-            ensureNative(mux);
-
-            return () => {
-                const i = mux.entries.indexOf(entry);
-                if (i !== -1) mux.entries.splice(i, 1);
-            };
+            return entry.unsubscribe;
         },
 
         has(role: string): boolean {
@@ -189,100 +159,20 @@ function createMux(): MuxInternal {
         },
 
         dispatch(name: number, data: unknown): boolean {
-            if (bus) {
-                const frame: DispatchFrame = {
-                    name, data, phase: 'start',
-                    ctx: { handled: false, dispatched: false, rejectionEmitted: false },
-                    entries: [], muxes: [], result: defaultReturn(name),
-                };
-                bus.emit(BUS_NAMESPACE, BUS_EVENT, frame);
-                return frame.result;
-            }
-
-            mux.dispatchDepth++;
-            try {
-                const ctx: EventContext = { handled: false, dispatched: false, rejectionEmitted: false };
-                return dispatchSnapshot(name, data, mux.entries.slice().map((entry) => ({ entry, ctx })));
-            } finally {
-                mux.dispatchDepth--;
-            }
+            const result = evbus.dispatchRuntimeEvent(name, data);
+            return typeof result === 'boolean' ? result : defaultReturn(name);
         },
     };
-
-    if (bus) {
-        try {
-            const sharedBus = bus;
-            sharedBus.on(BUS_NAMESPACE, BUS_EVENT, (frame) => {
-                if (frame.phase === 'collect') {
-                    mux.dispatchDepth++;
-                    frame.muxes.push(mux);
-                    for (const entry of mux.entries) frame.entries.push({ entry, ctx: frame.ctx });
-                    return;
-                }
-                if (frame.phase !== 'start') return;
-
-                // Keep evbus' outer listener snapshot alive while invoking the
-                // sorted receivers, including when a sandbox is collected.
-                frame.phase = 'collect';
-                try {
-                    sharedBus.emit(BUS_NAMESPACE, BUS_EVENT, frame);
-                    frame.phase = 'done';
-                    frame.entries.sort((a, b) =>
-                        (b.entry.priority - a.entry.priority) || (a.entry.seq - b.entry.seq));
-                    frame.result = dispatchSnapshot(frame.name, frame.data, frame.entries);
-                } finally {
-                    frame.phase = 'done';
-                    for (const member of frame.muxes) member.dispatchDepth--;
-                }
-            });
-        } catch {
-            bus = null;
-            state = undefined;
-        }
-    }
-
     return mux;
-}
-
-function ensureNative(mux: MuxInternal, reassert = false): void {
-    if (mux.dispatchDepth > 0 || (mux.native && !reassert)) return;
-    // Circu installs this non-configurable marker only on the runtime's main
-    // realm (including workers), not on engine.Sandbox globals. A native
-    // function borrowed from the main realm may otherwise bypass its sandbox
-    // check and replace the runtime-wide receiver.
-    const marker = Object.getOwnPropertyDescriptor(globalThis, 'isWorker');
-    if (!marker || typeof marker.value !== 'boolean' || marker.writable || marker.configurable) return;
-    if (Object.getPrototypeOf(engine.onEvent) !== Function.prototype) return;
-    try {
-        const bus = nativeBus();
-        const state = bus?.get(BUS_NAMESPACE, BUS_STATE) as BusState | undefined;
-        if (state?.owner && state.owner !== globalThis) return;
-        mux.nativeReceiver ??= (name: number, data: unknown) => mux.dispatch(name, data);
-        engine.onEvent(mux.nativeReceiver);
-        mux.native = true;
-        // The native receiver can only be installed by the runtime's main
-        // context. Make it the owner even if a sandbox created the state first.
-        if (state) {
-            state.owner = globalThis;
-            bus?.set(BUS_NAMESPACE, BUS_STATE, state);
-        }
-    } catch {
-        // Sandboxed contexts reject onEvent (CHECK_IF_IN_SANDBOX). Receivers stay
-        // registered so an in-process dispatch() still works.
-    }
 }
 
 /** The realm-local mux, created on first use. */
 export function getEventMux(): EventMux {
     const g = globalThis as unknown as Record<symbol, MuxInternal | undefined>;
     let mux = g[SLOT];
-    if (!mux || mux.version !== 1) {
+    if (!mux || mux.version !== 1 || mux.backend !== 'runtime-evbus') {
         mux = createMux();
         g[SLOT] = mux;
-    } else {
-        // A prior instance may have lost the native slot to a direct
-        // engine.onEvent() call by some other module; re-assert it.
-        ensureNative(mux, true);
     }
     return mux;
 }
@@ -306,8 +196,6 @@ export const WEBAPI_ROLE = 'webapi';
 export const WEBAPI_COMPAT_ROLE = 'webapi-compat';
 /** Role of the node `process` bridge in cno/src/node/process/mod.ts. */
 export const NODE_PROCESS_ROLE = 'node-process';
-/** Role of the `unhandledRejection` -> `process` bridge below. */
-export const NODE_PROCESS_REJECTION_ROLE = 'node-process-rejection';
 
 /** Priority band: user-visible dispatch must run before diagnostics. */
 export const PRIORITY_WEBAPI = 100;
@@ -395,8 +283,14 @@ export function installWebApiCompatBridge(): () => void {
             }
             // A beforeunload listener error is fatal, unlike other event errors.
             if (!dispatchGlobalPropagating(event)) return undefined;
-            // EXIT must still emit unload, so this event does not set dispatched.
-            return wasPrevented(event) ? true : false;
+            // The context is per native dispatch, so this only suppresses a
+            // second beforeunload bridge; a later EXIT still emits unload.
+            ctx.dispatched = true;
+            if (wasPrevented(event)) {
+                ctx.handled = true;
+                return true;
+            }
+            return false;
         }
 
         if (name === EV.EXIT) {
@@ -433,57 +327,12 @@ export const LIFECYCLE_GUARD_ROLE = 'lifecycle-guard';
 
 /* ------------------------------------------------------------------ *
  * EV_UNHANDLED_REJECTION -> process 'unhandledRejection'
+ *
+ * Owned by cno/src/node/process/mod.ts, which subscribes directly to evbus
+ * when the node process module installs. CTS must not discover node objects,
+ * so there is no CTS-side rejection bridge; the shared `rejectionEmitted`
+ * context field remains available to any additional bridge.
  * ------------------------------------------------------------------ */
-
-/** Node modules cannot import CTS after cache installation, so use a slot. */
-const PROCESS_SLOT = Symbol.for('cno.node.process.default');
-
-interface ProcessEmitterLike {
-    emit(event: string, ...args: unknown[]): boolean;
-    listenerCount(event: string): number;
-}
-
-function processEmitter(): ProcessEmitterLike | null {
-    try {
-        const p = (globalThis as unknown as Record<symbol, unknown>)[PROCESS_SLOT];
-        if (!p || (typeof p !== 'object' && typeof p !== 'function')) return null;
-        const cand = p as ProcessEmitterLike;
-        if (typeof cand.emit !== 'function' || typeof cand.listenerCount !== 'function') return null;
-        return cand;
-    } catch {
-        // Exotic global; treat as absent.
-        return null;
-    }
-}
-
-/**
- * Bridge rejections to process when a handler exists. For this native event,
- * `false` means continue (opposite JOB_EXCEPTION); never return `true`.
- */
-export function installNodeProcessRejectionBridge(): () => void {
-    return installEventReceiver(NODE_PROCESS_REJECTION_ROLE, (name, data, ctx) => {
-        if (name !== EV.UNHANDLED_REJECTION) return undefined;
-
-        const proc = processEmitter();
-        if (!proc) return undefined;
-
-        // Roles may register in either order; never emit the same rejection twice.
-        if (ctx.rejectionEmitted) return undefined;
-
-        const [promise, reason] = Array.isArray(data) ? data : [undefined, data];
-
-        // Without a handler, leave diagnostics and native handling untouched.
-        if (proc.listenerCount('unhandledRejection') === 0) return undefined;
-
-        ctx.rejectionEmitted = true;
-        try {
-            proc.emit('unhandledRejection', reason, promise);
-        } catch { /* handler errors are not native aborts */ }
-
-        ctx.handled = true;
-        return false;
-    }, PRIORITY_NODE_PROCESS);
-}
 
 /** Record native exit so synthetic unload remains exactly-once. */
 function ensureLifecycleGuard(mux: MuxInternal): void {
