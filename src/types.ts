@@ -42,6 +42,8 @@ export interface LifecycleScriptEntry {
 
 export interface ConfigOptions {
     cacheDir?:      string;
+    /** Installed file-backed Bun payload directory (index.js and sqlite.js). */
+    bunDir?:        string;
     enableHttp?:    boolean;
     enableJsr?:     boolean;
     enableNode?:    boolean;

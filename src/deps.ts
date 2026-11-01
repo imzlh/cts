@@ -6,6 +6,7 @@ import type { OxcTranspiler } from './oxc';
 import { ImportScanner } from './import-scanner';
 import { isParseWorkerError } from './parse';
 import { isScannablePath, isWasmPath } from './scan';
+import { isBunSpecifier } from './resolve/bun-specifier';
 
 const os = import.meta.use('os');
 
@@ -258,6 +259,9 @@ export class DepScanner {
                     });
                 }
                 if (this.options.excludeSpecPath?.(info.specPath) === true) return;
+                // Bun payloads are installation files: keep the resolution edge for
+                // full-graph consumers, but never scan them or record their imports.
+                if (isBunSpecifier(info.specPath)) return;
                 const fileKind = this.options.fileKindOverrides?.get(info.specPath) ?? info.fileKind;
 
                 // Always record edge (per-parent node_modules link). Use resolved npm: path.

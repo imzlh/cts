@@ -1,8 +1,9 @@
 import { moduleEvaluationKey, moduleRef, type RuntimeConfig, type ModuleInfo } from '../types';
+import { bunPayloadViewRef, canonicalBunSpecifier } from '../resolve/bun-specifier';
 import { Transformer } from '../source/transform';
 import { JscCache, isRemote, isFileBackedPath, type SourceFreshness } from '../source/cache';
 import { readText, readBytes, log } from '../utils';
-import { err, ErrorKind } from '../errors';
+import { err, ErrorKind, requireCycleError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 
 const engine = import.meta.use('engine');
@@ -59,6 +60,8 @@ function isAttributedSyntaxError(e: SyntaxError): boolean {
 
 export class EsmCompiler {
     private readonly esmCache    = new Map<string, CModuleEngine.Module>();
+    // The Bun object behind each synthetic `bun` module, for require('bun').
+    private readonly bunObjects  = new Map<string, object>();
     private readonly esmLoading  = new Set<string>();
     // Compile and evaluation guards share moduleEvaluationKey: local file aliases
     // cannot re-enter one another, while explicit moduleId views remain separate.
@@ -89,6 +92,9 @@ export class EsmCompiler {
     load(info: ModuleInfo, meta: Record<string, unknown> = {}, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
         log.debug('loader', () =>
             `load ${info.specPath} → ${info.localPath} kind=${info.fileKind} format=${info.format}`);
+        if (info.specPath === 'bun' && info.moduleId === undefined && info.fileKind === 'source') {
+            return this.loadBunView(info, resolveMtime);
+        }
         switch (info.fileKind) {
             case 'binary': return this.loadBytes(info);
             case 'text':   return this.loadText(info);
@@ -272,6 +278,63 @@ export class EsmCompiler {
         this.esmCache.set(cacheKey, mod);
         return mod;
     }
+    /** The Bun object (ESM default) behind an already-loaded synthetic `bun` module. */
+    bunObject(info: ModuleInfo): object {
+        const bun = this.bunObjects.get(moduleRef(info));
+        if (!bun) throw err(ErrorKind.Generic, `Bun module "${info.specPath}" is not loaded`);
+        return bun;
+    }
+
+    /**
+     * Native Bun exposes `import Bun, * as ns from 'bun'` with `Bun === globalThis.Bun`
+     * and a namespace whose keys are exactly Object.keys(Bun): there is no `default`
+     * key. QuickJS cannot express that with a source module (a default export is
+     * always a namespace key), but a C module's namespace is a plain object that
+     * is not consulted when linking `import D from`. So the payload is loaded as a
+     * hidden module, evaluated, and its default object is re-exported through a
+     * C module whose `default` namespace property is deleted. The export entry
+     * (what default imports bind to) is left in place.
+     */
+    private loadBunView(info: ModuleInfo, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
+        const cacheKey = moduleRef(info);
+        const hit = this.esmCache.get(cacheKey);
+        if (hit) return hit;
+
+        const payloadInfo: ModuleInfo = { ...info, moduleId: bunPayloadViewRef(canonicalBunSpecifier(info.specPath)!) };
+        const evalScope = moduleEvaluationKey(payloadInfo);
+        // The payload reaching `bun` again (e.g. through the Bun global getter) while
+        // it evaluates would re-enter an EVALUATING QuickJS module, which aborts.
+        if (this.isInFlight(evalScope)) {
+            throw requireCycleError(cacheKey, info.localPath, 'require-esm');
+        }
+        const payload = this.loadEsm(payloadInfo, {}, resolveMtime);
+        const result = engine.promiseResult(this.trackEvaluation(evalScope, () => payload.eval()));
+        if (result === null) {
+            throw err(ErrorKind.Generic,
+                `Bun payload "${info.localPath}" must not use top-level await`,
+                undefined, 'ERR_REQUIRE_ASYNC_MODULE');
+        }
+        const bun: unknown = payload.namespace.default;
+        if (bun === null || (typeof bun !== 'object' && typeof bun !== 'function')) {
+            throw err(ErrorKind.Generic, `Bun payload "${info.localPath}" has no default export object`);
+        }
+
+        const mod = engine.Module.create(cacheKey);
+        mod.export('default', bun);
+        for (const key of Object.keys(bun)) {
+            if (key !== 'default') mod.export(key, Reflect.get(bun, key));
+        }
+        const ns = mod.namespace;
+        if (!Reflect.deleteProperty(ns, 'default')) {
+            throw err(ErrorKind.Generic, 'Cannot hide the default key of the Bun module namespace');
+        }
+        Object.defineProperty(ns, Symbol.toStringTag, { value: 'Module' });
+        Object.freeze(ns);
+
+        this.bunObjects.set(cacheKey, bun);
+        this.esmCache.set(cacheKey, mod);
+        return mod;
+    }
 
     private loadBytes(info: ModuleInfo): CModuleEngine.Module {
         const mod = engine.Module.create(moduleRef(info));
@@ -294,6 +357,7 @@ export class EsmCompiler {
 
     clearLoadedModules(): void {
         this.esmCache.clear();
+        this.bunObjects.clear();
     }
 
     /** True while this moduleEvaluationKey is compiling or evaluating. */

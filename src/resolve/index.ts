@@ -7,6 +7,8 @@ import { HttpHandler }  from './protocols/http';
 import { JsrHandler }   from './protocols/jsr';
 import { NpmHandler }   from './protocols/npm';
 import { NodeHandler }  from './protocols/node';
+import { BunHandler } from './protocols/bun';
+import { bunPayloadViewName, isBunSpecifier } from './bun-specifier';
 import { DataHandler }  from './protocols/data';
 import { BlobHandler }  from './protocols/blob';
 import { LockStore }    from '../lock';
@@ -216,6 +218,7 @@ export class ModuleResolver {
     get lockStore(): LockStore { return this.lock; }
     private readonly importIndex:  ImportMapIndex | null;
     private readonly aliasIndex:   PathAliasEntry[];
+    private readonly bun: BunHandler;
     private mainEntry = '';
     /** specPath → ModuleInfo — live resolution cache. */
     private readonly resolvedModules = new Map<string, ModuleInfo>();
@@ -242,6 +245,8 @@ export class ModuleResolver {
         this.reg(new BlobHandler(cfg));
         this.reg(new NpmHandler(cfg, (spec, parent, attr, onProgress) =>
             this.resolvePackageImportTarget(spec, parent, attr, onProgress)));
+        this.bun = new BunHandler(cfg);
+        this.reg(this.bun);
 
         const flagged: Array<[ProtocolHandler, keyof RuntimeConfig]> = [
             [new HttpHandler(cfg), 'enableHttp'],
@@ -297,6 +302,13 @@ export class ModuleResolver {
         }
         if (spec.includes('\\') || spec[1] === ':') spec = canonicalizePath(spec);
 
+        // `bun` and `bun:*` are reserved builtin names. Resolve (or reject) them
+        // before pack edges, import maps, lock/frozen checks, or any npm fallback.
+        if (isBunSpecifier(spec)) {
+            const info = await runAsync(this.bun.resolve(spec, parent));
+            return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
+        }
+
         // pack: parent — resolve original specifier before maps/lock redirect out.
         if (protoOf(parent) === 'pack') {
             const packedSpec = spec.startsWith('node:') || isBuiltinSpecifier(spec)
@@ -338,6 +350,7 @@ export class ModuleResolver {
         onProgress?: ProgressCallback,
         splitAbsoluteSuffix = false,
     ): Promise<ModuleInfo> {
+        if (isBunSpecifier(spec)) return await runAsync(this.bun.resolve(spec, parent));
         const proto = protoOf(spec);
         if (proto) {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
@@ -355,6 +368,7 @@ export class ModuleResolver {
 
     private async resolveBareAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         if (spec.startsWith('@std/')) return await this.dispatchAsync(`jsr:${spec}`, parent, attr, onProgress);
+        if (isBunSpecifier(spec)) return await runAsync(this.bun.resolve(spec, parent));
         if (isBuiltinSpecifier(spec)) return await this.dispatchAsync(`node:${spec}`, parent, attr, onProgress);
         // pack: bare imports are offline edges only (no project dir at run).
         if (protoOf(parent) === 'pack') {
@@ -402,6 +416,14 @@ export class ModuleResolver {
         }
         // Canonical path before maps/dispatch (drive case + backslashes).
         spec = canonicalizePath(spec);
+
+        // Do not let a project import map or --frozen turn a Bun builtin into a
+        // package/cache lookup. Unknown bun:* names fail here with
+        // ERR_UNKNOWN_BUILTIN_MODULE.
+        if (isBunSpecifier(spec)) {
+            const info = runSync(this.bun.resolve(spec, parent));
+            return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
+        }
 
         // Keep manifest edge specs; import maps can escape pack to live cache.
         if (protoOf(parent) === 'pack') {
@@ -471,7 +493,7 @@ export class ModuleResolver {
 
         // L2 — module index: for canonical specifiers, check without dispatching
         const proto = protoOf(mapped);
-        if (this.canReadSourceIndex(attr) && proto && proto !== 'file') {
+        if (this.canReadSourceIndex(attr) && (isAbsolute(mapped) || (proto && proto !== 'file'))) {
             const lockHit = this.lock.getModule(mapped);
             if (lockHit && this.canUseCachedInfo(lockHit)) {
                 log.debug('resolver', () => `L2 hit: "${mapped}"`);
@@ -486,6 +508,17 @@ export class ModuleResolver {
     }
 
     getInfo(specPath: string): ModuleInfo {
+        if (isBunSpecifier(specPath)) {
+            return this.resolvedModules.get(specPath) ?? runSync(this.bun.resolve(specPath, ''));
+        }
+        // Hidden Bun payload module: same file as the canonical module, own identity.
+        const payloadOf = bunPayloadViewName(specPath);
+        if (payloadOf) {
+            const base = this.getInfo(payloadOf);
+            const view: ModuleInfo = { ...base, moduleId: specPath };
+            this.rememberRuntimeInfo(view);
+            return view;
+        }
         const runtime = this.runtimeModules.get(specPath);
         if (runtime) return runtime;
         const cached = this.resolvedModules.get(specPath);
@@ -567,6 +600,7 @@ export class ModuleResolver {
         attr?: Record<string, unknown>,
         splitAbsoluteSuffix = false,
     ): ModuleInfo {
+        if (isBunSpecifier(spec)) return runSync(this.bun.resolve(spec, parent));
         const proto = protoOf(spec);
         if (proto) {
             if (this.disabled.has(proto)) throw err(ErrorKind.ProtocolDisabled, `Protocol "${proto}:" is disabled`);
@@ -586,8 +620,10 @@ export class ModuleResolver {
         onProgress?: ProgressCallback,
     ): Flow<ModuleInfo> {
         const target = spec.startsWith('@std/') ? `jsr:${spec}`
+            : isBunSpecifier(spec) ? spec
             : isBuiltinSpecifier(spec) ? `node:${spec}`
             : spec;
+        if (isBunSpecifier(target)) return yield* this.bun.resolve(target, parent);
         const proto = protoOf(target);
         const handler = this.handlers.get(proto || 'npm');
         if (proto && this.disabled.has(proto)) {
@@ -659,6 +695,7 @@ export class ModuleResolver {
 
     private resolveBare(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         if (spec.startsWith('@std/')) return this.dispatch(`jsr:${spec}`, parent, attr);
+        if (isBunSpecifier(spec)) return runSync(this.bun.resolve(spec, parent));
         if (isBuiltinSpecifier(spec)) return this.dispatch(`node:${spec}`, parent, attr);
         if (protoOf(parent) === 'pack') {
             const handler = this.handlers.get('pack');
@@ -727,7 +764,7 @@ export class ModuleResolver {
         if (!spec || spec[0] === '.' || spec[0] === '/' || spec.startsWith('#')) return null;
         const proto = protoOf(spec);
         if (proto && proto !== 'npm') return null;
-        if (spec.startsWith('@std/') || isBuiltinSpecifier(spec)) return null;
+        if (spec.startsWith('@std/') || isBuiltinSpecifier(spec) || isBunSpecifier(spec)) return null;
         const npm = this.handlers.get('npm');
         if (!(npm instanceof NpmHandler)) return null;
         return npm.tryResolveLocal(spec, parent, attr);
@@ -760,7 +797,9 @@ export class ModuleResolver {
         this.sourceInfoCache.set(sourceKey, resolved);
         this.rememberRuntimeInfo(resolved);
 
-        const cacheLockEntry = protoOf(canonical.specPath) !== 'node';
+        // Node and Bun builtins are supplied by the installation, not the lock.
+        const cacheLockEntry = !isBunSpecifier(canonical.specPath)
+            && protoOf(canonical.specPath) !== 'node';
         // Recoverable by getInfo() even for transient resolves. Transient fills only
         // when absent — a real ESM resolve wins (conditions and format may differ).
         if (!transient || !this.resolvedModules.has(canonical.specPath)) {

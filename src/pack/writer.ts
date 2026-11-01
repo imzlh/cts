@@ -5,6 +5,7 @@ import { DepScanner } from '../deps';
 import { guessFileKind } from '../resolve/protocols/base';
 import { hasImportAttributes, isTsLikePath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
+import { isBunSpecifier } from '../resolve/bun-specifier';
 import { relativePath, dirname, basename, canonicalizePath, ensureDir, PrecacheProgress, log } from '../utils';
 import { err, ErrorKind } from '../errors';
 import { encodePackHeader, completePackManifest, type PackBlobSource, type PackManifest, type PackModuleEntry } from './format';
@@ -180,7 +181,7 @@ export async function writePack(
         const scanner = new DepScanner(runtime.resolver, runtime.config, prog, oxc, parseImports, {
             fullGraph: true,
             reportSummary: false,
-            excludeSpecPath: specPath => specPath.startsWith('node:'),
+            excludeSpecPath: specPath => specPath.startsWith('node:') || isBunSpecifier(specPath),
             fileKindOverrides: options.entryLang
                 ? new Map<string, FileKind>([[entryInfo.specPath, 'source']])
                 : undefined,
@@ -198,7 +199,9 @@ export async function writePack(
         const entryDir = dirname(entryInfo.localPath);
         const workspaceRoots = entryDir === projectDir ? [projectDir] : [projectDir, entryDir];
         // Drop node builtins (runtime-provided; packing polyfills is dead weight).
-        const packableModules = scanResult.modules.filter(m => specScheme(m.specPath) !== 'node');
+        // Bun builtins are installed payloads, resolved at run time like node:.
+        const packableModules = scanResult.modules.filter(m =>
+            specScheme(m.specPath) !== 'node' && !isBunSpecifier(m.specPath));
         const classified = classifyModules(packableModules, workspaceRoots);
         classified.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
@@ -227,7 +230,7 @@ export async function writePack(
                     edges[parentId] = bucket!;
                 }
                 bucket![edge.specifier] = childId;
-            } else if (!edge.childSpecPath.startsWith('node:')) {
+            } else if (!edge.childSpecPath.startsWith('node:') && !isBunSpecifier(edge.childSpecPath)) {
                 throw err(ErrorKind.Generic,
                     `pack: resolved edge target was not included: "${edge.specifier}" from "${edge.parentSpecPath}" -> "${edge.childSpecPath}"`);
             }
@@ -332,6 +335,7 @@ export async function writePack(
                     if (spec.startsWith('node:') || isBuiltinSpecifier(spec)) {
                         return spec.startsWith('node:') ? spec : `node:${spec}`;
                     }
+                    if (isBunSpecifier(spec)) return spec;
                     const childId = edges[parent]?.[spec];
                     if (!childId) throw err(ErrorKind.ModuleNotFound, `pack: no static edge for "${spec}" from "${parent}"`);
                     const child = moduleById.get(childId);

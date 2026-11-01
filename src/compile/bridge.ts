@@ -4,6 +4,7 @@ import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
 import { isResolutionMiss, requireCycleError, setErrorCode } from '../errors';
 import { builtinModuleNames } from '../resolve/builtins';
+import { BUN_MODULES, isBunSpecifier } from '../resolve/bun-specifier';
 import { errMsg, log } from '../utils';
 import { ensureInternalBridge, notifyInternalBridge } from './internal-registry';
 import type { NodeModuleInteropBridge } from './node-interop';
@@ -136,11 +137,16 @@ export function buildCjsDeps(
 ): CjsDeps {
     return {
         resolveBuiltin(name: string, parent: string): ModuleInfo {
+            if (isBunSpecifier(name)) return resolver.resolve(name, parent);
             return resolver.resolve(`node:${name}`, parent);
         },
 
         loadEsmSync(info: ModuleInfo, from?: string): Record<string, unknown> {
             return loadEsmSync(info, esm, undefined, from);
+        },
+
+        bunObject(info: ModuleInfo): unknown {
+            return esm.bunObject(info);
         },
 
         loadWasmSync,
@@ -302,7 +308,7 @@ export function installInternalBridge(
     const value = {
         mkRequire,
         preloadModule,
-        builtinModules: builtinModuleNames(),
+        builtinModules: [...new Set([...builtinModuleNames(), ...BUN_MODULES])],
         cache,
         registerModuleHooks,
         hasModuleResolveHooks,

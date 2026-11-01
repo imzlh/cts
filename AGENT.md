@@ -2,7 +2,27 @@
 
 ## Overview
 
-`cts/` is the JavaScript runtime layer for `cno-cli`. It resolves imports across npm, JSR, HTTP, file, and node: protocols, caches results in a SQLite lock store, pre-compiles to QuickJS bytecode, and executes via a custom engine hook pipeline.
+`cts/` is the JavaScript runtime layer for `cno-cli`. It resolves imports across npm, JSR, HTTP, file, Node, and optional Bun builtins, caches results in a SQLite lock store, pre-compiles to QuickJS bytecode, and executes via a custom engine hook pipeline.
+
+## Bun Builtins
+
+- Reserve `bun` and every case-insensitive `bun:*` spelling before maps, lock,
+  packs, npm, or network. Only canonical `bun` and `bun:sqlite` currently map to
+  file-backed payloads from `RuntimeConfig.bunDir`; all other family members fail.
+- Keep `specPath` canonical (`bun` / `bun:sqlite`) even though `localPath` points
+  into the installation. Never persist these runtime-provided modules in the
+  lock or include their payload bytes in a `.jspack`.
+- A pack may retain a canonical Bun dependency edge. At execution time, including
+  after relocation and in workers, resolve it from the current installation.
+- The bare `bun` public namespace intentionally differs from a normal source ESM:
+  default import and CommonJS `require` return the Bun object, but the namespace
+  has no own `default` property. Preserve the hidden payload-module identity and
+  its cycle guards when changing ESM/CJS loading.
+- Do not register Bun as a Node builtin or add `bun` to global package export
+  conditions. APIs such as `Bun.resolve` need a per-call ESM inspection path with
+  local conditions so Node/Deno package selection remains unchanged.
+- Loader changes must retain the main-bundle/payload/pack boundary described in
+  the root `AGENT.md`; Bun API implementations belong under `cno/src/bun/`.
 
 ## Directory Layout
 

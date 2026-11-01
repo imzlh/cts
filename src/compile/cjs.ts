@@ -2,6 +2,7 @@ import type { ModuleInfo } from '../types';
 import { dirname, fileUrlToPath, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, normalizePath, readText, toHostPath as sharedToHostPath, toHostPaths as sharedToHostPaths, hasSchemeId, schemeId } from '../utils';
 import { err, ErrorKind, requireCycleError } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
+import { canonicalBunSpecifier, isBunSpecifier } from '../resolve/bun-specifier';
 import { guessFileKind } from '../resolve/protocols/base';
 import { createCtx, detectFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
 import { buildCjsWrapperSource, cjsContextSlot, type CjsContext } from './cjs-wrap';
@@ -37,6 +38,10 @@ export interface CjsDeps {
     /** Sync ESM load for require(); returns namespace via promiseResult.
      *  `from` is the requiring file, used for cycle error attribution. */
     loadEsmSync(info: ModuleInfo, from?: string): Record<string, unknown>;
+    /** The Bun object (ESM default) of the synthetic `bun` module, valid after
+     *  loadEsmSync(info). Its namespace has no `default` key, so require('bun')
+     *  cannot read it from there. */
+    bunObject?(info: ModuleInfo): unknown;
     /** Load a wasm module synchronously for CJS require(.wasm). */
     loadWasmSync?(info: ModuleInfo): Record<string, unknown>;
     /** Resolve any external specifier → concrete module info. */
@@ -199,6 +204,16 @@ function esmRequireView(ns: Record<string, unknown>): Record<string, unknown> {
     });
     Object.defineProperty(view, Symbol.toStringTag, { value: 'Module' });
     return Object.preventExtensions(view);
+}
+
+/** Unknown or malformed `bun:*` fails closed, before any resolver lookup. */
+function requireBunName(id: string): 'bun' | 'bun:sqlite' {
+    const name = canonicalBunSpecifier(id);
+    if (!name) {
+        throw err(ErrorKind.ModuleNotFound, `Unknown Bun builtin "${id}"`,
+            undefined, 'ERR_UNKNOWN_BUILTIN_MODULE');
+    }
+    return name;
 }
 
 function normalizeExecError(error: unknown, filename: string): Error {
@@ -918,6 +933,13 @@ export class CjsLoader {
 
         // require.resolve inspects cached resolution without fetching.
         const resolve = ((id: string, opts?: { paths?: string[] }): string => {
+            if (isBunSpecifier(id)) {
+                // Reject a missing payload, but report the canonical builtin
+                // name rather than the payload path.
+                const name = requireBunName(id);
+                self.deps.resolveBuiltin(name, parentPath);
+                return name;
+            }
             // Builtins resolve to the original specifier, not a cache path.
             if (isBuiltinSpecifier(id)) return id;
             const searchIn = opts?.paths ? normalizeRequireResolvePaths(opts.paths) : [parentPath];
@@ -929,7 +951,7 @@ export class CjsLoader {
         }) as CjsRequireFn['resolve'];
         // Builtins have no filesystem search paths.
         resolve.paths = (id: string): string[] | null => {
-            if (isBuiltinSpecifier(id)) return null;
+            if (isBunSpecifier(id) || isBuiltinSpecifier(id)) return null;
             if (isRelative(id) || isAbsolute(id) || id === '.') return toHostPaths([dirname(parentPath)]);
             return toHostPaths(buildPaths(dirname(parentPath)));
         };
@@ -963,6 +985,9 @@ export class CjsLoader {
     }
 
     private requireFrom(id: string, parentPath: string, parentMod: CjsModule | null, forceJsCjs = false): unknown {
+        // Reserved before every other lookup: never maps, lock, npm or the FS.
+        if (isBunSpecifier(id)) return this.loadBun(id, parentPath).exports;
+
         // 1. Node built-ins
         const bare = id.startsWith('node:') ? id.slice(5) : id;
         if (isBuiltinSpecifier(id)) return this.loadBuiltin(bare, parentPath).exports;
@@ -1020,7 +1045,29 @@ export class CjsLoader {
         return mod.exports;
     }
 
-    /** Builtin via deps; default merged with named exports (not the require(esm) view). */
+    /**
+     * `bun` / `bun:sqlite` from the file-backed payload. Native Bun hands
+     * `require('bun')` the ESM default (same object, no `default` key), while
+     * `bun:sqlite` gets a namespace-like view with `__esModule` and `default`.
+     */
+    private loadBun(id: string, parent: string): CjsModule {
+        const info = this.deps.resolveBuiltin(requireBunName(id), parent);
+        const key = info.specPath;
+        const hit = this.builtinCache.get(key);
+        if (hit) return hit;
+        const ns = this.deps.loadEsmSync(info, parent);
+        const mod = this.synth(info.localPath);
+        if (key === 'bun') {
+            if (!this.deps.bunObject) throw err(ErrorKind.Generic, 'Bun module loader is unavailable');
+            mod.exports = this.deps.bunObject(info);
+        } else {
+            mod.exports = esmRequireView(ns);
+        }
+        this.builtinCache.set(key, mod);
+        return mod;
+    }
+
+    /** Node builtin via deps; default merged with named exports (not the require(esm) view). */
     private loadBuiltin(name: string, parent: string): CjsModule {
         const hit = this.builtinCache.get(name);
         if (hit) return hit;
