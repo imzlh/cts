@@ -849,7 +849,7 @@ export class ModuleResolver {
     }
 
     private isTransientResolve(attr?: Record<string, unknown>): boolean {
-        return attr?.cjs === true;
+        return attr?.cjs === true || attr?.inspect === true;
     }
 
     private normalizeParentRef(parent: string): string {

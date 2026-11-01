@@ -316,6 +316,11 @@ export function installInternalBridge(
         runModuleResolveHooks,
         runModuleLoadHooks,
         nodeModuleInterop,
+        resolveEsmForInspection(spec: string, parent: string): string {
+            const info = resolver.resolveForInspection(spec, parent, { bunConditions: true });
+            return info.specPath.startsWith('node:') || isBunSpecifier(info.specPath)
+                ? info.specPath : info.localPath;
+        },
         specToLocalPath(specPath: string): string | null {
             const normalized = normalizeNpmSpec(specPath);
             try {

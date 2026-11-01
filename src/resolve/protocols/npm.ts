@@ -838,8 +838,8 @@ export class NpmHandler implements ProtocolHandler {
         return { dir: pkgDir, resolvedVer: exactVer };
     }
 
-    private ctxOptions(forceCjs?: boolean): { forceCjs?: boolean; conditions?: string[] } {
-        return { forceCjs, conditions: this.cfg.conditions };
+    private ctxOptions(forceCjs?: boolean, attr?: Record<string, unknown>): { forceCjs?: boolean; conditions?: string[] } {
+        return { forceCjs, conditions: attr?.bunConditions === true ? [...(this.cfg.conditions ?? []), 'bun'] : this.cfg.conditions };
     }
 
     *resolve(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
@@ -856,7 +856,7 @@ export class NpmHandler implements ProtocolHandler {
         // # imports from local node_modules files — resolve via owning package's "imports"
         if (spec.startsWith('#')) {
             const pkgDir = this.findOwningPackageDir(parent);
-            const ctx = pkgDir ? createCtx(pkgDir, this.ctxOptions(forceCjs)) : null;
+            const ctx = pkgDir ? createCtx(pkgDir, this.ctxOptions(forceCjs, attr)) : null;
             const resolved = ctx ? resolveImports(ctx, spec) : null;
             if (resolved && pkgDir) {
                 const pkg = readPkg(pkgDir);
@@ -866,7 +866,7 @@ export class NpmHandler implements ProtocolHandler {
             throw packageImportNotDefinedError(spec, pkgDir ?? '', parent);
         }
         const { name: specName, version: parsedRange, subpath } = parseNpmSpec(spec);
-        const selfRef = this.resolveSelfReference(parent, specName, subpath, forceCjs);
+        const selfRef = this.resolveSelfReference(parent, specName, subpath, forceCjs, attr);
         if (selfRef) return selfRef;
         // A `latest` request defers to the parent's declared range. When that
         // declaration is npm alias syntax the real package name comes from it too,
@@ -877,7 +877,7 @@ export class NpmHandler implements ProtocolHandler {
         const name = declared?.name ?? specName;
         const range = declared?.range ?? parsedRange;
         const pkg = yield* this.ensureInstalled(name, range, parent, onProgress);
-        return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs);
+        return this.resolvePkg(pkg.dir, pkg.resolvedVer, name, subpath, forceCjs, attr);
     }
 
     tryResolveLocal(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo | null {
@@ -891,7 +891,7 @@ export class NpmHandler implements ProtocolHandler {
         }
         if (!canUseLocalPackageForRange(parsed.version)) return null;
 
-        const selfRef = this.resolveSelfReference(parent, parsed.name, parsed.subpath, forceCjs);
+        const selfRef = this.resolveSelfReference(parent, parsed.name, parsed.subpath, forceCjs, attr);
         if (selfRef) return selfRef;
 
         const origin = this.parentOrigin(parent);
@@ -901,7 +901,7 @@ export class NpmHandler implements ProtocolHandler {
         if (!local) return null;
         const pkg = readPkg(local);
         const resolvedVer = pkg?.version ?? parsed.version;
-        return this.resolvePkg(local, resolvedVer, parsed.name, parsed.subpath, forceCjs);
+        return this.resolvePkg(local, resolvedVer, parsed.name, parsed.subpath, forceCjs, attr);
     }
 
     tryResolveLocalFile(localPath: string, attr?: Record<string, unknown>): ModuleInfo | null {
@@ -1038,7 +1038,7 @@ export class NpmHandler implements ProtocolHandler {
     ): Flow<ModuleInfo> {
         const { name, version } = parseNpmSpec(parent);
         const pkg = yield* this.ensureInstalled(name, version, parent, onProgress);
-        const ctx = createCtx(pkg.dir, this.ctxOptions(forceCjs));
+        const ctx = createCtx(pkg.dir, this.ctxOptions(forceCjs, attr));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${pkg.dir}`);
         const resolved = resolveImports(ctx, spec);
         if (!resolved) throw packageImportNotDefinedError(spec, pkg.dir, parent);
@@ -1046,8 +1046,8 @@ export class NpmHandler implements ProtocolHandler {
             name, pkg.resolvedVer, pkg.dir, resolved, parent, attr, onProgress);
     }
 
-    private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo {
-        const ctx = createCtx(dir, this.ctxOptions(forceCjs));
+    private resolvePkg(dir: string, ver: string, name: string, subpath: string, forceCjs: boolean, attr?: Record<string, unknown>): ModuleInfo {
+        const ctx = createCtx(dir, this.ctxOptions(forceCjs, attr));
         if (!ctx) throw err(ErrorKind.ModuleNotFound, `package.json not found in ${dir}`);
         // types-only "." exports (e.g. @types/react 19.x) fall through to the marker below;
         // a real format mismatch (e.g. cjs-only package required via import) still throws.
@@ -1121,7 +1121,7 @@ export class NpmHandler implements ProtocolHandler {
         return results[0] ?? null;
     }
 
-    private resolveSelfReference(parent: string, name: string, subpath: string, forceCjs: boolean): ModuleInfo | null {
+    private resolveSelfReference(parent: string, name: string, subpath: string, forceCjs: boolean, attr?: Record<string, unknown>): ModuleInfo | null {
         if (!parent) return null;
         // Node allows self-reference from any package that declares "exports";
         // store parents keep the pre-exports behaviour (legacy main/index too).
@@ -1131,7 +1131,7 @@ export class NpmHandler implements ProtocolHandler {
         const parentPkg = readPkg(parentPkgDir);
         if (!parentPkg?.name || parentPkg.name !== name || !parentPkg.version) return null;
         if (!fromStore && parentPkg.exports === undefined) return null;
-        return this.resolvePkg(parentPkgDir, parentPkg.version, name, subpath, forceCjs);
+        return this.resolvePkg(parentPkgDir, parentPkg.version, name, subpath, forceCjs, attr);
     }
 
     private toPackageModuleInfo(name: string, version: string, pkgDir: string, resolved: ResolvedPath): ModuleInfo {
