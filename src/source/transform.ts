@@ -1,5 +1,5 @@
 import { transformCnoCode } from '../../deps/sucrase/src/index';
-import { errMsg, log } from '../utils';
+import { dirname, joinPaths, hasSchemeId, isAbsolute, normalizePath, toPosixPath, readText, errMsg, log } from '../utils';
 import { err, ErrorKind, TransformError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
 
@@ -15,22 +15,37 @@ const KIND_JSON = 5;
 
 export interface TransformerOptions {
     sourceMaps?: boolean;
+    /** Honor `//# sourceMappingURL` annotations in passthrough (untranspiled) sources. */
+    inlineSourceMaps?: boolean;
     jsxPragma?: string;
     jsxFragmentPragma?: string;
 }
 
 export class Transformer {
     private readonly sourceMaps: boolean;
+    private readonly inlineSourceMaps: boolean;
     private readonly jsxPragma: string;
     private readonly jsxFragmentPragma: string;
     private oxc: OxcTranspiler | null = null;
     private oxcLoader: (() => OxcTranspiler | null) | null = null;
     private oxcLoaded = false;
+    /** Modules whose embedded map was injected; consumed by the bytecode persist gate. */
+    private readonly inlineMappedKeys = new Set<string>();
 
     constructor(options: TransformerOptions = {}) {
         this.sourceMaps = options.sourceMaps ?? true;
+        this.inlineSourceMaps = options.inlineSourceMaps ?? false;
         this.jsxPragma = options.jsxPragma ?? 'React.createElement';
         this.jsxFragmentPragma = options.jsxFragmentPragma ?? 'React.Fragment';
+    }
+
+    /**
+     * Consume the inline-map marker for a module. A persisted .jsc cannot be
+     * re-injected from (the map lives in the runtime, not the bytecode), so
+     * annotated modules must stay source-cached to keep stacks remapped.
+     */
+    tookInlineSourceMap(moduleKey: string): boolean {
+        return this.inlineMappedKeys.delete(moduleKey);
     }
 
     /** Install the native oxc transpiler. When set, it takes priority over Sucrase. */
@@ -81,6 +96,10 @@ export class Transformer {
             case KIND_JSON: return `export default ${code};`;
             default:
                 log.debug('transformer', () => `passthrough: ${filename}`);
+                // No inline-map load here: string inputs (stdin/eval entries)
+                // have no file to resolve an annotation against. TS-family
+                // shebang sources pre-load in transformBytes; passthrough
+                // shebang sources load via the bytes-tail path.
                 return code;
         }
     }
@@ -150,7 +169,12 @@ export class Transformer {
             case KIND_TSX:
             case KIND_JSX: {
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
-                    return this.transform(engine.decodeString(bytes), filename, lang, mapKey);
+                    const decoded = engine.decodeString(bytes);
+                    // Pre-load before delegating: transform() must not load
+                    // (string path), but this module is file-backed and will
+                    // reach the bytecode persist gate.
+                    this.loadInlineSourceMap(mapKey ?? filename, filename, decoded);
+                    return this.transform(decoded, filename, lang, mapKey);
                 }
                 const oxc = this.getOxc();
                 if (oxc) {
@@ -174,9 +198,11 @@ export class Transformer {
                 );
             }
             case KIND_JSON: return `export default ${engine.decodeString(bytes)};`;
-            default:
+            default: {
                 log.debug('transformer', () => `passthrough bytes: ${filename}`);
+                this.loadInlineSourceMapBytes(mapKey ?? filename, filename, bytes);
                 return bytes;
+            }
         }
     }
 
@@ -186,6 +212,42 @@ export class Transformer {
             else smap.loadJSON(name, sourceMap);
         } catch (e) {
             log.debug('transformer', () => `smap: ${name}: ${errMsg(e)}`);
+        }
+    }
+
+    /**
+     * Load a passthrough module's embedded sourceMappingURL map into the
+     * native runtime. Transpiled sources do not need this: oxc/Sucrase inject
+     * their maps under the same key. Opt-in because it costs one stat + read
+     * + JSON parse per annotated file.
+     */
+    loadInlineSourceMap(moduleKey: string, localPath: string, code: string, track = true): void {
+        if (!this.inlineSourceMaps) return;
+        const url = embeddedSourceMapUrl(code);
+        if (url !== undefined) this.loadResolvedInlineSourceMap(moduleKey, localPath, url, track);
+    }
+
+    /** Byte variant: only the tail is decoded, so multi-MB bundles stay cheap. */
+    private loadInlineSourceMapBytes(moduleKey: string, localPath: string, bytes: Uint8Array): void {
+        if (!this.inlineSourceMaps || bytes.byteLength === 0) return;
+        const windowStart = Math.max(0, bytes.byteLength - INLINE_SOURCEMAP_TAIL_BYTES);
+        const url = embeddedSourceMapUrlFromTail(engine.decodeString(bytes.subarray(windowStart)));
+        if (url !== undefined) this.loadResolvedInlineSourceMap(moduleKey, localPath, url, true);
+    }
+
+    private loadResolvedInlineSourceMap(moduleKey: string, localPath: string, url: string, track: boolean): void {
+        if (hasSchemeId(url)) {
+            log.debug('transformer', () => `smap: ${moduleKey}: data URI / URL maps are not loaded`);
+            return;
+        }
+        const posix = toPosixPath(url);
+        const mapPath = isAbsolute(posix) ? normalizePath(posix) : joinPaths(dirname(localPath), posix);
+        try {
+            smap.loadJSON(moduleKey, readText(mapPath));
+            if (track) this.inlineMappedKeys.add(moduleKey);
+            log.debug('transformer', () => `smap: inline map loaded for ${moduleKey}`);
+        } catch (e) {
+            log.debug('transformer', () => `smap: ${moduleKey}: ${errMsg(e)}`);
         }
     }
 
@@ -202,6 +264,7 @@ export class Transformer {
                 return this.run(code, filename, false, true);
             default:
                 log.debug('transformer', () => `cjs passthrough: ${filename}`);
+                this.loadInlineSourceMap(filename, filename, code);
                 return code;
         }
     }
@@ -249,6 +312,65 @@ export function isPassthroughSource(filename: string): boolean {
     // .cts needs TS strip (transformForCjs / transform); not plain JS passthrough.
     return kind !== KIND_TS && kind !== KIND_CTS && kind !== KIND_TSX
         && kind !== KIND_JSX && kind !== KIND_JSON;
+}
+
+/**
+ * Extract the sourceMappingURL from the last source line. Tail-only matching:
+ * a whole-file scan would misfire on string literals mentioning the marker,
+ * and the ecosystem convention places the annotation last.
+ */
+function embeddedSourceMapUrl(code: string): string | undefined {
+    let end = code.length;
+    while (end > 0) {
+        const ch = code.charCodeAt(end - 1);
+        if (ch !== 10 && ch !== 13 && ch !== 32 && ch !== 9) break;
+        end--;
+    }
+    const lineStart = Math.max(code.lastIndexOf('\n', end - 1), code.lastIndexOf('\r', end - 1)) + 1;
+    const line = code.slice(lineStart, end);
+    return matchSourceMapAnnotation(line, lineStart === 0);
+}
+
+const INLINE_SOURCEMAP_TAIL_BYTES = 4096;
+
+/**
+ * Tail variant for byte pipelines. When the window begins mid-line
+ * (lineStart === 0) the full-line match is unavailable, so the annotation is
+ * matched end-anchored instead — minified single-line bundles end with it
+ * glued after code.
+ */
+function embeddedSourceMapUrlFromTail(tail: string): string | undefined {
+    let end = tail.length;
+    while (end > 0) {
+        const ch = tail.charCodeAt(end - 1);
+        if (ch !== 10 && ch !== 13 && ch !== 32 && ch !== 9) break;
+        end--;
+    }
+    const lineStart = Math.max(tail.lastIndexOf('\n', end - 1), tail.lastIndexOf('\r', end - 1)) + 1;
+    return matchSourceMapAnnotation(tail.slice(lineStart, end), lineStart === 0);
+}
+
+/** Full-line first; end-anchored only where the line start is provably present. */
+function matchSourceMapAnnotation(line: string, mayBeTruncatedHead: boolean): string | undefined {
+    const fullLine = /^[\t ]*\/\/[#@][\t ]*sourceMappingURL=([^\s]+)[\t ]*$/.exec(line);
+    if (fullLine) return fullLine[1];
+    if (mayBeTruncatedHead) {
+        const endAnchored = /\/\/[#@][\t ]*sourceMappingURL=([^\s]+)[\t ]*$/.exec(line);
+        if (endAnchored) return endAnchored[1];
+    }
+    return undefined;
+}
+
+/** Public gate for the bytecode caches: annotated passthrough modules must
+ *  stay source-cached, because their map lives in the runtime, not in .jsc. */
+export function hasEmbeddedSourceMap(text: string): boolean {
+    return embeddedSourceMapUrl(text) !== undefined;
+}
+
+export function hasEmbeddedSourceMapBytes(bytes: Uint8Array): boolean {
+    if (bytes.byteLength === 0) return false;
+    const windowStart = Math.max(0, bytes.byteLength - INLINE_SOURCEMAP_TAIL_BYTES);
+    return embeddedSourceMapUrlFromTail(engine.decodeString(bytes.subarray(windowStart))) !== undefined;
 }
 
 function sourceKind(filename: string, lang?: string): number {

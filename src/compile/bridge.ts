@@ -179,6 +179,10 @@ export function buildCjsDeps(
             return esm.transformer.transformForCjs(code, filePath);
         },
 
+        tookInlineSourceMap(localPath: string): boolean {
+            return esm.transformer.tookInlineSourceMap(localPath);
+        },
+
         loadCjsCompiled(localPath: string): unknown | null {
             return esm.jsc.loadCompiled(localPath, false, undefined, localPath);
         },

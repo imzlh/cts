@@ -74,6 +74,7 @@ export class EsmCompiler {
         this.jsc = new JscCache(cfg.cacheDir);
         this.transformer = new Transformer({
             sourceMaps: true,
+            inlineSourceMaps: cfg.enableInlineSourceMap === true,
             jsxPragma: cfg.jsxPragma,
             jsxFragmentPragma: cfg.jsxFragmentPragma,
         });
@@ -206,6 +207,7 @@ export class EsmCompiler {
         this.esmInFlightPaths.add(evalScope);
         let sourceFreshness: SourceFreshness | undefined;
         let mod: CModuleEngine.Module;
+        let inlineMapped = false;
         try {
             // The sidecar must describe the bytes about to be compiled, not whatever
             // revision happens to be on disk after compilation finishes.
@@ -215,6 +217,9 @@ export class EsmCompiler {
             sourceFreshness = source?.freshness;
             const bytes = source?.bytes ?? readBytes(info.localPath);
             const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleId);
+            // Consume immediately: every transformBytes load must clear its
+            // marker, whether or not this load reaches the persist gate.
+            inlineMapped = this.transformer.tookInlineSourceMap(moduleId);
             mod = this.compileEsm(code, moduleId, info.localPath);
         } catch (e) {
             this.esmCache.delete(cacheKey);
@@ -239,7 +244,10 @@ export class EsmCompiler {
             return cached;
         }
 
-        if (tryBytecode && fileBacked && sourceFreshness) {
+        // An embedded map is injected at compile time and lives in the runtime,
+        // not in the bytecode: annotated modules must stay source-cached so a
+        // later load re-injects instead of serving unmapped positions.
+        if (tryBytecode && fileBacked && sourceFreshness && !inlineMapped) {
             if (remote) this.jsc.persist(info.localPath, mod, moduleId, sourceFreshness);
             else        this.jsc.persistLocal(info.localPath, mod, moduleId, sourceFreshness);
         }

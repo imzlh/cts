@@ -52,6 +52,8 @@ export interface CjsDeps {
     resolveExternalCached?(req: string, parent: string): ModuleInfo | null;
     /** Prepare source for CJS execution (e.g. strip TS/JSX syntax). */
     prepareSource?(code: string, filePath: string): string | null;
+    /** Consume the embedded-sourceMappingURL marker for path (see Transformer). */
+    tookInlineSourceMap?(localPath: string): boolean;
     /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. */
     loadCjsCompiled?(localPath: string): unknown | null;
     /** Source snapshot retained by a preceding bytecode-cache miss. */
@@ -693,7 +695,9 @@ export class CjsLoader {
             path: toHostPath(dir),
         };
         // Node-compatible extension handlers enter through module._compile.
-        mod._compile = (code: string, file: string) => this.compileExtensionSource(mod, code, file);
+        // The file argument is ignored on purpose: registration and eval keys
+        // must both derive from getInternalFilename(mod).
+        mod._compile = (code: string) => this.compileExtensionSource(mod, code);
         mod.require = this.mkRequire(filename, mod);
         if (parent) parent.children.push(mod);
         return mod;
@@ -761,11 +765,11 @@ export class CjsLoader {
     }
 
     /** Source entry used by Node-compatible `.js` extension handlers. */
-    private compileExtensionSource(mod: CjsModule, code: string, filename: string): void {
-        const localPath = normalizePath(filename || getInternalFilename(mod));
+    private compileExtensionSource(mod: CjsModule, code: string): void {
         let src = code;
         if (this.deps.prepareSource) {
-            const transformed = this.deps.prepareSource(src, localPath);
+            // Register/lookup keys must match the eval key below exactly.
+            const transformed = this.deps.prepareSource(src, getInternalFilename(mod));
             if (transformed !== null) src = transformed;
         }
         // User-rewritten source must not enter the original bytecode cache.
@@ -836,6 +840,10 @@ export class CjsLoader {
         const filename = getInternalFilename(mod);
         const shouldPatchFunction = hasDynamicImportFunctionSource(src);
 
+        // Consume unconditionally so every prepareSource caller clears its
+        // marker; only the persisting branch acts on it.
+        const inlineMapped = this.deps.tookInlineSourceMap?.(filename) ?? false;
+
         let compiled: unknown;
         try {
             compiled = engine.eval(buildCjsWrapperSource(src), filename,
@@ -846,7 +854,7 @@ export class CjsLoader {
             throw normalizeExecError(e, filename);
         }
 
-        if (this.deps.persistCjsCompiled && sourceFreshness) {
+        if (this.deps.persistCjsCompiled && sourceFreshness && !inlineMapped) {
             try {
                 this.deps.persistCjsCompiled(filename, engine.serialize(compiled).buffer, sourceFreshness);
             } catch (e) {

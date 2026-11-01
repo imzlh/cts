@@ -1,4 +1,4 @@
-import { Transformer, isPassthroughSource } from './source/transform';
+import { Transformer, isPassthroughSource, hasEmbeddedSourceMap, hasEmbeddedSourceMapBytes } from './source/transform';
 import { OxcTranspiler, oxcExtPath, tryLoadOxc } from './oxc';
 import { ImportScanner } from './import-scanner';
 import { errMsg, log, getMemoryTier, getMemoryFile, readBytes, readText, type MemoryTier } from './utils';
@@ -516,11 +516,16 @@ export class ParseDriver {
         for (const m of modules) {
             try {
                 const source = readText(m.localPath);
-                const code = prepareForCache(transformer, source, m.localPath, m.format, m.lang, m.specPath);
-                const bc = compileForCache(code, compileIdentity(m), m.format);
-                if (onCompiled) onCompiled(m.localPath, bc, m.specPath);
-                else bytecodes.set(m.localPath, bc);
-                done++;
+                if (hasEmbeddedSourceMap(source)) {
+                    log.debug('precompile', () => `skip ${m.localPath}: embedded sourceMappingURL`);
+                    done++;
+                } else {
+                    const code = prepareForCache(transformer, source, m.localPath, m.format, m.lang, m.specPath);
+                    const bc = compileForCache(code, compileIdentity(m), m.format);
+                    if (onCompiled) onCompiled(m.localPath, bc, m.specPath);
+                    else bytecodes.set(m.localPath, bc);
+                    done++;
+                }
             } catch (e) {
                 fail++;
                 log.debug('precompile', () => `inline compile fail: ${m.localPath}: ${errMsg(e)}`);
@@ -603,6 +608,16 @@ export class ParseDriver {
     }
 
     /** Main-thread compile: CJS (transformForCjs) or plain JS passthrough. */
+    private skipAnnotatedBytecode(m: CompileTarget): void {
+        // An embedded sourceMappingURL map is injected at load time and lives
+        // in the runtime, not in bytecode: persisting would serve unmapped
+        // positions forever. Leave the module source-cached; the load path
+        // re-injects on every run.
+        log.debug('precompile', () => `skip ${m.localPath}: embedded sourceMappingURL`);
+        this.transformDone++;
+        this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
+    }
+
     private compileOnMain(m: CompileTarget): void {
         try {
             const transformer = this.getInlineTransformer();
@@ -610,10 +625,17 @@ export class ParseDriver {
             let bc: ArrayBuffer;
             if (m.format === 'cjs') {
                 // Always strip TS/JSX; .cts must not hit EVAL_COMPILE_ONLY raw.
-                const code = prepareForCache(transformer, readText(m.localPath), m.localPath, 'cjs', m.lang, m.specPath);
+                const raw = readText(m.localPath);
+                if (hasEmbeddedSourceMap(raw)) return this.skipAnnotatedBytecode(m);
+                const code = prepareForCache(transformer, raw, m.localPath, 'cjs', m.lang, m.specPath);
                 bc = compileForCache(code, identity, 'cjs');
             } else {
                 const bytes = readBytes(m.localPath);
+                // Shebang-agnostic: an annotated tail must win over both the
+                // shebang and the plain compile branches.
+                if (hasEmbeddedSourceMapBytes(bytes)) {
+                    return this.skipAnnotatedBytecode(m);
+                }
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
                     const code = prepareForCache(
                         transformer, engine.decodeString(bytes), m.localPath, m.format, m.lang, m.specPath);

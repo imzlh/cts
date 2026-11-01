@@ -61,6 +61,7 @@ export interface ConfigOptions {
     enableCache?:   boolean;
     cachedOnly?:    boolean;
     enableOxc?:     boolean;
+    enableInlineSourceMap?: boolean; // honor //# sourceMappingURL in passthrough js/mjs/cjs
     eval?:          string;   // inline code to evaluate (-e / --eval)
     // Lock options
     lockDir?:       string;   // dir containing cts.lock (default: entry file dir)
@@ -90,6 +91,7 @@ export interface RuntimeConfig extends ConfigOptions {
     enableCache:    boolean;
     cachedOnly:     boolean;
     enableOxc:      boolean;
+    enableInlineSourceMap: boolean;
     ignoreScripts:  boolean;
     nodeModulesMode: NodeModulesMode;
     polyfill:       string;

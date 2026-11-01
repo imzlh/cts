@@ -1,5 +1,5 @@
 import type { RuntimeConfig, ConfigOptions } from './types';
-import { dirname, joinPaths, normalizePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier, isRelative, isAbsolute } from './utils';
+import { dirname, joinPaths, normalizePath, resolvePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier, isRelative, isAbsolute } from './utils';
 import { err, ErrorKind } from './errors';
 import { readEnv } from './utils/env';
 
@@ -19,6 +19,7 @@ const DEFAULTS = {
     enableCache: true,
     cachedOnly: false,
     enableOxc: true,
+    enableInlineSourceMap: false,
     ignoreScripts: false,
     nodeModulesMode: 'normal',
     polyfill:    '',
@@ -105,6 +106,37 @@ function mergeImportMapScopes(
     return merged;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Load a standalone import-map file (`{ imports, scopes }`), resolving
+ * relative targets and scopes against the map's own directory. Returns
+ * undefined when the file is missing, unparseable, or has an invalid root.
+ */
+export function importMapFromFile(mapPath: string): {
+    importMap?: Record<string, string>;
+    importMapScopes?: Record<string, Record<string, string>>;
+} | undefined {
+    let parsed: ConfigJson | null;
+    try {
+        parsed = safeParse(stripJsonc(engine.decodeString(fs.readFile(mapPath))));
+    } catch {
+        return undefined;
+    }
+    if (!isRecord(parsed)) return undefined;
+    // A relative --import-map path is relative to the invocation cwd. Making
+    // the map absolute also keeps its relative targets from becoming bare
+    // package specifiers (for example `maps/x.ts`).
+    const base = dirname(resolvePath(mapPath));
+    const out: { importMap?: Record<string, string>; importMapScopes?: Record<string, Record<string, string>> } = {};
+    if (parsed.imports) out.importMap = filterImports(parsed.imports, base);
+    const scopes = filterImportMapScopes(parsed.scopes, base);
+    if (Object.keys(scopes).length > 0) out.importMapScopes = scopes;
+    return out;
+}
+
 interface ConfigJson {
     compilerOptions?: {
         paths?: unknown;
@@ -151,6 +183,7 @@ function envConfig(): Partial<ConfigOptions> {
     const http = bool(v('ENABLE_HTTP')); if (http !== undefined) c.enableHttp = http;
     const jsr  = bool(v('ENABLE_JSR'));  if (jsr  !== undefined) c.enableJsr  = jsr;
     const node = bool(v('ENABLE_NODE')); if (node !== undefined) c.enableNode = node;
+    const ismap = bool(v('ENABLE_INLINE_SOURCEMAP')); if (ismap !== undefined) c.enableInlineSourceMap = ismap;
     const sil  = bool(v('SILENT'));      if (sil  !== undefined) c.silent = sil;
     const ml = v('MEMORY_LIMIT');   if (ml) c.memoryLimit  = parseSize(ml);
     const ms = v('MAX_STACK_SIZE'); if (ms) c.maxStackSize = parseSize(ms);
@@ -405,17 +438,12 @@ export function loadConfigFile(dir: string): Partial<ConfigOptions> {
             }
             if (typeof dc.importMap === 'string') {
                 const mp = joinPaths(d, dc.importMap);
-                if (fs.exists(mp)) {
-                    const mj = readJson(mp);
-                    if (mj?.imports) {
-                        cfg.importMap = { ...cfg.importMap, ...filterImports(mj.imports, dirname(mp)) };
-                    }
-                    if (mj) {
-                        cfg.importMapScopes = mergeImportMapScopes(
-                            cfg.importMapScopes,
-                            filterImportMapScopes(mj.scopes, dirname(mp)),
-                        );
-                    }
+                const fromFile = importMapFromFile(mp);
+                if (fromFile?.importMap) {
+                    cfg.importMap = { ...cfg.importMap, ...fromFile.importMap };
+                }
+                if (fromFile?.importMapScopes) {
+                    cfg.importMapScopes = mergeImportMapScopes(cfg.importMapScopes, fromFile.importMapScopes);
                 }
             }
             log.debug('config', () => `${name}: ${p}`);
