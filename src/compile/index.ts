@@ -31,7 +31,6 @@ export class ModuleCompiler {
         this.esm = new EsmCompiler(cfg);
         this.wasm = new WasmCompiler();
 
-        // Wire CjsLoader to resolver + ESM compiler via bridge callbacks
         const deps = buildCjsDeps(resolver, this.esm, (info) => {
             const wasmRef = moduleRef(info);
             // Same hazard as loadEsmSync (see bridge.ts): a WASM module whose JS
@@ -60,10 +59,9 @@ export class ModuleCompiler {
                     undefined, 'ERR_REQUIRE_ASYNC_MODULE');
             }
             return mod.namespace;
-        });
+        }, cfg.enableCache !== false);
         this.cjs = new CjsLoader(deps);
 
-        // Install global require + internal bridge
         installGlobalRequire(
             (entry) => this.cjs.mkRequire(entry),
             () => resolver.entry,
@@ -105,7 +103,6 @@ export class ModuleCompiler {
                 `Cannot load type declaration file "${info.localPath}" as a module.`);
         }
 
-        // WASM has its own cache + circular dep handling
         if (info.fileKind === 'wasm') {
             return this.wasm.load(
                 info,
@@ -115,7 +112,6 @@ export class ModuleCompiler {
             );
         }
 
-        // CJS format: execute via CjsLoader, then bridge to ESM Module
         if (info.format === 'cjs' && info.fileKind === 'source') {
             // Cycle: this CJS body is already on the stack, so the ESM module
             // being compiled right now imports a module that is mid-execution.
@@ -127,11 +123,14 @@ export class ModuleCompiler {
             if (cycle) throw cycle;
             const cjsMod = this.cjs.loadAndGet(info.localPath, undefined, info.specPath === this.resolver.entry);
             const mod = bridgeCjsToEsm(moduleRef(info), meta, cjsMod.exports);
+            // Cache the wrapper under the shared moduleRef key: detectFormat
+            // resolves one manifest-less .js to different formats per context,
+            // so an import of a file already loaded via require must find the
+            // executed wrapper instead of re-running the file as ESM.
             this.esm.setCache(info, mod);
             return mod;
         }
 
-        // ESM / JSON / binary / text: delegate to ESM compiler
         return this.esm.load(info, meta);
     }
 

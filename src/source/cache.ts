@@ -1,5 +1,6 @@
 import { dirname, joinPaths, ensureDir, log, canonicalizePath, normalizePath, isPathWithin } from '../utils';
 import { getMemoryBytecode, hasActiveFileStore, hasMemoryFile } from '../utils/memfs';
+import { writeAtomically } from '../pack/integrity';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -16,7 +17,10 @@ function removeCacheFiles(paths: { jsc: string; mt: string }): void {
     unlinkIfExists(paths.mt);
 }
 
-const FRESHNESS_VERSION = 'jsc-v3';
+// The sidecar also authenticates the bytecode.  The two files are replaced
+// separately, so a reader can otherwise observe a sidecar from one writer and
+// bytecode from another writer.
+const FRESHNESS_VERSION = 'jsc-v5';
 
 export interface SourceFreshness {
     mtim: string;
@@ -34,9 +38,25 @@ export interface SourceSnapshot {
     freshness: SourceFreshness;
 }
 
+/** checkFreshness() result: gate verdict plus the capture a compile persists. */
+export interface FreshnessCheck {
+    fresh: boolean;
+    /** Bytes + stamp of the read a stale verdict performed; undefined when the
+     *  read was not reached or failed. */
+    snapshot?: SourceSnapshot;
+}
+
+/** loadCompiled() result: the deserialized value plus the sidecar's verdict on
+ *  the contextual Function patch (bytecode cannot be scanned for dynamic
+ *  import, so the fresh-compile scan records it for warm loads). */
+export interface LoadedCompiled {
+    value: unknown;
+    patchFunction: boolean;
+}
+
 /**
- * Full-precision mtime token: String(date) is second-resolution and served stale
- * bytecode; numbers (resolver mtimes) pass through unchanged.
+ * Full-precision mtime token: rendering a Date directly loses sub-second
+ * precision, which is exactly what a same-second edit exploits.
  */
 function mtimeToken(mtim: unknown): string {
     const t = (mtim as Date | undefined)?.getTime?.();
@@ -44,13 +64,61 @@ function mtimeToken(mtim: unknown): string {
 }
 
 /**
- * md5 of the source bytes. mtime+size alone cannot detect a same-size edit that
- * keeps (or restores, e.g. `touch -r`, `git checkout`, codegen) the mtime, so the
- * content itself is the authority. Cheap: one small read plus a hash, only on the
- * freshness check, versus a full transform+compile on a miss.
+ * md5 of the source bytes. The stat mtime has second granularity (mod_fs.c
+ * builds the Date from st_mtime) and size alone cannot detect a same-size
+ * edit, so on every disk hit the content is the authority over the stamp.
  */
 function sourceDigest(bytes: CModuleCrypto.BufferSource): string {
     return crypto.hexEncode(crypto.md5(bytes));
+}
+
+/**
+ * Sidecar stamp: version line, `<mtim>:<size>:<hash>:<patch>`, optional
+ * identity line. `<patch>` is the recorded Function-patch verdict; anything but
+ * `0` patches, so unknown shapes fall back to the defensive default.
+ */
+interface SidecarStamp {
+    mtim: string;
+    size: number;
+    hash: string;
+    bytecodeHash: string;
+    patchFunction: boolean;
+    moduleId?: string;
+}
+
+function parseSidecar(raw: string): SidecarStamp | undefined {
+    const lines = raw.split('\n');
+    if (lines[0] !== FRESHNESS_VERSION || lines.length > 3) return undefined;
+    const parts = (lines[1] ?? '').split(':');
+    if (parts.length !== 5) return undefined;
+    const [mtim, size, hash, patch, bytecodeHash] = parts;
+    const parsedSize = Number(size);
+    if (mtim === undefined || hash === undefined || patch === undefined || bytecodeHash === undefined
+        || !Number.isInteger(parsedSize) || parsedSize < 0) return undefined;
+    return {
+        mtim,
+        size: parsedSize,
+        hash,
+        bytecodeHash,
+        patchFunction: patch !== '0',
+        moduleId: lines.length === 3 ? lines[2] : undefined,
+    };
+}
+
+function encodeSidecar(
+    revision: SourceFreshness,
+    bytecodeHash: string,
+    patchFunction: boolean,
+    moduleId?: string,
+): string {
+    const stamp = `${revision.mtim}:${revision.size}:${revision.hash}:${patchFunction ? 1 : 0}:${bytecodeHash}`;
+    return moduleId === undefined
+        ? `${FRESHNESS_VERSION}\n${stamp}`
+        : `${FRESHNESS_VERSION}\n${stamp}\n${encodeURIComponent(moduleId)}`;
+}
+
+function stampMatchesIdentity(stamp: SidecarStamp, moduleId?: string): boolean {
+    return stamp.moduleId === (moduleId === undefined ? undefined : encodeURIComponent(moduleId));
 }
 
 /** Deserialized value is valid but the wrong shape for this caller (see loadRaw). */
@@ -82,6 +150,8 @@ export class JscCache {
     private readonly sourceSnapshots = new Map<string, SourceSnapshot>();
     private readonly localDir: string | null;
     private readonly cacheRoot: string | null;
+    /** realpath(cacheRoot), resolved once; undefined until first needed. */
+    private ownedRoot: string | undefined;
 
     constructor(cacheDir?: string) {
         this.cacheRoot = cacheDir ? canonicalizePath(normalizePath(cacheDir)) : null;
@@ -108,14 +178,22 @@ export class JscCache {
 
     /** Keep adjacent remote bytecode inside the configured cache root. */
     private isCacheOwnedPath(localPath: string): boolean {
-        // Direct JscCache consumers without a root historically used adjacent
-        // remote files; retain that behavior for backwards compatibility.
+        // Direct JscCache consumers without a root have no isolated cache;
+        // adjacent remote files remain the only storage.
         if (!this.cacheRoot) return true;
-        let root = this.cacheRoot;
-        let target = canonicalizePath(normalizePath(localPath));
-        try { root = canonicalizePath(normalizePath(fs.realpath(root))); } catch {}
+        if (this.ownedRoot === undefined) {
+            let root = this.cacheRoot;
+            try { root = canonicalizePath(normalizePath(fs.realpath(root))); } catch {}
+            // The cache root does not move within a run.
+            this.ownedRoot = root;
+        }
+        const normalized = canonicalizePath(normalizePath(localPath));
+        // A symlink may be retargeted while this cache instance is alive. Do
+        // not memoize this lookup or ownership can remain tied to its old
+        // target and write adjacent bytecode into the wrong cache root.
+        let target = normalized;
         try { target = canonicalizePath(normalizePath(fs.realpath(localPath))); } catch {}
-        return isPathWithin(root, target);
+        return isPathWithin(this.ownedRoot, target);
     }
 
     /** Select adjacent remote storage or an isolated local hashed cache. */
@@ -132,14 +210,10 @@ export class JscCache {
         return snapshot;
     }
 
-    /** Read source bytes once and derive the matching freshness token. */
+    /** Stat + read + hash in one pass: the freshness capture for a read. */
     readSource(localPath: string): SourceSnapshot | undefined {
         try {
-            const stat = fs.stat(localPath);
-            const bytes = new Uint8Array(fs.readFile(localPath));
-            // size comes from the hashed bytes so both fields describe one revision.
-            const freshness = { mtim: mtimeToken(stat.mtim), size: bytes.byteLength, hash: sourceDigest(bytes) };
-            return { bytes, freshness };
+            return this.snapshotRevision(localPath, fs.stat(localPath));
         } catch {
             return undefined;
         }
@@ -149,78 +223,41 @@ export class JscCache {
         return this.readSource(localPath)?.freshness;
     }
 
-    private legacyFreshnessToken(localPath: string, cachedMtime?: number, source?: SourceFreshness): string {
-        if (source) {
-            // Resolver-supplied mtimes deliberately override the filesystem
-            // mtime while retaining the source bytes/hash from the snapshot.
-            const mtim = cachedMtime === undefined ? source.mtim : mtimeToken(cachedMtime);
-            return `${mtim}:${source.size}:${source.hash}`;
+    private snapshotRevision(localPath: string, stat: ReturnType<typeof fs.stat>): SourceSnapshot | undefined {
+        try {
+            const bytes = new Uint8Array(fs.readFile(localPath));
+            // size+hash describe the read bytes; mtime comes from the stat taken
+            // before them, so persisting this snapshot never re-stats after a
+            // compile could have observed an edit.
+            return {
+                bytes,
+                freshness: { mtim: mtimeToken(stat.mtim), size: bytes.byteLength, hash: sourceDigest(bytes) },
+            };
+        } catch {
+            return undefined;
         }
-        const stat = fs.stat(localPath);
-        const bytes = new Uint8Array(fs.readFile(localPath));
-        return `${mtimeToken(cachedMtime ?? stat.mtim)}:${bytes.byteLength}:${sourceDigest(bytes)}`;
     }
 
-    /**
-     * Identity-aware sidecars reject legacy stamps. The version prefix is
-     * unconditional: a v2 stamp (second-granularity mtime, no content hash) must
-     * never satisfy a v3 check, so pre-upgrade entries recompile once.
-     */
-    private freshnessToken(localPath: string, cachedMtime?: number, moduleId?: string, source?: SourceFreshness): string {
-        const stamp = this.legacyFreshnessToken(localPath, cachedMtime, source);
-        return moduleId === undefined
-            ? `${FRESHNESS_VERSION}\n${stamp}`
-            : `${FRESHNESS_VERSION}\n${stamp}\n${encodeURIComponent(moduleId)}`;
+    private readStamp(mtPath: string): SidecarStamp | undefined {
+        try {
+            return parseSidecar(engine.decodeString(fs.readFile(mtPath)));
+        } catch {
+            return undefined;
+        }
     }
 
-    private isFreshMtime(
-        localPath: string,
+    private writeMtime(
         mtPath: string,
-        cachedMtime?: number,
-        moduleId?: string,
-        source?: SourceFreshness,
-    ): boolean {
-        try {
-            const cachedMt = engine.decodeString(fs.readFile(mtPath));
-            return cachedMt === this.freshnessToken(localPath, cachedMtime, moduleId, source);
-        } catch {
-            return false;
-        }
-    }
-
-    private hasFreshFile(
-        paths: { jsc: string; mt: string },
-        localPath: string,
-        cachedMtime?: number,
-        moduleId?: string,
-        source?: SourceFreshness,
-    ): boolean {
-        try {
-            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId, source)) return false;
-            return !!fs.stat(paths.jsc);
-        } catch {
-            return false;
-        }
-    }
-
-    private removeLocalCacheDir(dir: string): void {
-        try {
-            if (!fs.stat(dir).isDirectory) return;
-            for (const f of fs.readdir(dir)) {
-                unlinkIfExists(joinPaths(dir, f));
-            }
-            try {
-                fs.rmdir(dir);
-            } catch {
-                // Another process may have touched this cache shard.
-            }
-        } catch {
-            // Ignore unreadable shards while clearing best-effort local cache.
-        }
-    }
-
-    private writeMtime(localPath: string, mtPath: string, moduleId?: string, source?: SourceFreshness): void {
-        fs.writeFile(mtPath, engine.encodeString(this.freshnessToken(localPath, undefined, moduleId, source)));
+        moduleId: string | undefined,
+        revision: SourceFreshness,
+        bytecodeHash: string,
+        patchFunction: boolean,
+    ): void {
+        writeAtomically(
+            mtPath,
+            engine.encodeString(encodeSidecar(revision, bytecodeHash, patchFunction, moduleId)),
+            ensureDir,
+        );
     }
 
     private writeCacheFile(
@@ -229,10 +266,20 @@ export class JscCache {
         bytecode: ArrayBuffer,
         moduleId?: string,
         source?: SourceFreshness,
+        patchFunction = true,
     ): void {
         ensureDir(dirname(paths.jsc));
-        fs.writeFile(paths.jsc, bytecode);
-        this.writeMtime(localPath, paths.mt, moduleId, source);
+        writeAtomically(paths.jsc, new Uint8Array(bytecode), ensureDir);
+        // Production callers pass the freshness captured before compiling; the
+        // fallback describes the current revision for snapshot-less callers.
+        const revision = source ?? this.readSource(localPath)?.freshness;
+        if (revision) {
+            // The sidecar is written after the bytecode and records its digest.
+            // A reader that crosses the two replacement windows therefore
+            // rejects the pair instead of deserializing the wrong module.
+            const bytecodeHash = sourceDigest(bytecode);
+            this.writeMtime(paths.mt, moduleId, revision, bytecodeHash, patchFunction);
+        }
     }
 
     load(
@@ -250,8 +297,8 @@ export class JscCache {
         remote: boolean,
         cachedMtime?: number,
         moduleId?: string,
-    ): unknown | null {
-        return this.loadRaw(localPath, remote, cachedMtime, moduleId, false);
+    ): LoadedCompiled | null {
+        return this.loadRaw(localPath, remote, cachedMtime, moduleId, false) as LoadedCompiled | null;
     }
 
     private loadRaw(
@@ -267,6 +314,8 @@ export class JscCache {
         // failed deserialize (corrupt / ABI change) clears the files.
         const accept = (value: unknown): unknown =>
             (value instanceof engine.Module) === wantModule ? value : MISMATCH;
+        const serve = (mod: unknown, patchFunction: boolean): unknown =>
+            wantModule ? mod : { value: mod, patchFunction };
 
         // L1a: owned buffers (precompile one-shot)
         const key = memoryKey(localPath, moduleId);
@@ -278,7 +327,7 @@ export class JscCache {
             try {
                 const mod = accept(engine.deserialize(new Uint8Array(bc)));
                 this.memory.delete(key);
-                if (mod !== MISMATCH) return mod;
+                if (mod !== MISMATCH) return serve(mod, true);
             } catch {
                 log.debug('jsc', () => `memory deserialize failed: ${localPath}`);
                 this.memory.delete(key);
@@ -296,85 +345,80 @@ export class JscCache {
                     ? new Uint8Array(buf, view.byteOffset, view.byteLength)
                     : new Uint8Array(view);
                 const mod = accept(engine.deserialize(bytes));
-                if (mod !== MISMATCH) return mod;
+                if (mod !== MISMATCH) return serve(mod, true);
             } catch {
                 log.debug('jsc', () => `vfs bytecode deserialize failed: ${localPath}`);
                 // Fall through: source recompile (ABI mismatch / corrupt blob).
             }
         }
 
-        // L2: on-disk only for real filesystem paths. A v3 freshness check
-        // necessarily reads and hashes source bytes; keep that exact snapshot so
-        // a miss transforms it without another stat/read/hash sequence.
+        // L2: on-disk only for real filesystem paths. One stat feeds the
+        // revision stamp; the bytes it reads are the content the miss path
+        // persists.
         const paths = this.cachePaths(localPath, remote);
         if (!paths) return null;
-        const source = isFileBackedPath(localPath) ? this.readSource(localPath) : undefined;
-        const rememberSource = () => {
-            if (source) this.sourceSnapshots.set(key, source);
+        let stat: ReturnType<typeof fs.stat>;
+        try {
+            stat = fs.stat(localPath);
+        } catch {
+            return null;
+        }
+        const readRevision = (): SourceSnapshot | undefined => this.snapshotRevision(localPath, stat);
+        const remember = (snapshot: SourceSnapshot | undefined): void => {
+            if (snapshot) this.sourceSnapshots.set(key, snapshot);
         };
 
-        if (remote) {
-            if (!this.isFreshMtime(localPath, paths.mt, cachedMtime, moduleId, source?.freshness)) {
-                rememberSource();
-                removeCacheFiles(paths);
-                return null;
-            }
-            try {
-                const mod = accept(engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))));
-                if (mod !== MISMATCH) {
-                    return mod;
-                }
-                rememberSource();
-                return null;
-            } catch {}
-            rememberSource();
-            removeCacheFiles(paths);
+        // Sidecar before source: an absent .mt is a cold miss — no unlinks (the
+        // next persist rewrites both files), but keep the read, since it is the
+        // freshness capture the recompile persists. Only a sidecar that exists
+        // and disagrees (unparseable or foreign identity) is cleared.
+        let rawSidecar: string | undefined;
+        try {
+            rawSidecar = engine.decodeString(fs.readFile(paths.mt));
+        } catch {}
+        const stamp = rawSidecar === undefined ? undefined : parseSidecar(rawSidecar);
+        if (stamp === undefined || !stampMatchesIdentity(stamp, moduleId)) {
+            remember(readRevision());
+            if (rawSidecar !== undefined) removeCacheFiles(paths);
             return null;
         }
 
-        try {
-            const cachedMt = engine.decodeString(fs.readFile(paths.mt));
-            if (cachedMt !== this.freshnessToken(localPath, cachedMtime, moduleId, source?.freshness)) {
-                rememberSource();
-                removeCacheFiles(paths);
-                return null;
-            }
-        } catch {
-            rememberSource();
+        // Content identity decides on every disk hit: the native stat exposes
+        // second-granularity mtimes (mod_fs.c builds the Date from st_mtime),
+        // so a stat-only tier cannot distinguish a same-second same-size edit.
+        // The read+hash IS the freshness authority, and the read doubles as
+        // the snapshot the recompile persists on a miss. A resolver-supplied
+        // mtime (e.g. -1) must still agree with the stamp to keep its
+        // invalidation power.
+        const snapshot = readRevision();
+        const mtimOk = cachedMtime === undefined || mtimeToken(cachedMtime) === stamp.mtim;
+        if (!snapshot
+            || !mtimOk
+            || snapshot.freshness.size !== stamp.size
+            || snapshot.freshness.hash !== stamp.hash) {
+            remember(snapshot);
             removeCacheFiles(paths);
             return null;
         }
-
         try {
-            const mod = accept(engine.deserialize(new Uint8Array(fs.readFile(paths.jsc))));
-            if (mod !== MISMATCH) {
-                return mod;
+            const bytecode = new Uint8Array(fs.readFile(paths.jsc));
+            // Do not re-read the sidecar here. Its bytecode digest makes this
+            // one sidecar read a coherent generation check even if another
+            // writer replaced either file after the read.
+            if (sourceDigest(bytecode) !== stamp.bytecodeHash) {
+                remember(snapshot);
+                return null;
             }
-            rememberSource();
+            const mod = accept(engine.deserialize(bytecode));
+            if (mod !== MISMATCH) return serve(mod, stamp.patchFunction);
+            remember(snapshot);
             return null;
         } catch {
             log.debug('jsc', () => `disk deserialize failed: ${paths.jsc}`);
         }
-        rememberSource();
+        remember(snapshot);
         removeCacheFiles(paths);
         return null;
-    }
-
-    /** On-disk .jsc bytes only (no deserialize); for pack. Null if not durable. */
-    loadRawBytes(
-        localPath: string,
-        remote: boolean,
-        cachedMtime?: number,
-        moduleId?: string,
-    ): ArrayBuffer | null {
-        const paths = this.cachePaths(localPath, remote);
-        if (!paths) return null;
-        if (!this.hasFreshFile(paths, localPath, cachedMtime, moduleId)) return null;
-        try {
-            return fs.readFile(paths.jsc);
-        } catch {
-            return null;
-        }
     }
 
     /** Freshness without deserializing (precache gate). */
@@ -384,9 +428,63 @@ export class JscCache {
         cachedMtime?: number,
         moduleId?: string,
     ): boolean {
+        return this.checkFreshness(localPath, remote, cachedMtime, moduleId).fresh;
+    }
+
+    /**
+     * hasFresh plus the stale-path source capture in one stat/read/hash pass.
+     * A fresh verdict still reads and hashes the source — content is the
+     * authority on every disk hit — and the read it performs IS the capture
+     * the caller must persist: running hasFresh and captureFreshness back to
+     * back would read and hash the source twice.
+     */
+    checkFreshness(
+        localPath: string,
+        remote: boolean,
+        cachedMtime?: number,
+        moduleId?: string,
+    ): FreshnessCheck {
         const paths = this.cachePaths(localPath, remote);
-        if (!paths) return false;
-        return this.hasFreshFile(paths, localPath, cachedMtime, moduleId);
+        if (!paths) return { fresh: false };
+        try {
+            try {
+                fs.stat(paths.jsc);
+            } catch {
+                return { fresh: false, snapshot: this.readSource(localPath) };
+            }
+            const stamp = this.readStamp(paths.mt);
+            if (!stamp || !stampMatchesIdentity(stamp, moduleId)) {
+                return { fresh: false, snapshot: this.readSource(localPath) };
+            }
+            const stat = fs.stat(localPath);
+            // Content hash decides on every check: native stat mtimes have
+            // second granularity (mod_fs.c builds the Date from st_mtime), so
+            // the stat alone cannot clear a same-size edit landed within the
+            // same second. The read doubles as the stale-path capture the
+            // caller persists. A resolver-supplied mtime must still agree
+            // with the stamp to keep its invalidation power — and that path
+            // captures too, so the caller can never fall back to a
+            // post-compile read that could bless a pre-edit revision.
+            if (cachedMtime !== undefined && mtimeToken(cachedMtime) !== stamp.mtim) {
+                return { fresh: false, snapshot: this.snapshotRevision(localPath, stat) };
+            }
+            const snapshot = this.snapshotRevision(localPath, stat);
+            if (!snapshot) return { fresh: false };
+            let bytecodeHash: string;
+            try {
+                bytecodeHash = sourceDigest(new Uint8Array(fs.readFile(paths.jsc)));
+            } catch {
+                return { fresh: false, snapshot };
+            }
+            return {
+                fresh: snapshot.freshness.size === stamp.size
+                    && snapshot.freshness.hash === stamp.hash
+                    && bytecodeHash === stamp.bytecodeHash,
+                snapshot,
+            };
+        } catch {
+            return { fresh: false };
+        }
     }
 
     clearMemory(): void {
@@ -398,11 +496,18 @@ export class JscCache {
         this.memory.set(memoryKey(localPath, moduleId), bc);
     }
 
-    persistBytecode(localPath: string, bc: ArrayBuffer, remote: boolean, moduleId?: string, source?: SourceFreshness): void {
+    persistBytecode(
+        localPath: string,
+        bc: ArrayBuffer,
+        remote: boolean,
+        moduleId?: string,
+        source?: SourceFreshness,
+        patchFunction = true,
+    ): void {
         const paths = this.cachePaths(localPath, remote);
         if (!paths) return;
         try {
-            this.writeCacheFile(paths, localPath, bc, moduleId, source);
+            this.writeCacheFile(paths, localPath, bc, moduleId, source, patchFunction);
         } catch (e) { log.warn('jsc', `persistBytecode failed: ${paths.jsc}`, e); }
     }
 
@@ -449,6 +554,22 @@ export class JscCache {
             log.debug('jsc', () => `cleared local cache: ${this.localDir}`);
         } catch (e) {
             log.debug('jsc', () => `clearLocal failed: ${e}`);
+        }
+    }
+
+    private removeLocalCacheDir(dir: string): void {
+        try {
+            if (!fs.stat(dir).isDirectory) return;
+            for (const f of fs.readdir(dir)) {
+                unlinkIfExists(joinPaths(dir, f));
+            }
+            try {
+                fs.rmdir(dir);
+            } catch {
+                // Another process may have touched this cache shard.
+            }
+        } catch {
+            // Ignore unreadable shards while clearing best-effort local cache.
         }
     }
 }

@@ -1,10 +1,8 @@
+import { URL } from './url';
+
 export interface CurlTarget {
     protocol: string;
 }
-
-declare const URL: {
-    new(input: string): CurlTarget;
-};
 
 export type CurlInitHook = (curl: CModuleCURL.CURL, url: CurlTarget) => void;
 

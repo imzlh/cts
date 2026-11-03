@@ -1,7 +1,3 @@
-// Each receiver owns a native runtime-event subscription. The realm-local
-// facade only retains role replacement, introspection, and lifecycle state.
-// Return polarity differs per event — do not normalize it.
-
 const engine = import.meta.use('engine');
 
 /** Native event ids. Read from the engine enum, with the C values as fallback. */

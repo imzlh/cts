@@ -656,6 +656,15 @@ export class NpmHandler implements ProtocolHandler {
     private readonly packagesPrepared = new Set<string>();
     /** Process-local registry meta (avoids re-parse + coalesces concurrent fetches). */
     private readonly metaMem = new Map<string, NpmMeta>();
+    /** lockedVersionForRange results per `name\0range` — the lock LIKE-scan is
+     *  O(all cached modules); entries are dropped when a module is persisted
+     *  into the lock (onLockModulePersisted), so mid-run installs stay fresh. */
+    private readonly lockedRangeCache = new Map<string, string | null>();
+    /** parentOrigin results per parent string — parents repeat across a graph
+     *  and the classification is run-stable (same assumption as ownerDirCache). */
+    private readonly parentOriginCache = new Map<string, 'cache' | 'node_modules' | 'project'>();
+    /** Run-scoped realpath per input dir; inputs are existing owner/search dirs. */
+    private readonly realPathCache = new Map<string, string | null>();
     private readonly pendingLifecycle: LifecycleScriptEntry[] = [];
     private readonly queuedLifecycle = new Set<string>();
     /** Flat-store version lists per package name (avoids readdir thrash). */
@@ -682,6 +691,9 @@ export class NpmHandler implements ProtocolHandler {
         this.dependenciesChecked.clear();
         this.packagesPrepared.clear();
         this.metaMem.clear();
+        this.lockedRangeCache.clear();
+        this.parentOriginCache.clear();
+        this.realPathCache.clear();
         this.storeVersionsCache.clear();
         this.warnedStoreFallback.clear();
         this.storeRootListing = null;
@@ -1238,11 +1250,16 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private realPath(path: string): string | null {
+        const hit = this.realPathCache.get(path);
+        if (hit !== undefined) return hit;
+        let real: string | null = null;
         try {
-            return normalizePath(fs.realpath(path));
+            real = normalizePath(fs.realpath(path));
         } catch {
-            return null;
+            real = null;
         }
+        this.realPathCache.set(path, real);
+        return real;
     }
 
     private parentFsPath(parent: string): string {
@@ -1299,6 +1316,9 @@ export class NpmHandler implements ProtocolHandler {
     }
 
     private lockedVersionForRange(name: string, range: string): string | null {
+        const key = `${name}\0${range}`;
+        const hit = this.lockedRangeCache.get(key);
+        if (hit !== undefined) return hit;
         const lock = this.cfg.lockStore;
         if (!lock) return null;
         const prefix = `npm:${name}@`;
@@ -1314,26 +1334,54 @@ export class NpmHandler implements ProtocolHandler {
                 versions.add(parsed.version);
             } catch {}
         }
-        if (!versions.size) return null;
-        const list = [...versions];
-        if (!range || range === 'latest' || range === '*') {
-            return latestVersion(list);
+        let result: string | null;
+        if (!versions.size) {
+            result = null;
+        } else {
+            const list = [...versions];
+            result = !range || range === 'latest' || range === '*'
+                ? latestVersion(list)
+                : matchLatestVersion(list, range) ?? (list.includes(range) ? range : null);
         }
-        return matchLatestVersion(list, range)
-            ?? (list.includes(range) ? range : null);
+        this.lockedRangeCache.set(key, result);
+        return result;
+    }
+
+    /** Lock gained a module — locked-range memos for its package may now have an
+     *  answer and must not keep serving a stale miss. */
+    onLockModulePersisted(specPath: string): void {
+        if (!specPath.startsWith('npm:')) return;
+        let name: string;
+        try {
+            name = parseNpmSpec(specPath).name;
+        } catch {
+            return;
+        }
+        const prefix = `${name}\0`;
+        for (const key of this.lockedRangeCache.keys()) {
+            if (key.startsWith(prefix)) this.lockedRangeCache.delete(key);
+        }
     }
 
     private parentOrigin(parent?: string): 'cache' | 'node_modules' | 'project' | 'none' {
         if (!parent) return 'none';
+        const hit = this.parentOriginCache.get(parent);
+        if (hit !== undefined) return hit;
         const resolvedLocal = this.resolvedParentLocalPath(parent);
         const norm = normalizePath(resolvedLocal ?? (parent.startsWith('npm:') ? parent : this.parentFsPath(parent)));
         const cacheRoot = normalizePath(this.cacheDir);
+        let origin: 'cache' | 'node_modules' | 'project';
         if ((parent.startsWith('npm:') && !resolvedLocal) || isPathWithin(cacheRoot, norm)) {
-            return 'cache';
+            origin = 'cache';
+        } else if (this.isVirtualProjectNodeModulesPath(norm)) {
+            origin = 'project';
+        } else if (norm.includes('/node_modules/')) {
+            origin = 'node_modules';
+        } else {
+            origin = 'project';
         }
-        if (this.isVirtualProjectNodeModulesPath(norm)) return 'project';
-        if (norm.includes('/node_modules/')) return 'node_modules';
-        return 'project';
+        this.parentOriginCache.set(parent, origin);
+        return origin;
     }
 
     private findLocal(name: string, parent?: string): string | null {
@@ -1918,7 +1966,7 @@ export class NpmHandler implements ProtocolHandler {
             onProgress,
         });
         if (metaRes.status < 200 || metaRes.status >= 300) {
-            // A registry 404/410 is a resolution miss, not a transport failure. Every other
+            // A registry 404/410 is a resolution miss, not a transport failure.
             if (metaRes.status === 404 || metaRes.status === 410) {
                 throw err(ErrorKind.ModuleNotFound, `npm package not found: "${name}" (HTTP ${metaRes.status} ${url})`);
             }

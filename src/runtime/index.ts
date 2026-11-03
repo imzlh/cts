@@ -10,7 +10,7 @@ import { LockStore } from '../lock';
 import { materializeNodeModules } from '../resolve/linker';
 import { guessFileKind, isTypeDecl } from '../resolve/protocols/base';
 import { isScannablePath } from '../scan';
-import { isRemote } from '../source/cache';
+import { isRemote, type SourceFreshness } from '../source/cache';
 import { moduleRef, type FileKind, type ModuleFormat, type ModuleInfo, type NodeBuiltinResolver, type RuntimeConfig } from '../types';
 import { PrecacheProgress, clearNegativeCache, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, npmNameVersion, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
 import { installEngineHooks, type EngineHooks } from './hooks';
@@ -79,14 +79,25 @@ function runtimeErrorInfo(error: unknown): { name: string; message: string; stac
 }
 
 // The CLI owns exit status; workers and library embeddings may omit this hook.
-const REQUEST_EXIT_CODE_NAMESPACE = 'cno.runtime';
+const CNO_RUNTIME_NAMESPACE = 'cno.runtime';
 const REQUEST_EXIT_CODE_KEY = 'requestExitCode';
+/** Key under which cno/src/webapi announces its own runtime-event receiver. */
+const WEBAPI_EVENT_RECEIVER_KEY = 'webapiEventReceiver';
+
+/** webapi evaluates before the runtime is constructed on every user-code path. */
+function webapiOwnsEventBridge(): boolean {
+    try {
+        return import.meta.use('evbus')?.get(CNO_RUNTIME_NAMESPACE, WEBAPI_EVENT_RECEIVER_KEY) === true;
+    } catch {
+        return false;
+    }
+}
 
 /** Mark failure without stopping the event loop and aborting a test suite. */
 function requestFailureExitCode(): void {
     let fn: unknown;
     try {
-        fn = import.meta.use('evbus')?.get(REQUEST_EXIT_CODE_NAMESPACE, REQUEST_EXIT_CODE_KEY);
+        fn = import.meta.use('evbus')?.get(CNO_RUNTIME_NAMESPACE, REQUEST_EXIT_CODE_KEY);
     } catch {
         return;
     }
@@ -187,10 +198,18 @@ function lifecycleEnv(cwd: string, exePath: string, sessionEnv?: Record<string, 
 }
 
 /** Clone process env into a mutable session map for export/unset during one script. */
-function newLifecycleSession(cwd: string): LifecycleSession {
+function newLifecycleSession(cwd: string, cacheDir: string): LifecycleSession {
     const env = os.environ();
     const copy: Record<string, string> = Object.create(null);
     for (const k in env) copy[k] = env[k]!;
+    // Nested `node` commands are the cno executable. Keep their Node builtin
+    // resolver on the same cache whose polyfills this precache run installed.
+    // Windows treats environment names case-insensitively, so avoid duplicate
+    // cache settings when the host used a differently-cased spelling.
+    for (const k of Object.keys(copy)) {
+        if (k.toLowerCase() === 'cts_cache_dir') delete copy[k];
+    }
+    copy.CTS_CACHE_DIR = cacheDir;
     return { cwd: toPosixPath(cwd), env: copy };
 }
 
@@ -346,7 +365,11 @@ export class TypeScriptRuntime {
         const trace = new Set<unknown>();
 
         // User handlers run before diagnostics so they can mark errors handled.
-        installWebApiCompatBridge();
+        // webapi owns the global dispatch through its own receiver and publishes
+        // that on the shared bus channel; installing the compat bridge beside it
+        // would only add a second listener that ctx.dispatched stands down on
+        // every event. Without webapi the bridge is the only delivery path.
+        if (!webapiOwnsEventBridge()) installWebApiCompatBridge();
 
         installEventReceiver('cts-diagnostics', (name: number, data: unknown, ctx) => {
             const ET = engine.EventType;
@@ -356,10 +379,11 @@ export class TypeScriptRuntime {
                 if (isWebWorkerRuntime()) {
                     const pipe = worker.pipe;
                     if (pipe) {
+                        const info = runtimeErrorInfo(r);
                         pipe.postMessage({
                             __cno_role: 'error',
-                            message: runtimeErrorInfo(r).message,
-                            error: runtimeErrorInfo(r),
+                            message: info.message,
+                            error: info,
                             filename: '',
                             lineno: 0,
                             colno: 0,
@@ -381,10 +405,11 @@ export class TypeScriptRuntime {
                 if (isWebWorkerRuntime()) {
                     const pipe = worker.pipe;
                     if (pipe) {
+                        const info = runtimeErrorInfo(data);
                         pipe.postMessage({
                             __cno_role: 'error',
-                            message: runtimeErrorInfo(data).message,
-                            error: runtimeErrorInfo(data),
+                            message: info.message,
+                            error: info,
                             filename: '',
                             lineno: 0,
                             colno: 0,
@@ -528,6 +553,10 @@ export class TypeScriptRuntime {
 
             const scannableModules: ScanResult['modules'] = [];
             const toCompile: ScanResult['modules'] = [];
+            // Freshness is captured by the gate below: a separate capture pass
+            // would stat+read+hash every stale module a second time.
+            const sourceFreshness = new Map<string, SourceFreshness | undefined>();
+            const sourceBytes = new Map<string, Uint8Array | undefined>();
             // CJS bytecode always uses local hashed cache (no specPath at load).
             const cacheRemote = (m: { format: ModuleFormat; specPath: string }) =>
                 m.format === 'cjs' ? false : isRemote(m.specPath);
@@ -536,28 +565,33 @@ export class TypeScriptRuntime {
             for (const m of result.modules) {
                 if (!isPrecompilePath(m.localPath)) continue;
                 scannableModules.push(m);
-                if (!this.compiler.esm.jsc.hasFresh(m.localPath, cacheRemote(m), undefined, cacheIdentity(m))) {
-                    toCompile.push(m);
-                }
+                const check = this.compiler.esm.jsc.checkFreshness(m.localPath, cacheRemote(m), undefined, cacheIdentity(m));
+                if (check.fresh) continue;
+                toCompile.push(m);
+                sourceFreshness.set(m.localPath, check.snapshot?.freshness);
+                sourceBytes.set(m.localPath, check.snapshot?.bytes);
             }
 
             if (toCompile.length > 0) {
-                const sourceFreshness = new Map(toCompile.map(m => [
-                    m.localPath,
-                    this.compiler.esm.jsc.captureFreshness(m.localPath),
-                ]));
                 log.debug('precache', () => `precompile begin: ${toCompile.length}/${scannableModules.length} modules`);
                 prog?.setCompileProgress(0, toCompile.length);
                 // Stream each bytecode straight to disk and drop it — never hold
                 // the whole graph's bytecode in memory (peak RSS bound).
-                const formatByLocalPath = new Map(toCompile.map(m => [m.localPath, m.format]));
+                // The freshness gate owns the source read. Pass those exact bytes
+                // through ParseDriver so a file edit after the gate cannot compile
+                // one revision and stamp another.
+                const compileTargets = toCompile.map(m => ({
+                    ...m,
+                    sourceBytes: sourceBytes.get(m.localPath),
+                }));
+                const formatByLocalPath = new Map(compileTargets.map(m => [m.localPath, m.format]));
                 let written = 0;
                 let fail = 0;
                 try {
                     // Stub deps during precache compile so missing edges don't cascade.
                     await this.withStubModuleLoader(precompileStubLoader(), () =>
                         parseDriver.compileModules(
-                            toCompile,
+                            compileTargets,
                             (done, total) => prog?.setCompileProgress(done, total),
                             (localPath, bc, specPath) => {
                                 const format = formatByLocalPath.get(localPath);
@@ -571,6 +605,8 @@ export class TypeScriptRuntime {
                                 }
                                 this.compiler.esm.jsc.persistBytecode(
                                     localPath, bc, remote, identity, source,
+                                    // No scanned verdict exists here; the default
+                                    // true preserves the always-patch warm behavior.
                                 );
                                 written++;
                             },
@@ -585,6 +621,11 @@ export class TypeScriptRuntime {
                     prog?.clearForOutput();
                     log.warn('precompile', () => `batch failed: ${errMsg(e)}`);
                     throw e instanceof Error ? e : new Error(errMsg(e));
+                } finally {
+                    // Do not retain gate snapshots after the compile batch. The
+                    // targets also clear their per-module reference when done.
+                    sourceBytes.clear();
+                    sourceFreshness.clear();
                 }
                 log.debug('precache', () => `precompile end: ${written}/${toCompile.length} bytecodes` +
                     (fail ? `, ${fail} fail` : ''));
@@ -689,7 +730,7 @@ export class TypeScriptRuntime {
         shellArg: string,
     ): Promise<{ code: number; diag?: string }> {
         const plan = planLifecycleScript(script, { exePath: os.exePath, shell, shellArg });
-        const session = newLifecycleSession(cwd);
+        const session = newLifecycleSession(cwd, this.config.cacheDir);
         let lastDiag: string | undefined;
         const code = await runLifecyclePlan(plan, async (command, sess) => {
             const r = await this.spawnLifecycleCommand(command, sess);

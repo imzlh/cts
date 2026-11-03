@@ -7,7 +7,7 @@ import { guessFileKind } from '../resolve/protocols/base';
 import { createCtx, detectFormat, packagePathNotExportedError, resolveExports } from '../resolve/pkg';
 import { buildCjsWrapperSource, cjsContextSlot, type CjsContext } from './cjs-wrap';
 import { getNodeModuleInterop } from './node-interop';
-import type { SourceFreshness, SourceSnapshot } from '../source/cache';
+import type { LoadedCompiled, SourceFreshness, SourceSnapshot } from '../source/cache';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -54,12 +54,15 @@ export interface CjsDeps {
     prepareSource?(code: string, filePath: string): string | null;
     /** Consume the embedded-sourceMappingURL marker for path (see Transformer). */
     tookInlineSourceMap?(localPath: string): boolean;
-    /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. */
-    loadCjsCompiled?(localPath: string): unknown | null;
+    /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. The sidecar's
+     *  Function-patch verdict travels with the value (bytecode cannot be
+     *  scanned on a warm hit). */
+    loadCjsCompiled?(localPath: string): LoadedCompiled | null;
     /** Source snapshot retained by a preceding bytecode-cache miss. */
     takeSourceSnapshot?(localPath: string): SourceSnapshot | undefined;
-    /** Persist freshly compiled CJS bytecode (already engine.serialize()'d). */
-    persistCjsCompiled?(localPath: string, bytes: ArrayBuffer, source?: SourceFreshness): void;
+    /** Persist freshly compiled CJS bytecode (already engine.serialize()'d),
+     *  recording whether the scan saw a dynamic import() in the source. */
+    persistCjsCompiled?(localPath: string, bytes: ArrayBuffer, source: SourceFreshness | undefined, patchFunction: boolean): void;
     captureSourceFreshness?(localPath: string): SourceFreshness | undefined;
     /** Synthetic runtime parent for materialized container files, if any. */
     runtimeParent?(localPath: string): string | null;
@@ -69,8 +72,6 @@ interface ResolvedCjsRequest {
     info: ModuleInfo;
     isCjs: boolean;
 }
-
-// Performance: counter-based CJS context keys (no regex), dir-level path cache
 
 const INTERNAL_ID = Symbol('cts.cjs.id');
 const INTERNAL_FILENAME = Symbol('cts.cjs.filename');
@@ -812,8 +813,9 @@ export class CjsLoader {
         const cached = this.deps.loadCjsCompiled?.(filename);
         if (cached != null) {
             log.debug('cjs', () => `bytecode cache hit: ${filename}`);
-            // No source on cache hit — patch Function for dynamic import defensively.
-            this.runCompiled(mod, cached, true);
+            // The sidecar's verdict stands in for the fresh-path scan: bytecode
+            // cannot be checked for dynamic import() use.
+            this.runCompiled(mod, cached.value, cached.patchFunction);
             return;
         }
 
@@ -856,7 +858,7 @@ export class CjsLoader {
 
         if (this.deps.persistCjsCompiled && sourceFreshness && !inlineMapped) {
             try {
-                this.deps.persistCjsCompiled(filename, engine.serialize(compiled).buffer, sourceFreshness);
+                this.deps.persistCjsCompiled(filename, engine.serialize(compiled).buffer, sourceFreshness, shouldPatchFunction);
             } catch (e) {
                 log.debug('cjs', () => `persist compiled failed: ${filename}`, e);
             }

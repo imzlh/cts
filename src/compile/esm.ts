@@ -90,30 +90,24 @@ export class EsmCompiler {
 
     // Public: load a module from its ModuleInfo (format-agnostic dispatch)
 
-    load(info: ModuleInfo, meta: Record<string, unknown> = {}, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
+    load(info: ModuleInfo, meta: Record<string, unknown> = {}): CModuleEngine.Module {
         log.debug('loader', () =>
             `load ${info.specPath} → ${info.localPath} kind=${info.fileKind} format=${info.format}`);
         if (info.specPath === 'bun' && info.moduleId === undefined && info.fileKind === 'source') {
-            return this.loadBunView(info, resolveMtime);
+            return this.loadBunView(info);
         }
         switch (info.fileKind) {
             case 'binary': return this.loadBytes(info);
             case 'text':   return this.loadText(info);
-            case 'json':   return this.loadEsm(info, meta, resolveMtime);
-            case 'wasm':   return this.loadEsm(info, meta, resolveMtime); // WASM dispatched by compile/index.ts
+            case 'json':   return this.loadEsm(info, meta);
         }
-        return this.loadEsm(info, meta, resolveMtime);
+        return this.loadEsm(info, meta);
     }
 
     loadSource(code: string, info: ModuleInfo, meta: Record<string, unknown> = {}): CModuleEngine.Module {
         log.debug('loader', () => `loadSource ${info.specPath} kind=${info.fileKind} format=${info.format}`);
         if (info.fileKind === 'text') return this.loadTextSource(code, info);
         return this.loadEsmSource(code, info, meta);
-    }
-
-    /** Store a module in esmCache (for CJS bridge results that need strong ref). */
-    setCache(info: ModuleInfo, mod: CModuleEngine.Module): void {
-        this.esmCache.set(this.cacheKey(info), mod);
     }
 
     /** Compile ESM source code, wrapping SyntaxError with file context. */
@@ -147,7 +141,7 @@ export class EsmCompiler {
         return ne;
     }
 
-    private loadEsm(info: ModuleInfo, meta: Record<string, unknown>, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
+    private loadEsm(info: ModuleInfo, meta: Record<string, unknown>): CModuleEngine.Module {
         const cacheKey = moduleRef(info);
         const moduleId = cacheKey;
         const evalScope = moduleEvaluationKey(info);
@@ -168,11 +162,14 @@ export class EsmCompiler {
         const remote = isRemote(info.specPath);
         const fileBacked = isFileBackedPath(info.localPath);
         // Extension policy (works for pack:/name.ts keys, not only host paths).
-        // Transform-source paths are always cache candidates; plain local .js only when file-backed (L2).
+        // Transform-source paths are always cache candidates; plain local .js
+        // only when file-backed (L2). Local .json too: without it the
+        // `export default` wrapper re-parses on every warm run.
         const needsTransform = isTransformSourcePath(info.localPath);
         const needsCompile = !needsTransform && isCompiledSourcePath(info.localPath);
         const allowCache = info.cacheBytecode !== false && this.cfg.enableCache !== false;
-        const tryBytecode = allowCache && (remote || needsTransform || needsCompile);
+        const tryBytecode = allowCache &&
+            (remote || needsTransform || needsCompile || info.fileKind === 'json');
 
         if (tryBytecode) {
             // In-flight for the bytecode read too: jsc.load() links the module,
@@ -185,12 +182,7 @@ export class EsmCompiler {
             this.esmInFlightPaths.add(evalScope);
             let cached: CModuleEngine.Module | null;
             try {
-                cached = this.jsc.load(
-                    info.localPath,
-                    remote && fileBacked,
-                    fileBacked ? resolveMtime?.(info.localPath) : undefined,
-                    moduleId,
-                );
+                cached = this.jsc.load(info.localPath, remote && fileBacked, undefined, moduleId);
             } finally {
                 if (!alreadyLoading) this.esmInFlightPaths.delete(evalScope);
             }
@@ -201,7 +193,6 @@ export class EsmCompiler {
             }
         }
 
-        // VFS (pack) or fs → transform → compile
         this.esmLoading.add(cacheKey);
         const alreadyLoading = this.esmInFlightPaths.has(evalScope);
         this.esmInFlightPaths.add(evalScope);
@@ -303,7 +294,7 @@ export class EsmCompiler {
      * C module whose `default` namespace property is deleted. The export entry
      * (what default imports bind to) is left in place.
      */
-    private loadBunView(info: ModuleInfo, resolveMtime?: (p: string) => number | undefined): CModuleEngine.Module {
+    private loadBunView(info: ModuleInfo): CModuleEngine.Module {
         const cacheKey = moduleRef(info);
         const hit = this.esmCache.get(cacheKey);
         if (hit) return hit;
@@ -315,7 +306,7 @@ export class EsmCompiler {
         if (this.isInFlight(evalScope)) {
             throw requireCycleError(cacheKey, info.localPath, 'require-esm');
         }
-        const payload = this.loadEsm(payloadInfo, {}, resolveMtime);
+        const payload = this.loadEsm(payloadInfo, {});
         const result = engine.promiseResult(this.trackEvaluation(evalScope, () => payload.eval()));
         if (result === null) {
             throw err(ErrorKind.Generic,
@@ -384,6 +375,16 @@ export class EsmCompiler {
 
     hasPendingLoads(): boolean {
         return this.esmLoading.size > 0;
+    }
+
+    /**
+     * Store a CJS bridge wrapper in esmCache. detectFormat resolves one
+     * manifest-less .js to different formats per context, so a later import
+     * of a file already loaded via require must find the executed wrapper
+     * under the shared moduleRef key instead of re-running the file as ESM.
+     */
+    setCache(info: ModuleInfo, mod: CModuleEngine.Module): void {
+        this.esmCache.set(this.cacheKey(info), mod);
     }
 
     private cacheKey(info: ModuleInfo): string {

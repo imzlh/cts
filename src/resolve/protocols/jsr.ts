@@ -67,11 +67,15 @@ function matchesJsrChecksum(data: Uint8Array | ArrayBuffer, checksum: string): b
 export class JsrHandler implements ProtocolHandler {
     readonly protocols = ['jsr'];
     private readonly resolved = new Map<string, string>();
+    /** Parsed registry metadata per `@scope/name[@ver]`. `_at` travels with the
+     *  object so the per-call TTL check still drives the refresh path. */
+    private readonly metaMem = new Map<string, CachedJsrMetadata>();
 
     constructor(private readonly cfg: RuntimeConfig) {}
 
     clearCache(): void {
         this.resolved.clear();
+        this.metaMem.clear();
     }
 
     *resolve(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Flow<ModuleInfo> {
@@ -191,13 +195,18 @@ export class JsrHandler implements ProtocolHandler {
         const packageId = `@${scope}/${name}`;
         const id = ver === undefined ? packageId : `${packageId}@${ver}`;
         const kind = ver === undefined ? 'package' : 'version';
+        const memo = this.metaMem.get(id);
+        if (memo && (!isCacheExpired(memo._at ?? 0, this.cfg.jsrCacheTTL) || this.cfg.cachedOnly)) return memo;
         const dir = joinPaths(this.cfg.cacheDir, 'jsr', scope, name, ver ?? '');
         const file = joinPaths(dir, 'meta.json');
         const exists = yield { type: StepType.FS_EXISTS, path: file };
         if (exists) {
             const text = expectText(yield { type: StepType.FS_READ_TEXT, path: file });
             const cached = parseCachedMeta<CachedJsrMetadata>(text);
-            if (cached && (!isCacheExpired(cached._at ?? 0, this.cfg.jsrCacheTTL) || this.cfg.cachedOnly)) return cached;
+            if (cached && (!isCacheExpired(cached._at ?? 0, this.cfg.jsrCacheTTL) || this.cfg.cachedOnly)) {
+                this.metaMem.set(id, cached);
+                return cached;
+            }
         }
         if (this.cfg.cachedOnly) {
             throw err(ErrorKind.ModuleNotFound,
@@ -215,8 +224,11 @@ export class JsrHandler implements ProtocolHandler {
         if (ver === undefined && !('latest' in meta && meta.latest)) {
             throw err(ErrorKind.VersionNotFound, `${packageId}: registry returned no latest`);
         }
+        const fetchedAt = Date.now();
         yield { type: StepType.FS_ENSURE_DIR, path: dir };
-        yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: Date.now() }, null, 2) };
+        yield { type: StepType.FS_WRITE_TEXT, path: file, text: JSON.stringify({ ...meta, _at: fetchedAt }, null, 2) };
+        // Same _at as the file so the next TTL check matches a fresh file read.
+        this.metaMem.set(id, { ...meta, _at: fetchedAt });
         return meta;
     }
 

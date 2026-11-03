@@ -1,12 +1,12 @@
 import type { ScanResult } from '../deps';
-import type { NodeModulesMode, PackageJson } from '../types';
+import type { NodeModulesMode } from '../types';
 import {
     joinPaths, dirname, ensureDir, errMsg, npmNameVersion, isWindows,
-    hardlinkOrCopyDirRecursive, readText, safeParse, matchLatestVersion, isValidNpmPackageName,
+    hardlinkOrCopyDirRecursive, matchLatestVersion, isValidNpmPackageName,
     yieldEventLoop, toPosixPath, relativePath,
 } from '../utils';
 import { err, ErrorKind } from '../errors';
-import { getBinMap, resolvePackageBinPath } from './pkg';
+import { getBinMap, readPkgFresh, resolvePackageBinPath } from './pkg';
 
 const fs = import.meta.use('fs');
 const asyncfs = import.meta.use('asyncfs');
@@ -59,6 +59,8 @@ export async function materializeNodeModules(
     projectDir: string,
     onLinked?: (done: number, total: number) => void,
 ): Promise<void> {
+    storeRootListings.clear();
+    storeScopeListings.clear();
     const storeRoot = joinPaths(cacheDir, 'npm');
     const { rootEdges } = partitionRootEdges(edges);
 
@@ -166,7 +168,7 @@ function findMissingRequiredDeps(roots: ScanEdge[], storeRoot: string): string[]
         const id = `${pkg.name}@${pkg.version}`;
         if (seen.has(id)) continue;
         seen.add(id);
-        const manifest = readPkgJsonFull(pkg.dir);
+        const manifest = readPkgFresh(pkg.dir);
         if (!manifest) continue;
         for (const dep of collectDeclaredDeps(manifest)) {
             if (dep.optional) continue;
@@ -211,7 +213,7 @@ function collectHardPackages(roots: ScanEdge[], storeRoot: string): HardPkg[] {
 
     while (queue.length > 0) {
         const pkg = queue.shift()!;
-        const manifest = readPkgJsonFull(pkg.storeDir);
+        const manifest = readPkgFresh(pkg.storeDir);
         if (!manifest) continue;
         for (const dep of collectDeclaredDeps(manifest)) {
             const depDir = resolveStorePackage(storeRoot, dep.name, dep.range, pkg.storeDir);
@@ -266,7 +268,7 @@ async function materializeHardVirtual(
     type SoftJob = { source: string; target: string; label: string; optional: boolean };
     const softJobs: SoftJob[] = [];
     for (const pkg of packages) {
-        const manifest = readPkgJsonFull(pkg.storeDir);
+        const manifest = readPkgFresh(pkg.storeDir);
         if (!manifest) continue;
         const nm = joinPaths(virtualPkgRoot(projectDir, pkg.name, pkg.version), 'node_modules');
         for (const dep of collectDeclaredDeps(manifest)) {
@@ -426,6 +428,8 @@ function pruneVirtualOrphans(virtualRoot: string, desiredKeys: Set<string>): voi
  * Read-only install-graph edges from package.json deps/peers; never writes the store.
  */
 export function buildInstallViewEdges(edges: ScanEdge[], storeRoot: string): ViewEdge[] {
+    storeRootListings.clear();
+    storeScopeListings.clear();
     const seeds = collectSeedPackages(edges, storeRoot);
     const out: ViewEdge[] = [];
     const seenPkg = new Set<string>();
@@ -439,7 +443,7 @@ export function buildInstallViewEdges(edges: ScanEdge[], storeRoot: string): Vie
         if (seenPkg.has(id)) continue;
         seenPkg.add(id);
 
-        const manifest = readPkgJsonFull(pkg.dir);
+        const manifest = readPkgFresh(pkg.dir);
         if (!manifest) continue;
 
         const declared = collectDeclaredDeps(manifest);
@@ -656,7 +660,7 @@ function packageSatisfiesRange(pkgDir: string, range: string): boolean {
     // github:/tarball pins are install-owned. Trust a linked package.json here;
     // resolveStorePackage never picks opaque deps via store alias/semver alone.
     if (isOpaqueDepRange(r)) return pkgJsonExists(pkgDir);
-    const pkg = readPkgJsonFull(pkgDir);
+    const pkg = readPkgFresh(pkgDir);
     const ver = pkg?.version != null ? String(pkg.version) : null;
     if (!ver) return false;
     if (isExactVersion(r)) return ver === r || ver === stripLeadingV(r);
@@ -671,31 +675,46 @@ function isOpaqueDepRange(range: string): boolean {
     return false;
 }
 
+/** Readdir results for the read-only store, keyed by dir. Cleared at each
+ *  materialize/view entry point so a listing never outlives one run. */
+const storeRootListings = new Map<string, string[]>();
+const storeScopeListings = new Map<string, string[]>();
+
+function listStoreDir(dir: string, cache: Map<string, string[]>): string[] {
+    const hit = cache.get(dir);
+    // [] is a valid negative listing — do not re-readdir every miss.
+    if (hit !== undefined) return hit;
+    let listing: string[];
+    try {
+        listing = fs.readdir(dir);
+    } catch {
+        listing = [];
+    }
+    cache.set(dir, listing);
+    return listing;
+}
+
 function listStoreVersions(storeRoot: string, name: string): string[] {
     if (!isValidNpmPackageName(name)) return [];
     const versions: string[] = [];
-    try {
-        if (name.startsWith('@')) {
-            const slash = name.indexOf('/');
-            if (slash <= 0) return versions;
-            const scope = name.slice(0, slash);
-            const leaf = name.slice(slash + 1);
-            const scopeDir = joinPaths(storeRoot, scope);
-            for (const entry of fs.readdir(scopeDir)) {
-                const ver = versionFromScopedEntry(leaf, entry);
-                if (ver) versions.push(ver);
-            }
-        } else {
-            const prefix = `${name}@`;
-            for (const entry of fs.readdir(storeRoot)) {
-                if (entry.startsWith(prefix)) {
-                    const ver = entry.slice(prefix.length);
-                    if (ver && !ver.includes('/')) versions.push(ver);
-                }
+    if (name.startsWith('@')) {
+        const slash = name.indexOf('/');
+        if (slash <= 0) return versions;
+        const scope = name.slice(0, slash);
+        const leaf = name.slice(slash + 1);
+        const scopeDir = joinPaths(storeRoot, scope);
+        for (const entry of listStoreDir(scopeDir, storeScopeListings)) {
+            const ver = versionFromScopedEntry(leaf, entry);
+            if (ver) versions.push(ver);
+        }
+    } else {
+        const prefix = `${name}@`;
+        for (const entry of listStoreDir(storeRoot, storeRootListings)) {
+            if (entry.startsWith(prefix)) {
+                const ver = entry.slice(prefix.length);
+                if (ver && !ver.includes('/')) versions.push(ver);
             }
         }
-    } catch {
-        // store root missing or unreadable
     }
     return versions;
 }
@@ -723,7 +742,7 @@ function packageIdFromDir(
             if (isValidNpmPackageName(name) && isExactVersion(version)) return { name, version };
         }
     }
-    const pkg = readPkgJsonFull(depDir);
+    const pkg = readPkgFresh(depDir);
     if (pkg?.name && pkg.version && isValidNpmPackageName(pkg.name) && isExactVersion(String(pkg.version))) {
         return { name: pkg.name, version: String(pkg.version) };
     }
@@ -778,7 +797,7 @@ function materializeProjectBins(
         const cv = npmNameVersion(edge.childSpecPath);
         if (!cv) continue;
         const pkgDir = joinPaths(storeRoot, `${cv.name}@${cv.version}`);
-        const pkg = readPkgJson(pkgDir);
+        const pkg = readPkgFresh(pkgDir);
         if (!pkg) continue;
         const binMap = getBinMap(pkg);
         for (const binName in binMap) {
@@ -810,32 +829,6 @@ function materializeProjectBins(
                 // Best-effort: missing bin must not fail the whole materialize.
             }
         }
-    }
-}
-
-function readPkgJson(dir: string): PackageJson | null {
-    try {
-        const raw = readText(joinPaths(dir, 'package.json'));
-        return safeParse(raw);
-    } catch {
-        return null;
-    }
-}
-
-function readPkgJsonFull(dir: string): {
-    name?: string;
-    version?: string;
-    dependencies?: Record<string, string>;
-    peerDependencies?: Record<string, string>;
-    optionalDependencies?: Record<string, string>;
-    peerDependenciesMeta?: Record<string, { optional?: boolean }>;
-    bin?: unknown;
-} | null {
-    try {
-        const raw = readText(joinPaths(dir, 'package.json'));
-        return safeParse(raw);
-    } catch {
-        return null;
     }
 }
 

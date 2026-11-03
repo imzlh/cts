@@ -90,11 +90,8 @@ cts/
 │   │   # cts/src/task-shell.ts.
 │   │
 │   ├── source/              # Source loading + transformation
-│   │   ├── index.ts         # readSource(), readSourceForCjs()
 │   │   ├── transform.ts     # Transformer class, TransformerOptions
-│   │   └── cache.ts         # JscCache class, isRemote()
-│   │   # NOTE: no source/oxc.ts or source/scan.ts — those live at the top level
-│   │   # (cts/src/oxc.ts, cts/src/scan.ts). source/ holds exactly these three.
+│   │   └── cache.ts         # JscCache class, isRemote(), isFileBackedPath()
 │   │
 │   ├── debug/               # Debugger integration
 │   │
@@ -215,16 +212,16 @@ Format-agnostic layer between resolve and compile. Reads files, transforms to JS
 
 | File | Key Exports | Responsibility |
 |---|---|---|
-| `index.ts` | `readSource()`, `readSourceForCjs()` | Read + transform source files |
 | `transform.ts` | `Transformer`, `TransformerOptions` | oxc (native) → sucrase (fallback) |
-| `cache.ts` | `JscCache`, `isRemote()` | L1 memory + L2 disk bytecode cache |
+| `cache.ts` | `JscCache`, `isRemote()`, `isFileBackedPath()` | L1 memory + L2 disk bytecode cache with content-identity freshness |
 
-`source/` contains **only** those three files. Earlier revisions of this table also
-listed `source/oxc.ts` and `source/scan.ts`; **neither exists.** The real modules are
-top-level: `cts/src/oxc.ts` (`OxcTranspiler`, `OxcModule`, `isOxcModule()`,
+`source/` contains **exactly** the two files in the table — there is no barrel
+`index.ts` (consumers import `../source/transform` and `../source/cache`
+directly), and no `source/oxc.ts` or `source/scan.ts`: those modules are
+top-level `cts/src/oxc.ts` (`OxcTranspiler`, `OxcModule`, `isOxcModule()`,
 `oxcExtPath()`, `tryLoadOxc()`) and `cts/src/scan.ts` (`extractImports()`,
 `hasImportAttributes()`, `isTsLikePath()`, `isScannablePath()`, `isWasmPath()`) —
-both already listed in the top-level table above. `import-scanner.ts` imports them
+both listed in the top-level table above. `import-scanner.ts` imports them
 as `./oxc` and `./scan`, not `./source/…`.
 
 ### utils/ — Utilities
@@ -254,7 +251,8 @@ No circular deps. Used everywhere.
 - **LRU**: instantiate with capacity, use `get`/`set` — no manual eviction
 - **Module identity**: use `moduleRef(info)` (returns `info.moduleId ?? info.specPath`) as the QuickJS module name, not `localPath`
 - **Cycle guards**: use `moduleEvaluationKey(info)` (returns `info.moduleId ?? info.localPath`) across compilation, bytecode linking, and synchronous evaluation; file aliases share a guard, while explicit views remain independent.
-- **Bytecode identity**: pass the effective QuickJS module identity through every `JscCache` load/freshness/write API; identity-aware sidecars reject legacy or mismatched stamps instead of reusing a bytecode graph compiled for another ref. Capture `SourceFreshness` before reading a file and pass it to persistence, so edits during compilation cannot bless stale bytecode. If that snapshot fails, execute without persisting. Remote bytecode is adjacent only when the resolved file is inside the configured cache root; workspace/symlink targets use the hashed local cache. Cache roots are normalized in both `createConfig` and `JscCache`, so trailing/repeated separators cannot change ownership or cache keys; protocol specifiers remain untouched by filesystem normalization.
+- **Bytecode identity**: pass the effective QuickJS module identity through every `JscCache` load/freshness/write API; identity-aware sidecars reject legacy or mismatched stamps instead of reusing a bytecode graph compiled for another ref. Capture `SourceFreshness` before reading a file and pass it to persistence, so edits during compilation cannot bless stale bytecode. If that snapshot fails, execute without persisting. Freshness is content-authority: every disk hit reads the source and compares its size+md5 against the sidecar — native stat mtimes have second granularity, so a stat-only tier cannot distinguish a same-second same-size edit. The read doubles as the snapshot the recompile persists on a miss. Sidecars also record whether warm CJS bytecode needs the contextual `Function` patch (bytecode cannot be scanned); a sidecar without a verdict patches defensively. Remote bytecode is adjacent only when the resolved file is inside the configured cache root; workspace/symlink targets use the hashed local cache. Cache roots are normalized in both `createConfig` and `JscCache`, so trailing/repeated separators cannot change ownership or cache keys; protocol specifiers remain untouched by filesystem normalization.
+- **Cache disable**: `cfg.enableCache === false` unwires the CJS bytecode deps (`loadCjsCompiled`/`persistCjsCompiled`) in `buildCjsDeps` and drops ESM modules from the `tryBytecode` policy, so the demand-load path never stats, hashes, reads or writes `.jsc`/`.jsc.mt`. (An explicit `--precache` run still persists bytecode — caching is its purpose.)
 - **Pack isolation**: do not resolve a missing manifest edge against disk/network; incomplete scans and compiles are fatal
 - **Attribute views**: use `moduleViewRef()`; do not encode view state in a user query/hash suffix
 - **Bytecode safety**: propagate `cacheBytecode: false` for `sourceOnly` pack entries so warm caches cannot erase import attributes

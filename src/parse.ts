@@ -13,12 +13,12 @@ const worker = import.meta.use('worker');
 const smap = import.meta.use('sourcemap');
 const asyncfs = import.meta.use('asyncfs');
 
-// Workers read/scan/transform; QuickJS bytecode compilation stays on main.
-
 interface WorkerTask {
     id: number;
     kind: 'scan' | 'transform';
     localPath: string;
+    /** Source captured by the freshness gate; avoids a second disk read. */
+    sourceBytes?: Uint8Array;
     /** Module runtime identity for Transformer.transform mapKey. */
     specPath?: string;
     lang?: string;
@@ -61,6 +61,8 @@ export interface CompileTarget {
     localPath: string;
     format?: ModuleFormat;
     lang?: string;
+    /** Optional source snapshot captured before compilation (not read again). */
+    sourceBytes?: Uint8Array;
     /** Eval filename to bake into the bytecode; defaults to the runtime identity. */
     identity?: string;
 }
@@ -113,6 +115,7 @@ function isWorkerTask(value: unknown): value is WorkerTask {
         && typeof value.id === 'number'
         && (value.kind === 'scan' || value.kind === 'transform')
         && typeof value.localPath === 'string'
+        && (value.sourceBytes === undefined || value.sourceBytes instanceof Uint8Array)
         && (value.lang === undefined || typeof value.lang === 'string')
         && (value.strict === undefined || typeof value.strict === 'boolean');
 }
@@ -177,7 +180,7 @@ export async function runParseWorker(): Promise<void> {
         let bytes: Uint8Array;
         try {
             const mem = getMemoryFile(task.localPath);
-            bytes = mem !== undefined ? mem : await asyncfs.readFile(task.localPath);
+            bytes = task.sourceBytes ?? (mem !== undefined ? mem : await asyncfs.readFile(task.localPath));
         } catch (e) {
             // Must report the failure: without a result the driver retries the task
             // until it times out instead of failing it with this read error.
@@ -303,8 +306,6 @@ class TxWorker {
         return this.termination;
     }
 }
-
-// ParseDriver — worker scan/transform, main-thread bytecode compile
 
 export class ParseDriver {
     private workers: TxWorker[] = [];
@@ -439,7 +440,14 @@ export class ParseDriver {
                 continue;
             }
             const id = this.nextId++;
-            tasks.push({ id, kind: 'transform', localPath: m.localPath, specPath: m.specPath, lang: m.lang });
+            tasks.push({
+                id,
+                kind: 'transform',
+                localPath: m.localPath,
+                sourceBytes: m.sourceBytes,
+                specPath: m.specPath,
+                lang: m.lang,
+            });
             this.specMap.set(id, { specPath: m.specPath, identity: compileIdentity(m), format: m.format });
         }
 
@@ -515,7 +523,9 @@ export class ParseDriver {
         log.debug('precompile', () => `inline precompile begin: ${total} modules`);
         for (const m of modules) {
             try {
-                const source = readText(m.localPath);
+                const source = m.sourceBytes !== undefined
+                    ? engine.decodeString(m.sourceBytes)
+                    : readText(m.localPath);
                 if (hasEmbeddedSourceMap(source)) {
                     log.debug('precompile', () => `skip ${m.localPath}: embedded sourceMappingURL`);
                     done++;
@@ -530,6 +540,9 @@ export class ParseDriver {
                 fail++;
                 log.debug('precompile', () => `inline compile fail: ${m.localPath}: ${errMsg(e)}`);
                 onFailed?.(m.localPath, m.specPath, e);
+            } finally {
+                // A gate snapshot is only needed for this compile attempt.
+                m.sourceBytes = undefined;
             }
             onProgress?.(done + fail, total);
         }
@@ -579,6 +592,9 @@ export class ParseDriver {
         if (entry) this.specMap.delete(r.id);
         this.taskRetries.delete(task.id);
         if (r.code && entry) {
+            // The worker received a structured clone; release the driver's
+            // copy as soon as the result settles (retries happen above).
+            task.sourceBytes = undefined;
             const { specPath, identity, format } = entry;
             try {
                 if (r.sourceMap) {
@@ -596,6 +612,7 @@ export class ParseDriver {
             }
             this.transformDone++;
         } else {
+            task.sourceBytes = undefined;
             this.transformFail++;
             log.debug('precompile', () => `transform fail: ${task.localPath}: ${r.error}`);
             this.onFailed?.(task.localPath, entry?.specPath ?? task.localPath, r.error);
@@ -607,17 +624,18 @@ export class ParseDriver {
         if (this.transformDone + this.transformFail >= this.taskTotal) this.finish();
     }
 
-    /** Main-thread compile: CJS (transformForCjs) or plain JS passthrough. */
     private skipAnnotatedBytecode(m: CompileTarget): void {
         // An embedded sourceMappingURL map is injected at load time and lives
         // in the runtime, not in bytecode: persisting would serve unmapped
         // positions forever. Leave the module source-cached; the load path
         // re-injects on every run.
         log.debug('precompile', () => `skip ${m.localPath}: embedded sourceMappingURL`);
+        m.sourceBytes = undefined;
         this.transformDone++;
         this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
     }
 
+    /** Main-thread compile: CJS (transformForCjs) or plain JS passthrough. */
     private compileOnMain(m: CompileTarget): void {
         try {
             const transformer = this.getInlineTransformer();
@@ -625,12 +643,14 @@ export class ParseDriver {
             let bc: ArrayBuffer;
             if (m.format === 'cjs') {
                 // Always strip TS/JSX; .cts must not hit EVAL_COMPILE_ONLY raw.
-                const raw = readText(m.localPath);
+                const raw = m.sourceBytes !== undefined
+                    ? engine.decodeString(m.sourceBytes)
+                    : readText(m.localPath);
                 if (hasEmbeddedSourceMap(raw)) return this.skipAnnotatedBytecode(m);
                 const code = prepareForCache(transformer, raw, m.localPath, 'cjs', m.lang, m.specPath);
                 bc = compileForCache(code, identity, 'cjs');
             } else {
-                const bytes = readBytes(m.localPath);
+                const bytes = m.sourceBytes ?? readBytes(m.localPath);
                 // Shebang-agnostic: an annotated tail must win over both the
                 // shebang and the plain compile branches.
                 if (hasEmbeddedSourceMapBytes(bytes)) {
@@ -659,6 +679,9 @@ export class ParseDriver {
             this.transformFail++;
             log.debug('precompile', () => `main compile fail: ${m.localPath}: ${errMsg(e)}`);
             this.onFailed?.(m.localPath, m.specPath, e);
+        } finally {
+            // A gate snapshot is only needed for this compile attempt.
+            m.sourceBytes = undefined;
         }
         this.onProgressCb?.(this.transformDone + this.transformFail, this.taskTotal);
     }
@@ -815,10 +838,14 @@ export class ParseDriver {
     }
 
     private cancelOutstanding(error = new ParseWorkerError('parse worker pool terminated')): void {
-        for (const task of this.scanQueue) this.taskRetries.delete(task.id);
+        for (const task of this.scanQueue) {
+            task.sourceBytes = undefined;
+            this.taskRetries.delete(task.id);
+        }
         this.scanQueue.length = 0;
 
         for (const task of this.pending) {
+            task.sourceBytes = undefined;
             this.specMap.delete(task.id);
             this.taskRetries.delete(task.id);
         }
@@ -827,6 +854,7 @@ export class ParseDriver {
         for (const taskId of [...this.taskInfo.keys()]) {
             const taken = this.takeTask(taskId);
             if (!taken) continue;
+            taken.task.sourceBytes = undefined;
             if (taken.task.kind === 'transform') this.specMap.delete(taskId);
             this.taskRetries.delete(taskId);
         }

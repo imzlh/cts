@@ -128,6 +128,7 @@ export class Transformer {
                         kind !== KIND_JSX,
                         kind === KIND_TSX || kind === KIND_JSX,
                         mapKey,
+                        kind === KIND_CTS,
                     ),
                 };
             }
@@ -315,9 +316,10 @@ export function isPassthroughSource(filename: string): boolean {
 }
 
 /**
- * Extract the sourceMappingURL from the last source line. Tail-only matching:
- * a whole-file scan would misfire on string literals mentioning the marker,
- * and the ecosystem convention places the annotation last.
+ * Extract the sourceMappingURL from the complete last source line. String
+ * callers already own the source, so retaining a long data URL or path here is
+ * cheap and avoids silently truncating a valid annotation. Byte callers keep
+ * their bounded tail scan below so multi-MB files are not decoded wholesale.
  */
 function embeddedSourceMapUrl(code: string): string | undefined {
     let end = code.length;
@@ -327,8 +329,7 @@ function embeddedSourceMapUrl(code: string): string | undefined {
         end--;
     }
     const lineStart = Math.max(code.lastIndexOf('\n', end - 1), code.lastIndexOf('\r', end - 1)) + 1;
-    const line = code.slice(lineStart, end);
-    return matchSourceMapAnnotation(line, lineStart === 0);
+    return matchSourceMapAnnotation(code.slice(lineStart, end), lineStart === 0);
 }
 
 const INLINE_SOURCEMAP_TAIL_BYTES = 4096;
@@ -351,11 +352,14 @@ function embeddedSourceMapUrlFromTail(tail: string): string | undefined {
 }
 
 /** Full-line first; end-anchored only where the line start is provably present. */
+const SOURCEMAP_FULL_LINE = /^[\t ]*\/\/[#@][\t ]*sourceMappingURL=([^\s]+)[\t ]*$/;
+const SOURCEMAP_END_ANCHORED = /\/\/[#@][\t ]*sourceMappingURL=([^\s]+)[\t ]*$/;
+
 function matchSourceMapAnnotation(line: string, mayBeTruncatedHead: boolean): string | undefined {
-    const fullLine = /^[\t ]*\/\/[#@][\t ]*sourceMappingURL=([^\s]+)[\t ]*$/.exec(line);
+    const fullLine = SOURCEMAP_FULL_LINE.exec(line);
     if (fullLine) return fullLine[1];
     if (mayBeTruncatedHead) {
-        const endAnchored = /\/\/[#@][\t ]*sourceMappingURL=([^\s]+)[\t ]*$/.exec(line);
+        const endAnchored = SOURCEMAP_END_ANCHORED.exec(line);
         if (endAnchored) return endAnchored[1];
     }
     return undefined;

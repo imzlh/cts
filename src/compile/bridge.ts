@@ -2,6 +2,7 @@ import { type ModuleInfo, moduleEvaluationKey, moduleRef } from '../types';
 import type { CjsCacheStore, CjsDeps, CjsRequireFn } from './cjs';
 import type { EsmCompiler } from './esm';
 import type { ModuleResolver } from '../resolve/index';
+import type { LoadedCompiled, SourceFreshness } from '../source/cache';
 import { isResolutionMiss, requireCycleError, setErrorCode } from '../errors';
 import { builtinModuleNames } from '../resolve/builtins';
 import { BUN_MODULES, isBunSpecifier } from '../resolve/bun-specifier';
@@ -53,8 +54,6 @@ function buildCjsEsmWrapper(specPath: string, exports: Record<string, unknown>):
     return new engine.Module(code, specPath);
 }
 
-// ESM -> CJS bridge: wrap CJS exports as an ESM Module
-
 /** ESM Module from CJS exports; honors __esModule. */
 export function bridgeCjsToEsm(
     specPath: string,
@@ -96,13 +95,10 @@ export function bridgeCjsToEsm(
     return mod;
 }
 
-// CJS -> ESM bridge: synchronously load ESM via promiseResult
-
 /** Sync ESM for require(): throw → error; null → TLA (reject); else namespace. */
 export function loadEsmSync(
     info: ModuleInfo,
     esm: EsmCompiler,
-    resolveMtime?: (p: string) => number | undefined,
     from = '<unknown>',
 ): Record<string, unknown> {
     // Never expose or evaluate a partial in-flight ESM namespace to require().
@@ -111,7 +107,7 @@ export function loadEsmSync(
         throw requireCycleError(moduleRef(info), from, 'require-esm');
     }
 
-    const mod = esm.load(info, {}, resolveMtime);
+    const mod = esm.load(info, {});
     const result = engine.promiseResult(esm.trackEvaluation(evalScope, () => mod.eval()));
 
     // null = top-level await unresolved; do NOT weaken with namespace check (causes silent dead-lock)
@@ -127,14 +123,35 @@ export function loadEsmSync(
     return mod.namespace;
 }
 
-// CjsDeps factory: wire CjsLoader to resolver + ESM compiler
-
-/** Wire CjsLoader to resolver + ESM compiler. */
+/** Wire CjsLoader to resolver + ESM compiler. With `enableCache` false the CJS
+ *  bytecode deps stay unwired: loads skip the .jsc/.mt freshness work entirely
+ *  and nothing reads or writes the bytecode cache. */
 export function buildCjsDeps(
     resolver: ModuleResolver,
     esm: EsmCompiler,
     loadWasmSync?: (info: ModuleInfo) => Record<string, unknown>,
+    enableCache = true,
 ): CjsDeps {
+    const bytecodeDeps = enableCache
+        ? {
+            loadCjsCompiled(localPath: string): LoadedCompiled | null {
+                return esm.jsc.loadCompiled(localPath, false, undefined, localPath);
+            },
+
+            takeSourceSnapshot(localPath: string) {
+                return esm.jsc.takeSourceSnapshot(localPath, localPath);
+            },
+
+            persistCjsCompiled(localPath: string, bytes: ArrayBuffer, source: SourceFreshness | undefined, patchFunction: boolean): void {
+                esm.jsc.persistBytecode(localPath, bytes, false, localPath, source, patchFunction);
+            },
+
+            captureSourceFreshness(localPath: string) {
+                return esm.jsc.captureFreshness(localPath);
+            },
+        }
+        : {};
+
     return {
         resolveBuiltin(name: string, parent: string): ModuleInfo {
             if (isBunSpecifier(name)) return resolver.resolve(name, parent);
@@ -142,7 +159,7 @@ export function buildCjsDeps(
         },
 
         loadEsmSync(info: ModuleInfo, from?: string): Record<string, unknown> {
-            return loadEsmSync(info, esm, undefined, from);
+            return loadEsmSync(info, esm, from);
         },
 
         bunObject(info: ModuleInfo): unknown {
@@ -183,29 +200,13 @@ export function buildCjsDeps(
             return esm.transformer.tookInlineSourceMap(localPath);
         },
 
-        loadCjsCompiled(localPath: string): unknown | null {
-            return esm.jsc.loadCompiled(localPath, false, undefined, localPath);
-        },
-
-        takeSourceSnapshot(localPath: string) {
-            return esm.jsc.takeSourceSnapshot(localPath, localPath);
-        },
-
-        persistCjsCompiled(localPath: string, bytes: ArrayBuffer, source): void {
-            esm.jsc.persistBytecode(localPath, bytes, false, localPath, source);
-        },
-
-        captureSourceFreshness(localPath: string) {
-            return esm.jsc.captureFreshness(localPath);
-        },
+        ...bytecodeDeps,
 
         runtimeParent(localPath: string): string | null {
             return resolver.packParentRef(localPath);
         },
     };
 }
-
-// Global require + CTS_INTERNAL installation
 
 /** Normalize path traversal (../..) in npm subpaths (scoped names keep @scope/pkg). */
 function normalizeNpmSpec(spec: string): string {

@@ -391,6 +391,8 @@ export class ModuleResolver {
      * Resolve for inspection only, from project/lock/store data already on disk:
      * never fetch or install (`require.resolve()` must not do network I/O).
      * Toggles handler-level `cachedOnly` instead of threading another flag.
+     * DO NOT COLLAPSE IT BACK INTO resolve(): only this toggle keeps
+     * require.resolve() fetch-free, and the defect it prevents is silent.
      */
     resolveForInspection(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         const prevCachedOnly = this.cfg.cachedOnly;
@@ -716,6 +718,8 @@ export class ModuleResolver {
     private applyImportMap(spec: string, parent: string): string {
         const idx = this.importIndex;
         if (!idx) return spec;
+        // No scopes: skip the per-resolve parent normalization entirely.
+        if (idx.scopes.length === 0) return matchImportMap(spec, idx.imports) ?? spec;
         const scopeParent = normalizeImportMapScopeRef(parent);
         for (const [scope, mappings] of idx.scopes) {
             if (!scopeParent.startsWith(scope)) continue;
@@ -806,7 +810,11 @@ export class ModuleResolver {
             this.resolvedModules.set(canonical.specPath, canonical);
         }
         if (!transient) {
-            if (cacheLockEntry && opts?.persistModule) this.lock.setModule(canonical);
+            if (cacheLockEntry && opts?.persistModule) {
+                this.lock.setModule(canonical);
+                const npm = this.handlers.get('npm');
+                if (npm instanceof NpmHandler) npm.onLockModulePersisted(canonical.specPath);
+            }
             if (cacheLockEntry && opts?.persistSource) this.lock.setSourceByKey(sourceKey, canonical.specPath);
             // mainEntry is set only by loadEntry / loadSourceEntry(main), not first
             // resolve — so `cno test` modules keep import.meta.main === false.

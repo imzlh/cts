@@ -5,8 +5,6 @@ import { err, ErrorKind, setErrorCode } from '../errors';
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
-// pkg 512 / format 2048 / formatDir 512 / exports 1024
-
 const _NO_PKG = Symbol('no.pkg');
 
 /**

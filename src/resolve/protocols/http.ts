@@ -36,10 +36,10 @@ export class HttpHandler implements ProtocolHandler {
                     // Only 404/410 are a resolution miss (as in npm.ts); other
                     // statuses are transport failures and must not fall through.
                     if (result.status === 404 || result.status === 410) {
-                        // One message for every non-2xx, so the text a consumer logs
-                    // never changes when a status moves between the two kinds.
-                    throw err(ErrorKind.ModuleNotFound,
-                        `HTTP ${result.status} fetching ${url}`);
+                        // One message for every non-2xx, so the text a consumer
+                        // logs never changes when a status moves between the two kinds.
+                        throw err(ErrorKind.ModuleNotFound,
+                            `HTTP ${result.status} fetching ${url}`);
                     }
                     throw err(ErrorKind.NetworkError,
                         `HTTP ${result.status} fetching ${url}`);

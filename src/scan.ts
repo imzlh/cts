@@ -166,8 +166,6 @@ export function hasImportAttributes(source: string, _isTs = true): boolean {
         if ((c === 105 || c === 101) && isWordAt(source, i, c === 105 ? 'import' : 'export')) {
             const kwLen = 6;
             if (!isIdentBoundary(source, i + kwLen)) { i++; continue; }
-            // Long statements (minified bundles, huge named-import lists) used to
-            // truncate at 4000 chars and drop a trailing `with {…}`.
             const capped = i + STATEMENT_SCAN_CAP;
             const end = Math.min(n, capped);
             let j = i + kwLen;
