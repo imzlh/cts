@@ -259,8 +259,8 @@ export class DepScanner {
                     });
                 }
                 if (this.options.excludeSpecPath?.(info.specPath) === true) return;
-                // Bun payloads are installation files: keep the resolution edge for
-                // full-graph consumers, but never scan them or record their imports.
+                // Bun polyfills are runtime-provided like Node builtins: keep the
+                // canonical edge, but do not add their implementation to user graphs.
                 if (isBunSpecifier(info.specPath)) return;
                 const fileKind = this.options.fileKindOverrides?.get(info.specPath) ?? info.fileKind;
 

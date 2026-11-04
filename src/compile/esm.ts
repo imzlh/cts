@@ -289,7 +289,7 @@ export class EsmCompiler {
      * and a namespace whose keys are exactly Object.keys(Bun): there is no `default`
      * key. QuickJS cannot express that with a source module (a default export is
      * always a namespace key), but a C module's namespace is a plain object that
-     * is not consulted when linking `import D from`. So the payload is loaded as a
+     * is not consulted when linking `import D from`. So the implementation is loaded as a
      * hidden module, evaluated, and its default object is re-exported through a
      * C module whose `default` namespace property is deleted. The export entry
      * (what default imports bind to) is left in place.
@@ -299,23 +299,23 @@ export class EsmCompiler {
         const hit = this.esmCache.get(cacheKey);
         if (hit) return hit;
 
-        const payloadInfo: ModuleInfo = { ...info, moduleId: bunPayloadViewRef(canonicalBunSpecifier(info.specPath)!) };
-        const evalScope = moduleEvaluationKey(payloadInfo);
-        // The payload reaching `bun` again (e.g. through the Bun global getter) while
+        const implementationInfo: ModuleInfo = { ...info, moduleId: bunPayloadViewRef(canonicalBunSpecifier(info.specPath)!) };
+        const evalScope = moduleEvaluationKey(implementationInfo);
+        // The implementation reaching `bun` again (e.g. through the Bun global getter) while
         // it evaluates would re-enter an EVALUATING QuickJS module, which aborts.
         if (this.isInFlight(evalScope)) {
             throw requireCycleError(cacheKey, info.localPath, 'require-esm');
         }
-        const payload = this.loadEsm(payloadInfo, {});
-        const result = engine.promiseResult(this.trackEvaluation(evalScope, () => payload.eval()));
+        const implementation = this.loadEsm(implementationInfo, {});
+        const result = engine.promiseResult(this.trackEvaluation(evalScope, () => implementation.eval()));
         if (result === null) {
             throw err(ErrorKind.Generic,
-                `Bun payload "${info.localPath}" must not use top-level await`,
+                `Bun implementation "${info.localPath}" must not use top-level await`,
                 undefined, 'ERR_REQUIRE_ASYNC_MODULE');
         }
-        const bun: unknown = payload.namespace.default;
+        const bun: unknown = implementation.namespace.default;
         if (bun === null || (typeof bun !== 'object' && typeof bun !== 'function')) {
-            throw err(ErrorKind.Generic, `Bun payload "${info.localPath}" has no default export object`);
+            throw err(ErrorKind.Generic, `Bun implementation "${info.localPath}" has no default export object`);
         }
 
         const mod = engine.Module.create(cacheKey);

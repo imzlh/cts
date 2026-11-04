@@ -210,7 +210,7 @@ function esmRequireView(ns: Record<string, unknown>): Record<string, unknown> {
 }
 
 /** Unknown or malformed `bun:*` fails closed, before any resolver lookup. */
-function requireBunName(id: string): 'bun' | 'bun:sqlite' {
+function requireBunName(id: string): import('../resolve/bun-specifier').BunModule {
     const name = canonicalBunSpecifier(id);
     if (!name) {
         throw err(ErrorKind.ModuleNotFound, `Unknown Bun builtin "${id}"`,
@@ -944,8 +944,8 @@ export class CjsLoader {
         // require.resolve inspects cached resolution without fetching.
         const resolve = ((id: string, opts?: { paths?: string[] }): string => {
             if (isBunSpecifier(id)) {
-                // Reject a missing payload, but report the canonical builtin
-                // name rather than the payload path.
+                // Reject a missing implementation, but report the canonical
+                // builtin name rather than its setup source path.
                 const name = requireBunName(id);
                 self.deps.resolveBuiltin(name, parentPath);
                 return name;
@@ -1056,7 +1056,7 @@ export class CjsLoader {
     }
 
     /**
-     * `bun` / `bun:sqlite` from the file-backed payload. Native Bun hands
+     * `bun` / `bun:sqlite` from setup-managed TypeScript sources. Native Bun hands
      * `require('bun')` the ESM default (same object, no `default` key), while
      * `bun:sqlite` gets a namespace-like view with `__esModule` and `default`.
      */

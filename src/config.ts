@@ -367,7 +367,9 @@ export function createConfig(userConfig: Partial<ConfigOptions> = {}, argv: stri
     cfg._ = cli._; cfg._args = cli._args; cfg._offset = cli._offset;
 
     if (!cfg.cacheDir) cfg.cacheDir = defaultCacheDir();
-    cfg.cacheDir = normalizePath(toPosixPath(cfg.cacheDir));
+    // Freeze cache ownership at runtime construction. Relative cache paths must
+    // not drift if a worker or embedder changes cwd after setup/resolution.
+    cfg.cacheDir = resolvePath(toPosixPath(cfg.cacheDir));
     verifyCacheDir(cfg.cacheDir);
 
     // Apply tier defaults unless explicitly overridden by CLI or env.

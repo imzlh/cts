@@ -27,6 +27,10 @@ function protoOf(s: string): string {
     return schemeId(s) ?? '';
 }
 
+function isBunInternalSpecifier(spec: string): boolean {
+    return spec.startsWith('bun-internal:');
+}
+
 /**
  * Node resolves ESM specifiers as URLs, so `./with%20space.mjs` refers to
  * `with space.mjs`. Try the literal path first (a file may contain '%'), then
@@ -259,6 +263,46 @@ export class ModuleResolver {
         }
     }
 
+    private internalNode(spec: string, parent: string): ModuleInfo | null {
+        if (!this.bunInternalParent(parent) || !isBuiltinSpecifier(spec)) return null;
+        const node = this.handlers.get('node');
+        if (!(node instanceof NodeHandler)) return null;
+        const info = runSync(node.resolve(spec.startsWith('node:') ? spec : `node:${spec}`, parent));
+        this.bun.issueNodeSource(info, spec, parent);
+        return info;
+    }
+
+    private async internalNodeAsync(spec: string, parent: string): Promise<ModuleInfo | null> {
+        if (!this.bunInternalParent(parent) || !isBuiltinSpecifier(spec)) return null;
+        const node = this.handlers.get('node');
+        if (!(node instanceof NodeHandler)) return null;
+        const info = await runAsync(node.resolve(spec.startsWith('node:') ? spec : `node:${spec}`, parent));
+        this.bun.issueNodeSource(info, spec, parent);
+        return info;
+    }
+
+    private nodeRelative(spec: string, parent: string): ModuleInfo | null {
+        if (!parent.startsWith('node:') || !isRelative(spec)) return null;
+        const node = this.handlers.get('node');
+        if (!(node instanceof NodeHandler)) return null;
+        const info = runSync(node.resolve(spec, parent));
+        if (this.bun.isTrustedNodeParent(parent)) {
+            this.bun.issueNodeSource(info, spec, parent);
+        }
+        return info;
+    }
+
+    private async nodeRelativeAsync(spec: string, parent: string): Promise<ModuleInfo | null> {
+        if (!parent.startsWith('node:') || !isRelative(spec)) return null;
+        const node = this.handlers.get('node');
+        if (!(node instanceof NodeHandler)) return null;
+        const info = await runAsync(node.resolve(spec, parent));
+        if (this.bun.isTrustedNodeParent(parent)) {
+            this.bun.issueNodeSource(info, spec, parent);
+        }
+        return info;
+    }
+
     private reg(h: ProtocolHandler): void {
         for (const p of h.protocols) this.handlers.set(p, h);
     }
@@ -293,6 +337,9 @@ export class ModuleResolver {
     async resolveAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
 
+        const bunInternalParent = this.bunInternalParent(parent);
+        const internalNode = await this.internalNodeAsync(spec, parent);
+        const nodeRelative = await this.nodeRelativeAsync(spec, parent);
         parent = this.normalizeParentRef(parent);
         const requestSpec = spec;
         // Exact cache is keyed by the caller's specifier (see exactResolveKey).
@@ -301,6 +348,22 @@ export class ModuleResolver {
             if (hit) return hit;
         }
         if (spec.includes('\\') || spec[1] === ':') spec = canonicalizePath(spec);
+
+        if (isBunInternalSpecifier(spec) && !this.bun.isIssuedInternal(spec)) {
+            throw err(ErrorKind.ModuleNotFound, `Untrusted Bun internal module "${spec}"`);
+        }
+
+        if (internalNode) {
+            return this.publishResolved(requestSpec, spec, parent, internalNode, attr, { rememberExact: true });
+        }
+        if (nodeRelative) {
+            return this.publishResolved(requestSpec, spec, parent, nodeRelative, attr, { rememberExact: true });
+        }
+
+        if (bunInternalParent && isRelative(spec)) {
+            const info = await runAsync(this.bun.resolve(spec, parent));
+            return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
+        }
 
         // `bun` and `bun:*` are reserved builtin names. Resolve (or reject) them
         // before pack edges, import maps, lock/frozen checks, or any npm fallback.
@@ -409,6 +472,9 @@ export class ModuleResolver {
     resolve(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
+        const bunInternalParent = this.bunInternalParent(parent);
+        const internalNode = this.internalNode(spec, parent);
+        const nodeRelative = this.nodeRelative(spec, parent);
         parent = this.normalizeParentRef(parent);
         const requestSpec = spec;
         // Exact cache is keyed by the caller's specifier (see exactResolveKey).
@@ -418,6 +484,22 @@ export class ModuleResolver {
         }
         // Canonical path before maps/dispatch (drive case + backslashes).
         spec = canonicalizePath(spec);
+
+        if (isBunInternalSpecifier(spec) && !this.bun.isIssuedInternal(spec)) {
+            throw err(ErrorKind.ModuleNotFound, `Untrusted Bun internal module "${spec}"`);
+        }
+
+        if (internalNode) {
+            return this.publishResolved(requestSpec, spec, parent, internalNode, attr, { rememberExact: true });
+        }
+        if (nodeRelative) {
+            return this.publishResolved(requestSpec, spec, parent, nodeRelative, attr, { rememberExact: true });
+        }
+
+        if (bunInternalParent && isRelative(spec)) {
+            const info = runSync(this.bun.resolve(spec, parent));
+            return this.publishResolved(requestSpec, spec, parent, info, attr, { rememberExact: true });
+        }
 
         // Do not let a project import map or --frozen turn a Bun builtin into a
         // package/cache lookup. Unknown bun:* names fail here with
@@ -513,13 +595,16 @@ export class ModuleResolver {
         if (isBunSpecifier(specPath)) {
             return this.resolvedModules.get(specPath) ?? runSync(this.bun.resolve(specPath, ''));
         }
-        // Hidden Bun payload module: same file as the canonical module, own identity.
+        // Hidden Bun implementation module: same source as the canonical module, own identity.
         const payloadOf = bunPayloadViewName(specPath);
         if (payloadOf) {
             const base = this.getInfo(payloadOf);
             const view: ModuleInfo = { ...base, moduleId: specPath };
             this.rememberRuntimeInfo(view);
             return view;
+        }
+        if (isBunInternalSpecifier(specPath) && !this.bun.isIssuedInternal(specPath)) {
+            throw err(ErrorKind.ModuleNotFound, `Untrusted Bun internal module "${specPath}"`);
         }
         const runtime = this.runtimeModules.get(specPath);
         if (runtime) return runtime;
@@ -801,8 +886,9 @@ export class ModuleResolver {
         this.sourceInfoCache.set(sourceKey, resolved);
         this.rememberRuntimeInfo(resolved);
 
-        // Node and Bun builtins are supplied by the installation, not the lock.
+        // Node and Bun builtins are setup-managed sources, not lock entries.
         const cacheLockEntry = !isBunSpecifier(canonical.specPath)
+            && !isBunInternalSpecifier(canonical.specPath)
             && protoOf(canonical.specPath) !== 'node';
         // Recoverable by getInfo() even for transient resolves. Transient fills only
         // when absent — a real ESM resolve wins (conditions and format may differ).
@@ -862,8 +948,16 @@ export class ModuleResolver {
 
     private normalizeParentRef(parent: string): string {
         const runtime = this.runtimeModules.get(parent);
-        if (runtime) return runtime.specPath;
+        // Hidden Bun implementation refs must reach BunHandler intact so its
+        // relative imports use the setup source path, not the public `bun` id.
+        if (runtime) return isBunSpecifier(runtime.specPath) ? parent : runtime.specPath;
         return canonicalizePath(parent);
+    }
+
+    private bunInternalParent(parent: string): boolean {
+        if (this.bun.isTrustedParent(parent)) return true;
+        const runtime = this.runtimeModules.get(parent);
+        return runtime !== undefined && isBunSpecifier(runtime.specPath) && this.bun.isTrustedParent(runtime.specPath);
     }
 
     private rememberRuntimeInfo(info: ModuleInfo): void {

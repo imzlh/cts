@@ -199,7 +199,7 @@ export async function writePack(
         const entryDir = dirname(entryInfo.localPath);
         const workspaceRoots = entryDir === projectDir ? [projectDir] : [projectDir, entryDir];
         // Drop node builtins (runtime-provided; packing polyfills is dead weight).
-        // Bun builtins are installed payloads, resolved at run time like node:.
+        // Bun builtins are setup-managed sources, resolved at run time like node:.
         const packableModules = scanResult.modules.filter(m =>
             specScheme(m.specPath) !== 'node' && !isBunSpecifier(m.specPath));
         const classified = classifyModules(packableModules, workspaceRoots);
