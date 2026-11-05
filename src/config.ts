@@ -6,7 +6,6 @@ import { readEnv } from './utils/env';
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
-const timers = import.meta.use('timers');
 
 const DEFAULTS = {
     enableHttp:  true,
@@ -242,14 +241,6 @@ function readTextOrEmpty(path: string): string {
 
 function isJscArtifact(path: string): boolean {
     return path.endsWith('.jsc') || path.endsWith('.jsc.mt');
-}
-
-function clearJsc(dir: string): void {
-    timers.setTimeout(() => {
-        try {
-            clearJscSync(dir);
-        } catch {}
-    }, 0);
 }
 
 function clearJscSync(dir: string): void {

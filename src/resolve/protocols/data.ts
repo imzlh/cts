@@ -7,6 +7,7 @@ import { materializePayload, mimeToExt, mimeToKind, payloadCachePath } from './p
 
 const engine = import.meta.use('engine');
 const algorithm = import.meta.use('algorithm');
+const crypto = import.meta.use('crypto');
 
 interface DataParsed { mime: string; isBase64: boolean; data: string }
 
@@ -42,6 +43,13 @@ function decodeDataPayload(parsed: DataParsed): Uint8Array | ArrayBuffer {
     }
 }
 
+/** Digest of the full data: URL. Keying by digest instead of the raw URL
+ *  keeps a megabyte payload string from living in the cache key as well as
+ *  the stored ModuleInfo; the digest is verified against the spec on hit. */
+function dataCacheKey(spec: string): string {
+    return crypto.hexEncode(crypto.md5(engine.encodeString(spec)));
+}
+
 export class DataHandler implements ProtocolHandler {
     readonly protocols = ['data'];
     private readonly resolved = new Map<string, ModuleInfo>();
@@ -53,21 +61,22 @@ export class DataHandler implements ProtocolHandler {
     }
 
     *resolve(spec: string, _parent: string): Flow<ModuleInfo> {
-        const cached = this.resolved.get(spec);
-        if (cached !== undefined) return cached;
+        const key = dataCacheKey(spec);
+        const cached = this.resolved.get(key);
+        if (cached !== undefined && cached.specPath === spec) return cached;
 
         const parsed = parseDataUrl(spec);
         const bytes = decodeDataPayload(parsed);
         const localPath = yield* materializePayload(this.cfg.cacheDir, 'data', spec, mimeToExt(parsed.mime, IMAGE_EXT), bytes);
 
         const info: ModuleInfo = { specPath: spec, localPath, format: 'esm', fileKind: mimeToKind(parsed.mime) };
-        this.resolved.set(spec, info);
+        this.resolved.set(key, info);
         return info;
     }
 
     localPath(specPath: string): string {
-        const cached = this.resolved.get(specPath);
-        if (cached !== undefined) return cached.localPath;
+        const cached = this.resolved.get(dataCacheKey(specPath));
+        if (cached !== undefined && cached.specPath === specPath) return cached.localPath;
         const { mime } = parseDataUrl(specPath);
         return payloadCachePath(this.cfg.cacheDir, 'data', specPath, mimeToExt(mime, IMAGE_EXT));
     }

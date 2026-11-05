@@ -3,9 +3,6 @@ import { nodeCommandArgv, parseShellCommand, requiresShellEvaluation, resolveWin
 import { expandArgv, expandRedirectTarget, parseTaskScript, type TaskCommand, type TaskPipeline } from './task-shell';
 import { LockStore } from './lock';
 import { getBinMap, getLookupBinMap, readPkgFresh, resolvePackageBinPath } from './resolve/pkg';
-import { createConfig } from './config';
-import { NpmHandler } from './resolve/protocols/npm';
-import { runAsync } from './flow';
 import { readEnv } from './utils/env';
 
 const os = import.meta.use('os');

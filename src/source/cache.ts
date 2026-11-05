@@ -1,4 +1,4 @@
-import { dirname, joinPaths, ensureDir, log, canonicalizePath, normalizePath, isPathWithin } from '../utils';
+import { dirname, joinPaths, ensureDir, log, canonicalizePath, normalizePath, isPathWithin, LRU } from '../utils';
 import { getMemoryBytecode, hasActiveFileStore, hasMemoryFile } from '../utils/memfs';
 import { writeAtomically } from '../pack/integrity';
 
@@ -146,8 +146,10 @@ export function isFileBackedPath(localPath: string): boolean {
 export class JscCache {
     /** Optional owned L1 buffers (precompile); pack uses VFS bytecode() instead. */
     private readonly memory = new Map<string, ArrayBuffer>();
-    /** Source bytes observed by a disk-cache miss; consumed by the compiler. */
-    private readonly sourceSnapshots = new Map<string, SourceSnapshot>();
+    /** Source bytes observed by a disk-cache miss; consumed by the compiler.
+     *  Bounded: snapshots left unconsumed by abandoned compiles would
+     *  otherwise pin every missed file's bytes until teardown. */
+    private readonly sourceSnapshots = new LRU<string, SourceSnapshot>(64);
     private readonly localDir: string | null;
     private readonly cacheRoot: string | null;
     /** realpath(cacheRoot), resolved once; undefined until first needed. */

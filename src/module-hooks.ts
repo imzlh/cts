@@ -69,6 +69,9 @@ function runModuleHooks<Context, Result>(
     context: Context,
     terminal: (specifier: string, context: Context) => Result,
 ): Result {
+    // No hooks installed (the common CLI run) — skip building the chain.
+    if (registrations.length === 0) return terminal(specifier, context);
+
     let next: (specifier: string, context?: Context) => Result =
         (nextSpecifier, nextContext) => terminal(nextSpecifier, nextContext ?? context);
 

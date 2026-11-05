@@ -219,13 +219,9 @@ function isIdentBoundary(source: string, idx: number): boolean {
 
 function isWordAt(source: string, idx: number, word: string): boolean {
     if (idx + word.length > source.length) return false;
-    if (idx > 0 && !isIdentBoundary(source, idx - 1) && !isWs(source.charCodeAt(idx - 1))) {
-        // previous char must not be identifier-continue (start of keyword)
-        const p = source.charCodeAt(idx - 1);
-        if ((p >= 65 && p <= 90) || (p >= 97 && p <= 122) || (p >= 48 && p <= 57) || p === 36 || p === 95) {
-            return false;
-        }
-    }
+    // The word must not start mid-identifier: an identifier-continue char
+    // immediately before disqualifies it (boundary = not identifier-continue).
+    if (idx > 0 && !isIdentBoundary(source, idx - 1) && !isWs(source.charCodeAt(idx - 1))) return false;
     for (let k = 0; k < word.length; k++) {
         if (source.charCodeAt(idx + k) !== word.charCodeAt(k)) return false;
     }

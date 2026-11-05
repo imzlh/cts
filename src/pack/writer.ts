@@ -27,9 +27,6 @@ interface SourceSnapshot extends BlobRange {
     sourceOnly: boolean;
     /** Digest of the ON-DISK bytes, for the pack-time change check. */
     digest: string;
-    /** Embedded text after sourceMappingURL stripping. UNUSED at the compile
-     *  step today; needed to close the bytecode-sourcemap gap (see sourceModules.push). */
-    code: string;
 }
 
 class BlobBuilder implements PackBlobSource {
@@ -301,9 +298,13 @@ export async function writePack(
                     // Hash what is ON DISK (the re-read below compares against the
                     // file), not the stripped bytes.
                     digest: contentDigest(onDisk),
-                    code: stripped.text,
                 };
                 sourceSnapshots.set(m.localPath, snapshot);
+                // Stripped text is deliberately NOT retained here: nothing reads
+                // it today, and keeping every module's source alive through the
+                // whole pack write would pin tens of MB on large packs. When the
+                // bytecode-sourcemap gap needs the text, re-fetch it from the
+                // blob range instead.
                 // NOT in rawRanges: that map backs verbatim asset views, which must
                 // not alias the stripped text (dedup allows the duplicate range).
             }

@@ -176,7 +176,7 @@ export function decodePack(bytes: Uint8Array): PackContainer {
     // Digest the raw bytes BEFORE parsing; hashing a re-serialization would
     // hide things JSON.parse normalizes away.
     const manifestBytes = bytes.subarray(manifestStart, manifestEnd);
-    const declaredDigest = bytesToHex(bytes.subarray(10, 10 + MANIFEST_DIGEST_LEN));
+    const declaredDigest = crypto.hexEncode(bytes.subarray(10, 10 + MANIFEST_DIGEST_LEN));
     const actualDigest = contentDigest(manifestBytes);
     if (!digestEqual(declaredDigest, actualDigest)) {
         throw new Error(
@@ -198,17 +198,6 @@ export function decodePack(bytes: Uint8Array): PackContainer {
     const parsedIds = manifestText.includes('\\') ? canonicalizeIds(parsed) : parsed;
     const manifest = validateManifest(parsedIds, blob.byteLength, true);
     return { manifest, blob };
-}
-
-const HEX = '0123456789abcdef';
-
-function bytesToHex(bytes: Uint8Array): string {
-    let out = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-        const b = bytes[i]!;
-        out += HEX[(b >> 4) & 0xf]! + HEX[b & 0xf]!;
-    }
-    return out;
 }
 
 /** Scan the JSON string at `start`; null if malformed. Escapes are decoded. */

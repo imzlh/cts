@@ -4,6 +4,7 @@ import { guessFileKind } from './base';
 import { expectFetch, expectText, StepType, type Flow, type ProgressCallback } from '../../flow';
 import { joinPaths, dirname, normalizePath } from '../../utils/path';
 import { safeParse, isCacheExpired, matchLatestRecordVersion } from '../../utils/misc';
+import { LRU } from '../../utils/lru';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
 import { err, ErrorKind } from '../../errors';
@@ -68,8 +69,10 @@ export class JsrHandler implements ProtocolHandler {
     readonly protocols = ['jsr'];
     private readonly resolved = new Map<string, string>();
     /** Parsed registry metadata per `@scope/name[@ver]`. `_at` travels with the
-     *  object so the per-call TTL check still drives the refresh path. */
-    private readonly metaMem = new Map<string, CachedJsrMetadata>();
+     *  object so the per-call TTL check still drives the refresh path. Bounded
+     *  LRU (npm.ts precedent): each entry carries a whole manifest, and eviction
+     *  only costs a re-read of the on-disk meta copy. */
+    private readonly metaMem = new LRU<string, CachedJsrMetadata>(64);
 
     constructor(private readonly cfg: RuntimeConfig) {}
 

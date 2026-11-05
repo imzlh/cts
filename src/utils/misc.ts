@@ -4,20 +4,22 @@ import { URL } from './url';
 
 const crypto = import.meta.use('crypto');
 const zlib = import.meta.use('zlib');
+const engine = import.meta.use('engine');
+const algorithm = import.meta.use('algorithm');
 
 export const errMsg = (e: unknown) => e instanceof Error ? e.message : String(e);
 export function assert(c: unknown, msg?: string): asserts c {
     if (!c) throw err(ErrorKind.Generic, msg ?? 'Assertion failed');
 }
 
-/** FNV-1a 32-bit (plain JS numbers, faster than BigInt), as 8 hex chars. */
+/** A plain (non-null, non-array) object — the single type-guard the repo shares. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** FNV-1a 32-bit (native hash) as 8 hex chars. */
 export function hashString(s: string): string {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i);
-        h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h.toString(16).padStart(8, '0');
+    return algorithm.fnv1a32(engine.encodeString(s)).toString(16).padStart(8, '0');
 }
 
 export function isValidNpmPackageName(name: string): boolean {
@@ -390,14 +392,6 @@ function wildcardVersionSatisfies(v: string, range: string): boolean {
     return true;
 }
 
-export function matchVersion(vs: string[], r: string): string[] {
-    const out: string[] = [];
-    for (let i = 0; i < vs.length; i++) {
-        const version = vs[i];
-        if (version !== undefined && satisfies(version, r)) out.push(version);
-    }
-    return out;
-}
 export function latestVersion(vs: string[]): string | null {
     let latestStable: string | null = null;
     let latestPrerelease: string | null = null;

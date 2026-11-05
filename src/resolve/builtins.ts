@@ -23,14 +23,11 @@ const BUILTIN_SUBPATHS = new Set([
     'assert/strict', 'path/posix', 'path/win32', 'inspector/promises',
 ]);
 
-/** Subpaths of `node:`-only builtins. */
-const PREFIXED_BUILTIN_SUBPATHS = new Set<string>();
-
 export function isBuiltinSpecifier(id: string): boolean {
     const prefixed = id.startsWith('node:');
     const bare = prefixed ? id.slice(5) : id;
     if (BUILTINS.has(bare)) return true;
-    if (prefixed && (PREFIXED_BUILTINS.has(bare) || PREFIXED_BUILTIN_SUBPATHS.has(bare))) return true;
+    if (prefixed && PREFIXED_BUILTINS.has(bare)) return true;
     return bare.includes('/') && BUILTIN_SUBPATHS.has(bare);
 }
 
@@ -40,6 +37,5 @@ export function builtinModuleNames(): string[] {
         ...BUILTINS,
         ...BUILTIN_SUBPATHS,
         ...[...PREFIXED_BUILTINS].map(n => `node:${n}`),
-        ...[...PREFIXED_BUILTIN_SUBPATHS].map(n => `node:${n}`),
     ];
 }

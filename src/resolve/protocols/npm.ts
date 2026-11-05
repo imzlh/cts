@@ -9,7 +9,7 @@ import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpa
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
-import { uname, isWindows, getMemoryTier } from '../../utils/index';
+import { LRU, uname, isWindows, getMemoryTier } from '../../utils/index';
 import { findLocalBin } from '../../utils/bin';
 import pkg from '../../../package.json' with { type: 'json' };
 import { readEnv } from '../../utils/env';
@@ -654,8 +654,10 @@ export class NpmHandler implements ProtocolHandler {
     private readonly dependenciesChecked = new Set<string>();
     /** name@version already had bins/optional/lifecycle prepared this process. */
     private readonly packagesPrepared = new Set<string>();
-    /** Process-local registry meta (avoids re-parse + coalesces concurrent fetches). */
-    private readonly metaMem = new Map<string, NpmMeta>();
+    /** Process-local registry meta (avoids re-parse + coalesces concurrent fetches).
+     *  Bounded LRU: each entry is a full versions table, and eviction only costs
+     *  a re-read of the on-disk meta copy. */
+    private readonly metaMem = new LRU<string, NpmMeta>(64);
     /** lockedVersionForRange results per `name\0range` — the lock LIKE-scan is
      *  O(all cached modules); entries are dropped when a module is persisted
      *  into the lock (onLockModulePersisted), so mid-run installs stay fresh. */
