@@ -22,14 +22,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: imzlh/circu.js
-          ref: 8df0b515762350a1cb29731655c9ecca39edc098
+          ref: d4ad1b5ae718262659cf85053d54aee8f49af979
           path: circu.js
           sparse-checkout: types
       - uses: actions/checkout@v4
         with:
           repository: imzlh/cno-stdhttp
-          # Publish this HTTP commit before updating the dependent workflow.
-          ref: 958bc1954096dac5851d9a7951ec1dcc36d2bea4
+          ref: 94114402c7c1d68f3a48ece6b4e84280ac924bbb
           path: http
       - uses: pnpm/action-setup@v4
         with:
