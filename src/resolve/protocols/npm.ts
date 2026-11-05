@@ -658,11 +658,21 @@ export class NpmHandler implements ProtocolHandler {
      *  Bounded LRU: each entry is a full versions table, and eviction only costs
      *  a re-read of the on-disk meta copy. */
     private readonly metaMem = new LRU<string, NpmMeta>(64);
-    /** Results of in-flight fetches, held outside the evicting cache until the
-     *  coalescing parent reads them: with the cache full, a 64-way concurrent
-     *  meta storm could evict an entry between fetchMetaBody's set and
-     *  fetchMeta's re-get and turn a successful fetch into a loud failure. */
+    /** Results of the most recent successful meta loads, held outside the
+     *  evicting cache until every coalesced waiter has read them: with the
+     *  cache full, concurrent fetches can evict an entry between
+     *  fetchMetaBody's set and fetchMeta's re-get and turn a successful fetch
+     *  into a loud failure. FIFO-bounded and overwritten on the next load of
+     *  the same name, so entries never outlive their usefulness. */
     private readonly pendingMeta = new Map<string, NpmMeta>();
+
+    private notePendingMeta(name: string, meta: NpmMeta): void {
+        this.pendingMeta.set(name, meta);
+        if (this.pendingMeta.size > 64) {
+            const oldest = this.pendingMeta.keys().next();
+            if (!oldest.done) this.pendingMeta.delete(oldest.value);
+        }
+    }
     /** lockedVersionForRange results per `name\0range` — the lock LIKE-scan is
      *  O(all cached modules); entries are dropped when a module is persisted
      *  into the lock (onLockModulePersisted), so mid-run installs stay fresh. */
@@ -1927,7 +1937,6 @@ export class NpmHandler implements ProtocolHandler {
             flow: this.fetchMetaBody(name, onProgress),
         };
         const after = this.metaMem.get(name) ?? this.pendingMeta.get(name);
-        this.pendingMeta.delete(name);
         if (!after) throw err(ErrorKind.Generic, `Failed to fetch npm metadata for ${name}`);
         return after;
     }
@@ -1957,6 +1966,7 @@ export class NpmHandler implements ProtocolHandler {
                 if (age < 24 * 60 * 60 * 1000) {
                     const meta = safeParse<NpmMeta>(expectText(yield { type: StepType.FS_READ_TEXT, path: cacheFile }));
                     this.metaMem.set(name, meta);
+                    this.notePendingMeta(name, meta);
                     return;
                 }
             } catch {}
@@ -1985,7 +1995,7 @@ export class NpmHandler implements ProtocolHandler {
         log.debug('npm', () => `fetched meta ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - started}ms`);
         const meta = safeParse<NpmMeta>(engine.decodeString(body));
         this.metaMem.set(name, meta);
-        this.pendingMeta.set(name, meta);
+        this.notePendingMeta(name, meta);
         yield { type: StepType.FS_ENSURE_DIR, path: dirname(cacheFile) };
         // Cache the raw response bytes verbatim — avoids re-serializing the
         // whole (often multi-MB) metadata object just to persist it.
