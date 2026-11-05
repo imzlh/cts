@@ -1,4 +1,4 @@
-import { transformCnoCode } from '../../deps/sucrase/src/index';
+import { transformCnoCode } from '../../deps/sucrase/src/cno';
 import { dirname, joinPaths, hasSchemeId, isAbsolute, normalizePath, toPosixPath, readText, errMsg, log } from '../utils';
 import { err, ErrorKind, TransformError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
