@@ -1,5 +1,5 @@
 import type { RuntimeConfig, ConfigOptions } from './types';
-import { dirname, joinPaths, normalizePath, resolvePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, uname, isWindows, getMemoryTier, isRelative, isAbsolute } from './utils';
+import { dirname, joinPaths, normalizePath, resolvePath, toPosixPath, readText, writeText, ensureDir, stripJsonc, safeParse, parseArgs, log, isWindows, getMemoryTier, isRelative, isAbsolute } from './utils';
 import { err, ErrorKind } from './errors';
 import { readEnv } from './utils/env';
 

@@ -5,7 +5,7 @@ import { expectFetch, expectTarFiles, expectText, StepType, type Flow, type TarF
 import { fileUrlToPath, hasLeadingSlashDrive, joinPaths, dirname, basename, extname, normalizePath, toPosixPath, pathRoot, cwd, schemeId, isPathWithin, relativePath } from '../../utils/path';
 import { readText, resolveFile, clearNegativeCache, ensureDir } from '../../utils/io';
 import { matchLatestVersion, latestVersion, latestRecordVersion, matchLatestRecordVersion, safeParse, fmtBytes, hashString, matchesIntegrity, hasSupportedIntegrity, isValidNpmPackageName, npmDepTarget, parseNpmAliasDep, errMsg } from '../../utils/misc';
-import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, resolvePackageBinPath, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolveCtx, type ResolvedPath } from '../pkg';
+import { detectFormat, detectPackageJsonFormat, readPkg, createCtx, resolveSubpath, resolveImports, getBinMap, resolvePackageBinPath, isPackageSubpathBlockedByExports, isRootExportRuntimeless, packagePathNotExportedError, packageImportNotDefinedError, type ResolvedPath } from '../pkg';
 import { err, ErrorKind } from '../../errors';
 import { log } from '../../utils/log';
 import { isatty } from '../../utils/progress';
@@ -658,6 +658,11 @@ export class NpmHandler implements ProtocolHandler {
      *  Bounded LRU: each entry is a full versions table, and eviction only costs
      *  a re-read of the on-disk meta copy. */
     private readonly metaMem = new LRU<string, NpmMeta>(64);
+    /** Results of in-flight fetches, held outside the evicting cache until the
+     *  coalescing parent reads them: with the cache full, a 64-way concurrent
+     *  meta storm could evict an entry between fetchMetaBody's set and
+     *  fetchMeta's re-get and turn a successful fetch into a loud failure. */
+    private readonly pendingMeta = new Map<string, NpmMeta>();
     /** lockedVersionForRange results per `name\0range` — the lock LIKE-scan is
      *  O(all cached modules); entries are dropped when a module is persisted
      *  into the lock (onLockModulePersisted), so mid-run installs stay fresh. */
@@ -693,6 +698,7 @@ export class NpmHandler implements ProtocolHandler {
         this.dependenciesChecked.clear();
         this.packagesPrepared.clear();
         this.metaMem.clear();
+        this.pendingMeta.clear();
         this.lockedRangeCache.clear();
         this.parentOriginCache.clear();
         this.realPathCache.clear();
@@ -1920,7 +1926,8 @@ export class NpmHandler implements ProtocolHandler {
             key: `npm-meta:${name}`,
             flow: this.fetchMetaBody(name, onProgress),
         };
-        const after = this.metaMem.get(name);
+        const after = this.metaMem.get(name) ?? this.pendingMeta.get(name);
+        this.pendingMeta.delete(name);
         if (!after) throw err(ErrorKind.Generic, `Failed to fetch npm metadata for ${name}`);
         return after;
     }
@@ -1978,6 +1985,7 @@ export class NpmHandler implements ProtocolHandler {
         log.debug('npm', () => `fetched meta ${name} ${fmtBytes(body.byteLength)} in ${Date.now() - started}ms`);
         const meta = safeParse<NpmMeta>(engine.decodeString(body));
         this.metaMem.set(name, meta);
+        this.pendingMeta.set(name, meta);
         yield { type: StepType.FS_ENSURE_DIR, path: dirname(cacheFile) };
         // Cache the raw response bytes verbatim — avoids re-serializing the
         // whole (often multi-MB) metadata object just to persist it.

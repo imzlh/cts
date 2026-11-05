@@ -4,8 +4,6 @@ import { URL } from './url';
 
 const crypto = import.meta.use('crypto');
 const zlib = import.meta.use('zlib');
-const engine = import.meta.use('engine');
-const algorithm = import.meta.use('algorithm');
 
 export const errMsg = (e: unknown) => e instanceof Error ? e.message : String(e);
 export function assert(c: unknown, msg?: string): asserts c {
@@ -17,9 +15,17 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** FNV-1a 32-bit (native hash) as 8 hex chars. */
+/** FNV-1a 32-bit over UTF-16 code units, as 8 hex chars. Deliberately NOT the
+ *  native algorithm.fnv1a32 (UTF-8 bytes): the value names on-disk cache
+ *  entries, and switching the unit would orphan every non-ASCII keyed file
+ *  (--cached-only would miss warm caches). */
 export function hashString(s: string): string {
-    return algorithm.fnv1a32(engine.encodeString(s)).toString(16).padStart(8, '0');
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, '0');
 }
 
 export function isValidNpmPackageName(name: string): boolean {
