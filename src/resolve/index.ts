@@ -890,9 +890,9 @@ export class ModuleResolver {
         const cacheLockEntry = !isBunSpecifier(canonical.specPath)
             && !isBunInternalSpecifier(canonical.specPath)
             && protoOf(canonical.specPath) !== 'node';
-        // Recoverable by getInfo() even for transient resolves. Transient fills only
-        // when absent — a real ESM resolve wins (conditions and format may differ).
-        if (!transient || !this.resolvedModules.has(canonical.specPath)) {
+        // CJS loads need getInfo() recovery, but inspection-only conditions must
+        // never become the canonical answer for a later runtime import.
+        if (attr?.inspect !== true && (!transient || !this.resolvedModules.has(canonical.specPath))) {
             this.resolvedModules.set(canonical.specPath, canonical);
         }
         if (!transient) {

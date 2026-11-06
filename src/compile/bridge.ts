@@ -327,8 +327,8 @@ export function installInternalBridge(
         runModuleResolveHooks,
         runModuleLoadHooks,
         nodeModuleInterop,
-        resolveEsmForInspection(spec: string, parent: string): string {
-            const info = resolver.resolveForInspection(spec, parent, { bunConditions: true });
+        resolveEsmForInspection(spec: string, parent: string, esm = true): string {
+            const info = resolver.resolveForInspection(spec, parent, { bunConditions: true, cjs: !esm });
             return info.specPath.startsWith('node:') || isBunSpecifier(info.specPath)
                 ? info.specPath : info.localPath;
         },
