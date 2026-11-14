@@ -865,7 +865,6 @@ async function executeInternalTaskShell(
 function availableTaskSignalNumbers(
     names: readonly string[],
 ): CModuleSignals.Signal[] {
-    if (!signals) return [];
     const numbers = new Set<CModuleSignals.Signal>();
     for (const name of names) {
         const signalNumber = signals.signals[name];
@@ -1068,12 +1067,10 @@ export async function runTaskChild(
 ): Promise<number> {
     const signalGuards: CModuleSignals.SignalHandler[] = [];
     try {
-        if (signals) {
-            for (const signalNumber of availableTaskSignalNumbers(taskTerminalSignalNames)) {
-                try {
-                    signalGuards.push(signals.signal(signalNumber, () => {}));
-                } catch {}
-            }
+        for (const signalNumber of availableTaskSignalNumbers(taskTerminalSignalNames)) {
+            try {
+                signalGuards.push(signals.signal(signalNumber, () => {}));
+            } catch {}
         }
     } catch {}
 
