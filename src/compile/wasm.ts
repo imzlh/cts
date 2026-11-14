@@ -350,12 +350,19 @@ export function buildWasmModule(
     const mod = engine.Module.create(info.specPath);
     const ns: Record<string, unknown> = {};
 
+    /* Function wrappers are created once so a table slot and the namespace can
+     * share one identity, like the JS API's Table.get() === exports.fn. */
+    const fnWrappers = new Map<number, (...args: unknown[]) => CModuleWASM.WasmFunctionResult>();
+    for (const e of exp) {
+        if (e.kind !== 'function') continue;
+        fnWrappers.set(e.externIndex, (...args: unknown[]) =>
+            mapWasmError(() => inst.call(e.name, ...args.map(toWasmValue))));
+    }
+
     for (const e of exp) {
         switch (e.kind) {
             case 'function': {
-                const fn = (...args: unknown[]): CModuleWASM.WasmFunctionResult => {
-                    return inst.call(e.name, ...args.map(a => toWasmValue(a)));
-                };
+                const fn = fnWrappers.get(e.externIndex)!;
                 tagNativeExport(fn, inst, e.externIndex);
                 ns[e.name] = fn;
                 mod.export(e.name, fn);
@@ -382,9 +389,12 @@ export function buildWasmModule(
                 const funcrefCache = new Map<number, CModuleWASM.WasmTableValue>();
                 const makeFuncrefCallable = (owner: CModuleWASM.Instance, index: number): CModuleWASM.WasmTableValue => {
                     const cached = funcrefCache.get(index);
-                    if (cached && (cached as { owner?: unknown }).owner === owner) return cached;
+                    if (cached && typeof cached === 'object') {
+                        const tag = Reflect.get(cached, FUNCREF_CALLABLE) as { owner: CModuleWASM.Instance } | undefined;
+                        if (tag && tag.owner === owner) return cached;
+                    }
                     const callable = ((...args: unknown[]) =>
-                        owner.callByIndex(index, ...args.map(toWasmValue))) as CModuleWASM.WasmTableValue;
+                        mapWasmError(() => owner.callByIndex(index, ...args.map(toWasmValue)))) as CModuleWASM.WasmTableValue;
                     Object.defineProperty(callable, FUNCREF_CALLABLE, { value: { owner, index } });
                     funcrefCache.set(index, callable);
                     return callable;
@@ -404,28 +414,40 @@ export function buildWasmModule(
                     },
                     get(i: number): CModuleWASM.WasmTableValue {
                         const raw = inst.tableGet(e.name, i);
-                        /* funcref slots come back as {owner, index}; expose a
-                         * stable callable invoking the defining instance,
-                         * matching WebAssembly.Table.get semantics. */
+                        /* funcref slots come back as {owner, index}; return the
+                         * shared function wrapper when the slot points at one of
+                         * this instance's own exports (Table.get() === exports.fn),
+                         * else a stable callable invoking the defining instance. */
                         if (isFuncref && raw !== null && raw !== undefined && typeof raw === 'object'
                             && 'owner' in raw && 'index' in raw) {
                             const ref = raw as { owner: CModuleWASM.Instance; index: number };
+                            if (ref.owner === inst) {
+                                const wrapper = fnWrappers.get(ref.index);
+                                if (wrapper) return wrapper as CModuleWASM.WasmTableValue;
+                            }
                             return makeFuncrefCallable(ref.owner, ref.index);
                         }
                         return raw;
                     },
                     set(i: number, v: CModuleWASM.WasmTableValue): void {
-                        /* Accept our own funcref callables back (convert to the
-                         * owning instance's index) instead of letting C coerce
-                         * the function object to index 0. */
-                        const tagged = typeof v === 'function' && Reflect.has(v, FUNCREF_CALLABLE)
-                            ? Reflect.get(v, FUNCREF_CALLABLE) as { owner: CModuleWASM.Instance; index: number }
-                            : null;
-                        if (tagged) {
-                            if (tagged.owner !== inst) {
+                        /* Accept our own function wrappers and funcref callables
+                         * back (convert to the owning instance's index) instead
+                         * of letting C coerce the function object to index 0.
+                         * Only funcref tables convert: an externref table stores
+                         * the callable as a plain externref value. */
+                        let target: { instance: CModuleWASM.Instance; index: number } | null = null;
+                        if (isFuncref && typeof v === 'function') {
+                            target = nativeExternBacking(v);
+                            if (!target && Reflect.has(v, FUNCREF_CALLABLE)) {
+                                const tag = Reflect.get(v, FUNCREF_CALLABLE) as { owner: CModuleWASM.Instance; index: number };
+                                target = { instance: tag.owner, index: tag.index };
+                            }
+                        }
+                        if (target) {
+                            if (target.instance !== inst) {
                                 throw new TypeError('WebAssembly.Table.set(): funcref belongs to a different instance');
                             }
-                            inst.tableSet(e.name, i, tagged.index);
+                            inst.tableSet(e.name, i, target.index);
                             return;
                         }
                         inst.tableSet(e.name, i, v);
@@ -467,7 +489,7 @@ export function buildWasmModule(
         exports: Record<string, unknown>;
     } = {
         callFunction: (name: string, ...args: CModuleWASM.WasmValue[]) =>
-            inst.call(name, ...args),
+            mapWasmError(() => inst.call(name, ...args)),
         exports: ns,
     };
     Object.defineProperty(wrappedInst, Symbol.toStringTag, { value: 'WebAssembly.Instance' });

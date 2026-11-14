@@ -151,14 +151,6 @@ export class EsmCompiler {
             return hit;
         }
 
-        // Circular dependency guard
-        if (this.esmLoading.has(cacheKey)) {
-            log.debug('loader', () => `cycle: ${info.specPath} -- returning placeholder`);
-            const placeholder = engine.Module.create(cacheKey);
-            this.esmCache.set(cacheKey, placeholder);
-            return placeholder;
-        }
-
         const remote = isRemote(info.specPath);
         const fileBacked = isFileBackedPath(info.localPath);
         // Extension policy (works for pack:/name.ts keys, not only host paths).
@@ -224,17 +216,6 @@ export class EsmCompiler {
             if (!alreadyLoading) this.esmInFlightPaths.delete(evalScope);
         }
 
-        // Populate placeholder if one was created during circular resolution
-        const cached = this.esmCache.get(cacheKey);
-        if (cached && cached !== mod) {
-            const ns = mod.namespace;
-            for (const key of Object.keys(ns)) {
-                this.exportPlaceholderBinding(cached, key, ns[key]);
-            }
-            log.debug('loader', () => `populated ESM placeholder: ${info.specPath} (${Object.keys(ns).length} exports)`);
-            return cached;
-        }
-
         // An embedded map is injected at compile time and lives in the runtime,
         // not in the bytecode: annotated modules must stay source-cached so a
         // later load re-injects instead of serving unmapped positions.
@@ -246,14 +227,6 @@ export class EsmCompiler {
         Object.assign(mod.meta, meta);
         this.esmCache.set(cacheKey, mod);
         return mod;
-    }
-
-    private exportPlaceholderBinding(mod: CModuleEngine.Module, key: string, value: unknown): void {
-        try {
-            mod.export(key, value);
-        } catch {
-            // Circular placeholders may already contain a binding with this name.
-        }
     }
 
     loadEsmSource(code: string, info: ModuleInfo, meta: Record<string, unknown>): CModuleEngine.Module {
