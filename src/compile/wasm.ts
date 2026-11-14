@@ -160,6 +160,8 @@ function resolveFunctionImport(
             const backing = nativeExternBacking(fn);
             if (backing) {
                 const { instance, index } = backing;
+                log.debug('wasm', () =>
+                    `function import "${modName}::${fnName}" resolved (live provider, sourceIndex=${index})`);
                 return {
                     module: modName,
                     name: fnName,
@@ -172,6 +174,8 @@ function resolveFunctionImport(
                 };
             }
             if (typeof fn === 'function') {
+                log.debug('wasm', () =>
+                    `function import "${modName}::${fnName}" resolved (JavaScript trampoline)`);
                 return { module: modName, name: fnName, func: fn as WasmImportFunction };
             }
             if (fn !== undefined) return { module: modName, name: fnName, func: () => toWasmValue(fn) };
