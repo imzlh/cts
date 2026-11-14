@@ -20,7 +20,6 @@ import {
 const engine = import.meta.use('engine');
 
 const CTS_REQUIRE_GETTER = Symbol.for('cts.require.getter');
-let cjsBridgeId = 0;
 
 /** Package name end in npm body: after scope for @scope/name, else first /. */
 function npmBodyNameEnd(body: string): number {
@@ -35,23 +34,11 @@ function npmBodyNameEnd(body: string): number {
 }
 
 function buildCjsEsmWrapper(specPath: string, exports: Record<string, unknown>): CModuleEngine.Module {
-    const slot = `__cts_cjs_bridge_${cjsBridgeId++}`;
-    Reflect.set(globalThis, slot, exports);
-
-    let code = `const __cts = globalThis[${JSON.stringify(slot)}];\n`;
-    let index = 0;
+    const mod = new engine.Module('', specPath);
     for (const key of Object.keys(exports)) {
-        const local = `__cts_export_${index++}`;
-        code += `const ${local} = __cts[${JSON.stringify(key)}];\n`;
-        if (key === 'default') {
-            code += `export default ${local};\n`;
-        } else {
-            // Arbitrary module export names (ES2022): reserved words, spaces, quotes.
-            code += `export { ${local} as ${JSON.stringify(key)} };\n`;
-        }
+        mod.export(key, exports[key]);
     }
-    code += `delete globalThis[${JSON.stringify(slot)}];\n`;
-    return new engine.Module(code, specPath);
+    return mod;
 }
 
 /** ESM Module from CJS exports; honors __esModule. */

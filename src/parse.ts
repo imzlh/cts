@@ -599,8 +599,7 @@ export class ParseDriver {
             try {
                 if (r.sourceMap) {
                     try {
-                        if (r.sourceMap instanceof Uint8Array) smap.loadJSONBytes(specPath, r.sourceMap);
-                        else smap.load(specPath, r.sourceMap);
+                        smap.load(specPath, r.sourceMap);
                     } catch (e) { log.debug('precompile', () => `smap relay: ${task.localPath}: ${errMsg(e)}`); }
                 }
                 const bc = compileForCache(r.code, identity, format);

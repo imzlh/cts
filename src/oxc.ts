@@ -97,7 +97,7 @@ export class OxcTranspiler {
         const result = this.transpileCapture(source, filename, mapKey, lang);
         if (!result) return null;
         if (result.sourceMap) {
-            try { smap.loadJSON(mapKey ?? filename, result.sourceMap); }
+            try { smap.load(mapKey ?? filename, result.sourceMap); }
             catch (e) { log.debug('oxc', () => `smap: ${filename}: ${errMsg(e)}`); }
         }
         return result.code;

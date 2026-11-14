@@ -209,8 +209,7 @@ export class Transformer {
 
     private registerSourceMap(name: string, sourceMap: string | Uint8Array): void {
         try {
-            if (sourceMap instanceof Uint8Array) smap.loadJSONBytes(name, sourceMap);
-            else smap.loadJSON(name, sourceMap);
+            smap.load(name, sourceMap);
         } catch (e) {
             log.debug('transformer', () => `smap: ${name}: ${errMsg(e)}`);
         }
@@ -244,7 +243,7 @@ export class Transformer {
         const posix = toPosixPath(url);
         const mapPath = isAbsolute(posix) ? normalizePath(posix) : joinPaths(dirname(localPath), posix);
         try {
-            smap.loadJSON(moduleKey, readText(mapPath));
+            smap.load(moduleKey, readText(mapPath));
             if (track) this.inlineMappedKeys.add(moduleKey);
             log.debug('transformer', () => `smap: inline map loaded for ${moduleKey}`);
         } catch (e) {

@@ -37,7 +37,7 @@ const ENV_MODULE: Record<string, (...args: number[]) => number> = {
     emscripten_get_now: () => globalThis.performance?.now?.() ?? Date.now(),
 };
 
-// WASI module names — handled by setWasiOptions, skip in manual resolution
+// WASI module names — handled by Module.configureWasi(), skip manual resolution
 const WASI_MODULES = new Set(['wasi_unstable', 'wasi_snapshot_preview1']);
 
 // Heuristic match for "the env module": env, ./env.js, env.js
@@ -57,6 +57,51 @@ function getExport(exports: WasmImportExports, name: string): unknown {
 
 function getObjectField(value: unknown, key: PropertyKey): unknown {
     return value && typeof value === 'object' ? Reflect.get(value, key) : undefined;
+}
+
+/* Export wrappers carry their defining native instance and kind-relative
+ * extern index so a wasm->wasm import links as a live provider instead of a
+ * same-size stand-in: state stays shared and calls never round-trip JS. */
+const NATIVE_INSTANCE = Symbol('cts.wasm.nativeInstance');
+const NATIVE_EXTERN_INDEX = Symbol('cts.wasm.nativeExternIndex');
+const FUNCREF_CALLABLE = Symbol('cts.wasm.funcrefCallable');
+
+function nativeExternBacking(value: unknown): { instance: CModuleWASM.Instance; index: number } | null {
+    const isTagged = value !== null
+        && (typeof value === 'object' || typeof value === 'function')
+        && Reflect.has(value, NATIVE_INSTANCE)
+        && Reflect.has(value, NATIVE_EXTERN_INDEX);
+    if (isTagged) {
+        const instance = Reflect.get(value, NATIVE_INSTANCE) as CModuleWASM.Instance;
+        const index = Reflect.get(value, NATIVE_EXTERN_INDEX) as number;
+        if (instance && Number.isInteger(index) && index >= 0) return { instance, index };
+    }
+    return null;
+}
+
+function tagNativeExport(target: object, instance: CModuleWASM.Instance, index: number): void {
+    Object.defineProperty(target, NATIVE_INSTANCE, { value: instance });
+    Object.defineProperty(target, NATIVE_EXTERN_INDEX, { value: index });
+}
+
+/* Native wasm errors carry a `wasmError` tag; map them onto the facade error
+ * classes so consumers can catch WebAssembly.CompileError/LinkError/etc. */
+function toWasmFacadeError(e: unknown): unknown {
+    if (e instanceof Error) {
+        const tag = Reflect.get(e, 'wasmError');
+        if (tag === 'CompileError') return new CompileError(e.message);
+        if (tag === 'LinkError') return new LinkError(e.message, ErrorKind.ModuleNotFound);
+        if (tag === 'RuntimeError') return new RuntimeError(e.message);
+    }
+    return e;
+}
+
+function mapWasmError<T>(fn: () => T): T {
+    try {
+        return fn();
+    } catch (e) {
+        throw toWasmFacadeError(e);
+    }
 }
 
 function pendingExportValue(values: Record<string, unknown>, name: string): unknown {
@@ -99,11 +144,11 @@ function pendingNamedExport(
     };
 }
 
-function resolveImportFunc(
+function resolveFunctionImport(
     imp: CModuleWASM.ModuleImportDescriptor,
     parentPath: string,
     importSource: WasmImportSource,
-): WasmImportFunction | null {
+): CModuleWASM.ImportFunctionDescriptor | null {
     assert(wasm, "WASM support not available in this build");
     const { module: modName, name: fnName } = imp;
 
@@ -112,8 +157,24 @@ function resolveImportFunc(
         const exports = importSource.require(modName, parentPath);
         if (exports) {
             const fn = getExport(exports, fnName);
-            if (typeof fn === 'function') return fn as WasmImportFunction;
-            if (fn !== undefined) return () => toWasmValue(fn);
+            const backing = nativeExternBacking(fn);
+            if (backing) {
+                const { instance, index } = backing;
+                return {
+                    module: modName,
+                    name: fnName,
+                    /* The closure stays a correct fallback if the provider
+                     * binding is ever unavailable; native linkage is the fast path. */
+                    func: (...args: CModuleWASM.WasmFunctionArgument[]) =>
+                        instance.callByIndex(index, ...args),
+                    provider: instance,
+                    sourceIndex: index,
+                };
+            }
+            if (typeof fn === 'function') {
+                return { module: modName, name: fnName, func: fn as WasmImportFunction };
+            }
+            if (fn !== undefined) return { module: modName, name: fnName, func: () => toWasmValue(fn) };
         }
     } catch (e) {
         resolveErr = e;
@@ -123,7 +184,7 @@ function resolveImportFunc(
 
     if (RE_ENV_MODULE.test(modName)) {
         const fn = ENV_MODULE[fnName];
-        if (fn) return (...args) => fn(...args.map(Number));
+        if (fn) return { module: modName, name: fnName, func: (...args) => fn(...args.map(Number)) };
     }
 
     if (resolveErr) {
@@ -145,9 +206,14 @@ function resolveTableImport(
             const table = getExport(exports, fieldName);
             const length = getObjectField(table, 'length');
             if (typeof length === 'number') {
-                const element = getObjectField(table, 'element') === 'anyfunc' ? 'funcref' as const : 'externref' as const;
-                log.debug('wasm', () => `table import "${modName}::${fieldName}" resolved (element=${element}, initial=${length})`);
-                return { module: modName, name: fieldName, element, initial: length };
+                let rawElement = getObjectField(table, 'element');
+                if (rawElement === undefined) rawElement = getObjectField(getObjectField(table, 'type'), 'element');
+                const element = rawElement === 'anyfunc' || rawElement === 'funcref' ? 'funcref' as const : 'externref' as const;
+                const backing = nativeExternBacking(table);
+                log.debug('wasm', () => `table import "${modName}::${fieldName}" resolved (element=${element}, initial=${length}${backing ? ', live provider' : ''})`);
+                return backing
+                    ? { module: modName, name: fieldName, element, initial: length, provider: backing.instance, sourceIndex: backing.index }
+                    : { module: modName, name: fieldName, element, initial: length };
             }
             log.debug('wasm', () => `table import "${modName}::${fieldName}" not found in exports: keys=${JSON.stringify(Object.keys(exports))}`);
         }
@@ -171,7 +237,10 @@ function resolveMemoryImport(
             const buffer = getObjectField(mem, 'buffer');
             if (buffer instanceof ArrayBuffer) {
                 const initial = Math.ceil(buffer.byteLength / 65536);
-                return { module: modName, name: fieldName, initial };
+                const backing = nativeExternBacking(mem);
+                return backing
+                    ? { module: modName, name: fieldName, initial, provider: backing.instance, sourceIndex: backing.index }
+                    : { module: modName, name: fieldName, initial };
             }
         }
     } catch (e) {
@@ -196,13 +265,16 @@ function resolveGlobalImport(
                 const valueOf = getObjectField(g, 'valueOf');
                 const raw = value ?? (typeof valueOf === 'function' ? Reflect.apply(valueOf, g, []) : 0);
                 const vtype = typeof raw;
+                const backing = nativeExternBacking(g);
+                const rawMutable = getObjectField(getObjectField(g, 'type'), 'mutable');
+                const mutable = typeof rawMutable === 'boolean' ? rawMutable : true;
                 if (vtype !== 'number' && vtype !== 'bigint') {
-                    return { module: modName, name: fieldName, value: 0, type: 'i32' as const, mutable: true };
+                    return { module: modName, name: fieldName, value: 0, type: 'i32' as const, mutable, ...backing && { provider: backing.instance, sourceIndex: backing.index } };
                 }
                 const type = vtype === 'bigint' ? 'i64' as const
                     : vtype === 'number' ? (Number.isInteger(raw) ? 'i32' as const : 'f64' as const)
                     : 'i32' as const;
-                return { module: modName, name: fieldName, value: raw, type, mutable: true };
+                return { module: modName, name: fieldName, value: raw, type, mutable, ...backing && { provider: backing.instance, sourceIndex: backing.index } };
             }
         }
     } catch (e) {
@@ -218,9 +290,9 @@ export function buildWasmModule(
     if (!wasm) return null;
 
     const raw = readBytes(info.localPath);
-    const wmod = wasm.parseModule(raw);
+    const wmod = mapWasmError(() => wasm.load(raw));
 
-    const imports = wasm.moduleImports(wmod);
+    const imports = wmod.imports();
     if (imports.length > 0) {
         const funcDescs: CModuleWASM.ImportFunctionDescriptor[] = [];
         const globalDescs: CModuleWASM.GlobalImportDescriptor[] = [];
@@ -231,9 +303,9 @@ export function buildWasmModule(
             if (WASI_MODULES.has(imp.module)) continue;
 
             if (imp.kind === 'function') {
-                const resolved = resolveImportFunc(imp, info.specPath, importSource);
+                const resolved = resolveFunctionImport(imp, info.specPath, importSource);
                 if (resolved) {
-                    funcDescs.push({ module: imp.module, name: imp.name, func: resolved });
+                    funcDescs.push(resolved);
                 } else {
                     throw new LinkError(
                         `Unresolved import: ${imp.module}::${imp.name} (function) in ${info.localPath}`);
@@ -265,49 +337,62 @@ export function buildWasmModule(
             }
         }
 
-        if (funcDescs.length)  wasm.resolveImports(wmod, funcDescs);
-        if (globalDescs.length) wasm.resolveGlobalImports(wmod, globalDescs);
-        if (tableDescs.length)  wasm.resolveTableImports(wmod, tableDescs);
-        if (memoryDescs.length) wasm.resolveMemoryImports(wmod, memoryDescs);
+        if (funcDescs.length)  mapWasmError(() => wmod.resolveFunctions(funcDescs));
+        if (globalDescs.length) mapWasmError(() => wmod.resolveGlobals(globalDescs));
+        if (tableDescs.length)  mapWasmError(() => wmod.resolveTables(tableDescs));
+        if (memoryDescs.length) mapWasmError(() => wmod.resolveMemories(memoryDescs));
     }
 
-    wasm.setWasiOptions(wmod, [], null, null);
-    const inst = wasm.buildInstance(wmod);
+    mapWasmError(() => wmod.configureWasi({ args: [] }));
+    const inst = mapWasmError(() => wmod.instantiate());
 
-    const exp = wasm.moduleExports(wmod);
+    const exp = wmod.exports();
     const mod = engine.Module.create(info.specPath);
     const ns: Record<string, unknown> = {};
 
-    const wasm2 = wasm;
     for (const e of exp) {
         switch (e.kind) {
             case 'function': {
                 const fn = (...args: unknown[]): CModuleWASM.WasmFunctionResult => {
-                    return inst.callFunction(e.name, ...args.map(a => toWasmValue(a)));
+                    return inst.call(e.name, ...args.map(a => toWasmValue(a)));
                 };
+                tagNativeExport(fn, inst, e.externIndex);
                 ns[e.name] = fn;
                 mod.export(e.name, fn);
                 break;
             }
             case 'memory': {
                 const mem = {
-                    get buffer(): ArrayBuffer { return wasm2.getMemoryBuffer(inst); },
-                    grow(delta: number): number { return wasm2.growMemory(inst, delta); },
+                    get buffer(): ArrayBuffer { return inst.memoryBuffer(); },
+                    grow(delta: number): number { return inst.growMemory(delta); },
                     get type(): { minimum: number; maximum?: number } {
-                        const buf = wasm2.getMemoryBuffer(inst);
+                        const buf = inst.memoryBuffer();
                         return { minimum: Math.ceil(buf.byteLength / 65536) };
                     },
                 };
                 Object.defineProperty(mem, Symbol.toStringTag, { value: 'WebAssembly.Memory' });
+                tagNativeExport(mem, inst, e.externIndex);
                 ns[e.name] = mem;
                 mod.export(e.name, mem);
                 break;
             }
             case 'table': {
+                const tableInfo = inst.tableInfo(e.name);
+                const isFuncref = tableInfo.element === 'funcref' || tableInfo.element === 'unknown';
+                const funcrefCache = new Map<number, CModuleWASM.WasmTableValue>();
+                const makeFuncrefCallable = (owner: CModuleWASM.Instance, index: number): CModuleWASM.WasmTableValue => {
+                    const cached = funcrefCache.get(index);
+                    if (cached && (cached as { owner?: unknown }).owner === owner) return cached;
+                    const callable = ((...args: unknown[]) =>
+                        owner.callByIndex(index, ...args.map(toWasmValue))) as CModuleWASM.WasmTableValue;
+                    Object.defineProperty(callable, FUNCREF_CALLABLE, { value: { owner, index } });
+                    funcrefCache.set(index, callable);
+                    return callable;
+                };
                 const tbl = {
-                    get length(): number { return wasm2.tableSize(inst, e.name); },
+                    get length(): number { return inst.tableSize(e.name); },
                     get type(): { element: 'funcref' | 'externref'; minimum: number; maximum?: number } {
-                        const info = wasm2.getTableInfo(inst, e.name);
+                        const info = inst.tableInfo(e.name);
                         const element = info.element === 'unknown'
                             ? 'funcref' as const
                             : info.element as 'funcref' | 'externref';
@@ -317,29 +402,58 @@ export function buildWasmModule(
                             maximum: info.max_size > 0 ? info.max_size : undefined,
                         };
                     },
-                    get(i: number): CModuleWASM.WasmTableValue { return wasm2.tableGet(inst, e.name, i); },
-                    set(i: number, v: CModuleWASM.WasmTableValue): void { wasm2.tableSet(inst, e.name, i, v); },
-                    grow(d: number): number { return wasm2.tableGrow(inst, e.name, d); },
+                    get(i: number): CModuleWASM.WasmTableValue {
+                        const raw = inst.tableGet(e.name, i);
+                        /* funcref slots come back as {owner, index}; expose a
+                         * stable callable invoking the defining instance,
+                         * matching WebAssembly.Table.get semantics. */
+                        if (isFuncref && raw !== null && raw !== undefined && typeof raw === 'object'
+                            && 'owner' in raw && 'index' in raw) {
+                            const ref = raw as { owner: CModuleWASM.Instance; index: number };
+                            return makeFuncrefCallable(ref.owner, ref.index);
+                        }
+                        return raw;
+                    },
+                    set(i: number, v: CModuleWASM.WasmTableValue): void {
+                        /* Accept our own funcref callables back (convert to the
+                         * owning instance's index) instead of letting C coerce
+                         * the function object to index 0. */
+                        const tagged = typeof v === 'function' && Reflect.has(v, FUNCREF_CALLABLE)
+                            ? Reflect.get(v, FUNCREF_CALLABLE) as { owner: CModuleWASM.Instance; index: number }
+                            : null;
+                        if (tagged) {
+                            if (tagged.owner !== inst) {
+                                throw new TypeError('WebAssembly.Table.set(): funcref belongs to a different instance');
+                            }
+                            inst.tableSet(e.name, i, tagged.index);
+                            return;
+                        }
+                        inst.tableSet(e.name, i, v);
+                    },
+                    grow(d: number): number { return inst.tableGrow(e.name, d); },
                 };
                 Object.defineProperty(tbl, Symbol.toStringTag, { value: 'WebAssembly.Table' });
+                tagNativeExport(tbl, inst, e.externIndex);
                 ns[e.name] = tbl;
                 mod.export(e.name, tbl);
                 break;
             }
             case 'global': {
                 const gl = {
-                    get value(): CModuleWASM.WasmGlobalValue { return wasm2.getGlobal(inst, e.name); },
-                    set value(v: CModuleWASM.WasmGlobalValue) { wasm2.setGlobal(inst, e.name, v); },
-                    valueOf(): CModuleWASM.WasmGlobalValue { return wasm2.getGlobal(inst, e.name); },
+                    get value(): CModuleWASM.WasmGlobalValue { return inst.getGlobal(e.name); },
+                    set value(v: CModuleWASM.WasmGlobalValue) { inst.setGlobal(e.name, v); },
+                    valueOf(): CModuleWASM.WasmGlobalValue { return inst.getGlobal(e.name); },
                     get type(): { value: 'i32' | 'i64' | 'f32' | 'f64'; mutable: boolean } {
-                        const info = wasm2.getGlobalInfo(inst, e.name);
-                        const vt = (info.type === 'externref' || info.type === 'funcref' || info.type === 'unknown')
+                        const info = inst.globalInfo(e.name);
+                        const vt = (info.type === 'externref' || info.type === 'funcref'
+                            || info.type === 'v128' || info.type === 'unknown')
                             ? 'i32' as const
                             : info.type;
                         return { value: vt, mutable: info.mutable };
                     },
                 };
                 Object.defineProperty(gl, Symbol.toStringTag, { value: 'WebAssembly.Global' });
+                tagNativeExport(gl, inst, e.externIndex);
                 ns[e.name] = gl;
                 mod.export(e.name, gl);
                 break;
@@ -353,7 +467,7 @@ export function buildWasmModule(
         exports: Record<string, unknown>;
     } = {
         callFunction: (name: string, ...args: CModuleWASM.WasmValue[]) =>
-            inst.callFunction(name, ...args),
+            inst.call(name, ...args),
         exports: ns,
     };
     Object.defineProperty(wrappedInst, Symbol.toStringTag, { value: 'WebAssembly.Instance' });
@@ -406,7 +520,7 @@ export class WasmCompiler {
             const placeholder = engine.Module.create(info.specPath);
             placeholder.export('default', values);
             assert(wasm, 'WASM support not available in this build');
-            const descriptors = wasm.moduleExports(wasm.parseModule(readBytes(info.localPath)));
+            const descriptors = mapWasmError(() => wasm.load(readBytes(info.localPath))).exports();
             for (const descriptor of descriptors) {
                 if (descriptor.name === 'default' || descriptor.name === 'instance') continue;
                 placeholder.export(descriptor.name, pendingNamedExport(values, descriptor));

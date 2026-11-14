@@ -864,9 +864,9 @@ async function executeInternalTaskShell(
 
 function availableTaskSignalNumbers(
     names: readonly string[],
-): number[] {
+): CModuleSignals.Signal[] {
     if (!signals) return [];
-    const numbers = new Set<number>();
+    const numbers = new Set<CModuleSignals.Signal>();
     for (const name of names) {
         const signalNumber = signals.signals[name];
         if (typeof signalNumber === 'number') numbers.add(signalNumber);
@@ -1058,8 +1058,7 @@ function packageTaskEnv(metadata: TaskPackageMetadata, name: string, command: st
 
 function taskExitCode(info: CModuleProcess.ExitInfo): number {
     if (info.term_signal === null) return info.exit_status;
-    const signalNumber = signals?.signals[info.term_signal];
-    return typeof signalNumber === 'number' ? 128 + signalNumber : 1;
+    return 128 + info.term_signal;
 }
 
 export async function runTaskChild(

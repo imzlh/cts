@@ -22,10 +22,10 @@ export function scanWasmImportModules(bytes: Uint8Array, strict = false): string
         return [];
     }
     try {
-        const wmod = wasm.parseModule(bytes);
+        const wmod = wasm.load(bytes);
         const seen = new Set<string>();
         const out: string[] = [];
-        for (const imp of wasm.moduleImports(wmod)) {
+        for (const imp of wmod.imports()) {
             if (isHostWasmImportModule(imp.module)) continue;
             if (seen.has(imp.module)) continue;
             seen.add(imp.module);
