@@ -389,9 +389,9 @@ export function buildWasmModule(
                 const funcrefCache = new Map<number, CModuleWASM.WasmTableValue>();
                 const makeFuncrefCallable = (owner: CModuleWASM.Instance, index: number): CModuleWASM.WasmTableValue => {
                     const cached = funcrefCache.get(index);
-                    if (cached && typeof cached === 'object') {
-                        const tag = Reflect.get(cached, FUNCREF_CALLABLE) as { owner: CModuleWASM.Instance } | undefined;
-                        if (tag && tag.owner === owner) return cached;
+                    if (typeof cached === 'function' && Reflect.has(cached, FUNCREF_CALLABLE)) {
+                        const tag = Reflect.get(cached, FUNCREF_CALLABLE) as { owner: CModuleWASM.Instance };
+                        if (tag.owner === owner) return cached;
                     }
                     const callable = ((...args: unknown[]) =>
                         mapWasmError(() => owner.callByIndex(index, ...args.map(toWasmValue)))) as CModuleWASM.WasmTableValue;
@@ -431,10 +431,9 @@ export function buildWasmModule(
                     },
                     set(i: number, v: CModuleWASM.WasmTableValue): void {
                         /* Accept our own function wrappers and funcref callables
-                         * back (convert to the owning instance's index) instead
-                         * of letting C coerce the function object to index 0.
-                         * Only funcref tables convert: an externref table stores
-                         * the callable as a plain externref value. */
+                         * back (convert to the owning instance's index). Only
+                         * funcref tables convert: an externref table stores the
+                         * callable as a plain externref value. */
                         let target: { instance: CModuleWASM.Instance; index: number } | null = null;
                         if (isFuncref && typeof v === 'function') {
                             target = nativeExternBacking(v);
@@ -443,9 +442,14 @@ export function buildWasmModule(
                                 target = { instance: tag.owner, index: tag.index };
                             }
                         }
+                        /* C coerces any other non-null value to function index 0,
+                         * silently aliasing the slot; mirror the facade and reject. */
+                        if (isFuncref && target === null && v !== null) {
+                            throw new TypeError('Argument 1 must be null or a WebAssembly function');
+                        }
                         if (target) {
                             if (target.instance !== inst) {
-                                throw new TypeError('WebAssembly.Table.set(): funcref belongs to a different instance');
+                                throw new TypeError('Argument 1 must be null or a WebAssembly function');
                             }
                             inst.tableSet(e.name, i, target.index);
                             return;
