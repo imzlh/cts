@@ -136,6 +136,7 @@ export class LockStore {
                     return;
                 }
                 this.db = sqlite3.open('', sqlite3.O_CREATE | sqlite3.O_READWRITE | sqlite3.O_MEMORY);
+                this.markOpen();
             } else {
                 this.db = sqlite3.open(this.dbPath, sqlite3.O_CREATE | sqlite3.O_READWRITE);
             }
