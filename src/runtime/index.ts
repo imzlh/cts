@@ -86,15 +86,14 @@ const WEBAPI_EVENT_RECEIVER_KEY = 'webapiEventReceiver';
 
 /** webapi evaluates before the runtime is constructed on every user-code path. */
 function webapiOwnsEventBridge(): boolean {
-    try {
-        return import.meta.use('evbus')?.get(CNO_RUNTIME_NAMESPACE, WEBAPI_EVENT_RECEIVER_KEY) === true;
-    } catch {
-        return false;
-    }
+    return import.meta.use('evbus').get(CNO_RUNTIME_NAMESPACE, WEBAPI_EVENT_RECEIVER_KEY) === true;
 }
 
 /** Mark failure without stopping the event loop and aborting a test suite. */
 function requestFailureExitCode(): void {
+    // A missing, invalid, or unreadable bus disables the failure request; the
+    // published handler itself belongs to an unknown host embedding, so its
+    // failure must not interrupt the event receiver either.
     let fn: unknown;
     try {
         fn = import.meta.use('evbus')?.get(CNO_RUNTIME_NAMESPACE, REQUEST_EXIT_CODE_KEY);
@@ -264,9 +263,7 @@ function findProjectRoot(start: string): string | undefined {
     let cur = toPosixPath(start);
     for (;;) {
         for (const name of ['deno.json', 'deno.jsonc', 'package.json']) {
-            try {
-                if (fs.exists(joinPaths(cur, name))) return cur;
-            } catch {}
+            if (fs.exists(joinPaths(cur, name))) return cur;
         }
         const up = dirname(cur);
         if (up === cur) return undefined;

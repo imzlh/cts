@@ -47,11 +47,7 @@ export class LockStore {
 
     /** Does a persisted lock file exist in `dir`? Used to decide read-only reuse. */
     static existsAt(dir: string): boolean {
-        try {
-            return fs.exists(joinPaths(toPosixPath(dir), DB_FILENAME));
-        } catch {
-            return false;
-        }
+        return fs.exists(joinPaths(toPosixPath(dir), DB_FILENAME));
     }
 
     /** On-disk path of the lock (may not exist yet when in-memory/read-only). */

@@ -1066,13 +1066,13 @@ export async function runTaskChild(
     cwd: string,
 ): Promise<number> {
     const signalGuards: CModuleSignals.SignalHandler[] = [];
-    try {
-        for (const signalNumber of availableTaskSignalNumbers(taskTerminalSignalNames)) {
-            try {
-                signalGuards.push(signals.signal(signalNumber, () => {}));
-            } catch {}
+    for (const signalNumber of availableTaskSignalNumbers(taskTerminalSignalNames)) {
+        try {
+            signalGuards.push(signals.signal(signalNumber, () => {}));
+        } catch {
+            // A platform may reject an individual terminal signal.
         }
-    } catch {}
+    }
 
     try {
         const child = process.spawn(argv, {
@@ -1081,9 +1081,7 @@ export async function runTaskChild(
         });
         return taskExitCode(await child.wait());
     } finally {
-        for (const guard of signalGuards) {
-            try { guard.close(); } catch {}
-        }
+        for (const guard of signalGuards) guard.close();
     }
 }
 

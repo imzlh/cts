@@ -13,12 +13,8 @@ export const EV = {
 } as const;
 
 function numericEvent(name: string, fallback: number): number {
-    try {
-        const v = (engine.EventType as unknown as Record<string, unknown>)?.[name];
-        return typeof v === 'number' ? v : fallback;
-    } catch {
-        return fallback;
-    }
+    const v = (engine.EventType as unknown as Record<string, unknown>)?.[name];
+    return typeof v === 'number' ? v : fallback;
 }
 
 /** Per-dispatch state shared by all receivers for one native event. */
@@ -292,12 +288,8 @@ export function installWebApiCompatBridge(): () => void {
         if (name === EV.EXIT) {
             const Ev = globalCtor('Event');
             if (!Ev) return undefined;
-            try {
-                if (!inWorker()) dispatchGlobal(new (Ev as new (t: string) => unknown)('unload'));
-                dispatchGlobal(new (Ev as new (t: string) => unknown)('exit'));
-            } catch {
-                return undefined;
-            }
+            if (!inWorker()) dispatchGlobal(new (Ev as new (t: string) => unknown)('unload'));
+            dispatchGlobal(new (Ev as new (t: string) => unknown)('exit'));
             ctx.dispatched = true;
             return undefined;
         }
@@ -305,11 +297,7 @@ export function installWebApiCompatBridge(): () => void {
         if (name === EV.LOAD) {
             const Ev = globalCtor('Event');
             if (!Ev) return undefined;
-            try {
-                dispatchGlobal(new (Ev as new (t: string) => unknown)('load'));
-            } catch {
-                return undefined;
-            }
+            dispatchGlobal(new (Ev as new (t: string) => unknown)('load'));
             ctx.dispatched = true;
             return undefined;
         }
@@ -371,11 +359,7 @@ export function dispatchLoadEvent(): boolean {
     if (!Ev) return false;
     // Set before dispatch so a throwing listener cannot enable a second event.
     mux.loadFired = true;
-    try {
-        return dispatchGlobal(new (Ev as new (t: string) => unknown)('load'));
-    } catch {
-        return false;
-    }
+    return dispatchGlobal(new (Ev as new (t: string) => unknown)('load'));
 }
 
 /** Fire unload once unless native exit already did. */
@@ -387,9 +371,5 @@ export function dispatchUnloadEvent(): boolean {
     const Ev = globalCtor('Event');
     if (!Ev) return false;
     mux.unloadFired = true;
-    try {
-        return dispatchGlobal(new (Ev as new (t: string) => unknown)('unload'));
-    } catch {
-        return false;
-    }
+    return dispatchGlobal(new (Ev as new (t: string) => unknown)('unload'));
 }

@@ -753,11 +753,7 @@ function packageIdFromDir(
 }
 
 function pkgJsonExists(dir: string): boolean {
-    try {
-        return fs.exists(joinPaths(dir, 'package.json'));
-    } catch {
-        return false;
-    }
+    return fs.exists(joinPaths(dir, 'package.json'));
 }
 
 function stripLeadingV(range: string): string {

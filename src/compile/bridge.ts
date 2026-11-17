@@ -6,7 +6,7 @@ import type { LoadedCompiled, SourceFreshness } from '../source/cache';
 import { isResolutionMiss, requireCycleError, setErrorCode } from '../errors';
 import { builtinModuleNames } from '../resolve/builtins';
 import { BUN_MODULES, isBunSpecifier } from '../resolve/bun-specifier';
-import { errMsg, log } from '../utils';
+import { log } from '../utils';
 import { ensureInternalBridge, notifyInternalBridge } from './internal-registry';
 import type { NodeModuleInteropBridge } from './node-interop';
 import {
@@ -330,8 +330,5 @@ export function installInternalBridge(
     if (typeof bridge.mkRequire === 'function') {
         log.warn('bridge', () => 'CTS_INTERNAL re-installed — prior runtime hijacked');
     }
-    for (const [k, v] of Object.entries(value)) {
-        try { Reflect.set(bridge, k, v); }
-        catch (e) { log.debug('bridge', () => `CTS_INTERNAL field "${k}" overwrite failed: ${errMsg(e)}`); }
-    }
+    for (const [k, v] of Object.entries(value)) Reflect.set(bridge, k, v);
 }

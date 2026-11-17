@@ -91,11 +91,7 @@ function isRealAbsolutePath(spec: string): boolean {
         }
     }
     if (spec.charCodeAt(0) !== 47 /* / */) return false;
-    try {
-        return fs.exists(spec);
-    } catch {
-        return false;
-    }
+    return fs.exists(spec);
 }
 
 function isFilesystemLocalPath(spec: string): boolean {

@@ -2264,15 +2264,11 @@ export class NpmHandler implements ProtocolHandler {
     private readLinkedDepDir(parentDir: string, depName: string): string | null {
         if (!isValidNpmPackageName(depName)) return null;
         const target = joinPaths(parentDir, 'node_modules', depName);
+        if (!fs.exists(joinPaths(target, 'package.json')) && !fs.exists(target)) return null;
         try {
-            if (!fs.exists(joinPaths(target, 'package.json')) && !fs.exists(target)) return null;
-            try {
-                return fs.realpath(target);
-            } catch {
-                return target;
-            }
+            return fs.realpath(target);
         } catch {
-            return null;
+            return target; // broken symlink still names the intended slot
         }
     }
 

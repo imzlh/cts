@@ -12,14 +12,10 @@ interface BlobPayload {
 type BlobResolver = (url: string) => BlobPayload | null;
 
 // The CLI publishes this resolver under its `cno.runtime` channel; without a
-// publisher there is no blob support in this runtime.
+// publisher (e.g. in a worker's own bus) there is no blob support here.
 function blobUrlResolver(): BlobResolver | undefined {
-    try {
-        const resolver: unknown = import.meta.use('evbus')?.get('cno.runtime', 'blobUrlResolver');
-        return typeof resolver === 'function' ? resolver as BlobResolver : undefined;
-    } catch {
-        return undefined;
-    }
+    const resolver: unknown = import.meta.use('evbus').get('cno.runtime', 'blobUrlResolver');
+    return typeof resolver === 'function' ? resolver as BlobResolver : undefined;
 }
 
 function resolveBlobPayload(spec: string): BlobPayload {
