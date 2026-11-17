@@ -1,4 +1,4 @@
-import { isWindows, uname } from './platform';
+import { isWindows } from './platform';
 import { setErrorCode } from '../errors';
 import { URL } from './url';
 

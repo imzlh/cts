@@ -1,4 +1,4 @@
-import { moduleRef, moduleViewRef, type RuntimeConfig, type ModuleInfo, type NodeBuiltinResolver, type FileKind, type LifecycleScriptEntry } from '../types';
+import { moduleRef, moduleViewRef, type RuntimeConfig, type ModuleInfo, type NodeBuiltinResolver, type LifecycleScriptEntry } from '../types';
 import type { ProtocolHandler } from './protocols/base';
 import type { Flow, ProgressCallback } from '../flow';
 import { err, ErrorKind } from '../errors';

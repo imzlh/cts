@@ -1,5 +1,5 @@
 import type { ModuleInfo } from '../types';
-import { dirname, fileUrlToPath, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, isWindows, normalizePath, readText, toHostPath as sharedToHostPath, toHostPaths as sharedToHostPaths, hasSchemeId, schemeId } from '../utils';
+import { dirname, fileUrlToPath, joinPaths, isAbsolute, extname, isRelative, resolveFile, safeParse, log, normalizePath, readText, toHostPath as sharedToHostPath, toHostPaths as sharedToHostPaths, hasSchemeId, schemeId } from '../utils';
 import { err, ErrorKind, requireCycleError } from '../errors';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { canonicalBunSpecifier, isBunSpecifier } from '../resolve/bun-specifier';
