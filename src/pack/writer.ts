@@ -6,7 +6,7 @@ import { guessFileKind } from '../resolve/protocols/base';
 import { hasImportAttributes, isTsLikePath } from '../scan';
 import { isBuiltinSpecifier } from '../resolve/builtins';
 import { isBunSpecifier } from '../resolve/bun-specifier';
-import { relativePath, dirname, basename, canonicalizePath, ensureDir, PrecacheProgress, log } from '../utils';
+import { relativePath, dirname, basename, canonicalizePath, ensureDir, PrecacheProgress, log, errMsg } from '../utils';
 import { err, ErrorKind } from '../errors';
 import { encodePackHeader, completePackManifest, type PackBlobSource, type PackManifest, type PackModuleEntry } from './format';
 import { writeAll, writeAtomicallyStreamed } from './integrity';
@@ -363,7 +363,7 @@ export async function writePack(
 
         if (compileFailures.length > 0) {
             const lines = compileFailures
-                .map(f => `  - ${f.localPath}: ${f.error instanceof Error ? f.error.message : String(f.error)}`)
+                .map(f => `  - ${f.localPath}: ${errMsg(f.error)}`)
                 .join('\n');
             throw err(ErrorKind.TransformError, `pack: ${compileFailures.length} source module(s) failed to compile:\n${lines}`);
         }
@@ -401,7 +401,7 @@ export async function writePack(
 
         if (compileFailures.length > 0) {
             const lines = compileFailures
-                .map(f => `  - ${f.localPath}: ${f.error instanceof Error ? f.error.message : String(f.error)}`)
+                .map(f => `  - ${f.localPath}: ${errMsg(f.error)}`)
                 .join('\n');
             throw err(ErrorKind.TransformError, `pack: ${compileFailures.length} source module(s) failed to compile:\n${lines}`);
         }

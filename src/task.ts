@@ -1005,7 +1005,7 @@ async function rawExec(argv: string[], env: Record<string, string>, cwd: string)
         const mergedEnv = { ...os.environ(), ...env, PWD: cwd };
         return await runTaskChild(argv, mergedEnv, cwd);
     } catch (e) {
-        console.error(`[task] Failed to spawn: ${argv.join(' ')}\n  ${e instanceof Error ? e.message : String(e)}`);
+        console.error(`[task] Failed to spawn: ${argv.join(' ')}\n  ${errMsg(e)}`);
         return 1;
     }
 }

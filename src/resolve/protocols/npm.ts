@@ -775,7 +775,7 @@ export class NpmHandler implements ProtocolHandler {
             ver = body.resolvedVer;
         } catch (e) {
             log.debug('npm', () =>
-                `install-graph seed ensure failed: ${name}@${version}: ${e instanceof Error ? e.message : String(e)}`);
+                `install-graph seed ensure failed: ${name}@${version}: ${errMsg(e)}`);
             return;
         }
         const manifest = readPkg(dir);
@@ -789,7 +789,7 @@ export class NpmHandler implements ProtocolHandler {
                 child = yield* this.ensurePackageInStore(dep.name, dep.range, onProgress);
             } catch (e) {
                 log.debug('npm', () =>
-                    `install-graph ensure failed: ${dep.name}@${dep.range} from ${name}@${ver}: ${e instanceof Error ? e.message : String(e)}`);
+                    `install-graph ensure failed: ${dep.name}@${dep.range} from ${name}@${ver}: ${errMsg(e)}`);
                 continue;
             }
             if (!child) continue;
@@ -2208,7 +2208,7 @@ export class NpmHandler implements ProtocolHandler {
             this.linkDependency(parentDir, linkName, dep.dir);
         } catch (e) {
             // Unmet required peers are warnings in npm; do not fail the install tree.
-            log.debug('npm', () => `peer skipped: ${name} (${e instanceof Error ? e.message : String(e)})`);
+            log.debug('npm', () => `peer skipped: ${name} (${errMsg(e)})`);
             const local = this.findCachedPackageMatching(name, range);
             if (local) this.linkDependency(parentDir, linkName, local);
         }
@@ -2402,7 +2402,7 @@ export class NpmHandler implements ProtocolHandler {
             }
             this.linkDependency(parentDir, linkName, depDir);
         } catch (e) {
-            log.debug('npm', () => `optional dep skipped: ${name} (${e instanceof Error ? e.message : String(e)})`);
+            log.debug('npm', () => `optional dep skipped: ${name} (${errMsg(e)})`);
         }
     }
 
@@ -2430,7 +2430,7 @@ export class NpmHandler implements ProtocolHandler {
             }
             this.linkDependencyBins(parentDir, depDir);
         } catch (e) {
-            log.debug('npm', () => `dependency link skipped: ${depName} -> ${target} (${e instanceof Error ? e.message : String(e)})`);
+            log.debug('npm', () => `dependency link skipped: ${depName} -> ${target} (${errMsg(e)})`);
         }
     }
 
@@ -2505,7 +2505,7 @@ export class NpmHandler implements ProtocolHandler {
             ensureDir(dirname(target));
             symlinkDir(dir, target);
         } catch (e) {
-            log.debug('npm', () => `cache alias skipped: ${name} -> ${target} (${e instanceof Error ? e.message : String(e)})`);
+            log.debug('npm', () => `cache alias skipped: ${name} -> ${target} (${errMsg(e)})`);
         }
     }
 
@@ -2536,7 +2536,7 @@ export class NpmHandler implements ProtocolHandler {
                 symlinkFile(source, target);
                 chmodQuietly(source, 0o755);
             } catch (e) {
-                log.debug('bin', () => `bin link skipped: ${binName} -> ${target} (${e instanceof Error ? e.message : String(e)})`);
+                log.debug('bin', () => `bin link skipped: ${binName} -> ${target} (${errMsg(e)})`);
             }
         }
     }

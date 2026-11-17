@@ -1,5 +1,6 @@
 import type { ModuleFormat, FileKind } from '../types';
 import { canonicalizePath } from '../utils/path';
+import { errMsg } from '../utils/misc';
 
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
@@ -80,7 +81,7 @@ export function encodePack(manifest: PackManifest, blob: Uint8Array): Uint8Array
     try {
         out = new Uint8Array(totalLength);
     } catch (e) {
-        throw new Error(`Cannot encode .jspack file: container allocation failed: ${e instanceof Error ? e.message : String(e)}`);
+        throw new Error(`Cannot encode .jspack file: container allocation failed: ${errMsg(e)}`);
     }
     out.set(header, 0);
     out.set(blob, header.byteLength);
@@ -191,7 +192,7 @@ export function decodePack(bytes: Uint8Array): PackContainer {
     try {
         parsed = JSON.parse(manifestText);
     } catch (e) {
-        throw new Error(`Invalid .jspack file: malformed manifest: ${e instanceof Error ? e.message : String(e)}`);
+        throw new Error(`Invalid .jspack file: malformed manifest: ${errMsg(e)}`);
     }
     const blob = bytes.subarray(manifestEnd);
     // Fast path: no backslash in the text means nothing to canonicalize.
