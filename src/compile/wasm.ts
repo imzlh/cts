@@ -1,6 +1,7 @@
 import { moduleRef, type ModuleInfo } from '../types';
 import { errMsg, log, assert, readBytes } from '../utils';
 import { err, codeForKind, ErrorKind, isErrorKind, setErrorCode } from '../errors';
+import { promiseResultHandled } from './bridge';
 
 const engine = import.meta.use('engine');
 const wasm = import.meta.use('wasm');
@@ -576,7 +577,7 @@ export class WasmCompiler {
                     if (cached) return cached;
 
                     const loaded = loadModule(resolved, {});
-                    const evalResult = engine.promiseResult(
+                    const evalResult = promiseResultHandled(
                         evalModule(loaded) as ReturnType<CModuleEngine.Module['eval']>,
                     );
                     if (evalResult === null) {

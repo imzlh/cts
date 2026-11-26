@@ -12,7 +12,7 @@ import { guessFileKind, isTypeDecl } from '../resolve/protocols/base';
 import { isScannablePath } from '../scan';
 import { isRemote, type SourceFreshness } from '../source/cache';
 import { moduleRef, type FileKind, type ModuleFormat, type ModuleInfo, type NodeBuiltinResolver, type RuntimeConfig } from '../types';
-import { PrecacheProgress, clearNegativeCache, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, npmNameVersion, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
+import { PrecacheProgress, dirname, ensureDir, errMsg, isAbsolute, isWindows, joinPaths, log, normalizePath, npmNameVersion, cwd as posixCwd, pathRoot, resolveFile, toPosixPath, writeText } from '../utils';
 import { installEngineHooks, type EngineHooks } from './hooks';
 import {
     planLifecycleScript,
@@ -35,6 +35,11 @@ const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 const process = import.meta.use('process');
 const worker = import.meta.use('worker');
+// Lifecycle and nested spawns ask for piped stdout/stderr. Process pipes are
+// built from the streams classes, which only exist once that module has been
+// used, so this file owns the dependency instead of relying on someone else
+// having touched the namespace first.
+import.meta.use('streams');
 
 const fs = import.meta.use('fs');
 
@@ -373,7 +378,7 @@ export class TypeScriptRuntime {
             if (name === ET.UNHANDLED_REJECTION) {
                 const r = Array.isArray(data) ? data[1] : data;
                 if (postNodeWorkerError(r)) return false;
-                if (isWebWorkerRuntime()) {
+                if (isWebWorkerRuntime() && !ctx.dispatched) {
                     const pipe = worker.pipe;
                     if (pipe) {
                         const info = runtimeErrorInfo(r);
@@ -399,7 +404,7 @@ export class TypeScriptRuntime {
             }
             if (name === ET.JOB_EXCEPTION) {
                 if (postNodeWorkerError(data)) return true;
-                if (isWebWorkerRuntime()) {
+                if (isWebWorkerRuntime() && !ctx.dispatched) {
                     const pipe = worker.pipe;
                     if (pipe) {
                         const info = runtimeErrorInfo(data);
@@ -519,7 +524,7 @@ export class TypeScriptRuntime {
                 log.debug('precache', () => 'lifecycle scripts begin');
                 const count = await this.runLifecycleScripts(prog);
                 if (count > 0 && result.errors.length > 0) {
-                    clearNegativeCache();
+                    this.resolver.clearFileResolutionCaches();
                     await this.retryScanErrors(result);
                 }
                 prog?.pause();
@@ -590,7 +595,15 @@ export class TypeScriptRuntime {
                         parseDriver.compileModules(
                             compileTargets,
                             (done, total) => prog?.setCompileProgress(done, total),
-                            (localPath, bc, specPath) => {
+                            (localPath, bc, specPath, runtimeMapped) => {
+                                // The source map is registered in this runtime,
+                                // not in serialized QuickJS bytecode. Keep the
+                                // source-backed load path so a later runtime can
+                                // register it again before evaluating the module.
+                                if (runtimeMapped) {
+                                    log.debug('precache', () => `skip ${localPath}: runtime source map`);
+                                    return;
+                                }
                                 const format = formatByLocalPath.get(localPath);
                                 const remote = format === 'cjs' ? false : isRemote(specPath);
                                 const identity = format === 'cjs' ? localPath : specPath;

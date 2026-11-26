@@ -2,9 +2,13 @@ import { transformCnoCode } from '../../deps/sucrase/src/cno';
 import { dirname, joinPaths, hasSchemeId, isAbsolute, normalizePath, toPosixPath, readText, errMsg, log } from '../utils';
 import { err, ErrorKind, TransformError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
+import { decodeStringToken, extractImports } from '../scan';
+import { parse } from '../../deps/sucrase/src/parser';
+import { TokenType } from '../../deps/sucrase/src/parser/tokenizer/types';
 
 const engine = import.meta.use('engine');
 const smap = import.meta.use('sourcemap');
+const algorithm = import.meta.use('algorithm');
 
 const KIND_OTHER = 0;
 const KIND_TS = 1;
@@ -12,6 +16,11 @@ const KIND_TSX = 2;
 const KIND_JSX = 3;
 const KIND_CTS = 4;
 const KIND_JSON = 5;
+const KIND_JS_TRANSFORM = 6;
+const BUNDLE_SPECIFIER = 'bun:bundle';
+const BUNDLE_SPECIFIER_BYTES = engine.encodeString('bun:bundle');
+const ESCAPE_BYTE = new Uint8Array([92]);
+const DECORATOR_BYTE = new Uint8Array([64]);
 
 export interface TransformerOptions {
     sourceMaps?: boolean;
@@ -29,8 +38,8 @@ export class Transformer {
     private oxc: OxcTranspiler | null = null;
     private oxcLoader: (() => OxcTranspiler | null) | null = null;
     private oxcLoaded = false;
-    /** Modules whose embedded map was injected; consumed by the bytecode persist gate. */
-    private readonly inlineMappedKeys = new Set<string>();
+    /** Modules whose runtime source map was registered; consumed by the bytecode persist gate. */
+    private readonly runtimeMappedKeys = new Set<string>();
 
     constructor(options: TransformerOptions = {}) {
         this.sourceMaps = options.sourceMaps ?? true;
@@ -40,12 +49,14 @@ export class Transformer {
     }
 
     /**
-     * Consume the inline-map marker for a module. A persisted .jsc cannot be
+     * Consume the runtime-map marker for a module. A persisted .jsc cannot be
      * re-injected from (the map lives in the runtime, not the bytecode), so
-     * annotated modules must stay source-cached to keep stacks remapped.
+     * mapped modules must stay source-cached to keep stacks remapped.
+     *
+     * The method name is retained for the existing CJS bridge contract.
      */
     tookInlineSourceMap(moduleKey: string): boolean {
-        return this.inlineMappedKeys.delete(moduleKey);
+        return this.runtimeMappedKeys.delete(moduleKey);
     }
 
     /** Install the native oxc transpiler. When set, it takes priority over Sucrase. */
@@ -69,25 +80,30 @@ export class Transformer {
 
     transform(code: string, filename: string, lang?: string, mapKey?: string): string {
         code = stripShebang(code);
-        const kind = sourceKind(filename, lang);
+        const kind = transformKind(code, filename, lang);
         switch (kind) {
             case KIND_TS:
             case KIND_CTS:
             case KIND_TSX:
+            case KIND_JS_TRANSFORM:
             case KIND_JSX: {
                 const oxc = this.getOxc();
                 if (oxc) {
-                    const result = oxc.transpile(code, filename, mapKey, oxcLang(kind));
+                    const result = oxc.transpileCapture(code, filename, mapKey, oxcLang(kind), false);
                     if (result !== null) {
+                        if (this.sourceMaps && result.sourceMap) {
+                            this.registerSourceMap(mapKey ?? filename, result.sourceMap);
+                        }
                         log.debug('transformer', () => `oxc: ${filename}`);
-                        return result;
+                        return result.code;
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
+                rejectNativeTransformFallback(code, filename, kind);
                 // .cts keeps TS strip + unused imports (CJS require/exports intact).
                 return this.run(
                     code, filename,
-                    kind !== KIND_JSX,
+                    kind !== KIND_JSX && kind !== KIND_JS_TRANSFORM,
                     kind === KIND_TSX || kind === KIND_JSX,
                     mapKey,
                     kind === KIND_CTS,
@@ -107,25 +123,27 @@ export class Transformer {
     /** Like transform(); return sourcemap for remote JSContext. */
     transformCapture(code: string, filename: string, lang?: string, mapKey?: string): { code: string; sourceMap?: string | object } {
         code = stripShebang(code);
-        const kind = sourceKind(filename, lang);
+        const kind = transformKind(code, filename, lang);
         switch (kind) {
             case KIND_TS:
             case KIND_CTS:
             case KIND_TSX:
+            case KIND_JS_TRANSFORM:
             case KIND_JSX: {
                 const oxc = this.getOxc();
                 if (oxc) {
-                    const result = oxc.transpileCapture(code, filename, mapKey, oxcLang(kind));
+                    const result = oxc.transpileCapture(code, filename, mapKey, oxcLang(kind), false);
                     if (result !== null) {
                         log.debug('transformer', () => `oxc: ${filename}`);
                         return this.sourceMaps ? result : { code: result.code };
                     }
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
+                rejectNativeTransformFallback(code, filename, kind);
                 return {
                     code: this.run(
                         code, filename,
-                        kind !== KIND_JSX,
+                        kind !== KIND_JSX && kind !== KIND_JS_TRANSFORM,
                         kind === KIND_TSX || kind === KIND_JSX,
                         mapKey,
                         kind === KIND_CTS,
@@ -140,16 +158,17 @@ export class Transformer {
     }
 
     transformCaptureBytes(bytes: Uint8Array, filename: string, lang?: string, mapKey?: string): { code: string | Uint8Array; sourceMap?: string | Uint8Array | object } | null {
-        const kind = sourceKind(filename, lang);
+        const kind = transformKind(bytes, filename, lang);
         switch (kind) {
             case KIND_TS:
             case KIND_CTS:
             case KIND_TSX:
+            case KIND_JS_TRANSFORM:
             case KIND_JSX:
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) return null;
                 const oxc = this.getOxc();
                 if (!oxc) return null;
-                const result = oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
+                const result = oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind), false);
                 if (result !== null) {
                     log.debug('transformer', () => `oxc bytes: ${filename}`);
                     return this.sourceMaps ? result : { code: result.code };
@@ -163,11 +182,12 @@ export class Transformer {
 
     /** transform from file bytes; prefer no JS string. Sucrase/shebang fall back. */
     transformBytes(bytes: Uint8Array, filename: string, lang?: string, mapKey?: string): string | Uint8Array {
-        const kind = sourceKind(filename, lang);
+        const kind = transformKind(bytes, filename, lang);
         switch (kind) {
             case KIND_TS:
             case KIND_CTS:
             case KIND_TSX:
+            case KIND_JS_TRANSFORM:
             case KIND_JSX: {
                 if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
                     const decoded = engine.decodeString(bytes);
@@ -179,7 +199,7 @@ export class Transformer {
                 }
                 const oxc = this.getOxc();
                 if (oxc) {
-                    const result = oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind));
+                    const result = oxc.transpileBytes(bytes, filename, mapKey, oxcLang(kind), false);
                     if (result !== null) {
                         log.debug('transformer', () => `oxc bytes: ${filename}`);
                         if (this.sourceMaps && result.sourceMap) {
@@ -190,9 +210,11 @@ export class Transformer {
                     rejectNonUtf8(bytes, filename);
                     log.debug('transformer', () => `oxc fallback to sucrase: ${filename}`);
                 }
+                const decoded = engine.decodeString(bytes);
+                rejectNativeTransformFallback(decoded, filename, kind);
                 return this.run(
-                    engine.decodeString(bytes), filename,
-                    kind !== KIND_JSX,
+                    decoded, filename,
+                    kind !== KIND_JSX && kind !== KIND_JS_TRANSFORM,
                     kind === KIND_TSX || kind === KIND_JSX,
                     mapKey,
                     kind === KIND_CTS,
@@ -202,6 +224,12 @@ export class Transformer {
             default: {
                 log.debug('transformer', () => `passthrough bytes: ${filename}`);
                 this.loadInlineSourceMapBytes(mapKey ?? filename, filename, bytes);
+                if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
+                    // QuickJS receives passthrough bytes directly, so the
+                    // string transform's shebang handling is otherwise
+                    // bypassed for plain .js and extensionless entries.
+                    return stripShebang(engine.decodeString(bytes));
+                }
                 return bytes;
             }
         }
@@ -210,6 +238,7 @@ export class Transformer {
     private registerSourceMap(name: string, sourceMap: string | Uint8Array): void {
         try {
             smap.load(name, sourceMap);
+            this.runtimeMappedKeys.add(name);
         } catch (e) {
             log.debug('transformer', () => `smap: ${name}: ${errMsg(e)}`);
         }
@@ -244,7 +273,7 @@ export class Transformer {
         const mapPath = isAbsolute(posix) ? normalizePath(posix) : joinPaths(dirname(localPath), posix);
         try {
             smap.load(moduleKey, readText(mapPath));
-            if (track) this.inlineMappedKeys.add(moduleKey);
+            if (track) this.runtimeMappedKeys.add(moduleKey);
             log.debug('transformer', () => `smap: inline map loaded for ${moduleKey}`);
         } catch (e) {
             log.debug('transformer', () => `smap: ${moduleKey}: ${errMsg(e)}`);
@@ -252,21 +281,35 @@ export class Transformer {
     }
 
     /** Strip TS/JSX for CJS; does not rewrite ESM import/export. */
-    transformForCjs(code: string, filename: string, lang?: string): string {
+    transformForCjs(code: string, filename: string, lang?: string, mapKey?: string): string {
         code = stripShebang(code);
         switch (sourceKind(filename, lang)) {
             case KIND_TS:
             case KIND_CTS:
-                return this.run(code, filename, true, false, undefined, true);
+                code = this.run(code, filename, true, false, mapKey, true);
+                break;
             case KIND_TSX:
-                return this.run(code, filename, true, true, undefined, true);
+                code = this.run(code, filename, true, true, mapKey, true);
+                break;
             case KIND_JSX:
-                return this.run(code, filename, false, true);
+                code = this.run(code, filename, false, true, mapKey);
+                break;
             default:
                 log.debug('transformer', () => `cjs passthrough: ${filename}`);
-                this.loadInlineSourceMap(filename, filename, code);
-                return code;
+                this.loadInlineSourceMap(mapKey ?? filename, filename, code);
         }
+        const bundleFeature = hasBundleFeatureImport(code, false);
+        const decorators = hasDecoratorSyntax(code, false);
+        if (!bundleFeature && !decorators) return code;
+        const lowered = this.getOxc()?.transpileCapture(code, filename, mapKey, 'js', true);
+        if (lowered !== undefined && lowered !== null) {
+            if (this.sourceMaps && lowered.sourceMap) {
+                this.registerSourceMap(mapKey ?? filename, lowered.sourceMap);
+            }
+            return lowered.code;
+        }
+        rejectNativeTransformFallback(code, filename, KIND_JS_TRANSFORM);
+        return code;
     }
 
     private run(
@@ -374,6 +417,101 @@ export function hasEmbeddedSourceMapBytes(bytes: Uint8Array): boolean {
     if (bytes.byteLength === 0) return false;
     const windowStart = Math.max(0, bytes.byteLength - INLINE_SOURCEMAP_TAIL_BYTES);
     return embeddedSourceMapUrlFromTail(engine.decodeString(bytes.subarray(windowStart))) !== undefined;
+}
+
+function transformKind(source: string | Uint8Array, filename: string, lang?: string): number {
+    const kind = sourceKind(filename, lang);
+    if (kind !== KIND_OTHER) return kind;
+    return hasBundleFeatureImport(source, false) || hasDecoratorSyntax(source, false)
+        ? KIND_JS_TRANSFORM : kind;
+}
+
+function rejectNativeTransformFallback(
+    source: string,
+    filename: string,
+    kind: number,
+): void {
+    const isTypeScript = kind === KIND_TS || kind === KIND_TSX || kind === KIND_CTS;
+    const isJSXEnabled = kind === KIND_TSX || kind === KIND_JSX || kind === KIND_JS_TRANSFORM;
+    if (hasBundleFeatureImport(source, isTypeScript)) {
+        throw err(ErrorKind.TransformError, `${filename}: bun:bundle requires native OXC transformation`);
+    }
+    if (hasDecoratorSyntax(source, isTypeScript, isJSXEnabled)) {
+        throw err(ErrorKind.TransformError, `${filename}: standard decorators require native OXC transformation`);
+    }
+}
+
+function hasDecoratorSyntax(source: string | Uint8Array, isTypeScript: boolean, isJSXEnabled = true): boolean {
+    const candidate = typeof source === 'string'
+        ? source.includes('@')
+        : algorithm.bytesIndexOf(source, DECORATOR_BYTE) !== -1;
+    if (!candidate) return false;
+    const text = typeof source === 'string' ? source : engine.decodeString(source);
+    try {
+        return parse(text, isJSXEnabled, isTypeScript, false).tokens.some(token => token.type === TokenType.at);
+    } catch {
+        // Feature detection must not replace the normal transform diagnostic.
+        return false;
+    }
+}
+
+function hasBundleFeatureImport(source: string | Uint8Array, isTypeScript: boolean): boolean {
+    const hasRawSpecifier = typeof source === 'string'
+        ? source.includes(BUNDLE_SPECIFIER)
+        : algorithm.bytesIndexOf(source, BUNDLE_SPECIFIER_BYTES) !== -1;
+    if (!hasRawSpecifier) {
+        const hasEscape = typeof source === 'string'
+            ? source.includes('\\')
+            : algorithm.bytesIndexOf(source, ESCAPE_BYTE) !== -1;
+        if (!hasEscape || !hasEscapedBundleLiteral(source)) return false;
+    }
+    const text = typeof source === 'string' ? source : engine.decodeString(source);
+    try {
+        return extractImports(text, isTypeScript, true, { includeTypeOnlyImports: true })
+            .includes(BUNDLE_SPECIFIER);
+    } catch {
+        // Leave malformed imports to OXC/Sucrase so they retain file diagnostics.
+        return false;
+    }
+}
+
+function hasEscapedBundleLiteral(source: string | Uint8Array): boolean {
+    for (let index = 0; index < source.length; index++) {
+        const quote = codeAt(source, index);
+        if ((quote !== 34 && quote !== 39) ||
+            (codeAt(source, index + 1) !== 98 && codeAt(source, index + 1) !== 92)) continue;
+
+        let end = index + 1;
+        let hasEscape = false;
+        while (end < source.length && end - index <= 128) {
+            const code = codeAt(source, end);
+            if (code === quote) {
+                if (hasEscape) {
+                    const token = typeof source === 'string'
+                        ? source.slice(index, end + 1)
+                        : engine.decodeString(source.subarray(index, end + 1));
+                    if (decodeStringToken(token, 0, token.length) === BUNDLE_SPECIFIER) return true;
+                }
+                break;
+            }
+            if (code === 10 || code === 13 || code === 0x2028 || code === 0x2029) break;
+            if (code === 92) {
+                hasEscape = true;
+                const next = codeAt(source, end + 1);
+                if (next === 10 || next === 13 || next === 0x2028 || next === 0x2029 ||
+                    (next === 0xe2 && codeAt(source, end + 2) === 0x80 &&
+                        (codeAt(source, end + 3) === 0xa8 || codeAt(source, end + 3) === 0xa9))) return true;
+                end++;
+            }
+            end++;
+        }
+        if (end - index > 128) return true;
+    }
+    return false;
+}
+
+function codeAt(source: string | Uint8Array, index: number): number {
+    return typeof source === 'string' ? source.charCodeAt(index) : source[index]!;
 }
 
 function sourceKind(filename: string, lang?: string): number {

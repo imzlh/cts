@@ -11,7 +11,21 @@ import { ContextualKeyword } from '../deps/sucrase/src/parser/tokenizer/keywords
 /** Per-statement window for hasImportAttributes (was 4000 — too small for minified bundles). */
 const STATEMENT_SCAN_CAP = 64 * 1024;
 
-export function extractImports(source: string, isTs = true, strict = false): string[] {
+/**
+ * Imports of compile-time-only modules must not become resolver edges. Keep
+ * this list deliberately narrower than the Bun builtin family: unknown Bun
+ * builtins still need to fail closed when they are real runtime imports.
+ */
+export function isCompileTimeOnlyImport(specifier: string): boolean {
+    return specifier === 'bun:bundle';
+}
+
+export function extractImports(
+    source: string,
+    isTs = true,
+    strict = false,
+    options: { includeTypeOnlyImports?: boolean } = {},
+): string[] {
     let file: ReturnType<typeof parse>;
     try {
         file = parse(source, true, isTs, false);
@@ -54,12 +68,13 @@ export function extractImports(source: string, isTs = true, strict = false): str
                 continue;
             }
             // type-only import; `import type from '…'` is a value binding named type.
-            if (next.type === tt.name && next.contextualKeyword === ContextualKeyword._type) {
+            if (!options.includeTypeOnlyImports &&
+                next.type === tt.name && next.contextualKeyword === ContextualKeyword._type) {
                 const afterType = tokens[i + 2];
                 if (!afterType || afterType.contextualKeyword !== ContextualKeyword._from) continue;
             }
             const si = findFromString(tokens, i + 1);
-            if (si !== -1 && hasRuntimeImportSpecifier(tokens, i + 1, si)) {
+            if (si !== -1 && (options.includeTypeOnlyImports || hasRuntimeImportSpecifier(tokens, i + 1, si))) {
                 const specToken = tokens[si];
                 if (specToken) {
                     specs ??= new Set<string>();
@@ -276,7 +291,7 @@ function isShadowedRequire(tokenIndex: number, ranges: TokenRange[]): boolean {
         range.startTokenIndex <= tokenIndex && tokenIndex < range.endTokenIndex);
 }
 
-function decodeStringToken(source: string, start: number, end: number): string {
+export function decodeStringToken(source: string, start: number, end: number): string {
     const contentStart = start + 1;
     const contentEnd = end - 1;
     const firstSlash = source.indexOf('\\', contentStart);

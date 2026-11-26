@@ -11,6 +11,7 @@ const fs = import.meta.use('fs');
 const process = import.meta.use('process');
 const signals = import.meta.use('signals');
 const engine = import.meta.use('engine');
+import.meta.use('streams');     // prerequires
 
 const taskTerminalSignalNames = [
     'SIGINT', 'SIGQUIT', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU',
@@ -1066,6 +1067,7 @@ export async function runTaskChild(
     cwd: string,
 ): Promise<number> {
     const signalGuards: CModuleSignals.SignalHandler[] = [];
+    let primaryExitCode: number | undefined;
     for (const signalNumber of availableTaskSignalNumbers(taskTerminalSignalNames)) {
         try {
             signalGuards.push(signals.signal(signalNumber, () => {}));
@@ -1079,9 +1081,21 @@ export async function runTaskChild(
             stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
             env, cwd,
         });
-        return taskExitCode(await child.wait());
+        primaryExitCode = taskExitCode(await child.wait());
+        return primaryExitCode;
     } finally {
-        for (const guard of signalGuards) guard.close();
+        const closeErrors: unknown[] = [];
+        for (const guard of signalGuards) {
+            try {
+                guard.close();
+            } catch (error) {
+                closeErrors.push(error);
+            }
+        }
+        // Preserve the child/spawn failure. A cleanup failure is actionable
+        // only when the task itself completed successfully; in particular,
+        // do not turn a real non-zero child status into a thrown cleanup error.
+        if (primaryExitCode === 0 && closeErrors.length > 0) throw closeErrors[0];
     }
 }
 

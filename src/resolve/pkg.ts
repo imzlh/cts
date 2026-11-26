@@ -30,6 +30,22 @@ const exportsCache = new LRU<string, ResolvedPath | null>(1024);
 const PKG_TTL = 5 * 60 * 1000;
 const PACKAGE_SUBPATH_EXTS = ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.json', '.node', '.wasm'];
 
+function invalidPackageConfig(packagePath: string, message: string): Error {
+    return setErrorCode(err(ErrorKind.InvalidSpecifier,
+        `Invalid package config ${packagePath}: ${message}`), 'ERR_INVALID_PACKAGE_CONFIG');
+}
+
+function validatePackage(pkg: unknown, packagePath: string): PackageJson {
+    if (pkg === null || typeof pkg !== 'object' || Array.isArray(pkg)) {
+        throw invalidPackageConfig(packagePath, 'must be a JSON object');
+    }
+    const type = (pkg as { type?: unknown }).type;
+    if (Object.prototype.hasOwnProperty.call(pkg, 'type') && typeof type !== 'string') {
+        throw invalidPackageConfig(packagePath, '"type" must be a string');
+    }
+    return pkg as PackageJson;
+}
+
 export function readPkg(dir: string): PackageJson | null {
     const hit = pkgCache.get(dir);
     if (hit && Date.now() - hit.at < PKG_TTL)
@@ -37,10 +53,14 @@ export function readPkg(dir: string): PackageJson | null {
     const pkgPath = joinPaths(dir, 'package.json');
     if (!fs.exists(pkgPath)) { pkgCache.set(dir, { pkg: _NO_PKG, at: Date.now() }); return null; }
     try {
-        const pkg = safeParse<PackageJson>(engine.decodeString(fs.readFile(pkgPath)));
+        const pkg = validatePackage(
+            safeParse<unknown>(engine.decodeString(fs.readFile(pkgPath))),
+            pkgPath,
+        );
         pkgCache.set(dir, { pkg, at: Date.now() });
         return pkg;
     } catch (e) {
+        if (e instanceof Error && Reflect.get(e, 'code') === 'ERR_INVALID_PACKAGE_CONFIG') throw e;
         log.debug('pkg', () => `failed ${pkgPath}: ${e}`);
         pkgCache.set(dir, { pkg: _NO_PKG, at: Date.now() });
         return null;
@@ -51,8 +71,12 @@ export function readPkgFresh(dir: string): PackageJson | null {
     const pkgPath = joinPaths(dir, 'package.json');
     if (!fs.exists(pkgPath)) return null;
     try {
-        return safeParse<PackageJson>(engine.decodeString(fs.readFile(pkgPath)));
-    } catch {
+        return validatePackage(
+            safeParse<unknown>(engine.decodeString(fs.readFile(pkgPath))),
+            pkgPath,
+        );
+    } catch (e) {
+        if (e instanceof Error && Reflect.get(e, 'code') === 'ERR_INVALID_PACKAGE_CONFIG') throw e;
         return null;
     }
 }
@@ -181,7 +205,7 @@ export function detectPackageJsonFormat(localPath: string): ModuleFormat | null 
     return null;
 }
 
-/** Returns NO_MANIFEST for the no-package.json `.js` case; see detectFormat. */
+/** Returns NO_MANIFEST when no package scope declares a recognized type. */
 function _detectFormat(localPath: string): DirFormat {
     const ext = extname(localPath);
     if (ext === '.mjs' || ext === '.mts' || ext === '.ts' || ext === '.tsx' || ext === '.jsx') return 'esm';
@@ -295,8 +319,7 @@ function invalidPackageTargetError(ctx: ResolveCtx, target: unknown): Error {
 }
 
 function invalidPackageConfigError(ctx: ResolveCtx, message: string): Error {
-    return codedError(ErrorKind.InvalidSpecifier, 'ERR_INVALID_PACKAGE_CONFIG',
-        `Invalid package config ${joinPaths(ctx.pkgDir, 'package.json')}: ${message}`);
+    return invalidPackageConfig(joinPaths(ctx.pkgDir, 'package.json'), message);
 }
 
 function invalidModuleSpecifierError(spec: string): Error {

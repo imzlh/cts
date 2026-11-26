@@ -5,7 +5,7 @@ import { isRemote } from './source/cache';
 import type { OxcTranspiler } from './oxc';
 import { ImportScanner } from './import-scanner';
 import { isParseWorkerError } from './parse';
-import { isScannablePath, isWasmPath } from './scan';
+import { isCompileTimeOnlyImport, isScannablePath, isWasmPath } from './scan';
 import { isBunSpecifier } from './resolve/bun-specifier';
 
 const os = import.meta.use('os');
@@ -81,6 +81,10 @@ function shouldEnqueueScannedImport(parentSpecPath: string, spec: string, fullGr
 function isImportScannable(localPath: string, fileKind?: FileKind): boolean {
     return fileKind === 'source' || fileKind === 'wasm' ||
         isWasmPath(localPath) || isScannablePath(localPath);
+}
+
+function cacheableImports(imports: string[]): string[] {
+    return imports.filter(spec => !isCompileTimeOnlyImport(spec));
 }
 
 export class DepScanner {
@@ -357,7 +361,14 @@ export class DepScanner {
         const out: Array<{ spec: string; parent: string }> = [];
         for (let i = 0; i < imports.length; i++) {
             const spec = imports[i];
-            if (spec !== undefined && shouldEnqueueScannedImport(specPath, spec, fullGraph)) {
+            // bun:bundle is a compile-time intrinsic. It must disappear at the
+            // graph boundary, after either scanner has produced the raw import
+            // list, so cache/pack never ask the resolver for a fake builtin.
+            // Keep all other bun:* names intact: they are runtime imports and
+            // retain the resolver's fail-closed unknown-builtin behavior.
+            if (spec !== undefined &&
+                !isCompileTimeOnlyImport(spec) &&
+                shouldEnqueueScannedImport(specPath, spec, fullGraph)) {
                 out.push({ spec, parent: specPath });
             }
         }
@@ -374,7 +385,7 @@ export class DepScanner {
         // Warm precache may reuse lock imports; pack/fullGraph always rescans.
         if (!fullGraph) {
             const cached = this.resolver.lockStore.getImports(specPath);
-            if (cached !== undefined) return cached;
+            if (cached !== undefined) return cacheableImports(cached);
         }
         let imports: string[];
         if (!isImportScannable(localPath, fileKind)) {
@@ -390,6 +401,7 @@ export class DepScanner {
         } else {
             imports = await this.parseImports(localPath);
         }
+        imports = cacheableImports(imports);
         if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
         return imports;
     }
@@ -412,7 +424,7 @@ export class DepScanner {
     private loadImportsSync(specPath: string, localPath: string, fileKind: FileKind | undefined, fullGraph: boolean): string[] {
         if (!fullGraph) {
             const cached = this.resolver.lockStore.getImports(specPath);
-            if (cached !== undefined) return cached;
+            if (cached !== undefined) return cacheableImports(cached);
         }
         if (!isImportScannable(localPath, fileKind)) return [];
         const scanned = this.importScanner.scanFileResult(localPath, undefined, fullGraph);
@@ -420,8 +432,9 @@ export class DepScanner {
             if (fullGraph) throw new Error(`Could not read source for full dependency scan: ${localPath}`);
             return [];
         }
-        if (!fullGraph) this.resolver.lockStore.setImports(specPath, scanned);
-        return scanned;
+        const imports = cacheableImports(scanned);
+        if (!fullGraph) this.resolver.lockStore.setImports(specPath, imports);
+        return imports;
     }
 
     private async parseOne(

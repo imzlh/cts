@@ -14,8 +14,9 @@ import { BlobHandler }  from './protocols/blob';
 import { LockStore }    from '../lock';
 import { isBuiltinSpecifier } from './builtins';
 import { runAsync, runSync } from '../flow';
-import { fileUrlToPath, normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, parentDirKey, assert, LRU, log, schemeId } from '../utils';
-import { detectFormat } from './pkg';
+import { fileUrlToPath, normalizePath, joinPaths, isAbsolute, dirname, resolvePath, isRelative, canonicalizePath, resolveFile, clearNegativeCache, parentDirKey, assert, LRU, log, schemeId } from '../utils';
+import { getActiveFileStore, setActiveFileStore, type VirtualFileStore } from '../utils/memfs';
+import { clearPkgCache, detectFormat } from './pkg';
 import { guessFileKind, applyAttrType, validateAttrType } from './protocols/base';
 
 const os = import.meta.use('os');
@@ -29,6 +30,43 @@ function protoOf(s: string): string {
 
 function isBunInternalSpecifier(spec: string): boolean {
     return spec.startsWith('bun-internal:');
+}
+
+function resolveLocalFilePath(path: string): string {
+    let resolutionError: unknown;
+    try {
+        return resolveFile(path);
+    } catch (error) {
+        resolutionError = error;
+    }
+
+    // Keep resolveFile's negative-cache decision authoritative. This stat only
+    // distinguishes an existing file/directory from a missing extensionless
+    // candidate; it must never make a cached miss resolvable again.
+    try {
+        const stat = fs.stat(path);
+        if (stat.isFile || stat.isDirectory) throw resolutionError;
+    } catch (error) {
+        if (error === resolutionError) throw error;
+    }
+
+    const basenameStart = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1;
+    const extensionStart = path.lastIndexOf('.');
+    if (extensionStart > basenameStart) {
+        const extension = path.slice(extensionStart);
+        const inNodeModules = /(?:^|[\\/])node_modules(?:[\\/]|$)/.test(path);
+        const fallbacks = extension === '.js' || extension === '.jsx' ? ['.ts', '.tsx']
+            : extension === '.mjs' && !inNodeModules ? ['.mts']
+            : extension === '.cjs' && !inNodeModules ? ['.cts']
+            : [];
+        for (const fallback of fallbacks) {
+            const alternate = path.slice(0, extensionStart) + fallback;
+            try {
+                return resolveFile(alternate);
+            } catch {}
+        }
+    }
+    throw resolutionError;
 }
 
 /**
@@ -61,7 +99,7 @@ function resolveLocalFile(path: string): string {
         }
     }
     try {
-        return resolveFile(path);
+        return resolveLocalFilePath(path);
     } catch (e) {
         if (path.indexOf('%') === -1) throw e;
         let decoded: string;
@@ -72,7 +110,7 @@ function resolveLocalFile(path: string): string {
         }
         if (decoded === path) throw e;
         try {
-            return resolveFile(decoded);
+            return resolveLocalFilePath(decoded);
         } catch {
             throw e;
         }
@@ -226,8 +264,11 @@ export class ModuleResolver {
     private readonly runtimeModules = new Map<string, ModuleInfo>();
     /** In-memory (spec, parent) → ModuleInfo cache — skips SQLite on repeat resolves. */
     private readonly resolveCache = new LRU<string, ModuleInfo>(4096);
+    /** Runtime module-resolution failures, matching the loader's failed-import cache. */
+    private readonly resolutionMissCache = new LRU<string, Error>(4096);
     /** Mode-aware source cache for cjs-vs-esm lookups in the current runtime. */
     private readonly sourceInfoCache = new LRU<string, ModuleInfo>(4096);
+    private packFileStore: VirtualFileStore | null = null;
 
     constructor(
         private readonly cfg: RuntimeConfig,
@@ -306,12 +347,22 @@ export class ModuleResolver {
     /** Close the owned lock store: on Windows an open handle makes deleting the
      *  lock dir fail with EINVAL. */
     close(): void {
-        this.lock.close();
+        try {
+            this.lock.close();
+        } finally {
+            const store = this.packFileStore;
+            this.packFileStore = null;
+            if (store !== null && getActiveFileStore() === store) setActiveFileStore(null);
+        }
     }
 
     /** Register a `pack:` handler for an active .jspack container run (see pack/reader.ts). */
-    registerPackHandler(h: ProtocolHandler): void {
+    registerPackHandler(h: ProtocolHandler, fileStore?: VirtualFileStore): void {
         this.reg(h);
+        if (fileStore !== undefined) {
+            this.packFileStore = fileStore;
+            setActiveFileStore(fileStore);
+        }
     }
 
     set entry(s: string) { this.mainEntry = s; }
@@ -321,6 +372,7 @@ export class ModuleResolver {
         const h = this.handlers.get('node');
         assert(h instanceof NodeHandler, 'node handler not registered');
         h.registerResolver(r);
+        this.resolutionMissCache.clear();
     }
 
     moduleRef(info: Pick<ModuleInfo, 'specPath' | 'moduleId'>): string {
@@ -331,6 +383,18 @@ export class ModuleResolver {
     // Falls back to sync resolve when no async handler available (file, data, node).
 
     async resolveAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
+        const missKey = attr?.inspect === true ? null : this.resolutionMissKey(spec, parent, attr);
+        const cachedMiss = missKey === null ? undefined : this.resolutionMissCache.get(missKey);
+        if (cachedMiss !== undefined) throw cachedMiss;
+        try {
+            return await this.resolveAsyncUncached(spec, parent, attr, onProgress);
+        } catch (error) {
+            if (missKey !== null) this.rememberResolutionMiss(missKey, error);
+            throw error;
+        }
+    }
+
+    private async resolveAsyncUncached(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
         log.debug('resolver', () => `resolveAsync "${spec}" from "${parent}"`);
 
         const bunInternalParent = this.bunInternalParent(parent);
@@ -466,6 +530,18 @@ export class ModuleResolver {
     // Main resolution — three-level cache
 
     resolve(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
+        const missKey = attr?.inspect === true ? null : this.resolutionMissKey(spec, parent, attr);
+        const cachedMiss = missKey === null ? undefined : this.resolutionMissCache.get(missKey);
+        if (cachedMiss !== undefined) throw cachedMiss;
+        try {
+            return this.resolveUncached(spec, parent, attr);
+        } catch (error) {
+            if (missKey !== null) this.rememberResolutionMiss(missKey, error);
+            throw error;
+        }
+    }
+
+    private resolveUncached(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
         log.debug('resolver', () => `resolve "${spec}" from "${parent}"`);
 
         const bunInternalParent = this.bunInternalParent(parent);
@@ -644,13 +720,24 @@ export class ModuleResolver {
         }
     }
 
+    /** Clear filesystem-derived misses after lifecycle scripts create local files or packages. */
+    clearFileResolutionCaches(): void {
+        this.resolutionMissCache.clear();
+        clearNegativeCache();
+        clearPkgCache();
+        const npm = this.handlers.get('npm');
+        if (npm instanceof NpmHandler) npm.clearLocalResolutionCache();
+    }
+
     /** Clear runtime-only resolution caches while keeping persistent handler state intact. */
     clearRuntimeCaches(): void {
         this.runtimeModules.clear();
         this.packParentsByLocalPath.clear();
         this.resolvedModules.clear();
         this.resolveCache.clear();
+        this.resolutionMissCache.clear();
         this.sourceInfoCache.clear();
+        clearNegativeCache();
     }
 
     /** Drain deferred npm lifecycle scripts from the npm handler. */
@@ -924,6 +1011,18 @@ export class ModuleResolver {
     private exactResolveKey(spec: string, parent: string): string {
         if (isRelative(spec)) return `${spec}\0${parentDirKey(parent)}`;
         return `${spec}\0${parent}`;
+    }
+
+    private resolutionMissKey(spec: string, parent: string, attr?: Record<string, unknown>): string {
+        const mode = attr?.cjs === true ? 'cjs' : 'esm';
+        return `${mode}\0${spec}\0${this.normalizeParentRef(parent)}\0${this.attrSignature(attr)}`;
+    }
+
+    private rememberResolutionMiss(key: string, error: unknown): void {
+        if (error instanceof Error
+            && (error.kind === ErrorKind.FileNotFound || error.kind === ErrorKind.ModuleNotFound)) {
+            this.resolutionMissCache.set(key, error);
+        }
     }
 
     private canUseCachedInfo(info: ModuleInfo): boolean {

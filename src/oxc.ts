@@ -1,5 +1,6 @@
 import { log, errMsg } from './utils';
 import { readEnv } from './utils/env';
+import { err, ErrorKind } from './errors';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -10,9 +11,9 @@ const smap = import.meta.use('sourcemap');
 export interface OxcModule {
     transpile(source: string, opts?: OxcOptions): { code: string; deps: string[]; sourceMap?: string };
     scanImports(source: string, opts?: OxcOptions): string[];
-    transpileFast?: (source: string, kind: OxcKind, filename: string) => OxcTransformResult;
-    transpileBytes?: (source: Uint8Array, kind: OxcKind, filename: string) => OxcTransformResult;
-    transpileSharedBytes?: (source: Uint8Array, kind: OxcKind, filename: string) => OxcSharedBytesResult;
+    transpileFast?: (source: string, kind: OxcKind, filename: string, isCjs?: boolean) => OxcTransformResult;
+    transpileBytes?: (source: Uint8Array, kind: OxcKind, filename: string, isCjs?: boolean) => OxcTransformResult;
+    transpileSharedBytes?: (source: Uint8Array, kind: OxcKind, filename: string, isCjs?: boolean) => OxcSharedBytesResult;
     scanImportsFast?: (source: string, kind: OxcKind) => string[];
     scanImportsBytes?: (source: Uint8Array, kind: OxcKind) => string[];
     version: string;
@@ -35,6 +36,7 @@ interface OxcOptions {
     kind?: OxcOptionKind;
     depsOnly?: boolean;
     filename?: string;
+    isCjs?: boolean;
 }
 
 const OXC_KIND_JS = 0;
@@ -60,9 +62,9 @@ export function isOxcModule(value: unknown): value is OxcModule {
 export class OxcTranspiler {
     private mod: OxcModule;
     private transpileOptions: OxcOptions = { kind: 'js', filename: '' };
-    private transpileFast: ((source: string, kind: OxcKind, filename: string) => OxcTransformResult) | null = null;
-    private transpileBytesFn: ((source: Uint8Array, kind: OxcKind, filename: string) => OxcTransformResult) | null = null;
-    private transpileSharedBytesFn: ((source: Uint8Array, kind: OxcKind, filename: string) => OxcSharedBytesResult) | null = null;
+    private transpileFast: OxcModule['transpileFast'] | null = null;
+    private transpileBytesFn: OxcModule['transpileBytes'] | null = null;
+    private transpileSharedBytesFn: OxcModule['transpileSharedBytes'] | null = null;
     private scanImportsFast: ((source: string, kind: OxcKind) => string[]) | null = null;
     private scanImportsBytesFn: ((source: Uint8Array, kind: OxcKind) => string[]) | null = null;
     private scanLogged = false;
@@ -93,8 +95,8 @@ export class OxcTranspiler {
     }
 
     /** Transpile to JS. mapKey = runtime id (sourcemap + Module name), not disk path. */
-    transpile(source: string, filename: string, mapKey?: string, lang?: string): string | null {
-        const result = this.transpileCapture(source, filename, mapKey, lang);
+    transpile(source: string, filename: string, mapKey?: string, lang?: string, isCjs = false): string | null {
+        const result = this.transpileCapture(source, filename, mapKey, lang, isCjs);
         if (!result) return null;
         if (result.sourceMap) {
             try { smap.load(mapKey ?? filename, result.sourceMap); }
@@ -104,31 +106,29 @@ export class OxcTranspiler {
     }
 
     /** Like transpile(); return sourcemap for remote JSContext to register. */
-    transpileCapture(source: string, filename: string, mapKey?: string, lang?: string): { code: string; sourceMap?: string } | null {
+    transpileCapture(source: string, filename: string, mapKey?: string, lang?: string, isCjs = false): { code: string; sourceMap?: string } | null {
         try {
             const kind = kindFromFilename(filename, lang);
             const name = mapKey ?? filename;
             const { code, sourceMap } = this.transpileFast
-                ? this.transpileFast(source, kind, name)
-                : this.transpileCompat(source, kind, name);
+                ? this.transpileFast(source, kind, name, isCjs)
+                : this.transpileCompat(source, kind, name, isCjs);
             return { code, sourceMap };
         } catch (e) {
-            log.debug('oxc', () => `transpile failed for ${filename}: ${errMsg(e)}`);
-            return null;
+            return oxcFailure(e, filename, 'transpile');
         }
     }
 
-    transpileBytes(source: Uint8Array, filename: string, mapKey?: string, lang?: string): OxcTransformResult | OxcSharedBytesResult | null {
+    transpileBytes(source: Uint8Array, filename: string, mapKey?: string, lang?: string, isCjs = false): OxcTransformResult | OxcSharedBytesResult | null {
         if (!this.transpileSharedBytesFn && !this.transpileBytesFn) return null;
         try {
             const kind = kindFromFilename(filename, lang);
             const name = mapKey ?? filename;
             return this.transpileSharedBytesFn
-                ? this.transpileSharedBytesFn(source, kind, name)
-                : this.transpileBytesFn!(source, kind, name);
+                ? this.transpileSharedBytesFn(source, kind, name, isCjs)
+                : this.transpileBytesFn!(source, kind, name, isCjs);
         } catch (e) {
-            log.debug('oxc', () => `transpileBytes failed for ${filename}: ${errMsg(e)}`);
-            return null;
+            return oxcFailure(e, filename, 'transpileBytes');
         }
     }
 
@@ -145,8 +145,7 @@ export class OxcTranspiler {
             }
             return deps;
         } catch (e) {
-            log.debug('oxc', () => `scanImports failed for ${filename}: ${errMsg(e)}`);
-            return null;
+            return oxcFailure(e, filename, 'scanImports');
         }
     }
 
@@ -160,23 +159,33 @@ export class OxcTranspiler {
             }
             return deps;
         } catch (e) {
-            log.debug('oxc', () => `scanImportsBytes failed for ${filename}: ${errMsg(e)}`);
-            return null;
+            return oxcFailure(e, filename, 'scanImportsBytes');
         }
     }
 
-    private transpileCompat(source: string, kind: OxcKind, filename: string): OxcTransformResult {
+    private transpileCompat(source: string, kind: OxcKind, filename: string, isCjs: boolean): OxcTransformResult {
         const opts = this.transpileOptions;
         opts.kind = optionKindForKind(kind);
         opts.filename = filename;
+        opts.isCjs = isCjs;
         return this.mod.transpile(source, opts);
     }
+}
+
+function oxcFailure(error: unknown, filename: string, operation: string): null {
+    const message = errMsg(error);
+    if (message.startsWith('oxc: bun:bundle:') || message.startsWith('oxc: decorators:')) {
+        throw err(ErrorKind.TransformError, `${filename}: ${message}`, error);
+    }
+    log.debug('oxc', () => `${operation} failed for ${filename}: ${message}`);
+    return null;
 }
 
 function kindFromFilename(filename: string, lang?: string): OxcKind {
     if (lang === 'ts' || lang === 'mts' || lang === 'cts') return OXC_KIND_TS;
     if (lang === 'tsx') return OXC_KIND_TSX;
     if (lang === 'jsx') return OXC_KIND_JSX;
+    if (lang === 'js') return OXC_KIND_JS;
     if (filename.endsWith('.ts') || filename.endsWith('.mts') || filename.endsWith('.cts')) return OXC_KIND_TS;
     if (filename.endsWith('.tsx')) return OXC_KIND_TSX;
     if (filename.endsWith('.jsx')) return OXC_KIND_JSX;

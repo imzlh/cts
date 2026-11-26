@@ -256,6 +256,7 @@ export async function writePack(
             format?: ModuleFormat;
             lang?: string;
             identity?: string;
+            sourceBytes?: Uint8Array;
         }> = [];
         const rawRanges = new Map<string, BlobRange>();
         const sourceSnapshots = new Map<string, SourceSnapshot>();
@@ -317,11 +318,17 @@ export async function writePack(
                 format: m.format,
                 lang: m.specPath === entryInfo.specPath ? options.entryLang : undefined,
                 identity: id,
+                // Compile the exact bytes that will be shipped. In particular,
+                // the pack deliberately removes external sourceMappingURL
+                // annotations; reading the on-disk file here would make the
+                // precompiler reject an otherwise valid pack entry.
+                sourceBytes: blob.range(snapshot.offset, snapshot.length),
             });
         }
 
         const compileFailures: Array<{ localPath: string; specPath: string; error: unknown }> = [];
         const compiled = new Map<string, Uint8Array>();
+        const runtimeMapped = new Set<string>();
 
         if (sourceModules.length > 0) {
             // Throwaway placeholders so eager static-import resolution during
@@ -349,12 +356,13 @@ export async function writePack(
                 },
             }, () =>
                 // compileForCache reports both the real local path and synthetic id.
-                parseDriver.compileModules(sourceModules, (done, total) => prog?.setCompileProgress(done, total), (localPath, bc, syntheticSpecPath) => {
+                parseDriver.compileModules(sourceModules, (done, total) => prog?.setCompileProgress(done, total), (localPath, bc, syntheticSpecPath, hasRuntimeSourceMap) => {
                     if (compiled.has(syntheticSpecPath)) {
                         compileFailures.push({ localPath, specPath: syntheticSpecPath, error: new Error('duplicate compiler output') });
                         return;
                     }
                     compiled.set(syntheticSpecPath, new Uint8Array(bc));
+                    if (hasRuntimeSourceMap) runtimeMapped.add(syntheticSpecPath);
                 }, (localPath, specPath, error) => {
                     compileFailures.push({ localPath, specPath, error });
                 }),
@@ -394,7 +402,11 @@ export async function writePack(
                 sourceLength: sourceRange.length,
                 // Explicit false omitted to keep manifests small; true is required
                 // so loaders disable bytecode that would drop import attributes.
-                sourceOnly: sourceRange.sourceOnly || undefined,
+                // A runtime source map is registered in the compiler process,
+                // not embedded in bytecode. Pack execution must therefore
+                // re-transform this source so the map is registered under its
+                // pack identity instead of serving an unmapped warm module.
+                sourceOnly: sourceRange.sourceOnly || runtimeMapped.has(sourceModule.specPath) || undefined,
                 lang: source?.specPath === entryInfo.specPath ? options.entryLang : undefined,
             };
         }

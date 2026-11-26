@@ -32,7 +32,8 @@ export class NodeHandler implements ProtocolHandler {
         const bare = specPath.startsWith('node:') ? specPath.slice(5) : specPath;
         // Cross-tree imports resolved below canonicalise as `node:utils/...`;
         // their physical home is the sibling utils tree, not node/.
-        if (bare === 'utils' || bare.startsWith('utils/')) {
+        if (bare === 'utils') return joinPaths(this.cfg.cacheDir, 'utils', 'index.ts');
+        if (bare.startsWith('utils/')) {
             return joinPaths(this.cfg.cacheDir, `${bare}.ts`);
         }
         if (bare.includes('/')) return joinPaths(this.cfg.cacheDir, 'node', `${bare}.ts`);
@@ -50,8 +51,10 @@ export class NodeHandler implements ProtocolHandler {
         const nodeRoot = joinPaths(this.cfg.cacheDir, 'node');
         const utilsRoot = joinPaths(this.cfg.cacheDir, 'utils');
 
-        const parentLocal = parentBare === 'utils' || parentBare.startsWith('utils/')
-            ? joinPaths(utilsRoot, `${parentBare.slice('utils/'.length)}.ts`)
+        const parentLocal = parentBare === 'utils'
+            ? joinPaths(utilsRoot, 'index.ts')
+            : parentBare.startsWith('utils/')
+                ? joinPaths(utilsRoot, `${parentBare.slice('utils/'.length)}.ts`)
             : parentBare.includes('/')
                 ? joinPaths(nodeRoot, `${parentBare}.ts`)
                 : joinPaths(nodeRoot, parentBare, 'index.ts');
@@ -86,9 +89,13 @@ export class NodeHandler implements ProtocolHandler {
             if (p) { log.debug('node', () => `external -> ${p}`); return p; }
         }
         const nodeDir = joinPaths(this.cfg.cacheDir, 'node');
-        const localPath = bare.includes('/')
-            ? joinPaths(nodeDir, `${bare}.ts`)
-            : joinPaths(nodeDir, bare, 'index.ts');
+        const localPath = bare === 'utils'
+            ? joinPaths(this.cfg.cacheDir, 'utils', 'index.ts')
+            : bare.startsWith('utils/')
+                ? joinPaths(this.cfg.cacheDir, `${bare}.ts`)
+                : bare.includes('/')
+                    ? joinPaths(nodeDir, `${bare}.ts`)
+                    : joinPaths(nodeDir, bare, 'index.ts');
         const exists = yield { type: StepType.FS_EXISTS, path: localPath };
         // ERR_UNKNOWN_BUILTIN_MODULE is what node reports for an unknown
         // `node:` specifier (measured on v24.18.0, both import and require).

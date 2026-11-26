@@ -3,7 +3,7 @@ import type { OxcTranspiler } from '../oxc';
 import type { ModuleResolver } from '../resolve/index';
 import { isTypeDecl } from '../resolve/protocols/base';
 import { moduleEvaluationKey, moduleRef, type ModuleInfo, type RuntimeConfig } from '../types';
-import { bridgeCjsToEsm, buildCjsDeps, installGlobalRequire, installInternalBridge } from './bridge';
+import { bridgeCjsToEsm, buildCjsDeps, installGlobalRequire, installInternalBridge, promiseResultHandled } from './bridge';
 import { CjsLoader, clearDirPathsCache } from './cjs';
 import { EsmCompiler } from './esm';
 import { WasmCompiler } from './wasm';
@@ -50,7 +50,7 @@ export class ModuleCompiler {
                 (resolved, meta) => this.load(resolved, meta),
                 (m) => this.evalTracked(m),
             );
-            const result = engine.promiseResult(
+            const result = promiseResultHandled(
                 this.esm.trackEvaluation(evalScope, () => mod.eval()),
             );
             if (result === null) {
@@ -113,6 +113,9 @@ export class ModuleCompiler {
         }
 
         if (info.format === 'cjs' && info.fileKind === 'source') {
+            const requiredEsm = this.cjs.requiredEsmInfo(info.localPath);
+            if (requiredEsm) return this.esm.load(requiredEsm, meta);
+
             // Cycle: this CJS body is already on the stack, so the ESM module
             // being compiled right now imports a module that is mid-execution.
             // loadAndGet's `loaded || executing` guard would bridge the partial

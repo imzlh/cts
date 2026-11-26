@@ -3,6 +3,7 @@ import type { OxcTranspiler } from './oxc';
 import { extractImports, isTsLikePath, isWasmPath } from './scan';
 import { scanWasmImportModules } from './wasm-imports';
 import { errMsg, log, readBytes, readText } from './utils';
+import { ErrorKind } from './errors';
 
 const engine = import.meta.use('engine');
 
@@ -28,6 +29,7 @@ export class ImportScanner {
             // VFS-aware (pack: overlay); empty Uint8Array is a valid hit.
             return this.scanBytes(readBytes(localPath), localPath, lang, strict);
         } catch (e) {
+            if (e instanceof Error && e.kind === ErrorKind.TransformError) throw e;
             log.debug('scan', () => `read fail ${localPath}: ${errMsg(e)}`);
             if (strict) throw e;
             return null;
@@ -43,6 +45,7 @@ export class ImportScanner {
                 const deps = this.oxc.scanImportsBytes(bytes, localPath, lang);
                 if (deps !== null) return deps;
             } catch (e) {
+                if (e instanceof Error && e.kind === ErrorKind.TransformError) throw e;
                 log.debug('oxc', () => `scanImportsBytes ${localPath}: ${errMsg(e)}`);
             }
             try {
@@ -50,6 +53,7 @@ export class ImportScanner {
                 const deps = this.oxc.scanImports(source, localPath, lang);
                 if (deps !== null) return deps;
             } catch (e) {
+                if (e instanceof Error && e.kind === ErrorKind.TransformError) throw e;
                 log.debug('oxc', () => `scanImports ${localPath}: ${errMsg(e)}`);
             }
             if (!this.fallbackLogged) {
@@ -67,6 +71,7 @@ export class ImportScanner {
                 const deps = this.oxc.scanImports(source, localPath, lang);
                 if (deps !== null) return deps;
             } catch (e) {
+                if (e instanceof Error && e.kind === ErrorKind.TransformError) throw e;
                 log.debug('oxc', () => `scanImports ${localPath}: ${errMsg(e)}`);
             }
             if (!this.fallbackLogged) {
@@ -82,6 +87,7 @@ export class ImportScanner {
         try {
             return this.scanSource(readText(localPath), localPath, lang);
         } catch (e) {
+            if (e instanceof Error && e.kind === ErrorKind.TransformError) throw e;
             log.debug('scan', () => `readText fail ${localPath}: ${errMsg(e)}`);
             return [];
         }

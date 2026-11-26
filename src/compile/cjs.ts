@@ -52,7 +52,7 @@ export interface CjsDeps {
     resolveExternalCached?(req: string, parent: string): ModuleInfo | null;
     /** Prepare source for CJS execution (e.g. strip TS/JSX syntax). */
     prepareSource?(code: string, filePath: string): string | null;
-    /** Consume the embedded-sourceMappingURL marker for path (see Transformer). */
+    /** Consume the runtime source-map marker for path (see Transformer). */
     tookInlineSourceMap?(localPath: string): boolean;
     /** Fresh EVAL_COMPILE_ONLY bytecode for path, or null. The sidecar's
      *  Function-patch verdict travels with the value (bytecode cannot be
@@ -73,8 +73,13 @@ interface ResolvedCjsRequest {
     isCjs: boolean;
 }
 
+function isCommonJsRequest(info: ModuleInfo): boolean {
+    return info.format === 'cjs' || info.fileKind === 'json';
+}
+
 const INTERNAL_ID = Symbol('cts.cjs.id');
 const INTERNAL_FILENAME = Symbol('cts.cjs.filename');
+const ESM_REQUIRE_VIEW = Symbol('cts.cjs.esmRequireView');
 /** Marks a cache entry that only exists to be some child's `module.parent`.
  *  Without it a preRegister() stub is indistinguishable from a loaded module. */
 const PARENT_STUB = Symbol('cts.cjs.parentStub');
@@ -83,6 +88,7 @@ type InternalCjsModule = CjsModule & {
     [INTERNAL_ID]: string;
     [INTERNAL_FILENAME]: string;
     [PARENT_STUB]?: boolean;
+    [ESM_REQUIRE_VIEW]?: boolean;
     path?: string;
 };
 
@@ -535,6 +541,9 @@ export class CjsLoader {
     private readonly executing = new Set<string>();
     // Tracks ESM importers for CJS cycle error attribution.
     private readonly esmImporters = new Map<string, string>();
+    // A require(esm) entry is a view over EsmCompiler's real module, not CJS
+    // exports. Keep the source identity so a later import can reuse that module.
+    private readonly esmRequireInfos = new Map<string, ModuleInfo>();
     private readonly builtinCache = new Map<string, CjsModule>();
     private mainModule: CjsModule | null = null;
     /**
@@ -558,7 +567,16 @@ export class CjsLoader {
         this.builtinCache.clear();
         this.executing.clear();
         this.esmImporters.clear();
+        this.esmRequireInfos.clear();
         this.mainModule = null;
+    }
+
+    /** Return the real ESM identity behind a synthetic require(esm) cache entry. */
+    requiredEsmInfo(filename: string): ModuleInfo | null {
+        const path = normalizePath(filename);
+        const cached = this.cache.get(path) as InternalCjsModule | undefined;
+        if (!cached?.[ESM_REQUIRE_VIEW]) return null;
+        return this.esmRequireInfos.get(path) ?? null;
     }
 
     private currentCacheView(): Record<string, CjsModule> {
@@ -844,7 +862,7 @@ export class CjsLoader {
 
         // Consume unconditionally so every prepareSource caller clears its
         // marker; only the persisting branch acts on it.
-        const inlineMapped = this.deps.tookInlineSourceMap?.(filename) ?? false;
+        const runtimeMapped = this.deps.tookInlineSourceMap?.(filename) ?? false;
 
         let compiled: unknown;
         try {
@@ -856,7 +874,7 @@ export class CjsLoader {
             throw normalizeExecError(e, filename);
         }
 
-        if (this.deps.persistCjsCompiled && sourceFreshness && !inlineMapped) {
+        if (this.deps.persistCjsCompiled && sourceFreshness && !runtimeMapped) {
             try {
                 this.deps.persistCjsCompiled(filename, engine.serialize(compiled).buffer, sourceFreshness, shouldPatchFunction);
             } catch (e) {
@@ -1020,13 +1038,14 @@ export class CjsLoader {
         const hit = this.cache.get(path);
         if (hit) return hit.exports; // may be partial for circular deps
 
-        // 5. Load CJS
+        // 5. Load CJS. The resolver has already selected this format from the
+        // extension and package metadata; source contents cannot reclassify it.
         return this.loadResolvedCjs(path, parentMod).exports;
     }
 
     /** require(esm): loadEsmSync + same cache as CJS (Node 22+ semantics). */
     private requireEsm(info: ModuleInfo, parentPath: string): unknown {
-        const path = info.localPath;
+        const path = normalizePath(info.localPath);
         const hit = this.cache.get(path);
         // A parent stub is not a load result: fall through so loadEsmSync can run
         // its in-flight check (throw on a cycle) or genuinely load the module.
@@ -1041,7 +1060,8 @@ export class CjsLoader {
         const result = info.fileKind === 'wasm' && this.deps.loadWasmSync
             ? this.deps.loadWasmSync(info)
             : this.deps.loadEsmSync(info, parentPath);
-        const mod = this.synth(path);
+        const mod = this.synth(path) as InternalCjsModule;
+        mod[ESM_REQUIRE_VIEW] = true;
         // Node returns the whole namespace, not the bare default: an explicit
         // 'module.exports' export wins, otherwise keep every named export.
         if ('module.exports' in result) {
@@ -1051,6 +1071,7 @@ export class CjsLoader {
         } else {
             mod.exports = result;
         }
+        this.esmRequireInfos.set(path, info);
         this.cache.set(path, mod);
         return mod.exports;
     }
@@ -1139,7 +1160,7 @@ export class CjsLoader {
         if (runtimeParent) {
             // resolveExternal rethrows non-miss; do not wrap in empty catch.
             const ext = external(id, runtimeParent);
-            if (ext) return { info: ext, isCjs: ext.format === 'cjs' || ext.fileKind === 'json' };
+            if (ext) return { info: ext, isCjs: isCommonJsRequest(ext) };
             return null;
         }
 
@@ -1151,7 +1172,7 @@ export class CjsLoader {
         if (ext) {
             return {
                 info: ext,
-                isCjs: ext.format === 'cjs' || ext.fileKind === 'json',
+                isCjs: isCommonJsRequest(ext),
             };
         }
 
@@ -1209,6 +1230,6 @@ export class CjsLoader {
             format,
             fileKind,
         };
-        return { info, isCjs: format === 'cjs' || fileKind === 'json' };
+        return { info, isCjs: isCommonJsRequest(info) };
     }
 }

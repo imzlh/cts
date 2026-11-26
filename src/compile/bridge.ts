@@ -95,7 +95,7 @@ export function loadEsmSync(
     }
 
     const mod = esm.load(info, {});
-    const result = engine.promiseResult(esm.trackEvaluation(evalScope, () => mod.eval()));
+    const result = promiseResultHandled(esm.trackEvaluation(evalScope, () => mod.eval()));
 
     // null = top-level await unresolved; do NOT weaken with namespace check (causes silent dead-lock)
     if (result === null) {
@@ -108,6 +108,17 @@ export function loadEsmSync(
     }
 
     return mod.namespace;
+}
+
+/**
+ * Read a module evaluation promise synchronously without leaving a rejected
+ * promise for the host rejection tracker after the caller catches the error.
+ * `engine.promiseResult()` throws the rejection reason but does not mark the
+ * original promise handled itself.
+ */
+export function promiseResultHandled<T>(promise: Promise<T>): T | null {
+    void promise.catch(() => undefined);
+    return engine.promiseResult(promise);
 }
 
 /** Wire CjsLoader to resolver + ESM compiler. With `enableCache` false the CJS
@@ -231,13 +242,16 @@ export function installGlobalRequire(
     const prev = Reflect.get(globalThis, CTS_REQUIRE_GETTER);
     if (prev) log.warn('bridge', () => 'globalThis.require re-installed — prior runtime hijacked');
 
-    let requireFn: ((id: string) => unknown) | undefined;
-    let cachedEntry = '';
+    const requires = new Map<string, (id: string) => unknown>();
     const getter = () => {
-        const entry = getEntry();
-        if (!requireFn || entry !== cachedEntry) {
-            cachedEntry = entry;
-            requireFn = mkRequire(entry);
+        // The native helper's level 0 is the bridge getter itself and level 1
+        // is the property-access trampoline; the user module is level 2.
+        const caller = engine.getScriptOrModuleName(2);
+        const parent = caller && !caller.startsWith('<') ? caller : getEntry();
+        let requireFn = requires.get(parent);
+        if (!requireFn) {
+            requireFn = mkRequire(parent);
+            requires.set(parent, requireFn);
         }
         return requireFn;
     };

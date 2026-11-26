@@ -5,6 +5,7 @@ import { JscCache, isRemote, isFileBackedPath, type SourceFreshness } from '../s
 import { readText, readBytes, log } from '../utils';
 import { err, ErrorKind, requireCycleError } from '../errors';
 import type { OxcTranspiler } from '../oxc';
+import { promiseResultHandled } from './bridge';
 
 const engine = import.meta.use('engine');
 
@@ -190,7 +191,7 @@ export class EsmCompiler {
         this.esmInFlightPaths.add(evalScope);
         let sourceFreshness: SourceFreshness | undefined;
         let mod: CModuleEngine.Module;
-        let inlineMapped = false;
+        let runtimeMapped = false;
         try {
             // The sidecar must describe the bytes about to be compiled, not whatever
             // revision happens to be on disk after compilation finishes.
@@ -202,7 +203,7 @@ export class EsmCompiler {
             const code = this.transformer.transformBytes(bytes, info.localPath, metaLang(meta), moduleId);
             // Consume immediately: every transformBytes load must clear its
             // marker, whether or not this load reaches the persist gate.
-            inlineMapped = this.transformer.tookInlineSourceMap(moduleId);
+            runtimeMapped = this.transformer.tookInlineSourceMap(moduleId);
             mod = this.compileEsm(code, moduleId, info.localPath);
         } catch (e) {
             this.esmCache.delete(cacheKey);
@@ -216,10 +217,9 @@ export class EsmCompiler {
             if (!alreadyLoading) this.esmInFlightPaths.delete(evalScope);
         }
 
-        // An embedded map is injected at compile time and lives in the runtime,
-        // not in the bytecode: annotated modules must stay source-cached so a
-        // later load re-injects instead of serving unmapped positions.
-        if (tryBytecode && fileBacked && sourceFreshness && !inlineMapped) {
+        // Runtime maps are not part of bytecode. Keep any transformed module
+        // that registered one source-cached so a later load registers it again.
+        if (tryBytecode && fileBacked && sourceFreshness && !runtimeMapped) {
             if (remote) this.jsc.persist(info.localPath, mod, moduleId, sourceFreshness);
             else        this.jsc.persistLocal(info.localPath, mod, moduleId, sourceFreshness);
         }
@@ -244,6 +244,9 @@ export class EsmCompiler {
             const transformed = this.transformer.transform(code, info.localPath, metaLang(meta), moduleRef(info));
             mod = this.compileEsm(transformed, moduleRef(info), info.localPath);
         } finally {
+            // This path compiles caller-supplied source directly and has no
+            // bytecode persistence gate; do not strand its runtime-map marker.
+            this.transformer.tookInlineSourceMap(moduleRef(info));
             if (!alreadyLoading) this.esmInFlightPaths.delete(evalScope);
         }
         Object.assign(mod.meta, meta);
@@ -280,7 +283,9 @@ export class EsmCompiler {
             throw requireCycleError(cacheKey, info.localPath, 'require-esm');
         }
         const implementation = this.loadEsm(implementationInfo, {});
-        const result = engine.promiseResult(this.trackEvaluation(evalScope, () => implementation.eval()));
+        const result = promiseResultHandled(
+            this.trackEvaluation(evalScope, () => implementation.eval()),
+        );
         if (result === null) {
             throw err(ErrorKind.Generic,
                 `Bun implementation "${info.localPath}" must not use top-level await`,

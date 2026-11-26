@@ -93,8 +93,14 @@ function prepareForCache(
     mapKey?: string,
 ): string {
     // CJS keeps require/exports; transform() would rewrite import/export.
-    if (format === 'cjs') return transformer.transformForCjs(code, localPath, lang);
+    if (format === 'cjs') return transformer.transformForCjs(code, localPath, lang, mapKey);
     return transformer.transform(code, localPath, lang, mapKey);
+}
+
+function consumeRuntimeSourceMap(transformer: Transformer, mapKey: string, localPath: string): boolean {
+    const specMapped = transformer.tookInlineSourceMap(mapKey);
+    const localMapped = transformer.tookInlineSourceMap(localPath);
+    return specMapped || localMapped;
 }
 
 /** Transform worker safety timeout (ms). Scan tasks have no wall-clock kill. */
@@ -315,7 +321,7 @@ export class ParseDriver {
     /** id → {specPath, format} for in-flight transform tasks */
     private specMap = new Map<number, { specPath: string; identity: string; format: ModuleFormat | undefined }>();
     private bytecodes = new Map<string, ArrayBuffer>();
-    private onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void;
+    private onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string, runtimeMapped?: boolean) => void;
     private onFailed?: (localPath: string, specPath: string, error: unknown) => void;
     private nextId = 0;
     private maxWorkers: number;
@@ -415,7 +421,7 @@ export class ParseDriver {
     async compileModules(
         modules: CompileTarget[],
         onProgress?: (done: number, total: number) => void,
-        onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
+        onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string, runtimeMapped?: boolean) => void,
         onFailed?: (localPath: string, specPath: string, error: unknown) => void,
     ): Promise<Map<string, ArrayBuffer>> {
         if (this.closing) return new Map();
@@ -502,7 +508,7 @@ export class ParseDriver {
     async precompile(
         modules: CompileTarget[],
         onProgress?: (done: number, total: number) => void,
-        onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
+        onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string, runtimeMapped?: boolean) => void,
         onFailed?: (localPath: string, specPath: string, error: unknown) => void,
     ): Promise<Map<string, ArrayBuffer>> {
         return this.compileModules(modules, onProgress, onCompiled, onFailed);
@@ -511,7 +517,7 @@ export class ParseDriver {
     private async compileModulesInline(
         modules: CompileTarget[],
         onProgress?: (done: number, total: number) => void,
-        onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string) => void,
+        onCompiled?: (localPath: string, bc: ArrayBuffer, specPath: string, runtimeMapped?: boolean) => void,
         onFailed?: (localPath: string, specPath: string, error: unknown) => void,
     ): Promise<Map<string, ArrayBuffer>> {
         const bytecodes = new Map<string, ArrayBuffer>();
@@ -530,10 +536,12 @@ export class ParseDriver {
                     log.debug('precompile', () => `skip ${m.localPath}: embedded sourceMappingURL`);
                     done++;
                 } else {
-                    const code = prepareForCache(transformer, source, m.localPath, m.format, m.lang, m.specPath);
+                    const mapKey = m.format === 'cjs' ? compileIdentity(m) : m.specPath;
+                    const code = prepareForCache(transformer, source, m.localPath, m.format, m.lang, mapKey);
+                    const runtimeMapped = consumeRuntimeSourceMap(transformer, mapKey, m.localPath);
                     const bc = compileForCache(code, compileIdentity(m), m.format);
-                    if (onCompiled) onCompiled(m.localPath, bc, m.specPath);
-                    else bytecodes.set(m.localPath, bc);
+                    if (onCompiled) onCompiled(m.localPath, bc, m.specPath, runtimeMapped);
+                    else if (!runtimeMapped) bytecodes.set(m.localPath, bc);
                     done++;
                 }
             } catch (e) {
@@ -597,14 +605,16 @@ export class ParseDriver {
             task.sourceBytes = undefined;
             const { specPath, identity, format } = entry;
             try {
+                let runtimeMapped = false;
                 if (r.sourceMap) {
                     try {
                         smap.load(specPath, r.sourceMap);
+                        runtimeMapped = true;
                     } catch (e) { log.debug('precompile', () => `smap relay: ${task.localPath}: ${errMsg(e)}`); }
                 }
                 const bc = compileForCache(r.code, identity, format);
-                if (this.onCompiled) this.onCompiled(task.localPath, bc, specPath);
-                else this.bytecodes.set(task.localPath, bc);
+                if (this.onCompiled) this.onCompiled(task.localPath, bc, specPath, runtimeMapped);
+                else if (!runtimeMapped) this.bytecodes.set(task.localPath, bc);
             } catch (e) {
                 log.debug('precompile', () => `compile fail: ${task.localPath}: ${errMsg(e)}`);
                 this.onFailed?.(task.localPath, specPath, e);
@@ -640,13 +650,15 @@ export class ParseDriver {
             const transformer = this.getInlineTransformer();
             const identity = compileIdentity(m);
             let bc: ArrayBuffer;
+            let runtimeMapped: boolean;
             if (m.format === 'cjs') {
                 // Always strip TS/JSX; .cts must not hit EVAL_COMPILE_ONLY raw.
                 const raw = m.sourceBytes !== undefined
                     ? engine.decodeString(m.sourceBytes)
                     : readText(m.localPath);
                 if (hasEmbeddedSourceMap(raw)) return this.skipAnnotatedBytecode(m);
-                const code = prepareForCache(transformer, raw, m.localPath, 'cjs', m.lang, m.specPath);
+                const code = prepareForCache(transformer, raw, m.localPath, 'cjs', m.lang, identity);
+                runtimeMapped = consumeRuntimeSourceMap(transformer, identity, m.localPath);
                 bc = compileForCache(code, identity, 'cjs');
             } else {
                 const bytes = m.sourceBytes ?? readBytes(m.localPath);
@@ -655,24 +667,12 @@ export class ParseDriver {
                 if (hasEmbeddedSourceMapBytes(bytes)) {
                     return this.skipAnnotatedBytecode(m);
                 }
-                if (bytes.byteLength >= 2 && bytes[0] === 35 && bytes[1] === 33) {
-                    const code = prepareForCache(
-                        transformer, engine.decodeString(bytes), m.localPath, m.format, m.lang, m.specPath);
-                    bc = compileForCache(code, identity, m.format);
-                } else {
-                    try {
-                        bc = compileForCache(bytes, identity, m.format);
-                    } catch (e) {
-                        try {
-                            bc = compileForCache(engine.decodeString(bytes), identity, m.format);
-                        } catch {
-                            throw e;
-                        }
-                    }
-                }
+                const code = transformer.transformBytes(bytes, m.localPath, m.lang, identity);
+                runtimeMapped = consumeRuntimeSourceMap(transformer, identity, m.localPath);
+                bc = compileForCache(code, identity, m.format);
             }
-            if (this.onCompiled) this.onCompiled(m.localPath, bc, m.specPath);
-            else this.bytecodes.set(m.localPath, bc);
+            if (this.onCompiled) this.onCompiled(m.localPath, bc, m.specPath, runtimeMapped);
+            else if (!runtimeMapped) this.bytecodes.set(m.localPath, bc);
             this.transformDone++;
         } catch (e) {
             this.transformFail++;

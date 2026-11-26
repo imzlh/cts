@@ -719,6 +719,10 @@ export class NpmHandler implements ProtocolHandler {
         this.npmCfg = null;
     }
 
+    clearLocalResolutionCache(): void {
+        this.localCache.clear();
+    }
+
     /** Drain deferred npm lifecycle scripts (called by runtime after scan). */
     drainLifecycleScripts(): LifecycleScriptEntry[] {
         const scripts = this.pendingLifecycle.splice(0);

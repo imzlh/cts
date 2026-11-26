@@ -9,7 +9,7 @@ import {
     type PackModuleEntry,
 } from './format';
 import { log } from '../utils';
-import { setActiveFileStore, type VirtualFileStore } from '../utils/memfs';
+import type { VirtualFileStore } from '../utils/memfs';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -96,8 +96,7 @@ export class PackSession {
 
     /** Activate lazy store + pack: resolve. Re-install is safe (same store). */
     install(resolver: ModuleResolver): void {
-        setActiveFileStore(this.store);
-        resolver.registerPackHandler(new PackHandler(this.manifest));
+        resolver.registerPackHandler(new PackHandler(this.manifest), this.store);
         if (this.installed) return;
         this.installed = true;
         log.debug('pack', () =>
