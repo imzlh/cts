@@ -23,7 +23,7 @@
   conditions. APIs such as `Bun.resolve` need a per-call ESM inspection path with
   local conditions so Node/Deno package selection remains unchanged.
 - Loader changes must retain the main-bundle/source/pack boundary described in
-  the root `AGENT.md`; Bun API implementations belong under `cno/src/bun/`.
+  the root `AGENTS.md`; Bun API implementations belong under `cno/src/bun/`.
 
 ## Directory Layout
 
