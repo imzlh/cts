@@ -4,6 +4,7 @@ import { err, ErrorKind, setErrorCode } from '../errors';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+const { errno } = import.meta.use('error');
 
 const _NO_PKG = Symbol('no.pkg');
 
@@ -38,9 +39,9 @@ function invalidPackageConfig(packagePath: string, message: string): Error {
 function isMissingPackageError(error: unknown): boolean {
     if (error === null || (typeof error !== 'object' && typeof error !== 'function')) return false;
     const code = Reflect.get(error, 'code');
-    if (code === 'ENOENT' || code === 'ENOTDIR' || code === -2 || code === -20) return true;
-    const errno = Reflect.get(error, 'errno');
-    return errno === -2 || errno === -20;
+    if (code === 'ENOENT' || code === 'ENOTDIR' || code === errno.ENOENT || code === errno.ENOTDIR) return true;
+    const errorNumber = Reflect.get(error, 'errno');
+    return errorNumber === errno.ENOENT || errorNumber === errno.ENOTDIR;
 }
 
 function packageFromText(text: string, packagePath: string): PackageJson {
