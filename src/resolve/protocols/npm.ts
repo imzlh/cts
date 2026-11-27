@@ -945,7 +945,8 @@ export class NpmHandler implements ProtocolHandler {
         if (!pkgDir) return null;
         const pkg = readPkg(pkgDir);
         if (!pkg?.name) return null;
-        const format = detectPackageJsonFormat(normalized) ?? detectFormat(normalized);
+        const kind = attr?.cjs === true ? 'require' : 'import';
+        const format = detectPackageJsonFormat(normalized) ?? detectFormat(normalized, kind);
         return this.toLocalModuleInfo(pkg.name, pkg.version ?? '0.0.0', pkgDir, normalized, format);
     }
 

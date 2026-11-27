@@ -28,6 +28,10 @@ function protoOf(s: string): string {
     return schemeId(s) ?? '';
 }
 
+function detectRequestFormat(localPath: string, attr?: Record<string, unknown>) {
+    return detectFormat(localPath, attr?.cjs === true ? 'require' : 'import');
+}
+
 function isBunInternalSpecifier(spec: string): boolean {
     return spec.startsWith('bun-internal:');
 }
@@ -501,7 +505,7 @@ export class ModuleResolver {
         const alias = this.resolveAliasCandidates(spec);
         if (alias) {
             const { localPath } = alias;
-            return { specPath: localPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+            return { specPath: localPath, localPath, format: detectRequestFormat(localPath, attr), fileKind: guessFileKind(localPath) };
         }
         const npm = this.handlers.get('npm');
         if (npm) {
@@ -834,7 +838,7 @@ export class ModuleResolver {
         const specPath = localPath + specParts.suffix;
         const localNpm = this.canonicalizeLocalNpmFile(localPath, attr);
         if (localNpm && !specParts.suffix) return localNpm;
-        return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+        return { specPath, localPath, format: detectRequestFormat(localPath, attr), fileKind: guessFileKind(localPath) };
     }
 
     private async resolveRelativeAsync(spec: string, parent: string, attr?: Record<string, unknown>, onProgress?: ProgressCallback): Promise<ModuleInfo> {
@@ -860,7 +864,7 @@ export class ModuleResolver {
         const specPath  = localPath + specParts.suffix;
         const localNpm = this.canonicalizeLocalNpmFile(localPath, attr);
         if (localNpm && !specParts.suffix) return localNpm;
-        return { specPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+        return { specPath, localPath, format: detectRequestFormat(localPath, attr), fileKind: guessFileKind(localPath) };
     }
 
     private resolveBare(spec: string, parent: string, attr?: Record<string, unknown>): ModuleInfo {
@@ -874,7 +878,7 @@ export class ModuleResolver {
         const alias = this.resolveAliasCandidates(spec);
         if (alias) {
             const { localPath } = alias;
-            return { specPath: localPath, localPath, format: detectFormat(localPath), fileKind: guessFileKind(localPath) };
+            return { specPath: localPath, localPath, format: detectRequestFormat(localPath, attr), fileKind: guessFileKind(localPath) };
         }
         const npm = this.handlers.get('npm');
         if (npm) return runSync(npm.resolve(spec, parent, attr));
