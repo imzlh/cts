@@ -1,5 +1,5 @@
 import type { FileKind, PackageJson, ModuleFormat } from '../types';
-import { dirname, extname, joinPaths, normalizePath, isPathWithin, toPosixPath, resolveFile, safeParse, LRU, log, isValidNpmPackageName } from '../utils';
+import { dirname, extname, joinPaths, normalizePath, isPathWithin, toPosixPath, resolveFile, safeParse, LRU, isValidNpmPackageName } from '../utils';
 import { err, ErrorKind, setErrorCode } from '../errors';
 
 const fs = import.meta.use('fs');
@@ -35,6 +35,25 @@ function invalidPackageConfig(packagePath: string, message: string): Error {
         `Invalid package config ${packagePath}: ${message}`), 'ERR_INVALID_PACKAGE_CONFIG');
 }
 
+function isMissingPackageError(error: unknown): boolean {
+    if (error === null || (typeof error !== 'object' && typeof error !== 'function')) return false;
+    const code = Reflect.get(error, 'code');
+    if (code === 'ENOENT' || code === 'ENOTDIR' || code === -2 || code === -20) return true;
+    const errno = Reflect.get(error, 'errno');
+    return errno === -2 || errno === -20;
+}
+
+function packageFromText(text: string, packagePath: string): PackageJson {
+    try {
+        return validatePackage(safeParse<unknown>(text), packagePath);
+    } catch (error) {
+        if (error instanceof Error && error.kind === ErrorKind.SyntaxError) {
+            throw invalidPackageConfig(packagePath, error.message);
+        }
+        throw error;
+    }
+}
+
 function validatePackage(pkg: unknown, packagePath: string): PackageJson {
     if (pkg === null || typeof pkg !== 'object' || Array.isArray(pkg)) {
         throw invalidPackageConfig(packagePath, 'must be a JSON object');
@@ -51,17 +70,12 @@ export function readPkg(dir: string): PackageJson | null {
     if (hit && Date.now() - hit.at < PKG_TTL)
         return hit.pkg === _NO_PKG ? null : hit.pkg;
     const pkgPath = joinPaths(dir, 'package.json');
-    if (!fs.exists(pkgPath)) { pkgCache.set(dir, { pkg: _NO_PKG, at: Date.now() }); return null; }
     try {
-        const pkg = validatePackage(
-            safeParse<unknown>(engine.decodeString(fs.readFile(pkgPath))),
-            pkgPath,
-        );
+        const pkg = packageFromText(engine.decodeString(fs.readFile(pkgPath)), pkgPath);
         pkgCache.set(dir, { pkg, at: Date.now() });
         return pkg;
-    } catch (e) {
-        if (e instanceof Error && Reflect.get(e, 'code') === 'ERR_INVALID_PACKAGE_CONFIG') throw e;
-        log.debug('pkg', () => `failed ${pkgPath}: ${e}`);
+    } catch (error) {
+        if (!isMissingPackageError(error)) throw error;
         pkgCache.set(dir, { pkg: _NO_PKG, at: Date.now() });
         return null;
     }
@@ -69,15 +83,11 @@ export function readPkg(dir: string): PackageJson | null {
 
 export function readPkgFresh(dir: string): PackageJson | null {
     const pkgPath = joinPaths(dir, 'package.json');
-    if (!fs.exists(pkgPath)) return null;
     try {
-        return validatePackage(
-            safeParse<unknown>(engine.decodeString(fs.readFile(pkgPath))),
-            pkgPath,
-        );
-    } catch (e) {
-        if (e instanceof Error && Reflect.get(e, 'code') === 'ERR_INVALID_PACKAGE_CONFIG') throw e;
-        return null;
+        return packageFromText(engine.decodeString(fs.readFile(pkgPath)), pkgPath);
+    } catch (error) {
+        if (isMissingPackageError(error)) return null;
+        throw error;
     }
 }
 
